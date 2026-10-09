@@ -1,0 +1,46 @@
+# shoko-sonarr-linker — Compose example for Unraid-style Docker hosts.
+#
+# All paths below are examples, not deployment facts: adjust to the real
+# container-internal media paths, network names, and volumes. The image needs
+# ONLY the /data volume; it never mounts media libraries (and Shoko's side
+# effects — quality filter, renamer, plugins — are why that stays true).
+#
+# API keys live in the environment only (env-file / host env), never in this file.
+
+services:
+  shoko-sonarr-linker:
+    # Local smoke build: docker build -t shoko-sonarr-linker:local .
+    # Published GHCR image (publishing milestone): ghcr.io/<owner>/shoko-sonarr-linker:sha-<sha>
+    image: shoko-sonarr-linker:local
+    init: true              # PID-1 signal handling for graceful SIGTERM
+    # NOTE (foundation build): `daemon` is an honest stub that exits 4, so
+    # restart: unless-stopped will re-loop until the daemon ships. Drop the
+    # restart policy (or use the real daemon image) when deploying this example.
+    restart: unless-stopped
+    command: ["daemon", "/config/config.yaml"]
+    environment:
+      SONARR_API_KEY: "${SONARR_API_KEY}"
+      SHOKO_API_KEY: "${SHOKO_API_KEY}"
+      # Live writes additionally require SHOKO_LINKER_ALLOW_APPLY=1 here AND
+      # sync.apply_changes: true in the config. Dry-run is the default.
+    volumes:
+      - /mnt/user/appdata/shoko-sonarr-linker/config:/config:ro
+      - shoko-sonarr-linker-data:/data
+      # Unraid bind mounts: the container writes as UID/GID 1000. Set the share
+      # owner accordingly (e.g. `chown 1000:1000` on the appdata path) so /data
+      # is writable without running the container as root.
+    # No ports are exposed. The service is a network client only.
+    # Sonarr and Shoko are existing services; join their Docker network
+    # (name is deployment-specific) so configured URLs resolve:
+    networks:
+      - media
+
+networks:
+  media:
+    name: media            # example name; match the existing Sonarr/Shoko network
+
+volumes:
+  shoko-sonarr-linker-data:
+    # Persistent local volume for SQLite state and the Anime-Lists cache.
+    # A bind mount like /mnt/user/appdata/... works too; avoid network shares
+    # (SMB/NFS) for the SQLite file — locking is unreliable there.

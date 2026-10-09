@@ -1,0 +1,63 @@
+# shoko-sonarr-linker configuration example (paths are examples, not deployment facts).
+#
+# SECRETS ARE NEVER CONFIGURED HERE. Only the NAME of an environment variable is
+# stored in this file; the API key value is read from the process environment at access
+# time and is never kept in settings, printed in reports, or written to logs.
+#
+#   set SONARR_API_KEY=...   (Sonarr: User -> API, read-only use only)
+#   set SHOKO_API_KEY=...
+#
+# All media paths below are container-internal POSIX paths and are compared
+# case-sensitively, component by component: /anime never matches /anime-old.
+
+sonarr:
+  url: http://sonarr:8989
+  # A urlBase is preserved, e.g. http://host/sonarr, and used when joining API paths.
+  api_key_env: SONARR_API_KEY
+  # Nonempty allowlist. Series outside these roots (all live-action TV) are out of scope.
+  allowed_roots:
+    - /data/media/anime
+
+shoko:
+  url: http://shoko:8111
+  api_key_env: SHOKO_API_KEY
+  # Nonempty allowlist. Shoko-managed drop folders are excluded by listing only
+  # the Sonarr-owned anime paths here.
+  allowed_roots:
+    - /anime
+
+paths:
+  # Nonempty list of explicit container path mappings, each a component-boundary prefix.
+  mappings:
+    - sonarr: /data/media/anime
+      shoko: /anime
+
+mappings:
+  # anime-lists is the only supported source in v1; other values are rejected.
+  source: anime-lists
+  # Weekly by default; must be > 0. The daemon refreshes on this schedule.
+  refresh_hours: 168
+  # Optional user-maintained overrides (may be omitted).
+  overrides_file: /config/overrides.yaml
+
+sync:
+  interval_seconds: 300
+  full_reconcile_interval_hours: 24
+  new_file_grace_period_seconds: 300
+  # SAFE DEFAULT: false means dry-run. true alone is not enough — see the gate below.
+  apply_changes: false
+  # Must be >= 1.
+  max_concurrent_links: 1
+  # Optional; these are the defaults.
+  timeouts:
+    connect_seconds: 10
+    read_seconds: 30
+
+database:
+  path: /data/state.sqlite3
+
+# WRITE GATE (default-deny). Live Shoko writes require BOTH:
+#   1. sync.apply_changes: true above, AND
+#   2. the operator environment variable SHOKO_LINKER_ALLOW_APPLY=1
+# No command-line flag opens the gate by itself: `once --apply` refuses (exit 3)
+# unless both conditions hold.

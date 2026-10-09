@@ -44,7 +44,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = { "ARG" = "D" }
+"tests/*" = ["ARG"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,3 +55,4 @@ python_version = "3.12"
 strict = true
 mypy_path = "src"
 warn_unreachable = true
+files = ["src", "tests"]

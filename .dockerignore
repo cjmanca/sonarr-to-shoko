@@ -1,0 +1,21 @@
+# Keep the build context minimal: no secrets, no caches, no host state.
+.git
+.gitignore
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+docs/
+config.yaml
+*.sqlite3
+/data/
+compose.example.yaml
+Dockerfile
+.dockerignore

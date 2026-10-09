@@ -7,6 +7,7 @@
 - **[PROJECT.md](PROJECT.md)** is authoritative for product behavior, architecture, safety constraints, integrations, and acceptance criteria. Read the relevant sections when needed to understand a substantive change. The delegating orchestrator should supply a self-contained task brief with scope and acceptance checks.
 - **AGENTS.md** defines engineering procedure, testing, review, and reporting. Source code, tests, and upstream documentation describe current behavior, not permission to weaken PROJECT.md.
 - For delegated tasks, work from the **assigned brief** and the relevant source files. Do not independently select additional milestones or browse orchestration/progress artifacts. Return findings and evidence to the delegating agent, which owns project-wide decisions and bookkeeping.
+- For a **top-level project orchestration** session (including `/goal`), read and follow [ORCHESTRATION.md](ORCHESTRATION.md) at startup and after context compaction. That document, not this file, contains the portable orchestration policy. Delegated agents work from their scoped brief and `AGENTS.md`.
 - When requirements conflict or evidence is missing, report the discrepancy; do not silently override product safety rules. Keep new product requirements in PROJECT.md and reusable agent procedures here. Avoid duplicating specifications between documents.
 
 ## Working contract

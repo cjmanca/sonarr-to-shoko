@@ -1,0 +1,55 @@
+# Basic CI: validate every push/PR, build the image, never publish.
+# GHCR publishing (per-commit SHA tags, least-privilege publish job, latest
+# promotion) is a later milestone — this workflow deliberately has
+# NO packages:write permission and no registry login.
+#
+# Note: action refs pinned by tag here; SHA-pinning (commit SHAs for
+# actions/checkout, actions/setup-python) is required by the publishing milestone.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v4
+      - name: Install (locked dev group)
+        run: uv sync --frozen
+      - name: Ruff check
+        run: uv run ruff check .
+      - name: Ruff format check
+        run: uv run ruff format --check .
+      - name: Mypy
+        run: uv run mypy
+      - name: Pytest
+        run: uv run pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t shoko-sonarr-linker:ci .
+      - name: Smoke (CLI help + offline config validate + default-deny gate)
+        # Dummy long keys satisfy config load (values stay in the environment;
+        # offline validate makes no network call). once --apply must refuse (exit 3)
+        # with the safe default config (apply_changes: false).
+        run: |
+          docker run --rm -e SONARR_API_KEY=ci-dummy-sonarr-key-000000 -e SHOKO_API_KEY=ci-dummy-shoko-key-000000 shoko-sonarr-linker:ci --help
+          docker run --rm -e SONARR_API_KEY=ci-dummy-sonarr-key-000000 -e SHOKO_API_KEY=ci-dummy-shoko-key-000000 shoko-sonarr-linker:ci validate --offline config.example.yaml
+          rc=0
+          docker run --rm -e SONARR_API_KEY=ci-dummy-sonarr-key-000000 -e SHOKO_API_KEY=ci-dummy-shoko-key-000000 shoko-sonarr-linker:ci once --apply config.example.yaml || rc=$?
+          test $rc -eq 3

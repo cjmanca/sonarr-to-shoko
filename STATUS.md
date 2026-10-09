@@ -8,17 +8,19 @@
 
 ## Current checkpoint
 
-- **Goal status:** `TODO` (valid: `TODO`, `ACTIVE`, `PASS`, `PARTIAL/BLOCKED`).
-- **Active milestone / slice:** M0 — discovery / not started.
-- **Next concrete action:** Inspect git status and repository contents; verify versioned Sonarr/Shoko API and Anime-Lists mapping contracts against primary sources. Then begin M1's first buildable Python/Docker commit.
-- **Last accepted local commit:** None recorded.
-- **Working tree / uncommitted work:** Not inspected.
-- **Last observed branch / HEAD:** Not inspected.
-- **Last verified checks (command → result):** None yet.
-- **Open P0/P1 or gate-blocking P2 findings:** None reported yet (not a completed review).
-- **Current blockers / assumptions:** Production Sonarr/Shoko versions, credentials, mounts, safety settings, mapping coverage, and GitHub package permissions have not been verified.
-- **Offline vs live evidence:** No offline gates have been executed. Live Sonarr/Shoko, Plex, GHCR, and Unraid checks are `EXTERNAL/UNVERIFIED`.
-- **Proposed changes to frozen plan:** None. Any proposal belongs here until explicitly approved by the user.
+- **Goal status:** `ACTIVE` (orchestration goal; plan persisted in goal tool, phases M1→M9).
+- **Active milestone / slice:** **M1 PASS (offline gate)** — first-buildable boundary commit created on this checkpoint (SHA recorded at next ledger touch, riding the M2 commit). M0 **PASS** (offline gate, `d0c9196`).
+- **Next concrete action:** Prepare the M2 brief (Sonarr eligibility filter + file/episode inventory + baseline cohort rules, offline fixture gate) and delegate to an implementer; M1 P3 deferrals listed below must be honored in M2/M3 briefs.
+- **Last accepted local commit:** M1 boundary commit (this checkpoint); prior accepted `d0c9196` (M0 docs).
+- **Working tree / uncommitted work:** STATUS.md checkpoint update only (application tree fully committed in the boundary commit).
+- **Last observed branch / HEAD:** `main` (ahead of `origin/main`; pushes NOT authorized).
+- **Last verified checks (orchestrator-run, command → result):** PLAN.md SHA-256 matches ledger. `uv run pytest -o addopts="" -q` → **exit 0, 111 passed** (addopts `-q` + CLI `-q` = `-qq` suppresses the summary footer; use `-o addopts=""` to see counts). `uv run ruff check .` → 0; `uv run ruff format --check .` → 0 (15 files); `uv run mypy` → 0 (15 source files); `git diff --check` → 0. CLI smoke: `--help` 0; `validate --offline config.example.yaml` 0 (dummy env keys); `once --apply config.example.yaml` → **3 REFUSED** both with and without `SHOKO_LINKER_ALLOW_APPLY=1` (config gate false). `docker build -t shoko-sonarr-linker:m1-boundary .` → **exit 0**. Container smoke: `--help` 0, offline validate 0, `once --apply` → 3 REFUSED (gate text observed).
+- **Independent review (M1, read-only adversarial subagent):** **No P0/P1.** Findings triaged below; reviewer independently re-ran suite, CLI matrix, `docker build`, container smoke (all green) and verified non-root uid/gid, writable `/data`, `/app` root-owned, no source tree in image layers.
+- **Open P0/P1 or gate-blocking P2 findings:** **None open.** P2s fixed + regression-tested: (1) `_number` accepted NaN/inf and crashed on >float ints → finite/range checks (`must be a finite number` / `out of range`); (2) non-UTF-8 config and huge-int values raised raw tracebacks (exit 1) → `ConfigError` exit 2 paths. P3s closed: http docstring now matches POST replay semantics (301/302/307/308 same-origin walk, one delivery per target; pinned by parametrized test), `resolve_and_send` refuses foreign-origin absolute URLs before any request, `make_client` warns (length only) when a key is below the 8-char redaction floor, dead CLI handler-lookup branch removed, tests strengthened (`retries=0` transport pin, Sonarr key in `repr` check, short-key warning asserts value absent), compose example notes daemon-stub restart loop.
+- **Deferred P3s (reason):** `normalize_posix("//x")` keeps double-slash root (cosmetic; containment correct). `is_within_root` is lexical — filesystem symlinks inside allowlisted roots are out of lexical scope by design; **M2/M3 briefs must handle symlink resolution explicitly** (reviewer note, not an M1 defect).
+- **Current blockers / assumptions:** Production Sonarr/Shoko versions, credentials, mounts, safety settings, mapping coverage, and GitHub package permissions remain unverified (EXTERNAL/UNVERIFIED). Prior harness tooling outage did not recur this session; all checks ran.
+- **Offline vs live evidence:** All M1 gate items are offline evidence (mock HTTP, local Docker). Live Sonarr/Shoko, Plex, GHCR, Unraid checks are `EXTERNAL/UNVERIFIED`.
+- **Proposed changes to frozen plan:** None.
 
 ## Milestone ledger
 
@@ -26,8 +28,8 @@
 
 | Milestone | Status | Evidence (commands/results, review, commit) / blocker |
 | --- | --- | --- |
-| M0 | TODO | — |
-| M1 | TODO | — |
+| M0 | **PASS** (offline gate) | `docs/compatibility.md` @ `d0c9196`. Sonarr v3 + Shoko v5.3.3 (blob-SHA-verified tag `89246118…`) + Anime-Lists contracts; orchestrator re-verified every load-bearing claim against raw sources (README quotes verbatim; ManualLinkJob chain; `apikey` auth; PascalCase naming; `ListResult{Total,List}`; ETag-only conditional fetch — 304 measured; license null → no bundling; AoT S04E26→AniDB 16177 ep10 from live XML). Plan-nuance recorded: `RelocateOnImport` IS serialized (Newtonsoft) — read `RenameOnImport`/`MoveOnImport` directly. Live checks remain EXTERNAL/UNVERIFIED (§5 of doc). |
+| M1 | **PASS** (offline gate; first-buildable boundary) | Boundary commit recorded at next checkpoint update (rides M2 commit). Foundation package (`src/shoko_linker/` 8 modules + `py.typed`), 7 test modules, example config, Dockerfile, `.dockerignore`, Compose example, basic CI, README. Evidence (orchestrator-observed): 111 tests passed; ruff/format/mypy exit 0; CLI exit matrix (help 0, validate 0, `once --apply` 3 REFUSED both gate combos); `docker build` exit 0; container smoke 0/0/3. Two prior P1s (traceback redaction, urlBase join) fixed + tested. Independent read-only adversarial review: no P0/P1; 2 P2 + 6 P3 findings fixed/tested above. M8 publish workflow intentionally NOT here (CI is lint/test/build only, `contents: read`). Live/production items EXTERNAL/UNVERIFIED. |
 | M2 | TODO | — |
 | M3 | TODO | — |
 | M4 | TODO | — |
@@ -41,21 +43,28 @@
 
 ## Latest implementation / review checkpoint
 
-- **Slice / scoped assignment:** Not started.
-- **Files changed:** —
-- **Implementation summary:** —
-- **Targeted checks and exact results:** —
-- **Independent read-only review:** Not performed. Include severity, path/line, impact, and fix or disposition for each finding.
-- **Fixes and retests:** —
-- **Decision:** Not accepted / pending.
-- **Commit SHA:** —
-- **Next task brief (self-contained for subagents):** —
+- **Slice / scoped assignment:** M1 close-out (orchestrator): re-verify recorded evidence, independent adversarial review, fix findings, retest, Docker verification, boundary commit.
+- **Files changed (this slice):** `src/shoko_linker/config.py` (finite/range numeric validation, non-UTF-8 file → ConfigError), `src/shoko_linker/http.py` (accurate POST-redirect docstring, hop-0 origin binding, short-key redaction warning), `src/shoko_linker/logging_setup.py` (`register_secret` returns registration result; public `MIN_SECRET_LENGTH`), `src/shoko_linker/cli.py` (dead branch removed), `tests/test_config.py` (+7 cases), `tests/test_http.py` (+6 cases), `tests/test_logging.py` (registration-result pin), `README.md` (warning note), `compose.example.yaml` (stub restart-loop note).
+- **Implementation summary:** Fail-closed numeric and file-encoding validation; redirect walk documented and tested for exactly one delivery per target across 301/302/307/308 with 303+POST refusal; foreign-origin requests refused before transport; sub-floor key registration now warns without emitting the value; example Compose warns that the daemon is a stub in this build.
+- **Targeted checks and exact results:** See "Last verified checks" above (111 passed; lint/format/type/CLI/Docker/container all exit-0, gate refusal exit 3).
+- **Independent read-only review:** Full-diff adversarial pass (read-only subagent, sequential): commands independently run, invariants verified clean (gate composition, secret handling, path containment, redirect policy, Docker posture, CI least privilege + rc capture). Findings: 0 P0/P1, 2 P2, 6 P3 — all fixed this slice except two documented deferrals.
+- **Fixes and retests:** Full suite re-run after fixes → green (above), then Docker rebuild + container smoke re-run → green.
+- **Decision:** M1 accepted at the offline gate; boundary commit created.
+- **Commit SHA:** Boundary commit = created with this checkpoint (SHA recorded at next ledger touch).
+- **Next task brief (self-contained for subagents):** M2-a — Sonarr v3 inventory module: fetch `/api/v3/series`, filter by exact configured anime `rootFolderPath` before any per-series episode/file requests; index episode files by series/file ID + exact path + byte size + all episodes sharing `episodeFileId`; season 0 and multi-episode files; component-aware root containment; baseline cohort rules (complete snapshot, ID-reuse/source-restore detection stops auto-apply); offline MockTransport fixtures. M2 brief must include the symlink-handling obligation noted above.
 
 ## Blockers, deferred findings, and plan change proposals
 
 | Type / severity | Milestone | Reproducer or justification | Resolution / next action |
 | --- | --- | --- | --- |
-| None recorded | — | — | — |
+| P2 (resolved) | M1 | `config.py:_number` accepted `.nan`/`.inf` (`interval_seconds: .nan` → accepted; daemon `time.sleep(nan)` crash) and raised uncaught `OverflowError` on `10**400`. | Resolved: finiteness + range `ConfigError`s; parametrized regression tests; suite green. |
+| P2 (resolved) | M1 | Non-UTF-8 config file → uncaught `UnicodeDecodeError` traceback exit 1 (documented contract: exit 2, never raises for expected failures). | Resolved: `load_settings` catches decode → `ConfigError`; regression test; suite green. |
+| P3 (resolved) | M1 | `http.py` docstring claimed POST replay only for 307/308; implementation (spec-legal) also walks 301/302. No test pinned statuses. | Resolved: accurate docstring + parametrized 301/302/307/308 walk test (one delivery per target). |
+| P3 (resolved) | M1 | `resolve_and_send` accepted foreign absolute URLs → auth header to any host (no M1 caller; future-engine risk). | Resolved: hop-0 origin binding refuses foreign origins before any request; test added. |
+| P3 (resolved) | M1 | API keys shorter than 8 chars silently unregistered (unredactable) — e.g. `SHOKO_API_KEY=abc`. | Resolved: `make_client` logs length-only warning; `register_secret` returns bool; tests pin warning text and value absence. |
+| P3 (deferred) | M1→M2 | `normalize_posix("//x")` keeps the double-slash root form. Cosmetic; containment/mapping correct. | Defer (no functional impact); normalize opportunistically in M3 path work. |
+| P3→obligation (deferred) | M2/M3 | `is_within_root` is lexical by design: symlinks inside an allowlisted root can point outside it. Not an M1 defect. | M2/M3 briefs must resolve/verify real paths; PLAN M3 symlink uncertainty gate item covers it. |
+| P3 (resolved) | M1-b | Example Compose ran stub `daemon` (exit 4) under `restart: unless-stopped` → crash loop. | Resolved: prominent note (drop restart / use real daemon image when it ships). |
 
 ## External validation tracker
 
