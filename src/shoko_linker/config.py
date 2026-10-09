@@ -29,6 +29,9 @@ from .paths import PathMapping, normalize_posix, validate_mappings
 APPLY_ENV_VAR: Final[str] = "SHOKO_LINKER_ALLOW_APPLY"
 MAPPING_SOURCE: Final[str] = "anime-lists"
 DEFAULT_CONFIG_PATH: Final[str] = "config.yaml"
+DEFAULT_MAPPING_SOURCE_URL: Final[str] = (
+    "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-full.xml"
+)
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS: Final[float] = 10.0
 DEFAULT_READ_TIMEOUT_SECONDS: Final[float] = 30.0
@@ -52,7 +55,9 @@ _SYNC_KEYS: Final[frozenset[str]] = frozenset(
         "timeouts",
     }
 )
-_MAPPINGS_KEYS: Final[frozenset[str]] = frozenset({"source", "refresh_hours", "overrides_file"})
+_MAPPINGS_KEYS: Final[frozenset[str]] = frozenset(
+    {"source", "refresh_hours", "overrides_file", "source_url"}
+)
 _TIMEOUT_KEYS: Final[frozenset[str]] = frozenset({"connect_seconds", "read_seconds"})
 _DATABASE_KEYS: Final[frozenset[str]] = frozenset({"path"})
 _ENV_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -93,6 +98,7 @@ class MappingSettings:
     source: str
     refresh_hours: float
     overrides_file: str | None
+    source_url: str
 
 
 @dataclass(frozen=True)
@@ -361,6 +367,9 @@ def _mappings(section: Mapping[str, Any]) -> MappingSettings:
         source=MAPPING_SOURCE,
         refresh_hours=_positive_number(section, "refresh_hours", "mappings", DEFAULT_REFRESH_HOURS),
         overrides_file=overrides,
+        source_url=_base_url(
+            section.get("source_url", DEFAULT_MAPPING_SOURCE_URL), "mappings.source_url"
+        ),
     )
 
 

@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Formatting-only variant of gate_mappings.xml for digest-stability tests:
+     same entries, reversed entry order, shuffled attribute order, extra
+     comments and whitespace. Must produce an identical targets_digest. -->
+<anime-list>
+  <!-- entry 291 -->
+  <anime tvdbid="2910" anidbseason-ignore="" anidbid="291" defaulttvdbseason="1">
+    <name>Unverified anidbseason 2</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="2">;3-3;</mapping></mapping-list>
+  </anime>
+  <!-- entry 290 -->
+  <anime tvdbid="2900" anidbid="290" defaulttvdbseason="1">
+    <name>Offset without bounds excluded</name>
+    <mapping-list>
+      <mapping tvdbseason="1" offset="5" anidbseason="1">;</mapping>
+    </mapping-list>
+  </anime>
+  <!-- entry 280 -->
+  <anime defaulttvdbseason="0" tvdbid="2800" anidbid="280"><name>Season 0 by season alone never resolves</name></anime>
+  <!-- entry 270 -->
+  <anime tvdbid="2700" defaulttvdbseason="1" anidbid="270">
+    <name>Bounds without offset inert</name>
+    <mapping-list>
+      <mapping end="10" tvdbseason="1" start="1" anidbseason="1">;1-5;</mapping>
+    </mapping-list>
+  </anime>
+  <!-- entry 260 -->
+  <anime anidbid="260" episodeoffset="-10" defaulttvdbseason="1" tvdbid="2600">
+    <name>Negative entry offset</name>
+  </anime>
+  <!-- entry 250 -->
+  <anime tvdbid="2500" anidbid="250" defaulttvdbseason="1">
+    <name>Before mappings</name>
+    <before><mapping tvdbseason="1" anidbseason="1">;7-1;</mapping></before>
+  </anime>
+  <!-- entry 240 -->
+  <anime defaulttvdbseason="1" tvdbid="2400" anidbid="240">
+    <name>Unverified 101 range</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;101-1;2-2;</mapping></mapping-list>
+  </anime>
+  <!-- entry 230 -->
+  <anime anidbid="230" defaulttvdbseason="1" tvdbid="2300">
+    <name>Invalid pair left multi</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;1+2-1;</mapping></mapping-list>
+  </anime>
+  <!-- entry 220 -->
+  <anime episodeoffset="3" defaulttvdbseason="a" tvdbid="2200" anidbid="220">
+    <name>Absolute with offset fails closed</name>
+  </anime>
+  <!-- entry 210 -->
+  <anime tvdbid="2100" defaulttvdbseason="a" anidbid="210">
+    <name>Absolute identity with mapping list</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;1-301;</mapping></mapping-list>
+  </anime>
+  <!-- entry 200 -->
+  <anime defaulttvdbseason="a" tvdbid="2000" anidbid="200"><name>Absolute identity plain</name></anime>
+  <!-- entry 191 -->
+  <anime tvdbid="1900" anidbid="191" defaulttvdbseason="0">
+    <name>Season 0 claim B</name>
+    <mapping-list><mapping tvdbseason="0" anidbseason="0">;5-2;</mapping></mapping-list>
+  </anime>
+  <!-- entry 192 -->
+  <anime anidbid="192" defaulttvdbseason="1" tvdbid="1900">
+    <name>OAD-style rule never resolves season 0</name>
+    <mapping-list><mapping tvdbseason="0" anidbseason="1">;3-4;</mapping></mapping-list>
+  </anime>
+  <!-- entry 190 -->
+  <anime defaulttvdbseason="0" anidbid="190" tvdbid="1900">
+    <name>Season 0 claim A</name>
+    <mapping-list><mapping tvdbseason="0" anidbseason="0">;1-2;</mapping></mapping-list>
+  </anime>
+  <!-- entry 181 -->
+  <anime anidbid="181" tvdbid="1800" defaulttvdbseason="2"><name>No season 0 claim</name></anime>
+  <!-- entry 180 -->
+  <anime tvdbid="1800" defaulttvdbseason="1" anidbid="180">
+    <name>Unique season 0 mapping</name>
+    <mapping-list><mapping tvdbseason="0" anidbseason="0">;1-3;</mapping></mapping-list>
+  </anime>
+  <!-- entry 171 -->
+  <anime anidbid="171" defaulttvdbseason="1" tvdbid="1700">
+    <name>Collision B</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;9-4;</mapping></mapping-list>
+  </anime>
+  <!-- entry 170 -->
+  <anime tvdbid="1700" defaulttvdbseason="1" anidbid="170">
+    <name>Collision A</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;4-4;</mapping></mapping-list>
+  </anime>
+  <!-- entry 160 -->
+  <anime defaulttvdbseason="1" tvdbid="1600" anidbid="160">
+    <name>Two AniDB parts of one TVDB</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;1-1;2-1;</mapping></mapping-list>
+  </anime>
+  <!-- entry 150 -->
+  <anime tvdbid="1500" anidbid="150" defaulttvdbseason="1">
+    <name>Multi-episode AniDB to two TVDB</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;1-1+2;</mapping></mapping-list>
+  </anime>
+  <!-- entry 140 -->
+  <anime defaulttvdbseason="1" tvdbid="1400" anidbid="140">
+    <name>Trailer and Other encodings</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;201-1;202-2;401-3;402-4;</mapping></mapping-list>
+  </anime>
+  <!-- entry 130 -->
+  <anime tvdbid="1300" anidbid="130" defaulttvdbseason="1">
+    <name>TVDB zero exclusion</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;5-0;6-7;</mapping></mapping-list>
+  </anime>
+  <!-- entry 125 -->
+  <anime episodeoffset="1" tvdbid="1250" defaulttvdbseason="1" anidbid="125">
+    <name>Range offset beats entry offset</name>
+    <mapping-list>
+      <mapping offset="0" tvdbseason="1" end="10" start="1" anidbseason="1">;</mapping>
+    </mapping-list>
+  </anime>
+  <!-- entry 120 -->
+  <anime tvdbid="1200" anidbid="120" defaulttvdbseason="1">
+    <name>Range offset</name>
+    <mapping-list>
+      <mapping offset="20" start="1" end="10" tvdbseason="2" anidbseason="1">;</mapping>
+    </mapping-list>
+  </anime>
+  <!-- entry 110 -->
+  <anime weird="x" epoffset="4" episodeoffset="0" tvdbid="1100" defaulttvdbseason="1" anidbid="110">
+    <name>Explicit pair beats offset</name>
+    <mapping-list><mapping tvdbseason="1" anidbseason="1">;3-9;</mapping></mapping-list>
+    <legend>unknown child (ignored)</legend>
+  </anime>
+  <!-- entry 101 -->
+  <anime tvdbid="1000" defaulttvdbseason="2" anidbid="101"><name>Split B Season 2</name></anime>
+  <!-- entry 100 -->
+  <anime defaulttvdbseason="1" tvdbid="1000" anidbid="100"><name>Split A Season 1</name></anime>
+</anime-list>

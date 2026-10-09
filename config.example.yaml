@@ -39,6 +39,10 @@ mappings:
   refresh_hours: 168
   # Optional user-maintained overrides (may be omitted).
   overrides_file: /config/overrides.yaml
+  # Optional: Anime-Lists source URL, fetched at runtime (never bundled).
+  # Defaults to the canonical URL below when omitted; validated like a service URL
+  # (no credentials, query, or fragment; the ETag validator is bound to it).
+  source_url: https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-full.xml
 
 sync:
   interval_seconds: 300

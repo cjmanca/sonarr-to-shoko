@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Regression fixture: the exact <anime> elements for Attack on Titan
+  (TVDB series 267440, AniDB ids 9541, 9826, 10944, 13241, 14444, 14977,
+  16177, 17303) from the canonical Anime-Lists mapping source.
+
+  Source URL: https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-full.xml
+  Fetched:    2026-10-09
+  Full-file SHA-256 at fetch time:
+    492b080c17777ce43a51094fb4d892b0ea0e9fac8fe8c8b655dc27ec5e22eb17
+    (1,715,347 bytes, 10,771 <anime> elements; matches the measurement recorded
+     in docs/compatibility.md section 3)
+
+  Elements below are copied verbatim from the fetched document (the only
+  additions are the surrounding <anime-list> root wrapper required by the parser
+  and one indentation level).
+
+  Attribution: Anime-Lists/anime-lists (https://github.com/Anime-Lists/anime-lists).
+  The upstream project publishes no LICENSE file and its README is silent on
+  redistribution; per docs/compatibility.md section 3, shipping bundled copies
+  is UNVERIFIED. This excerpt is committed solely as an offline regression
+  anchor for the mapping parser, with source attribution, not as a bundled
+  distribution of the upstream data.
+-->
+<anime-list>
+  <anime anidbid="9541" tvdbid="267440" defaulttvdbseason="1" tmdbtv="1429" tmdbseason="1">
+    <name>Shingeki no Kyojin</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0">;1-1;2-2;3-3;4-4;5-5;6-6;7-8;8-9;9-10;10-11;11-0;12-0;13-0;14-0;15-0;</mapping>
+    </mapping-list>
+  </anime>
+
+  <anime anidbid="9826" tvdbid="267440" defaulttvdbseason="0" tmdbtv="1429" tmdbseason="0">
+    <name>Shingeki no Kyojin OAD</name>
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="0">;1-7;2-12;3-13;4-15;5-17;6-20;7-22;8-23;</mapping>
+    </mapping-list>
+  </anime>
+
+  <anime anidbid="10944" tvdbid="267440" defaulttvdbseason="2" tmdbtv="1429" tmdbseason="2">
+    <name>Shingeki no Kyojin Season 2</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0">;1-0;2-0;3-0;4-0;</mapping>
+    </mapping-list>
+  </anime>
+
+  <anime anidbid="13241" tvdbid="267440" defaulttvdbseason="3" tmdbtv="1429" tmdbseason="3">
+    <name>Shingeki no Kyojin Season 3</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0">;1-0;2-0;3-0;4-0;5-0;</mapping>
+    </mapping-list>
+  </anime>
+
+  <anime anidbid="14444" tvdbid="267440" defaulttvdbseason="3" episodeoffset="12" tmdbtv="1429" tmdbseason="3" tmdboffset="12">
+    <name>Shingeki no Kyojin Season 3 (2019)</name>
+  </anime>
+
+  <anime anidbid="14977" tvdbid="267440" defaulttvdbseason="4" tmdbtv="1429" tmdbseason="4">
+    <name>Shingeki no Kyojin: The Final Season</name>
+  </anime>
+
+  <anime anidbid="16177" tvdbid="267440" defaulttvdbseason="4" episodeoffset="16" tmdbtv="1429" tmdbseason="4" tmdboffset="16">
+    <name>Shingeki no Kyojin: The Final Season (2022)</name>
+  </anime>
+
+  <anime anidbid="17303" tvdbid="267440" defaulttvdbseason="4" episodeoffset="28" tmdbtv="1429" tmdbseason="4" tmdboffset="28">
+    <name>Shingeki no Kyojin: The Final Season (2023)</name>
+  </anime>
+</anime-list>

@@ -16,6 +16,7 @@ from shoko_linker.config import (
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_FULL_RECONCILE_HOURS,
     DEFAULT_INTERVAL_SECONDS,
+    DEFAULT_MAPPING_SOURCE_URL,
     DEFAULT_NEW_FILE_GRACE_SECONDS,
     DEFAULT_READ_TIMEOUT_SECONDS,
     DEFAULT_REFRESH_HOURS,
@@ -42,6 +43,7 @@ def test_example_config_loads() -> None:
     assert settings.mappings.source == "anime-lists"
     assert settings.mappings.refresh_hours == DEFAULT_REFRESH_HOURS
     assert settings.mappings.overrides_file == "/config/overrides.yaml"
+    assert settings.mappings.source_url == DEFAULT_MAPPING_SOURCE_URL
     assert settings.sync.apply_changes is False
     assert settings.sync.max_concurrent_links == 1
     assert settings.sync.connect_timeout_seconds == DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -244,6 +246,33 @@ def test_max_concurrent_links_must_be_at_least_one(base_document: dict[str, Any]
 def test_mapping_source_is_fixed(base_document: dict[str, Any]) -> None:
     base_document["mappings"]["source"] = "my-homegrown-map"
     with pytest.raises(ConfigError, match="mappings.source"):
+        parse_settings(_dump(base_document))
+
+
+def test_source_url_defaults_to_the_canonical_constant(base_document: dict[str, Any]) -> None:
+    settings = parse_settings(_dump(base_document))
+    assert settings.mappings.source_url == DEFAULT_MAPPING_SOURCE_URL
+
+
+def test_custom_source_url_is_preserved(base_document: dict[str, Any]) -> None:
+    base_document["mappings"]["source_url"] = "https://example.com/mirror/anime-list-full.xml"
+    settings = parse_settings(_dump(base_document))
+    assert settings.mappings.source_url == "https://example.com/mirror/anime-list-full.xml"
+
+
+@pytest.mark.parametrize(
+    "raw_url",
+    [
+        "https://user@host.example/anime-list-full.xml",
+        "https://host.example/anime-list-full.xml?ref=main",
+        "https://host.example/anime-list-full.xml#fragment",
+        "ftp://host.example/anime-list-full.xml",
+        "not a url",
+    ],
+)
+def test_invalid_source_url_is_rejected(base_document: dict[str, Any], raw_url: str) -> None:
+    base_document["mappings"]["source_url"] = raw_url
+    with pytest.raises(ConfigError, match="mappings.source_url"):
         parse_settings(_dump(base_document))
 
 
