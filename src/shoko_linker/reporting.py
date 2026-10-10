@@ -176,9 +176,18 @@ def daemon_report_payload(
     *,
     cycles: Sequence[tuple[CycleReport, str | None, str | None]],
 ) -> dict[str, Any]:
-    """Aggregate daemon view: every cycle summary plus the exit cause."""
+    """Aggregate daemon view: bounded cycle summaries plus totals and the exit cause.
+
+    ``cycles_run`` is the TRUE executed count (previously the history length). ``total_failed``
+    counts failed cycles, ``history_retained`` is the bounded-history size, and ``last_cycle_key``
+    names the most recent completed cycle (``None`` if none ran). ``cycle_summaries`` covers
+    only the bounded history, not every executed cycle.
+    """
     return {
-        "cycles_run": len(report.cycles),
+        "cycles_run": report.total_cycles,
+        "total_failed": report.total_failed,
+        "history_retained": len(report.cycles),
+        "last_cycle_key": report.last_cycle.cycle_key if report.last_cycle is not None else None,
         "exit_reason": report.exit_reason,
         "shutdown_requested": report.shutdown_requested,
         "cycle_summaries": [

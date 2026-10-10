@@ -402,6 +402,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> StubEnv:
     monkeypatch.setattr(cli, "attestation_target_path", lambda settings: environment.lease_path)
     monkeypatch.setattr(cli, "current_iso", lambda: environment.now_iso)
     monkeypatch.setattr(cli, "sleep", lambda seconds: None)
+    monkeypatch.setattr(cli, "interruptible_sleep", lambda seconds: None)
 
     def _endpoint(handler: Any, base: str) -> ApiEndpoint:
         client = httpx.Client(

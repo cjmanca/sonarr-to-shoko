@@ -53,6 +53,7 @@ import hashlib
 import logging
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -134,6 +135,12 @@ MAX_BACKOFF_SECONDS: Final[float] = 24 * 3600.0
 SOURCE_IDENTITY_FIELDS: Final[str] = "sonarr_url,shoko_url"
 # Matches the ``grace_period`` retryable label in :mod:`shoko_linker.state` (reason taxonomy).
 GRACE_PERIOD_REASON: Final[str] = "grace_period"
+
+#: Bounded daemon history (F4): an unbounded daemon retains only the last N cycle reports
+#: (older reports are released for GC); a bounded ``stop_after_cycles`` run retains
+#: every executed cycle (the run is finite). ``DaemonReport.total_cycles``/``total_failed``
+#: are the accurate counts and never depend on this bound.
+DAEMON_HISTORY_MAXLEN: Final[int] = 100
 
 
 class CycleMode(Enum):
@@ -244,11 +251,22 @@ class CycleReport:
 
 @dataclass(frozen=True)
 class DaemonReport:
-    """Aggregate of a daemon run: every cycle report and the exit cause."""
+    """Aggregate of a daemon run: a bounded cycle history, accurate totals, and the exit cause.
+
+    ``cycles`` is a **bounded history** (F4): for a bounded ``stop_after_cycles`` run it holds
+    every executed cycle (the run is finite); for an unbounded daemon it holds
+    the last :data:`DAEMON_HISTORY_MAXLEN` cycles — older reports (with their per-file plan and
+    import-folder data) are released for GC so an unattended service does not grow without bound.
+    ``total_cycles`` and ``total_failed`` are the accurate run counts and never depend on the
+    history bound; ``last_cycle`` is the most recent completed report (``None`` before any cycle).
+    """
 
     cycles: tuple[CycleReport, ...]
     exit_reason: str
     shutdown_requested: bool
+    total_cycles: int = 0
+    total_failed: int = 0
+    last_cycle: CycleReport | None = None
 
 
 @dataclass(frozen=True)
@@ -1703,10 +1721,13 @@ def run_daemon(
     mode: CycleMode = CycleMode.APPLY,
     jitter_ratio: float = 0.1,
     full_cycle: Callable[[str], bool] | None = None,
+    on_cycle_complete: Callable[[CycleReport], None] | None = None,
+    inter_cycle_wait: Callable[[float], None] | None = None,
 ) -> DaemonReport:
     """Poll cycles forever (or ``stop_after_cycles``), sleeping ``interval_seconds``
-    with jitter between them; SIGTERM is honoured at the ``should_stop`` check
-    **after** the current cycle completes (no mid-cycle abort).
+    with jitter between them; a shutdown request is honoured at the ``should_stop`` check
+    **after** the current cycle completes and **immediately on waking** from the inter-cycle
+    sleep (no mid-cycle abort, and no new cycle is started after a wake).
 
     Transport-level cycle failures grow the sleep with exponential backoff (24h cap,
     jitter); a successful cycle resets it. The persisted budget ``next_due``/pause
@@ -1715,12 +1736,39 @@ def run_daemon(
     ``full_cycle`` (M7-b cadence): when supplied, each cycle's ``full`` flag comes from
     ``full_cycle(now)`` — the CLI wires it to :func:`full_cycle_due` (interval-gated
     full vs light cycle). Without it every cycle is full (M6 behavior, default).
+
+    ``on_cycle_complete`` (F4): invoked immediately after EVERY cycle completes, before
+    the shutdown check and the sleep. The CLI wires it to persist cycle
+    metadata mid-run, log a concise summary, and let the report be garbage-collected. The
+    daemon keeps only a bounded history (:data:`DAEMON_HISTORY_MAXLEN` for an unbounded
+    run, every cycle for a finite ``stop_after_cycles`` run) plus accurate
+    ``total_cycles``/``total_failed`` counts, so an unattended daemon never retains
+    a per-cycle report list that grows without bound. A callback failure is logged,
+    never fatal to the loop.
+
+    ``inter_cycle_wait`` (F6): the seam used for the inter-cycle sleep, distinct from
+    ``deps.advance`` (which paces *in-cycle* verification polls). The CLI wires it to an
+    interruptible event-backed sleeper so a shutdown signal wakes the daemon promptly
+    while in-cycle pacing keeps its normal delay. Default: ``deps.advance``.
     """
-    reports: list[CycleReport] = []
+    history: deque[CycleReport] = deque(
+        maxlen=DAEMON_HISTORY_MAXLEN if stop_after_cycles is None else stop_after_cycles
+    )
     failures = 0
     index = 0
+    total_cycles = 0
+    total_failed = 0
+    last_cycle: CycleReport | None = None
     shutdown_requested = False
+    exit_reason = "stop_after_cycles"
+    first_cycle = True
     while True:
+        # F6: after waking from an interruptible sleep, exit before starting another cycle
+        # (the first cycle always runs, matching the "SIGTERM after the current cycle" contract).
+        if not first_cycle and should_stop is not None and should_stop():
+            shutdown_requested = True
+            exit_reason = "shutdown_requested"
+            break
         iso = now_iso()
         report = run_cycle(
             deps,
@@ -1730,19 +1778,35 @@ def run_daemon(
             cycle_key=cycle_key(index),
             full=True if full_cycle is None else full_cycle(iso),
         )
-        reports.append(report)
         index += 1
+        total_cycles += 1
+        failures = failures + 1 if report.failed else 0
+        total_failed += 1 if report.failed else 0
+        last_cycle = report
+        history.append(report)
+        if on_cycle_complete is not None:
+            try:
+                on_cycle_complete(report)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "cycle completion callback failed", exc_info=True
+                )
+        first_cycle = False
         if should_stop is not None and should_stop():
             shutdown_requested = True
+            exit_reason = "shutdown_requested"
             break
         if stop_after_cycles is not None and index >= stop_after_cycles:
+            exit_reason = "stop_after_cycles"
             break
-        failures = failures + 1 if report.failed else 0
         sleep_seconds = _compute_sleep(interval_seconds, failures, jitter_ratio, deps.jitter)
-        deps.advance(sleep_seconds)
-    exit_reason = "shutdown_requested" if shutdown_requested else "stop_after_cycles"
+        wait = inter_cycle_wait if inter_cycle_wait is not None else deps.advance
+        wait(sleep_seconds)
     return DaemonReport(
-        cycles=tuple(reports),
+        cycles=tuple(history),
         exit_reason=exit_reason,
         shutdown_requested=shutdown_requested,
+        total_cycles=total_cycles,
+        total_failed=total_failed,
+        last_cycle=last_cycle,
     )

@@ -46,6 +46,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -234,8 +235,23 @@ def attestation_input(settings: Settings, *, scope: str = SCOPE_DAEMON) -> bool:
 
 
 def sleep(seconds: float) -> None:
-    """Inter-cycle sleep (test seam)."""
+    """In-cycle pacing (test seam; also the ``DaemonDeps.advance`` default).
+
+    Plain wall-clock delay: in-cycle verification polls keep their pacing even after a
+    shutdown request (F6 review: a shared interruptible seam would turn remaining polls
+    into a GET burst). The inter-cycle sleep uses :func:`interruptible_sleep` instead.
+    """
     time.sleep(seconds)
+
+
+def interruptible_sleep(seconds: float) -> None:
+    """Inter-cycle sleep wired to the process-wide shutdown event (F6, test seam).
+
+    Production: a SIGTERM/SIGINT arriving during a long inter-cycle sleep wakes the
+    daemon promptly (the handler sets the event) instead of waiting out the full interval —
+    after which Docker escalates to SIGKILL. Tests inject a deterministic fake via this seam.
+    """
+    _SHUTDOWN_WAKE.wait(timeout=seconds)
 
 
 def budget_limits_from_settings(settings: Settings) -> BudgetLimits:
@@ -353,12 +369,19 @@ def time_rng_unit() -> float:
 # ------------------------------------------------------------------ signal handling
 
 
+_SHUTDOWN_WAKE: Final[threading.Event] = threading.Event()
+# Process-wide interrupt target for the inter-cycle :func:`sleep`. ``_run_daemon`` clears it
+# at startup; the signal handlers set it so a sleeping daemon wakes immediately (F6).
+
+
 @dataclass
 class StopState:
-    """Shutdown flag set by the installed signal handlers."""
+    """Shutdown flag set by the installed signal handlers, plus an event that wakes an
+    interruptible inter-cycle sleep the moment a shutdown signal arrives (F6)."""
 
     stopped: bool = False
     handlers: list[int] = field(default_factory=list)
+    shutdown_event: threading.Event = field(default_factory=threading.Event)
 
     def should_stop(self) -> bool:
         return self.stopped
@@ -369,9 +392,10 @@ def make_signal_handlers(state: StopState) -> list[int]:
 
     Windows note: ``signal.SIGINT`` is the Ctrl+C path; ``signal.SIGTERM`` exists on
     Windows and is registered when present (CPython emulates it for ``os.kill``). The
-    handlers only set the flag — :func:`shoko_linker.daemon.run_daemon` checks
-    ``should_stop`` **after** the current cycle completes, so a signal never aborts a
-    cycle mid-write.
+    handlers only set the flag and wake :attr:`StopState.shutdown_event` —
+    :func:`shoko_linker.daemon.run_daemon` checks ``should_stop`` **after** the current
+    cycle completes and **immediately on waking** from the (event-backed) inter-cycle sleep,
+    so a signal never aborts a cycle mid-write and never starts a new cycle after a wake.
     """
     installed: list[int] = []
     numbers: list[int] = [int(signal.SIGINT)]
@@ -386,7 +410,12 @@ def make_signal_handlers(state: StopState) -> list[int]:
 
 def _stop_handler(state: StopState) -> SignalHandler:
     def handler(_signum: int, _frame: FrameType | None) -> None:
+        # Async-signal-safe: a plain attribute assignment plus Event.set() — the events
+        # wake the interruptible sleep so a SIGTERM during a long sleep is honoured promptly
+        # instead of waiting out the interval (Docker would escalate to SIGKILL).
         state.stopped = True
+        state.shutdown_event.set()
+        _SHUTDOWN_WAKE.set()
 
     return handler
 
@@ -615,6 +644,10 @@ def _run_daemon(args: argparse.Namespace) -> int:
         print_config_summary(settings)
     preamble = _daemon_preamble(settings, request, mode, stop_after)
     state = StopState()
+    # F6: clear the inter-cycle interrupt target BEFORE handlers exist, so a signal that
+    # arrives during startup is never set-then-cleared (the wake would be lost and the
+    # daemon would sleep uninterruptibly).
+    _SHUTDOWN_WAKE.clear()
     installed = make_signal_handlers(state)
     preamble.append(f"signal handlers installed: {', '.join(_signal_name(n) for n in installed)}")
     if not json_out:
@@ -640,6 +673,28 @@ def _run_daemon(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).info("cycle %s starting (%s)", cycle_key, iso)
             return iso
 
+        def on_cycle_complete(report: CycleReport) -> None:
+            # F4: persist cadence/health metadata after EVERY completed cycle (mid-run),
+            # log a concise summary, and let the report be garbage-collected.
+            ended = current_iso()
+            started = store.get_meta(META_LAST_CYCLE_START_ISO) or ended
+            persist_cycle_meta(
+                store,
+                report,
+                started_iso=started,
+                ended_iso=ended,
+                interval_seconds=settings.sync.interval_seconds,
+                full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
+            )
+            logging.getLogger(__name__).info(
+                "cycle %s complete: mode=%s submitted=%d full=%s failed=%s",
+                report.cycle_key,
+                report.mode.value,
+                report.counts.submitted,
+                report.full,
+                report.failed,
+            )
+
         daemon_report = run_daemon(
             deps,
             cycle_key=_daemon_cycle_key,
@@ -651,23 +706,16 @@ def _run_daemon(args: argparse.Namespace) -> int:
             mode=mode,
             jitter_ratio=settings.sync.jitter_ratio,
             full_cycle=lambda iso: full_cycle_due(store, iso),
+            on_cycle_complete=on_cycle_complete,
+            inter_cycle_wait=interruptible_sleep,
         )
-        last = daemon_report.cycles[-1] if daemon_report.cycles else None
-        if last is not None:
-            persist_cycle_meta(
-                store,
-                last,
-                started_iso=store.get_meta(META_LAST_CYCLE_START_ISO) or current_iso(),
-                ended_iso=current_iso(),
-                interval_seconds=settings.sync.interval_seconds,
-                full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
-            )
     finally:
         store.close()
-    last = daemon_report.cycles[-1] if daemon_report.cycles else None
+    last = daemon_report.last_cycle
     exit_line = (
-        f"daemon exit: {daemon_report.exit_reason} after {len(daemon_report.cycles)} cycle(s); "
-        f"last cycle: {last.cycle_key if last is not None else '<none>'}"
+        f"daemon exit: {daemon_report.exit_reason} after {daemon_report.total_cycles} cycle(s) "
+        f"({daemon_report.total_failed} failed); last cycle: "
+        f"{last.cycle_key if last is not None else '<none>'}"
     )
     if json_out:
         print(

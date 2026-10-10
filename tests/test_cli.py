@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import signal
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from shoko_linker import cli
 from shoko_linker.cli import (
     EXIT_APPLY_GATE_REFUSAL,
     EXIT_CONFIG_INVALID,
@@ -149,3 +153,63 @@ def test_config_path_check_reports_invalid(
 
 def test_main_returns_int_for_a_valid_run() -> None:
     assert main(["validate", str(EXAMPLE_CONFIG)]) == EXIT_OK
+
+
+def test_stop_handler_sets_flag_and_wakes_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F6: the async-signal-safe handler marks stopped AND sets the shutdown event so an
+    interruptible sleep wakes promptly."""
+    monkeypatch.setattr(cli, "_SHUTDOWN_WAKE", threading.Event())
+    state = cli.StopState()
+    assert not state.should_stop()
+    assert not state.shutdown_event.is_set()
+    handler = cli._stop_handler(state)
+    handler(int(signal.SIGINT), None)
+    assert state.should_stop()
+    assert state.shutdown_event.is_set()
+    assert cli._SHUTDOWN_WAKE.is_set()
+
+
+def test_make_signal_handlers_installs_sigint_that_wakes_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F6: the SIGINT (Ctrl+C) path — installed handler sets the flag and the event."""
+    monkeypatch.setattr(cli, "_SHUTDOWN_WAKE", threading.Event())
+    state = cli.StopState()
+    original = signal.getsignal(signal.SIGINT)
+    try:
+        installed = cli.make_signal_handlers(state)
+        assert int(signal.SIGINT) in installed
+        assert not state.shutdown_event.is_set()
+        handler = signal.getsignal(signal.SIGINT)
+        assert callable(handler)
+        handler(int(signal.SIGINT), None)
+        assert state.should_stop()
+        assert state.shutdown_event.is_set()
+        assert cli._SHUTDOWN_WAKE.is_set()
+    finally:
+        signal.signal(signal.SIGINT, original)
+
+
+def test_in_cycle_sleep_pacing_survives_shutdown_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F6 review: the shutdown event targets ONLY the inter-cycle sleep. In-cycle
+    ``sleep`` (advance seam for verification polls) keeps its plain pacing after a wake,
+    so a shutdown mid-verification never turns remaining polls into a GET burst."""
+    wake = threading.Event()
+    wake.set()
+    monkeypatch.setattr(cli, "_SHUTDOWN_WAKE", wake)
+    calls: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: calls.append(seconds))
+    cli.sleep(5.0)
+    assert calls == [5.0]
+
+
+def test_interruptible_sleep_wakes_immediately_when_event_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F6: a pre-set shutdown event short-circuits the interval — no wall-clock wait."""
+    wake = threading.Event()
+    wake.set()
+    monkeypatch.setattr(cli, "_SHUTDOWN_WAKE", wake)
+    started = time.monotonic()
+    cli.interruptible_sleep(3600.0)
+    assert time.monotonic() - started < 1.0

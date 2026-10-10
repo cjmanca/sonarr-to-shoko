@@ -436,7 +436,14 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
         lambda store, settings: _source_endpoint(store, environment.stubs.source),
     )
     monkeypatch.setattr(cli, "current_iso", lambda: environment.now_iso)
-    monkeypatch.setattr(cli, "sleep", lambda seconds: environment.sleeps.append(seconds))
+    # F6 seam split: in-cycle pacing uses ``sleep``; the inter-cycle daemon sleep is the
+    # dedicated ``interruptible_sleep`` seam — record it as the interval.
+    monkeypatch.setattr(cli, "sleep", lambda seconds: None)
+
+    def _record_interval(seconds: float) -> None:
+        environment.sleeps.append(seconds)
+
+    monkeypatch.setattr(cli, "interruptible_sleep", _record_interval)
     yield environment
     signal.signal(signal.SIGINT, cast("Any", original_sigint))
 

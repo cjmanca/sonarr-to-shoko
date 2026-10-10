@@ -288,6 +288,23 @@ Restart behavior:
 - A persisted `requires_rebaseline` flag blocks apply until the
   source discontinuity is understood and cleared by the operator command.
 
+Shutdown (SIGTERM / SIGINT, e.g. `docker stop`):
+
+- The inter-cycle sleep is an **interruptible** wait on a shutdown event, so an idle daemon
+  exits within a second of the signal — it does not wait out the interval (`interval_seconds`
+  plus jitter) and then get SIGKILLed.
+- A signal that lands **during** a cycle is honoured only after the current cycle/protected
+  unit finishes: no cycle is aborted mid-write, and no new cycle starts after the daemon wakes.
+- Cycle metadata (health levels, cycle mode, full/light cadence markers, submitted counts) is
+  persisted **after every cycle**, so `report`/`health` stay fresh and a restart resumes the
+  cadence from the last completed cycle.
+- `compose.example.yaml` sets `stop_grace_period: 360s`, covering nominal cycles
+  (`sync.max_cycle_seconds` is 300s and gates new submissions). A worst-case inline
+  verification-poll sequence inside the in-flight unit can exceed the grace; then Docker
+  escalates to SIGKILL — **recoverable by design**: the durable submission state survives,
+  the next start's recovery phase classifies every open row (void/hold/poll/audit), and no
+  request is ever blindly resubmitted.
+
 Use the read-only report first. Operator close commands are:
 
 ```powershell

@@ -1056,6 +1056,7 @@ def wire_campaign_env(env: CampaignEnv, monkeypatch: Any) -> None:
     monkeypatch.setattr(cli, "attestation_target_path", lambda settings: env.lease)
     monkeypatch.setattr(cli, "current_iso", lambda: env.now)
     monkeypatch.setattr(cli, "sleep", lambda seconds: None)
+    monkeypatch.setattr(cli, "interruptible_sleep", lambda seconds: None)
     monkeypatch.setattr(
         cli, "sonarr_endpoint", lambda settings: endpoint(world.sonarr.handler, SONARR_BASE)
     )

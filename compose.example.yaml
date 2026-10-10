@@ -22,6 +22,15 @@ services:
     # one-shot `once`/campaign run is a CLI invocation, not this long-lived
     # service, so it does not need a restart policy.
     restart: unless-stopped
+    # F6 shutdown grace: Docker's default 10s stop window is far shorter than one daemon
+    # cycle. The interruptible inter-cycle sleep wakes the daemon within a second of SIGTERM
+    # when idle, but a SIGTERM that lands *during* a cycle is honoured only after the
+    # current cycle/protected unit finishes (no mid-write abort). 360s covers nominal
+    # cycles (sync.max_cycle_seconds = 300s gates submissions); a worst-case inline
+    # verification-poll sequence can exceed the grace, in which case Docker escalates to
+    # SIGKILL — that outcome is recoverable by design (durable submission state; the
+    # recovery phase never blindly resubmits).
+    stop_grace_period: 360s
     command: ["daemon", "/config/config.yaml"]
     environment:
       SONARR_API_KEY: "${SONARR_API_KEY}"

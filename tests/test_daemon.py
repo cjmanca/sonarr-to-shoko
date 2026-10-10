@@ -10,6 +10,7 @@ and every crash/ambiguity/churn path shows the durable ordering.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from collections.abc import Callable
@@ -22,11 +23,14 @@ import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker.cli import StopState, persist_cycle_meta
 from shoko_linker.config import Settings, parse_settings
 from shoko_linker.daemon import (
+    DAEMON_HISTORY_MAXLEN,
     CycleMode,
     DaemonDeps,
     compute_eligibility,
+    full_cycle_due,
     run_cycle,
     run_daemon,
     run_mapping_check,
@@ -35,7 +39,13 @@ from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.linking import SendOutcome, VerificationVerdict
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome, refresh
 from shoko_linker.policies import RunPolicy
+from shoko_linker.reporting import (
+    META_CYCLE_KEY,
+    META_CYCLE_SUBMITTED,
+)
 from shoko_linker.state import (
+    META_LAST_FULL_RECONCILE_ISO,
+    META_NEXT_FULL_RECONCILE_ISO,
     BaselineFile,
     BudgetLimits,
     Cohort,
@@ -1621,13 +1631,15 @@ def test_sigterm_exits_after_current_cycle(tmp_path: Path, monkeypatch: pytest.M
     activate_mapping(tmp_path, mapping_xml())
     store = open_tmp_store(tmp_path)
     seed_baseline(store, [file])
-    flags = {"stop": False}
-    cycles_seen = {"n": 0}
+    completed = {"n": 0}
+
+    def on_complete(_report: Any) -> None:
+        completed["n"] += 1
 
     def should_stop() -> bool:
-        cycles_seen["n"] += 1
-        flags["stop"] = cycles_seen["n"] >= STOP_AT
-        return flags["stop"]
+        # A pure predicate: a shutdown becomes visible once STOP_AT cycles have completed
+        # (the flag is set after the cycle finishes, so the daemon stops after that cycle).
+        return completed["n"] >= STOP_AT
 
     times = iter([T1, T1, T1, T1, T1])
     deps = build_deps(
@@ -1646,11 +1658,13 @@ def test_sigterm_exits_after_current_cycle(tmp_path: Path, monkeypatch: pytest.M
             now_iso=lambda: next(times),
             interval_seconds=10.0,
             should_stop=should_stop,
+            on_cycle_complete=on_complete,
         )
     finally:
         store.close()
     assert report.shutdown_requested is True
     assert report.exit_reason == "shutdown_requested"
+    assert report.total_cycles == COUNT_TWO
     assert len(report.cycles) == COUNT_TWO
 
 
@@ -3484,3 +3498,384 @@ def test_grace_deferrals_consume_zero_budget_counters(
     assert budgets.pending_episode_jobs == 0
     assert held == (0, 0)
     assert send_rows[0][0] == 0
+
+
+# ------------------------------------------------------------------ F4/F6: daemon reliability
+
+
+def _iso_seq(start: str, step_seconds: float, count: int) -> list[str]:
+    base = datetime.fromisoformat(start)
+    return [(base + timedelta(seconds=step_seconds * index)).isoformat() for index in range(count)]
+
+
+def _many_cycle_deps(
+    tmp_path: Path, store: StateStore, advance: Callable[[float], None]
+) -> DaemonDeps:
+    activate_mapping(tmp_path, mapping_xml())
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    return build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[],
+        shoko_files=[],
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO]),
+        advance=advance,
+    )
+
+
+def test_daemon_bounds_history_and_totals_across_many_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: an unbounded daemon keeps a small history, fires the callback every cycle, and
+    reports accurate totals (executed/failed) independent of the history bound."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    sleeper = Sleeper()
+    deps = _many_cycle_deps(tmp_path, store, sleeper.advance)
+    total = 1000
+    times = iter(_iso_seq(T0, 10.0, total))
+    seen = {"n": 0}
+    completed: list[str] = []
+
+    def on_complete(report: Any) -> None:
+        completed.append(report.cycle_key)
+
+    def now_iso() -> str:
+        seen["n"] += 1
+        return next(times)
+
+    def should_stop() -> bool:
+        return seen["n"] >= total
+
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=now_iso,
+            interval_seconds=10.0,
+            should_stop=should_stop,
+            mode=CycleMode.DRY_RUN,
+            on_cycle_complete=on_complete,
+        )
+    finally:
+        store.close()
+    assert report.exit_reason == "shutdown_requested"
+    assert report.shutdown_requested is True
+    assert report.total_cycles == total
+    assert report.total_failed == 0
+    assert len(completed) == total
+    assert len(report.cycles) <= DAEMON_HISTORY_MAXLEN
+    assert report.last_cycle is not None
+    assert report.last_cycle.cycle_key == f"c{total - 1}"
+    assert report.cycles[-1].cycle_key == f"c{total - 1}"
+
+
+def test_cycle_metadata_persists_mid_run_via_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: the CLI persistence callback runs after EVERY completed cycle, so the persisted
+    cycle meta advances during the run — not only at exit."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    deps = _many_cycle_deps(tmp_path, store, Sleeper().advance)
+    cycles = 5
+    times = iter(_iso_seq(T0, 10.0, cycles))
+    iso_by_key: dict[str, str] = {}
+
+    def on_complete(report: Any) -> None:
+        iso = iso_by_key[report.cycle_key]
+        persist_cycle_meta(
+            store,
+            report,
+            started_iso=iso,
+            ended_iso=iso,
+            interval_seconds=10.0,
+            full_reconcile_hours=1000.0,
+        )
+
+    def now_iso() -> str:
+        iso = next(times)
+        iso_by_key[f"c{len(iso_by_key)}"] = iso
+        return iso
+
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=now_iso,
+            interval_seconds=10.0,
+            stop_after_cycles=cycles,
+            mode=CycleMode.DRY_RUN,
+            on_cycle_complete=on_complete,
+        )
+        mid_run_key = store.get_meta(META_CYCLE_KEY)
+        mid_run_submitted = store.get_meta(META_CYCLE_SUBMITTED)
+    finally:
+        store.close()
+    assert report.exit_reason == "stop_after_cycles"
+    assert report.total_cycles == cycles
+    # The callback persisted the LAST completed cycle's key mid-run.
+    assert mid_run_key == f"c{cycles - 1}"
+    assert mid_run_submitted == "0"
+
+
+def test_full_light_cadence_forces_full_reconcile_with_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: driving the real ``full_cycle_due`` gate with a fake clock, the cadence starts
+    full, runs light cycles, then forces a full reconcile; markers advance mid-run."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    deps = _many_cycle_deps(tmp_path, store, Sleeper().advance)
+    cycles = 6
+    times = iter(_iso_seq(T0, 1200.0, cycles))  # 20-minute steps, 1h full interval
+    iso_by_key: dict[str, str] = {}
+    full_flags: list[bool] = []
+
+    def on_complete(report: Any) -> None:
+        full_flags.append(report.full)
+        iso = iso_by_key[report.cycle_key]
+        persist_cycle_meta(
+            store,
+            report,
+            started_iso=iso,
+            ended_iso=iso,
+            interval_seconds=10.0,
+            full_reconcile_hours=1.0,
+        )
+
+    def now_iso() -> str:
+        iso = next(times)
+        iso_by_key[f"c{len(iso_by_key)}"] = iso
+        return iso
+
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=now_iso,
+            interval_seconds=10.0,
+            stop_after_cycles=cycles,
+            mode=CycleMode.DRY_RUN,
+            full_cycle=lambda iso: full_cycle_due(store, iso),
+            on_cycle_complete=on_complete,
+        )
+        last_full = store.get_meta(META_LAST_FULL_RECONCILE_ISO)
+        next_full = store.get_meta(META_NEXT_FULL_RECONCILE_ISO)
+    finally:
+        store.close()
+    assert report.total_cycles == cycles
+    assert full_flags[0] is True  # first cycle is full (no marker)
+    assert False in full_flags  # light cycles occur between full reconciles
+    # The interval gate forces a full pass again after the light streak (>=2 full cycles).
+    assert sum(1 for flag in full_flags if flag) >= COUNT_TWO
+    assert last_full is not None
+    assert next_full is not None
+
+
+def test_failed_cycle_totals_and_history_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: injected transport failures are counted accurately in the totals and history flags."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    seed_baseline(store, [file])
+    sleeper = Sleeper()
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO]),
+        advance=sleeper.advance,
+        jitter=lambda: 1.0,
+        max_submissions=1,
+    )
+    deps = _swap_source(deps, lambda request: httpx.Response(503, request=request))
+    times = iter(
+        [T0, _due_iso(hours=1.0), _due_iso(hours=3.0), _due_iso(hours=7.0), _due_iso(hours=15.0)]
+    )
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=10.0,
+            stop_after_cycles=COUNT_FOUR,
+        )
+    finally:
+        store.close()
+    assert report.total_cycles == COUNT_FOUR
+    assert report.total_failed == COUNT_FOUR
+    assert all(cycle.failed for cycle in report.cycles)
+
+
+def test_interruptible_sleep_wakes_and_starts_no_new_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F6: a stop arriving during the inter-cycle sleep wakes the daemon, which exits the
+    moment it wakes — no additional cycle starts."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    state = StopState()
+    sleeper = Sleeper()
+    deps = _many_cycle_deps(tmp_path, store, sleeper.advance)
+    completed = {"n": 0}
+
+    def advance(seconds: float) -> None:
+        sleeper.advance(seconds)
+        # Emulate SIGTERM landing inside the sleep: wake and mark shutdown.
+        state.stopped = True
+        state.shutdown_event.set()
+
+    deps = DaemonDeps(**{**deps.__dict__, "advance": advance})
+    times = iter(_iso_seq(T0, 10.0, 3))
+
+    def on_complete(_report: Any) -> None:
+        completed["n"] += 1
+
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=300.0,
+            should_stop=state.should_stop,
+            mode=CycleMode.DRY_RUN,
+            on_cycle_complete=on_complete,
+        )
+    finally:
+        store.close()
+    assert report.total_cycles == 1  # woke after the first cycle's sleep; no second cycle
+    assert report.shutdown_requested is True
+    assert completed["n"] == 1
+    assert len(sleeper.sleeps) == 1
+    assert sleeper.sleeps[0] > 0.0
+    assert state.shutdown_event.is_set()
+
+
+def test_shutdown_mid_protected_unit_completes_unit_and_resubmits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F6: shutdown requested inside a protected unit lets the current cycle finish (its
+    single POST completes), starts no further POSTs, and leaves durable state recoverable."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    state = StopState()
+    shoko = ShokoStub([file])
+    sleeper = Sleeper()
+
+    def on_post() -> None:
+        state.stopped = True
+        state.shutdown_event.set()
+
+    shoko.on_post = on_post
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO]),
+        advance=sleeper.advance,
+        shoko=shoko,
+        max_submissions=1,
+    )
+    times = iter(_iso_seq(T0, 10.0, 5))
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=300.0,
+            should_stop=state.should_stop,
+            mode=CycleMode.APPLY,
+        )
+        record = store.get_file(500)
+        posts_after_cycle = shoko.posts_count()
+    finally:
+        store.close()
+    assert report.total_cycles == 1
+    assert report.shutdown_requested is True
+    assert posts_after_cycle == POSTS_ONE  # the unit's single POST completed
+    assert record is not None
+    assert record.state is FileState.VERIFIED
+    # Durable recovery on restart re-walks the VERIFIED row and issues zero POSTs.
+    restart = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    try:
+        plan = restart.recover_after_restart()
+        assert not plan.hold_for_verification
+        assert not plan.continue_polling
+        assert shoko.posts_count() == POSTS_ONE  # recovery re-walk issues zero new POSTs
+    finally:
+        restart.close()
+
+
+def test_cycle_completion_callback_failure_is_never_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F4 review: a CLI persistence callback crash is logged and the daemon keeps
+    cycling — the mid-run observability seam never becomes a new crash surface."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    sleeper = Sleeper()
+    deps = _many_cycle_deps(tmp_path, store, sleeper.advance)
+    cycles = 3
+    times = iter(_iso_seq(T0, 10.0, cycles))
+
+    def on_complete(_report: Any) -> None:
+        raise RuntimeError("meta write exploded")
+
+    with caplog.at_level(logging.WARNING, logger="shoko_linker.daemon"):
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=10.0,
+            stop_after_cycles=cycles,
+            mode=CycleMode.DRY_RUN,
+            on_cycle_complete=on_complete,
+        )
+    store.close()
+    assert report.total_cycles == cycles
+    assert report.exit_reason == "stop_after_cycles"
+    warned = sum(
+        1 for record in caplog.records if "cycle completion callback failed" in record.message
+    )
+    assert warned == cycles
+
+
+def test_inter_cycle_wait_seam_is_separate_from_in_cycle_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F6 review: the inter-cycle sleep uses the dedicated ``inter_cycle_wait`` seam;
+    ``deps.advance`` keeps its pacing role for in-cycle verification polls only."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    store = open_tmp_store(tmp_path)
+    sleeper = Sleeper()
+    deps = _many_cycle_deps(tmp_path, store, sleeper.advance)
+    waits: list[float] = []
+    cycles_three = 3
+    times = iter(_iso_seq(T0, 10.0, cycles_three))
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=10.0,
+            stop_after_cycles=cycles_three,
+            mode=CycleMode.DRY_RUN,
+            inter_cycle_wait=lambda seconds: waits.append(seconds),
+        )
+    finally:
+        store.close()
+    assert report.total_cycles == cycles_three
+    assert len(waits) == cycles_three - 1  # between-cycle sleeps only, via the dedicated seam
+    assert all(seconds > 0.0 for seconds in waits)
+    assert sleeper.sleeps == []  # in-cycle advance untouched by inter-cycle sleep
