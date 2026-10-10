@@ -1,0 +1,486 @@
+"""Offline tests for scripts/ghcr_tags.py (M8 F3).
+
+No live registry calls: a fake transport (and a monkeypatched ``_open`` seam
+for the urllib path) supplies canned OCI responses. Covers every outcome
+class — ok (with Link-header pagination), package_missing, auth_failure,
+permission_failure, network_failure, unavailable — plus plan-consumer abort
+semantics, exit-code mapping, and bounded provenance verification.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib.util
+import io
+import json
+import sys
+import urllib.error
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "ghcr_tags.py"
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+ZERO_DIGEST = "sha256:" + "0" * 64
+TOKEN = "ghp-token-123"
+
+
+def _load_module() -> Any:
+    spec = importlib.util.spec_from_file_location("ghcr_tags", SCRIPT)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+tags = _load_module()
+
+
+class FakeTransport:
+    """Scripted OCI transport: (method-path prefix match) -> canned response."""
+
+    def __init__(self, responses: list[tuple[int, dict[str, str], bytes]]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    def get(
+        self, url: str, headers: dict[str, str], timeout: float
+    ) -> tuple[int, dict[str, str], bytes]:
+        self.calls.append((url, headers))
+        if not self.responses:
+            raise AssertionError(f"no canned response left for {url}")
+        return self.responses.pop(0)
+
+
+class RaisingTransport:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def get(
+        self, url: str, headers: dict[str, str], timeout: float
+    ) -> tuple[int, dict[str, str], bytes]:
+        raise self.exc
+
+
+def _token_ok(token: str = TOKEN) -> tuple[int, dict[str, str], bytes]:
+    body = json.dumps({"token": token, "expires_in": 300}).encode()
+    return 200, {"content-type": "application/json"}, body
+
+
+def _token_401() -> tuple[int, dict[str, str], bytes]:
+    return 401, {}, b'{"errors":[{"code":"DENIED"}]}'
+
+
+def test_list_ok_paginates_via_link_header() -> None:
+    page1 = json.dumps({"name": "octo/shoko-sonarr-linker", "tags": [f"sha-{SHA_A}"]}).encode()
+    page2 = json.dumps(
+        {"name": "octo/shoko-sonarr-linker", "tags": ["latest", f"sha-{SHA_B}"]}
+    ).encode()
+    next_url = "https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list?last=x"
+    next_link = {"link": f'<{next_url}>; rel="next"'}
+    transport = FakeTransport(
+        [
+            _token_ok(),
+            (200, next_link, page1),
+            (200, {}, page2),
+        ]
+    )
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_OK
+    assert result["tags"] == [f"sha-{SHA_A}", "latest", f"sha-{SHA_B}"]
+    assert len(transport.calls) == 3
+    assert "token?service=ghcr.io" in transport.calls[0][0]
+    basic = base64.b64decode(transport.calls[0][1]["Authorization"].removeprefix("Basic ")).decode()
+    assert basic.endswith(f":{TOKEN}")  # token reaches the registry only as a Basic password
+    assert transport.calls[1][1]["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_list_package_missing_on_401_name_unknown_after_token() -> None:
+    body = json.dumps(
+        {"errors": [{"code": "NAME_UNKNOWN", "message": "repository name not known to registry"}]}
+    ).encode()
+    transport = FakeTransport([_token_ok(), (401, {}, body)])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_PACKAGE_MISSING
+    assert result["tags"] == []
+    assert "NAME_UNKNOWN" in result["detail"]
+
+
+def test_list_package_missing_on_404() -> None:
+    transport = FakeTransport([_token_ok(), (404, {}, b"{}")])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_PACKAGE_MISSING
+
+
+def test_list_token_401_is_auth_failure_not_package_missing() -> None:
+    transport = FakeTransport([_token_401()])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_AUTH_FAILURE
+    assert result["tags"] == []
+
+
+def test_list_token_403_is_permission_failure() -> None:
+    transport = FakeTransport([(403, {}, b'{"errors":[{"code":"DENIED"}]}')])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_PERMISSION_FAILURE
+
+
+def test_list_403_is_permission_failure() -> None:
+    body = json.dumps(
+        {"errors": [{"code": "DENIED", "message": "access to this repository is denied"}]}
+    ).encode()
+    transport = FakeTransport([_token_ok(), (403, {}, body)])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_PERMISSION_FAILURE
+
+
+def test_list_network_error_is_network_failure() -> None:
+    transport = RaisingTransport(tags.NetworkFailureError("connection refused"))
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_NETWORK_FAILURE
+
+
+def test_list_5xx_is_unavailable() -> None:
+    transport = FakeTransport([_token_ok(), (502, {}, b"bad gateway")])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+
+
+def test_list_malformed_json_is_unavailable() -> None:
+    transport = FakeTransport([_token_ok(), (200, {}, b"not json at all")])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+
+
+def test_list_token_json_malformed_is_unavailable() -> None:
+    transport = FakeTransport([(200, {}, b"<html>proxy error</html>")])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+
+
+def test_list_pagination_cap_is_unavailable() -> None:
+    page = json.dumps({"tags": ["x"]}).encode()
+    link = {
+        "link": '<https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list?n=100&last=x>; rel="next"'
+    }
+    transport = FakeTransport([_token_ok()] + [(200, link, page) for _ in range(60)])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport, max_pages=50)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+    assert "max_pages" in result["detail"]
+
+
+def test_list_rejects_offsite_link_header() -> None:
+    page1 = json.dumps({"tags": ["x"]}).encode()
+    evil = {"link": '<https://evil.example/v2/x/tags/list>; rel="next"'}
+    transport = FakeTransport([_token_ok(), (200, evil, page1)])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+    assert "ghcr.io" in result["detail"]
+
+
+def test_list_rejects_non_lowercase_namespace() -> None:
+    with pytest.raises(ValueError, match="lowercase GHCR namespace"):
+        tags.list_tags("Octo", "shoko-sonarr-linker", TOKEN, transport=FakeTransport([]))
+
+
+def test_plan_consumer_helper_aborts_on_unknown_state() -> None:
+    ok_doc = tags._result(tags.STATUS_OK, [f"sha-{SHA_A}", "latest"], "x")
+    assert tags.plan_sha_tags(ok_doc) == [f"sha-{SHA_A}"]
+    missing_doc = tags._result(tags.STATUS_PACKAGE_MISSING, [], "x")
+    assert tags.plan_sha_tags(missing_doc) == []
+    for status in (
+        tags.STATUS_AUTH_FAILURE,
+        tags.STATUS_PERMISSION_FAILURE,
+        tags.STATUS_NETWORK_FAILURE,
+        tags.STATUS_UNAVAILABLE,
+    ):
+        with pytest.raises(
+            tags.PlanAbortedError, match="refusing to publish against unknown state"
+        ):
+            tags.plan_sha_tags(tags._result(status, [], "x"))
+
+
+def test_exit_status_table() -> None:
+    exit_zero = {tags.STATUS_OK, tags.STATUS_PACKAGE_MISSING}
+    assert set(tags.SUCCESS_STATUSES) == exit_zero
+
+
+def test_main_list_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHCR_TOKEN", TOKEN)
+    monkeypatch.setattr(
+        tags,
+        "list_tags",
+        lambda *a, **k: dict(tags._result(tags.STATUS_OK, [f"sha-{SHA_A}"], "ok")),
+    )
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    assert tags.main(["list", "--owner", "octo"]) == 0
+    assert json.loads(out.getvalue())["status"] == tags.STATUS_OK
+
+    monkeypatch.setattr(
+        tags,
+        "list_tags",
+        lambda *a, **k: dict(tags._result(tags.STATUS_NETWORK_FAILURE, [], "boom")),
+    )
+    out2 = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out2)
+    assert tags.main(["list", "--owner", "octo"]) == 1
+    assert json.loads(out2.getvalue())["status"] == tags.STATUS_NETWORK_FAILURE
+
+
+def test_main_package_missing_exits_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHCR_TOKEN", TOKEN)
+    monkeypatch.setattr(
+        tags,
+        "list_tags",
+        lambda *a, **k: dict(tags._result(tags.STATUS_PACKAGE_MISSING, [], "fresh")),
+    )
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    assert tags.main(["list", "--owner", "octo"]) == 0
+
+
+def test_main_requires_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GHCR_TOKEN", raising=False)
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    assert tags.main(["list", "--owner", "octo"]) == 1
+    assert json.loads(out.getvalue())["status"] == tags.STATUS_AUTH_FAILURE
+
+
+def test_main_verify_bounded_and_aborts_on_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GHCR_TOKEN", TOKEN)
+    monkeypatch.setattr(tags, "verify_sha_tag", lambda sha, *a, **k: tags.PROVENANCE_PUBLISHED)
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rc = tags.main(["verify", "--owner", "octo", "--shas", f"{SHA_A},{SHA_B}"])
+    assert rc == 0
+    document = json.loads(out.getvalue())
+    assert document["status"] == tags.STATUS_OK
+    assert document["results"] == {
+        SHA_A: tags.PROVENANCE_PUBLISHED,
+        SHA_B: tags.PROVENANCE_PUBLISHED,
+    }
+
+
+def test_main_verify_respects_provenance_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHCR_TOKEN", TOKEN)
+    many = ",".join([f"{i:x}" * 40 for i in range(1, tags.VERIFY_CAP + 2)])
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    assert tags.main(["verify", "--owner", "octo", "--shas", many]) == 2
+    assert "cap" in err.getvalue()
+
+
+def _manifest(media_type: str, body: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
+    return 200, {"content-type": media_type}, json.dumps(body).encode()
+
+
+def _config_blob(revision: str) -> tuple[int, dict[str, str], bytes]:
+    body = json.dumps(
+        {"architecture": "amd64", "annotations": {"org.opencontainers.image.revision": revision}}
+    )
+    return 200, {"content-type": "application/vnd.oci.image.config.v1+json"}, body.encode()
+
+
+def test_verify_index_manifest_chain_published() -> None:
+    config = _config_blob(SHA_A)
+    config_digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
+    inner = _manifest(
+        "application/vnd.oci.image.manifest.v1+json",
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": config_digest},
+        },
+    )
+    inner_digest = "sha256:" + hashlib.sha256(inner[2]).hexdigest()
+    index = _manifest(
+        "application/vnd.oci.image.index.v1+json",
+        {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{"digest": inner_digest, "platform": {"os": "linux"}}],
+        },
+    )
+    transport = FakeTransport([_token_ok(), index, inner, config])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_PUBLISHED)
+    assert len(transport.calls) == 4
+
+
+def test_verify_index_annotation_revision_published() -> None:
+    index = _manifest(
+        "application/vnd.oci.image.index.v1+json",
+        {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "annotations": {"org.opencontainers.image.revision": SHA_A},
+        },
+    )
+    transport = FakeTransport([_token_ok(), index])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_PUBLISHED)
+    assert len(transport.calls) == 2
+
+
+def test_verify_plain_manifest_config_chain_published() -> None:
+    config = _config_blob(SHA_A)
+    digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
+    manifest = _manifest(
+        "application/vnd.oci.image.manifest.v1+json",
+        {"mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {"digest": digest}},
+    )
+    transport = FakeTransport([_token_ok(), manifest, config])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_PUBLISHED)
+
+
+def test_verify_manifest_level_annotations_published() -> None:
+    # P2 review: plain manifests can carry the revision annotation at manifest level.
+    manifest = _manifest(
+        "application/vnd.oci.image.manifest.v1+json",
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "annotations": {"org.opencontainers.image.revision": SHA_A},
+            "config": {"digest": ZERO_DIGEST},
+        },
+    )
+    transport = FakeTransport([_token_ok(), manifest])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_PUBLISHED)
+    assert len(transport.calls) == 2  # no config fetch needed once the annotation is found
+
+
+def test_verify_docker_schema2_config_labels_published() -> None:
+    # P2 review: docker schema2 pushes keep labels under config.config.Labels.
+    body = json.dumps(
+        {
+            "architecture": "amd64",
+            "config": {"Labels": {"org.opencontainers.image.revision": SHA_A}},
+        }
+    )
+    config = (
+        200,
+        {"content-type": "application/vnd.docker.container.image.v1+json"},
+        body.encode(),
+    )
+    digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
+    manifest = _manifest(
+        "application/vnd.docker.distribution.manifest.v2+json",
+        {
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"digest": digest},
+        },
+    )
+    transport = FakeTransport([_token_ok(), manifest, config])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_PUBLISHED)
+
+
+def test_verify_revision_mismatch_is_unknown_provenance() -> None:
+    config = _config_blob("f" * 40)
+    digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
+    manifest = _manifest(
+        "application/vnd.docker.distribution.manifest.v2+json",
+        {
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"digest": digest},
+        },
+    )
+    transport = FakeTransport([_token_ok(), manifest, config])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_UNKNOWN)
+
+
+def test_verify_404_is_not_published() -> None:
+    transport = FakeTransport([_token_ok(), (404, {}, b"{}")])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_NOT_PUBLISHED)
+
+
+def test_verify_manifest_5xx_is_unknown_provenance() -> None:
+    transport = FakeTransport([_token_ok(), (500, {}, b"boom")])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_UNKNOWN)
+
+
+def test_verify_config_blob_failure_is_unknown_provenance() -> None:
+    config = _config_blob(SHA_A)
+    digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
+    manifest = _manifest(
+        "application/vnd.oci.image.manifest.v1+json",
+        {"mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {"digest": digest}},
+    )
+    transport = FakeTransport([_token_ok(), manifest, (503, {}, b"unavailable")])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_UNKNOWN)
+
+
+def test_verify_network_failure_is_unknown_provenance() -> None:
+    transport = RaisingTransport(tags.NetworkFailureError("dns down"))
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_UNKNOWN)
+
+
+def test_verify_token_auth_failure_is_unknown_provenance() -> None:
+    transport = FakeTransport([_token_401()])
+    assert tags.verify_sha_tag(
+        SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
+    ) == (tags.PROVENANCE_UNKNOWN)
+
+
+def test_verify_rejects_non_sha_and_non_lowercase_owner() -> None:
+    with pytest.raises(ValueError, match="40-char lowercase hex"):
+        tags.verify_sha_tag(
+            "nope", "octo", "shoko-sonarr-linker", TOKEN, transport=FakeTransport([])
+        )
+    with pytest.raises(ValueError, match="namespace"):
+        tags.verify_sha_tag(
+            SHA_A, "Octo", "shoko-sonarr-linker", TOKEN, transport=FakeTransport([])
+        )
+
+
+def test_urllib_transport_maps_http_and_network_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            return b"body"
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return [("Content-Type", "application/json")]
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+    monkeypatch.setattr(tags, "_open", lambda request, timeout: FakeResponse())
+    transport = tags.UrllibTransport()
+    status, headers, body = transport.get("https://ghcr.io/v2/x/tags/list", {}, 1.0)
+    assert (status, body) == (200, b"body")
+    assert headers["content-type"] == "application/json"
+
+    def boom(request: Any, timeout: float) -> Any:
+        raise urllib.error.URLError("connection reset")
+
+    monkeypatch.setattr(tags, "_open", boom)
+    with pytest.raises(tags.NetworkFailureError):
+        transport.get("https://ghcr.io/v2/x/tags/list", {}, 1.0)

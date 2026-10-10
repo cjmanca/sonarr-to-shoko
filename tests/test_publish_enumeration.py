@@ -183,6 +183,78 @@ def test_enumerate_missing_tolerates_ls_remote_tag_forms(tmp_path: Path) -> None
     assert result.shas == [b]
 
 
+def test_enumerate_missing_registry_tag_format_zero_reschedule(tmp_path: Path) -> None:
+    """F3: a repeated backfill against an unchanged registry schedules nothing."""
+    repo = _init_repo(tmp_path)
+    a = _commit(repo, "a")
+    b = _commit(repo, "b")
+    c = _commit(repo, "c")
+    known = {f"sha-{a}", f"sha-{b}", f"sha-{c}", "latest"}  # ghcr_tags.py plain tag names
+    result = enum.enumerate_missing(repo, upto=c, known_tags=known, max_shas=100)
+    assert result.shas == []
+    assert {s.sha for s in result.skipped} == {a, b, c}
+    assert all(s.reason == "already-tagged" for s in result.skipped)
+
+
+def test_enumerate_missing_accepts_mixed_tag_formats(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    a = _commit(repo, "a")
+    b = _commit(repo, "b")
+    c = _commit(repo, "c")
+    known = {f"refs/tags/sha-{a}", f"refs/tags/sha-{a}^{{}}", f"sha-{b}", "SHA-B", "latest"}
+    result = enum.enumerate_missing(repo, upto=c, known_tags=known, max_shas=100)
+    assert result.shas == [c]
+    assert {s.sha for s in result.skipped} == {a, b}
+
+
+def test_enumerate_missing_unverified_provenance_reschedules(tmp_path: Path) -> None:
+    """F3: an unverified sha- tag is NOT trusted as published; the SHA is re-scheduled."""
+    repo = _init_repo(tmp_path)
+    a = _commit(repo, "a")
+    b = _commit(repo, "b")
+    c = _commit(repo, "c")
+    known = {f"sha-{a}", f"sha-{b}", f"sha-{c}"}
+    result = enum.enumerate_missing(repo, upto=c, known_tags=known, unverified={a}, max_shas=100)
+    assert result.shas == [a]
+    reasons = {s.sha: s.reason for s in result.skipped}
+    assert reasons[b] == "already-tagged"
+    assert reasons[c] == "already-tagged"
+    assert reasons[a] == "tag-provenance-unverified"
+    assert any("provenance" in note for note in result.notes)
+
+
+def test_cli_missing_accepts_unverified_file(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    a = _commit(repo, "a")
+    b = _commit(repo, "b")
+    tags_file = tmp_path / "tags.txt"
+    tags_file.write_text(f"sha-{a}\nsha-{b}\nlatest\n", encoding="utf-8")
+    unverified_file = tmp_path / "unverified.txt"
+    unverified_file.write_text(f"{a}\n", encoding="utf-8")
+    proc = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(SCRIPT),
+            "missing",
+            "--repo",
+            str(repo),
+            "--upto",
+            b,
+            "--known-tags-file",
+            str(tags_file),
+            "--unverified-file",
+            str(unverified_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout)
+    assert data["shas"] == [a]
+    assert {"sha": a, "reason": "tag-provenance-unverified"} in data["skipped"]
+
+
 def test_enumerate_missing_since_bounds_the_range_gap(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     a = _commit(repo, "a")

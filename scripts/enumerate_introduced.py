@@ -22,8 +22,12 @@ Enumeration semantics (see AGENTS/PROJECT §6 delivery policy):
   note; the rewritten commits are new SHAs and are published as such.
 * Backfill (``enumerate_missing``): SHAs reachable from ``upto`` (optionally
   after ``since``) that lack a ``sha-<fullsha>`` tag, given the tag set the
-  caller fetched from ``git ls-remote`` / ``gh`` (injected as ``known_tags`` so
-  tests need no network).
+  caller fetched from the GHCR registry (``scripts/ghcr_tags.py``; the
+  historical ``git ls-remote`` / ``gh`` forms are still accepted). Injected as
+  ``known_tags`` so tests need no network. ``unverified`` lists SHAs whose
+  ``sha-`` tag exists in the registry but whose provenance could not be
+  verified: they are re-scheduled (a ``sha-`` tag is content-addressed, so a
+  re-push is safe) instead of being skipped as already published.
 
 Ordering and capping: results are chronological, **oldest first**. When
 ``max_shas`` caps the list, the oldest prefix is kept and the remainder is
@@ -263,12 +267,18 @@ def enumerate_missing(
     tag_prefix: str = TAG_PREFIX,
     since: str | None = None,
     max_shas: int = DEFAULT_MAX_SHAS,
+    unverified: set[str] | None = None,
 ) -> EnumerationResult:
-    """SHAs reachable from ``upto`` lacking a ``sha-<fullsha>`` tag.
+    """SHAs reachable from ``upto`` lacking a verified ``sha-<fullsha>`` tag.
 
-    ``known_tags`` is the set of tag *names* as reported by
-    ``git ls-remote --tags`` / ``gh`` (``refs/tags/`` prefixes and ``^{}``
-    peel refs are tolerated; injection keeps this offline-testable).
+    ``known_tags`` is the set of tag *names*. Registry-format names
+    (``sha-<fullsha>`` from ``scripts/ghcr_tags.py``) and the historical
+    ``git ls-remote`` forms (``refs/tags/`` prefixes, ``^{}`` peel refs) are
+    both accepted; injection keeps this offline-testable.
+
+    ``unverified`` carries SHAs whose registry tag exists but whose provenance
+    could not be confirmed. Those SHAs are scheduled for publication instead of
+    being skipped, so backfill never trusts an unverified tag as "published".
     ``since`` (exclusive) restricts the scan to ``since..upto`` for targeted
     range-gap backfill; default scans the whole history up to ``upto``.
     """
@@ -278,17 +288,25 @@ def enumerate_missing(
         name.strip().lower().removeprefix("refs/tags/").removeprefix(tag_prefix).split("^")[0]
         for name in known_tags
     }
+    unverified_set = {sha.strip().lower() for sha in (unverified or set())}
     scan = f"{_resolve_commit(repo, since)}..{upto_full}" if since else upto_full
     result = EnumerationResult()
     for sha in _rev_list(repo, scan):
-        if sha in published:
+        if sha in published and sha not in unverified_set:
             result.skipped.append(SkippedCommit(sha, "already-tagged"))
+        elif sha in unverified_set:
+            result.shas.append(sha)
+            result.skipped.append(SkippedCommit(sha, "tag-provenance-unverified"))
         else:
             result.shas.append(sha)
     result.notes.append(
-        f"backfill scan {scan}: {len(result.shas)} untagged sha(s), "
-        f"{len(result.skipped)} already tagged"
+        f"backfill scan {scan}: {len(result.shas)} scheduled sha(s), "
+        f"{sum(1 for item in result.skipped if item.reason == 'already-tagged')} verified-published"
     )
+    if unverified_set:
+        result.notes.append(
+            f"provenance: {len(unverified_set)} registry tag(s) unverified; re-scheduled"
+        )
     return _apply_cap(result, max_shas)
 
 
@@ -314,6 +332,11 @@ def build_parser() -> argparse.ArgumentParser:
     missing.add_argument("--upto", required=True)
     missing.add_argument("--since", default=None)
     missing.add_argument("--known-tags-file", required=True, help="file of tag names, one per line")
+    missing.add_argument(
+        "--unverified-file",
+        default=None,
+        help="file of SHAs whose registry tag is provenance-unverified (re-scheduled)",
+    )
     missing.add_argument("--tag-prefix", default=TAG_PREFIX)
     return parser
 
@@ -338,6 +361,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         known = Path(args.known_tags_file).read_text(encoding="utf-8").splitlines()
+        unverified: set[str] = set()
+        if args.unverified_file:
+            unverified = Path(args.unverified_file).read_text(encoding="utf-8").splitlines()
         result = enumerate_missing(
             args.repo,
             upto=args.upto,
@@ -345,6 +371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tag_prefix=args.tag_prefix,
             since=args.since,
             max_shas=args.max_shas,
+            unverified=set(unverified),
         )
     json.dump(result.to_dict(), sys.stdout, indent=2)
     sys.stdout.write("\n")

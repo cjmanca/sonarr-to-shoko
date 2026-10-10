@@ -65,14 +65,26 @@ def _steps(job: dict[str, Any]) -> str:
 
 def test_publish_permissions_are_least_privilege() -> None:
     assert publish["permissions"] == {"contents": "read"}
-    assert publish["jobs"]["publish"]["permissions"] == {"contents": "read", "packages": "write"}
+    assert publish["jobs"]["publish"]["permissions"] == {
+        "contents": "read",
+        "packages": "write",
+        "actions": "read",
+    }
     assert publish["jobs"]["promote-latest"]["permissions"] == {
         "contents": "read",
         "packages": "write",
     }
-    # Only publish/promote-latest get packages:write; plan/test must not.
+    # M8 F3 update: plan legitimately carries packages:read (registry tag
+    # discovery is pull-only) and actions:write (historical-validator artifact);
+    # only publish/promote-latest get packages:write, and the test job keeps none.
+    assert publish["jobs"]["plan"]["permissions"] == {
+        "contents": "read",
+        "packages": "read",
+        "actions": "write",
+    }
+    assert "packages" not in json.dumps(publish["jobs"]["test"].get("permissions", {}))
     for name in ("test", "plan"):
-        assert "packages" not in json.dumps(publish["jobs"][name].get("permissions", {}))
+        assert "packages: write" not in json.dumps(publish["jobs"][name].get("permissions", {}))
 
 
 def test_ci_workflow_has_no_publish_permission() -> None:
@@ -276,3 +288,150 @@ def test_promote_gate_does_not_rely_on_publish_result() -> None:
     steps_dump = _steps(publish["jobs"]["promote-latest"])
     assert "scripts/ci_checks.sh" in steps_dump  # the real gate: full per-SHA re-check
     assert "git ls-remote" in steps_dump
+
+
+def _plan_run() -> str:
+    plan_steps = publish["jobs"]["plan"]["steps"]
+    step = next(step for step in plan_steps if step.get("id") == "plan")
+    return str(step["run"])
+
+
+def _plan_all_runs() -> str:
+    return "\n".join(str(step.get("run", "")) for step in publish["jobs"]["plan"]["steps"])
+
+
+def _image_name_run() -> str:
+    step = next(step for step in publish["jobs"]["plan"]["steps"] if step.get("id") == "image_name")
+    return str(step["run"])
+
+
+# --- F2: image reference correctness -------------------------------------------------
+
+
+def test_image_reference_uses_snake_case_owner_and_is_lowercased() -> None:
+    """F2: `github.repositoryOwner` resolves to "" and produced ghcr.io//name tags."""
+    assert "github.repository_owner" in PUBLISH_TEXT
+    assert "repositoryOwner" not in PUBLISH_TEXT
+    plan = publish["jobs"]["plan"]
+    assert plan["env"]["REPO_OWNER"] == "${{ github.repository_owner }}"
+    image_run = _image_name_run()
+    assert "tr 'A-Z' 'a-z'" in image_run  # GHCR namespaces must be lowercase
+    assert "ghcr.io/" in image_run
+    assert "${{ inputs" not in image_run  # owner reaches the shell only via env
+
+
+def test_image_reference_is_validated_before_any_push() -> None:
+    """Empty owner and invalid references must fail loudly, pre-build-push."""
+    image_run = _image_name_run()
+    assert '[ -n "${REPO_OWNER}" ]' in image_run  # owner non-empty guard
+    assert "github.repository_owner is empty" in image_run
+    assert "^[a-z0-9]+(-[a-z0-9]+)*$" in image_run  # GHCR namespace segment rule
+    assert r"ghcr\.io/[a-z0-9._-]+/shoko-sonarr-linker" in image_run
+    plan = publish["jobs"]["plan"]
+    outputs = plan["outputs"]
+    assert outputs["image"] == "${{ steps.image_name.outputs.image }}"
+    for job_name in ("publish", "promote-latest"):
+        steps = publish["jobs"][job_name]["steps"]
+        gate = next(
+            i
+            for i, s in enumerate(steps)
+            if str(s.get("name", "")).startswith("Validate image reference")
+        )
+        push = next(
+            i
+            for i, s in enumerate(steps)
+            if str(s.get("uses", "")).startswith("docker/build-push-action@")
+        )
+        assert gate < push  # the gate runs before docker/build-push-action can see the tag
+        gate_run = steps[gate]["run"]
+        assert "sha-[0-9a-f]{40}" in gate_run if job_name == "publish" else ":latest$" in gate_run
+        assert steps[gate]["env"]["IMAGE_TAG"].startswith("${{ needs.plan.outputs.image }}")
+
+
+def test_publish_tags_flow_from_plan_output_not_shell() -> None:
+    """`tags:` is a GitHub-evaluated input; the tag string never reaches a shell body."""
+    build = next(
+        step
+        for step in publish["jobs"]["publish"]["steps"]
+        if str(step.get("uses", "")).startswith("docker/build-push-action@")
+    )
+    assert build["with"]["tags"] == "${{ needs.plan.outputs.image }}:sha-${{ matrix.sha }}"
+    promote = next(
+        step
+        for step in publish["jobs"]["promote-latest"]["steps"]
+        if str(step.get("uses", "")).startswith("docker/build-push-action@")
+    )
+    assert promote["with"]["tags"] == "${{ needs.plan.outputs.image }}:latest"
+    plan = publish["jobs"]["plan"]
+    assert plan["env"]["REPO_OWNER"] == "${{ github.repository_owner }}"
+    assert plan["env"]["GHCR_PACKAGE"] == "shoko-sonarr-linker"
+    assert plan["env"]["GHCR_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    image_run = _image_name_run()
+    assert '"${REPO_OWNER}"' in image_run  # owner reaches the shell only via env indirection
+
+
+# --- F3: registry is the publication state -------------------------------------------
+
+
+def test_plan_discovers_registry_tags_not_git_tags() -> None:
+    """F3: `git ls-remote --tags` asserted the OLD defective design (git refs are
+    independent of GHCR container tags); registry discovery replaces it."""
+    all_runs = _plan_all_runs()
+    assert "ghcr_tags.py list" in all_runs
+    assert "known_tags.txt" in all_runs
+    registry_step = next(
+        step
+        for step in publish["jobs"]["plan"]["steps"]
+        if "ghcr_tags.py list" in str(step.get("run", ""))
+    )
+    assert registry_step["env"]["GHCR_OWNER"] == "${{ steps.image_name.outputs.owner }}"
+    assert "refusing to publish against unknown registry state" in registry_step["run"]
+    assert (
+        "package_missing" in registry_step["run"]
+    )  # fresh-package state is explicit, not a failure
+    # No run body queries git tags (header prose may document the replacement):
+    for body in _run_bodies(publish):
+        assert "git ls-remote --tags" not in body  # registry query, not git refs
+    # promote-latest keeps its head-verification ls-remote (refs/heads/main only)
+    assert "refs/heads/main" in _steps(publish["jobs"]["promote-latest"])
+
+
+def test_plan_verifies_tag_provenance_before_trusting_it() -> None:
+    """A registry sha- tag counts as published only when the revision annotation
+    verifies; unverified tags are re-scheduled, never trusted."""
+    plan_run = _plan_run()
+    assert "ghcr_tags.py verify" in plan_run
+    assert "provenance verification failed" in plan_run
+    assert 'select(.value != "published")' in plan_run
+    assert "unverified.txt" in plan_run
+    assert "--unverified-file unverified.txt" in plan_run
+    assert plan_run.count("ghcr_tags.py verify") == 2  # push path + backfill path
+
+
+def test_plan_uploads_and_publish_downloads_historical_validator() -> None:
+    """F3: pre-M8 commits have no scripts/ci_checks.sh in their own tree."""
+    upload = next(
+        step
+        for step in publish["jobs"]["plan"]["steps"]
+        if "upload-artifact" in str(step.get("uses", ""))
+    )
+    assert upload["with"]["name"] == "historical-validator"
+    assert upload["with"]["path"] == "scripts/validate_historical.py"
+    assert upload["with"]["if-no-files-found"] == "error"
+    publish_dump = _steps(publish["jobs"]["publish"])
+    download = next(
+        step
+        for step in publish["jobs"]["publish"]["steps"]
+        if "download-artifact" in str(step.get("uses", ""))
+    )
+    assert download["with"]["name"] == "historical-validator"
+    assert "historical-validator" in publish_dump
+    leg_run = next(
+        step["run"]
+        for step in publish["jobs"]["publish"]["steps"]
+        if "ci_checks.sh" in str(step.get("run"))
+    )
+    assert "[ -f scripts/ci_checks.sh ]" in leg_run  # per-commit tooling choice, not a blind run
+    assert "validate_historical.py" in leg_run
+    assert (ROOT / "scripts" / "validate_historical.py").is_file()
+    assert (ROOT / "scripts" / "ghcr_tags.py").is_file()

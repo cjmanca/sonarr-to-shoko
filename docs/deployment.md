@@ -14,6 +14,24 @@ verify, and only then widen the batch.
   evidence in this build is mocked/offline.
 - **GHCR publication is defined but unverified.** Build the image locally for the
   first live canary unless a published SHA image has already been validated.
+- **The publication pipeline's registry logic (M8 F2/F3) is mocked offline only.**
+  The plan job discovers already-published images from the GHCR OCI registry via
+  `scripts/ghcr_tags.py` (git refs are independent of container tags, so the
+  registry is the publication state); any registry failure class (auth,
+  permission, network, unavailable) aborts the run and never publishes against
+  unknown state, and an existing `sha-<fullsha>` tag counts as published only
+  after a bounded, best-effort manifest/config provenance check
+  (`org.opencontainers.image.revision` == full SHA; unverified tags are
+  re-scheduled, which is safe because `sha-` tags are content-addressed).
+  Publish legs for commits that predate `scripts/ci_checks.sh` validate the
+  historical source with the artifact-delivered `scripts/validate_historical.py`
+  fallback. The first authorized live workflow run is the external validation
+  of all of this; publication stays EXTERNAL/UNVERIFIED.
+- **Workflow lint/security scanning is substituted locally.** `actionlint`
+  and `zizmor` are not installed on the development host; the structural PyYAML
+  assertions in `tests/test_workflows.py` (permissions, gates, PR isolation,
+  SHA pins, env-indirection hygiene, image-reference validation, registry
+  discovery wiring, historical fallback) plus manual review stand in for them.
 - **Campaign multi-batch apply is currently defective.** Mocked M9-e2e evidence
   shows campaign apply can pause the next batch with
   `source_discontinuity` after the campaign's own accepted links shrink the

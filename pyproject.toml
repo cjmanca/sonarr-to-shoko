@@ -44,7 +44,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["ARG"]
+"tests/*" = ["ARG", "S105", "PLR2004"]  # test fixtures use fake credentials/registry tokens;
+# tests assert literal exit codes, HTTP statuses, and call counts by design
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
