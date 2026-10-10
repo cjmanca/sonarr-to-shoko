@@ -20,6 +20,9 @@ Hard safety properties this module enforces (PROJECT.md, docs/compatibility.md �
 * **Only the ``new_arrival`` cohort auto-applies in daemon cycles.** Backlog and
   campaign files are never auto-submitted (backlog/campaign runs are M7 CLI
   campaigns). ``classify_new`` decides cohort membership from the recorded baseline.
+  New arrivals inside ``sync.new_file_grace_period_seconds`` (default 300s, measured from
+  the persisted ``first_seen_iso``) defer with ``grace_period`` — they stay ``planned``
+  and consume no budget slot — so Shoko's post-arrival import state settles first.
 * **Apply requires the whole eligibility conjunction**: an open apply gate, a valid
   safety attestation, budget headroom, an active mapping generation, source
   continuity, a complete auto-apply-eligible baseline, and no pending rebaseline.
@@ -47,6 +50,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -59,6 +63,7 @@ from typing import Any, Final
 import httpx
 
 from . import mappings as _mappings
+from .attestation import AttestationVerdict
 from .config import Settings, apply_gate
 from .errors import HttpPolicyError
 from .http import ApiEndpoint, resolve_and_send
@@ -100,11 +105,15 @@ from .policies import RunPolicy
 from .shoko import ImportFolder, ShokoDiscovery, collect_shoko_discovery, match_shoko_files
 from .sonarr import SonarrFile, SonarrInventory, collect_sonarr_inventory
 from .state import (
+    ATTESTATION_PAUSE_REASON,
+    META_ATTESTATION_GATE,
+    META_NEXT_FULL_RECONCILE_ISO,
     BaselineFile,
     BudgetRefusal,
     Cohort,
     EligibilityVerdict,
     FileIdentitySnapshot,
+    FileRecord,
     FileSeed,
     FileState,
     LockHeldError,
@@ -123,6 +132,8 @@ MAX_SUCCESS_STATUS: Final[int] = 300
 
 MAX_BACKOFF_SECONDS: Final[float] = 24 * 3600.0
 SOURCE_IDENTITY_FIELDS: Final[str] = "sonarr_url,shoko_url"
+# Matches the ``grace_period`` retryable label in :mod:`shoko_linker.state` (reason taxonomy).
+GRACE_PERIOD_REASON: Final[str] = "grace_period"
 
 
 class CycleMode(Enum):
@@ -144,6 +155,10 @@ def _attestation_closed() -> bool:
     return False
 
 
+def _no_attestation_verdict() -> AttestationVerdict | None:
+    return None
+
+
 @dataclass(frozen=True)
 class DaemonDeps:
     """Every injected dependency a cycle needs: endpoints, stores, clocks, safety inputs.
@@ -151,6 +166,9 @@ class DaemonDeps:
     M7 supplies the real endpoints/attestation lease; tests inject ``MockTransport``
     endpoints, fake clocks, and tmp stores. Defaults are safe-closed (no attestation,
     no jitter, monotonic clock) so a partially wired daemon never writes.
+    ``blocked_over=None`` (the default) is **not** "no threshold": every preflight call
+    site resolves it through :func:`effective_blocked_over` to
+    ``sync.queue_blocked_tolerance`` (default 0 — a blocked queue suppresses apply).
     """
 
     settings: Settings
@@ -165,6 +183,7 @@ class DaemonDeps:
     jitter: Callable[[], float] = _no_jitter
     pid: int = field(default_factory=os.getpid)
     attestation_valid: Callable[[], bool] = _attestation_closed
+    attestation_verdict: Callable[[], AttestationVerdict | None] = _no_attestation_verdict
     lease_seconds: float = 600.0
     blocked_over: int | None = None
     verification_timeout_seconds: float = 600.0
@@ -218,6 +237,9 @@ class CycleReport:
     failed: bool
     live_held_sends: int = 0
     live_held_slots: int = 0
+    full: bool = True
+    plans: Mapping[int, LinkPlan] = MappingProxyType({})
+    folders: Mapping[int, ImportFolder] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -258,6 +280,23 @@ def roots_fingerprint(settings: Settings) -> str:
     lines = [f"sn|{root}" for root in sorted(settings.sonarr.allowed_roots)]
     lines.extend(f"sh|{root}" for root in sorted(settings.shoko.allowed_roots))
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def full_cycle_due(store: StateStore, now_iso: str) -> bool:
+    """True when a full reconcile is due: no/invalid marker, or ``now`` at/after the marker.
+
+    The marker is the persisted ``next_full_reconcile_iso`` (written by the CLI cycle
+    bookkeeping from ``sync.full_reconcile_interval_hours``); a light streak can never
+    starve the full pass beyond the configured interval — the interval gate forces it.
+    """
+    raw = store.get_meta(META_NEXT_FULL_RECONCILE_ISO)
+    if raw is None:
+        return True
+    try:
+        due = _parse_iso(raw)
+    except ValueError:
+        return True
+    return _parse_iso(now_iso) >= due
 
 
 def inventory_snapshot_hash(inventory: SonarrInventory, discovery: ShokoDiscovery) -> str:
@@ -396,6 +435,19 @@ def _load_overrides(deps: DaemonDeps) -> _mappings.Overrides | None:
 # ------------------------------------------------------------------ eligibility
 
 
+def effective_blocked_over(deps: DaemonDeps) -> int:
+    """The fail-closed queue-block threshold for every preflight call site.
+
+    M7 review P1: a blocked Shoko queue makes ``ManualLinkJob`` delivery untrustworthy,
+    so an unwired threshold is never "no threshold" — it is ``sync.queue_blocked_tolerance``
+    (default **0**: any blocked work refuses apply). ``queue=None`` keeps its independent
+    ``QUEUE_UNKNOWN`` fail-closed refusal.
+    """
+    if deps.blocked_over is not None:
+        return deps.blocked_over
+    return deps.settings.sync.queue_blocked_tolerance
+
+
 def _budget_headroom(deps: DaemonDeps) -> bool:
     """Non-mutating peek: is there room for at least one more submission?
 
@@ -452,6 +504,76 @@ def compute_eligibility(deps: DaemonDeps, now_iso: str) -> EligibilityVerdict:  
     if not flags.source_stable:
         reasons.append("source_unstable")
     return EligibilityVerdict(not reasons, tuple(reasons))
+
+
+# ------------------------------------------------------------------ attestation gate
+
+
+def attestation_gate(
+    deps: DaemonDeps,
+    now_iso: str,
+    *,
+    mutate: bool = True,
+) -> tuple[str, ...]:
+    """Compute the attestation gate and the persisted pause *transition* (once).
+
+    A lease that is absent/invalid/expired/stale suppresses apply (the eligibility
+    conjunction already refuses with ``attestation_invalid``). The first valid→invalid
+    transition persists one write pause (``attestation_expired``) and logs a warning;
+    repeated invalid cycles do **not** re-pause (no restart loop, daemon stays alive
+    reporting read-only). The first invalid→valid transition clears the pause **only when
+    the pause reason is exactly ``attestation_expired``** (a mapping-churn pause is never
+    cleared here). ``mutate=False`` (daemon DRY_RUN) computes the verdict and warns
+    without touching the persisted gate state.
+
+    Without a verdict seam (pure-bool M6-a wiring) this is a no-op: the bool input stays
+    authoritative and no pause bookkeeping happens.
+    """
+    verdict = deps.attestation_verdict()
+    if verdict is None:
+        return ()
+    reasons: list[str] = []
+    logging.getLogger(__name__).debug(
+        "attestation gate: status=%s reason=%s", verdict.status, verdict.reason
+    )
+    if verdict.valid_for_apply:
+        if verdict.warn:
+            reasons.append("attestation_expires_soon")
+            logging.getLogger(__name__).warning(
+                "safety attestation expires soon (%s): re-record the lease before "
+                "apply resumes being refused",
+                verdict.reason,
+            )
+        if not mutate:
+            return tuple(reasons)
+        gate = deps.store.get_meta(META_ATTESTATION_GATE)
+        if gate == "paused" and deps.store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON:
+            with contextlib.suppress(WriteDisabledError, StateError):
+                deps.store.resume(now_iso)
+                deps.store.set_meta(META_ATTESTATION_GATE, "valid")
+            reasons.append("attestation_resumed")
+        elif gate != "valid":
+            with contextlib.suppress(WriteDisabledError, StateError):
+                deps.store.set_meta(META_ATTESTATION_GATE, "valid")
+        return tuple(reasons)
+    reasons.append(f"attestation_{verdict.status}")
+    if not mutate:
+        return tuple(reasons)
+    gate = deps.store.get_meta(META_ATTESTATION_GATE)
+    if gate != "paused":
+        with contextlib.suppress(WriteDisabledError, StateError):
+            deps.store.pause(ATTESTATION_PAUSE_REASON, now_iso)
+            deps.store.set_meta(META_ATTESTATION_GATE, "paused")
+        logging.getLogger(__name__).warning(
+            "safety attestation is %s (%s): writes are paused (persisted, once per "
+            "transition); the daemon stays alive reporting read-only",
+            verdict.status,
+            verdict.reason,
+        )
+        reasons.append("attestation_pause_persisted")
+    else:
+        reasons.append("attestation_pause_active")
+    return tuple(reasons)
 
 
 # ------------------------------------------------------------------ reconcile
@@ -604,6 +726,8 @@ def _reconcile(
     discovery: ShokoDiscovery,
     active: ActiveMappings,
     now_iso: str,
+    *,
+    policy: RunPolicy = RunPolicy.NEW_ARRIVAL,
 ) -> _ReconcileResult:
     series_tvdb = {
         item.series.id: item.series.tvdb_id
@@ -637,7 +761,7 @@ def _reconcile(
         frozen = freeze_plan(
             match,
             resolutions,
-            policy=RunPolicy.NEW_ARRIVAL,
+            policy=policy,
             targets_digest=active.targets_digest,
             structure_digest=active.structure_digest,
             shoko_paths=shoko_paths,
@@ -780,6 +904,18 @@ def _verify_and_close(
     if verification is VerificationVerdict.VERIFIED:
         deps.store.mark_completed(cycle_key, now_iso)
     return f"verification:{verification.value}"
+
+
+def verify_and_close(
+    deps: DaemonDeps, plan: LinkPlan, file_id: int, cycle_key: str, now_iso: str
+) -> str:
+    """Public inline verification wrapper (campaign apply reuses the daemon's poll loop)."""
+    return _verify_and_close(deps, plan, file_id, cycle_key, now_iso)
+
+
+def xref_fetcher(endpoint: ApiEndpoint, file_id: int) -> Callable[[], ShokoFileXRefs | None]:
+    """Public alias for the XRef poll fetcher (campaign verification path)."""
+    return _xref_fetcher(endpoint, file_id)
 
 
 def inspect_send_state(deps: DaemonDeps, file_id: int) -> ShokoFileXRefs | None:
@@ -934,7 +1070,9 @@ def _recovery_replan_rows(
     return outcomes
 
 
-def _recovery_phase(deps: DaemonDeps, now_iso: str, cycle_start_mono: float) -> tuple[str, ...]:
+def _recovery_phase(
+    deps: DaemonDeps, now_iso: str, cycle_start_mono: float, *, full: bool = True
+) -> tuple[str, ...]:
     """Consume persisted recovery rows BEFORE processing new candidates (P1-3/P2-2).
 
     (a) continue_polling re-polls with the persisted target triples; (b) hold rows are
@@ -955,7 +1093,9 @@ def _recovery_phase(deps: DaemonDeps, now_iso: str, cycle_start_mono: float) -> 
     queue: list[tuple[Any, str]] = [(row, "poll") for row in plan.continue_polling]
     queue.extend((row, "hold") for row in plan.hold_for_verification)
     queue.sort(key=lambda entry: (_recovery_sort_key(deps, entry[0]), entry[0].shoko_file_id))
-    cap = deps.max_recovery_rows_per_cycle
+    cap = (
+        deps.max_recovery_rows_per_cycle if full else max(1, deps.max_recovery_rows_per_cycle // 2)
+    )
     deferred = 0
     for processed, (row, kind) in enumerate(queue):
         if processed >= cap or deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
@@ -1018,7 +1158,7 @@ def _process_candidate(
         queue=queue,
         active_targets_digest=active.targets_digest,
         active_structure_digest=active.structure_digest,
-        blocked_over=deps.blocked_over,
+        blocked_over=effective_blocked_over(deps),
         mapping_index=active.index,
     )
     if not gate.ok:
@@ -1064,6 +1204,24 @@ def _process_candidate(
     return _ApplyOutcome(1, 0, (), (_verify_and_close(deps, plan, file_id, cycle_key, now_iso),))
 
 
+def _grace_period_active(deps: DaemonDeps, record: FileRecord, now_iso: str) -> bool:
+    """True while a new arrival is inside the ``new_file_grace_period_seconds`` window.
+
+    Shoko's own import/XRef state settles *after* a file arrives, so submitting the file
+    in its arrival cycle races that settling. The recorded ``first_seen_iso`` (the cycle
+    that first saw the file) is the age anchor; ``grace == 0`` disables the window. An
+    unparseable anchor defers (fail closed: never a POST on an unknown age).
+    """
+    grace = deps.settings.sync.new_file_grace_period_seconds
+    if grace <= 0:
+        return False
+    try:
+        first_seen = _parse_iso(record.first_seen_iso)
+    except ValueError:
+        return True
+    return _parse_iso(now_iso) - first_seen < timedelta(seconds=grace)
+
+
 def _apply(
     deps: DaemonDeps,
     plans: Mapping[int, LinkPlan],
@@ -1080,6 +1238,13 @@ def _apply(
 
     ``max_submissions`` bounds **POSTs attempted**, not enumerated files; the rest stay
     ``planned`` (deferred). Returns ``(submitted, deferred, reasons, drift)``.
+
+    New arrivals inside the ``sync.new_file_grace_period_seconds`` window defer
+    with the ``grace_period`` reason: the row stays ``planned``, consumes **no** budget
+    reservation (no ``prepare_send``), and is never quarantined — the next cycle that
+    starts after the window closes submits it. Backlog/campaign files are outside this
+    gate (they are never daemon-submitted at all; campaign apply is the operator's act on
+    aged inventory).
     """
     submitted = 0
     deferred = 0
@@ -1098,6 +1263,10 @@ def _apply(
         if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
             deferred += len(ordered) - index
             break
+        if _grace_period_active(deps, record, now_iso):
+            deferred += 1
+            reasons.append(GRACE_PERIOD_REASON)
+            continue
         outcome = _process_candidate(
             deps, plans[file_id], file_id, flags, active, folders, queue, cycle_key, now_iso
         )
@@ -1188,16 +1357,27 @@ def run_cycle(
     *,
     now_iso: str,
     mode: CycleMode,
-    policy: RunPolicy,  # noqa: ARG001 - mandated cycle input; cohort gating is in can_auto_apply
+    policy: RunPolicy,
     cycle_key: str,
+    full: bool = True,
 ) -> CycleReport:
     """Run one reconciliation cycle. See module docstring for the safety contract.
 
-    Order: apply-lock preflight (APPLY only) → mapping scheduler → Sonarr
+    Order: apply-lock preflight (APPLY only) → attestation gate (APPLY mutates the
+    persisted pause transition; dry-run only warns) → mapping scheduler → Sonarr
     inventory → Shoko discovery → baseline establishment → source continuity →
     persisted recovery consumption → reconcile matches → (APPLY only) the ordered
     send/verify loop. ``policy`` names the daemon's cohort policy (only ``NEW_ARRIVAL``
     auto-applies; backlog/campaign campaigns are M7 CLI runs).
+
+    M7-b full/light cadence: ``full=True`` (the default — every explicit ``once`` and
+    every due full-reconcile) runs the complete cycle. A **light** cycle (``full=False``)
+    fetches the **same inventories** with a reduced work budget: the recovery phase cap
+    and the apply submission cap are halved, so prompt polling of new/changed series never
+    starves the recovery/apply queues; the interval gate (``full_reconcile_interval_hours``
+    via the persisted ``next_full_reconcile_iso`` marker) forces a full cycle. True delta
+    fetching (Sonarr change cache / Shoko discovery delta) is NOT
+    implemented and is documented as the M9 optimization — no endpoints are invented.
 
     P2-1: the acquired apply lock is released in ``finally`` — a mid-cycle exception can
     no longer wedge it. A non-owner release (the lease was stolen after a crash)
@@ -1210,7 +1390,9 @@ def run_cycle(
     if lock_reason is not None:
         return _read_only_report(mode, cycle_key, lock_reason, None)
     try:
-        return _run_cycle_body(deps, now_iso=now_iso, mode=mode, cycle_key=cycle_key)
+        return _run_cycle_body(
+            deps, now_iso=now_iso, mode=mode, cycle_key=cycle_key, policy=policy, full=full
+        )
     finally:
         if lock_acquired:
             try:
@@ -1228,14 +1410,24 @@ def run_cycle(
 
 
 def _run_cycle_body(
-    deps: DaemonDeps, *, now_iso: str, mode: CycleMode, cycle_key: str
+    deps: DaemonDeps,
+    *,
+    now_iso: str,
+    mode: CycleMode,
+    cycle_key: str,
+    policy: RunPolicy,
+    full: bool,
 ) -> CycleReport:
     """The cycle body — runs with the apply lock held (APPLY) under the caller's
-    ``try/finally`` that guarantees the release (P2-1)."""
+    ``try/finally`` that guarantees the release (P2-1). ``full=False`` is the M7-b light
+    cycle (same inventories, halved recovery/apply work budgets; see :func:`run_cycle`).
+    """
     cycle_start_mono = deps.monotonic()
     reasons: list[str] = []
     drift: list[str] = []
     existing_link: list[str] = []
+
+    reasons.extend(attestation_gate(deps, now_iso, mutate=mode is CycleMode.APPLY))
 
     phase = _mapping_phase(deps, now_iso)
     inventory = collect_sonarr_inventory(deps.sonarr, deps.settings)
@@ -1292,10 +1484,11 @@ def _run_cycle_body(
 
     # P1-3: consume persisted recovery rows BEFORE processing new candidates (the
     # budget ceiling is enforced against the true in-flight count). P2-A: bounded by the
-    # per-cycle recovery row cap and the monotonic cycle budget.
-    reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono))
+    # per-cycle recovery row cap and the monotonic cycle budget (M7-b light cycles
+    # run with the halved cap).
+    reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono, full=full))
 
-    reconcile = _reconcile(deps, inventory, discovery, active, now_iso)
+    reconcile = _reconcile(deps, inventory, discovery, active, now_iso, policy=policy)
     for file_id, skip_reason in sorted(reconcile.skip_reasons.items()):
         reasons.append(f"skip:{file_id}:{skip_reason}")
 
@@ -1326,6 +1519,7 @@ def _run_cycle_body(
         apply_running,
         reasons,
         drift,
+        full=full,
     )
 
     counts = _final_counts(
@@ -1355,6 +1549,9 @@ def _run_cycle_body(
         failed=False,
         live_held_sends=live_held_sends,
         live_held_slots=live_held_slots,
+        full=full,
+        plans=reconcile.plans,
+        folders=discovery.folders,
     )
 
 
@@ -1395,11 +1592,13 @@ def _run_apply(
     apply_running: bool,
     reasons: list[str],
     drift: list[str],
+    full: bool = True,
 ) -> tuple[int, int]:
     """Drive the apply loop and fold its reasons/drift into the cycle's lists."""
     if not apply_running:
         return (0, 0)
     queue = fetch_queue(deps.shoko)
+    max_submissions = deps.max_submissions if full else max(1, deps.max_submissions // 2)
     submitted, deferred, apply_reasons, apply_drift = _apply(
         deps,
         plans,
@@ -1410,7 +1609,7 @@ def _run_apply(
         cycle_key,
         now_iso,
         cycle_start_mono,
-        deps.max_submissions,
+        max_submissions,
     )
     reasons.extend(apply_reasons)
     drift.extend(apply_drift)
@@ -1503,6 +1702,7 @@ def run_daemon(
     policy: RunPolicy = RunPolicy.NEW_ARRIVAL,
     mode: CycleMode = CycleMode.APPLY,
     jitter_ratio: float = 0.1,
+    full_cycle: Callable[[str], bool] | None = None,
 ) -> DaemonReport:
     """Poll cycles forever (or ``stop_after_cycles``), sleeping ``interval_seconds``
     with jitter between them; SIGTERM is honoured at the ``should_stop`` check
@@ -1511,18 +1711,24 @@ def run_daemon(
     Transport-level cycle failures grow the sleep with exponential backoff (24h cap,
     jitter); a successful cycle resets it. The persisted budget ``next_due``/pause
     state in the stores means a restart neither disables refreshes nor tight-loops.
+
+    ``full_cycle`` (M7-b cadence): when supplied, each cycle's ``full`` flag comes from
+    ``full_cycle(now)`` — the CLI wires it to :func:`full_cycle_due` (interval-gated
+    full vs light cycle). Without it every cycle is full (M6 behavior, default).
     """
     reports: list[CycleReport] = []
     failures = 0
     index = 0
     shutdown_requested = False
     while True:
+        iso = now_iso()
         report = run_cycle(
             deps,
-            now_iso=now_iso(),
+            now_iso=iso,
             mode=mode,
             policy=policy,
             cycle_key=cycle_key(index),
+            full=True if full_cycle is None else full_cycle(iso),
         )
         reports.append(report)
         index += 1

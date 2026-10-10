@@ -64,7 +64,11 @@ for re-poll/re-inspection of persisted rows), and ``budgets`` carries
 ``completed_submissions``; these columns were added in-schema, no migration is needed.
 The second-round P1-A fix adds ``slot_released`` to ``sends`` — **also schema v1, unshipped**
 (no released image reads the old column set, so it is appended to ``_SCHEMA_SQL`` with no
-migration entry).
+migration entry). M7-b (also schema v1, unshipped — no image shipped with v1 columns has
+ever been released): ``campaigns.campaign_id`` becomes **TEXT** (the plan file's uuid4),
+gains ``attestation_scope``/``approval_iso``/``status_reason``/``last_batch_iso`` and a
+``status IN ('approved','paused','revoked')`` check; ``files.campaign_id`` is TEXT for the
+same reason, and :meth:`StateStore.prepare_send` takes ``campaign_id: str | None``.
 
 **Operator-only indirect chain (P3-B):** the transition graph contains the path
 ``indeterminate_write → waiting → planned → prepared_not_sent → request_may_have_been_sent``,
@@ -123,6 +127,8 @@ META_LAST_CYCLE_END_ISO: Final[str] = "last_cycle_end_iso"
 META_NEXT_CYCLE_DUE_ISO: Final[str] = "next_cycle_due_iso"
 META_LAST_FULL_RECONCILE_ISO: Final[str] = "last_full_reconcile_iso"
 META_NEXT_FULL_RECONCILE_ISO: Final[str] = "next_full_reconcile_iso"
+META_ATTESTATION_GATE: Final[str] = "attestation_gate"
+ATTESTATION_PAUSE_REASON: Final[str] = "attestation_expired"
 
 _SYNC_NAMES: Final[Mapping[int, str]] = {0: "off", 1: "normal", 2: "full", 3: "extra"}
 
@@ -428,7 +434,7 @@ class FileRecord:
     mapping_structure_digest: str | None
     mapping_revision: str | None
     policy: str | None
-    campaign_id: int | None
+    campaign_id: str | None
     state_detail: str
     updated_iso: str
     first_seen_iso: str
@@ -579,6 +585,45 @@ class EligibilityVerdict:
 
 
 @dataclass(frozen=True)
+class CampaignBinding:
+    """One approved plan-file entry bound to a campaign (fingerprint contract)."""
+
+    shoko_file_id: int
+    plan_fingerprint: str
+    request_fingerprint: str
+
+
+CAMPAIGN_STATUS_APPROVED: Final[str] = "approved"
+CAMPAIGN_BINDING_FIELDS: Final[int] = 3
+CAMPAIGN_STATUS_PAUSED: Final[str] = "paused"
+CAMPAIGN_STATUS_REVOKED: Final[str] = "revoked"
+CAMPAIGN_STATUSES: Final[frozenset[str]] = frozenset(
+    {CAMPAIGN_STATUS_APPROVED, CAMPAIGN_STATUS_PAUSED, CAMPAIGN_STATUS_REVOKED}
+)
+CAMPAIGN_QUEUE_STATES: Final[frozenset[FileState]] = frozenset(
+    {FileState.PLANNED, FileState.MAPPED}
+)
+
+
+@dataclass(frozen=True)
+class CampaignRecord:
+    """One persisted campaign: approval binding, totals, progress and status."""
+
+    campaign_id: str
+    digest: str
+    max_submissions: int
+    deadline_iso: str | None
+    attestation_scope: str
+    approval_iso: str
+    status: str
+    status_reason: str
+    total_sent: int
+    last_batch_iso: str | None
+    created_iso: str
+    bindings: tuple[CampaignBinding, ...]
+
+
+@dataclass(frozen=True)
 class ContinuityVerdict:
     """Source identity/snapshot continuity answer; drives the rebaseline requirement."""
 
@@ -666,7 +711,7 @@ CREATE TABLE files (
     mapping_structure_digest TEXT,
     mapping_revision TEXT,
     policy TEXT,
-    campaign_id INTEGER,
+    campaign_id TEXT,
     state_detail TEXT NOT NULL DEFAULT '',
     updated_iso TEXT NOT NULL,
     first_seen_iso TEXT NOT NULL,
@@ -688,15 +733,19 @@ CREATE TABLE sends (
     slot_released INTEGER NOT NULL DEFAULT 0 CHECK (slot_released IN (0, 1))
 );
 CREATE TABLE campaigns (
-    campaign_id INTEGER PRIMARY KEY,
+    campaign_id TEXT PRIMARY KEY,
     digest TEXT NOT NULL,
-    plan_fingerprint_set TEXT NOT NULL,
+    plan_fingerprint_set TEXT NOT NULL DEFAULT '[]',
     max_submissions INTEGER NOT NULL,
     deadline_iso TEXT,
-    attestation_expiry_iso TEXT,
+    attestation_scope TEXT NOT NULL DEFAULT '',
+    approval_iso TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'approved'
+        CHECK (status IN ('approved', 'paused', 'revoked')),
+    status_reason TEXT NOT NULL DEFAULT '',
     total_sent INTEGER NOT NULL DEFAULT 0,
-    created_iso TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open'
+    last_batch_iso TEXT,
+    created_iso TEXT NOT NULL
 );
 CREATE TABLE budgets (
     window_key TEXT PRIMARY KEY,
@@ -908,6 +957,51 @@ _SQL_ALL_FILES: Final[str] = (
     " updated_iso, first_seen_iso, last_verified_iso, identity_hash_json"
     " FROM files ORDER BY shoko_file_id"
 )
+_SQL_CAMPAIGN_FILES: Final[str] = (
+    "SELECT shoko_file_id, sonarr_series_id, sonarr_file_id, sonarr_path, sonarr_size,"
+    " state, cohort, plan_fingerprint, request_fingerprint, mapping_targets_digest,"
+    " mapping_structure_digest, mapping_revision, policy, campaign_id, state_detail,"
+    " updated_iso, first_seen_iso, last_verified_iso, identity_hash_json"
+    " FROM files WHERE campaign_id = ? ORDER BY shoko_file_id"
+)
+
+
+def _row_to_campaign(row: Any) -> CampaignRecord:
+    values = tuple(row)
+    bindings: list[CampaignBinding] = []
+    try:
+        document = json.loads(_as_str(values[11], "plan_fingerprint_set"))
+    except ValueError:
+        document = []
+    if isinstance(document, list):
+        for item in document:
+            if (
+                isinstance(item, list)
+                and len(item) == CAMPAIGN_BINDING_FIELDS
+                and not isinstance(item[0], bool)
+                and isinstance(item[0], int)
+                and isinstance(item[1], str)
+                and isinstance(item[2], str)
+            ):
+                bindings.append(
+                    CampaignBinding(
+                        shoko_file_id=item[0], plan_fingerprint=item[1], request_fingerprint=item[2]
+                    )
+                )
+    return CampaignRecord(
+        campaign_id=_as_str(values[0], "campaign_id"),
+        digest=_as_str(values[1], "digest"),
+        max_submissions=_as_int(values[2], "max_submissions"),
+        deadline_iso=_as_optional_str(values[3]),
+        attestation_scope=_as_str(values[4], "attestation_scope"),
+        approval_iso=_as_str(values[5], "approval_iso"),
+        status=_as_str(values[6], "status"),
+        status_reason=_as_str(values[7], "status_reason"),
+        total_sent=_as_int(values[8], "total_sent"),
+        last_batch_iso=_as_optional_str(values[9]),
+        created_iso=_as_str(values[10], "created_iso"),
+        bindings=tuple(bindings),
+    )
 
 
 def _row_to_file_record(row: Any) -> FileRecord:
@@ -926,7 +1020,7 @@ def _row_to_file_record(row: Any) -> FileRecord:
         mapping_structure_digest=_as_optional_str(values[10]),
         mapping_revision=_as_optional_str(values[11]),
         policy=_as_optional_str(values[12]),
-        campaign_id=_as_optional_int(values[13]),
+        campaign_id=_as_optional_str(values[13]),
         state_detail=_as_str(values[14], "state_detail"),
         updated_iso=_as_str(values[15], "updated_iso"),
         first_seen_iso=_as_str(values[16], "first_seen_iso"),
@@ -1115,7 +1209,7 @@ class StateStore:
         state: FileState = FileState.DISCOVERED,
         identity: FileIdentitySnapshot | None = None,
         policy: str | None = None,
-        campaign_id: int | None = None,
+        campaign_id: str | None = None,
     ) -> None:
         _require_iso(iso, "iso")
         params = (
@@ -1671,7 +1765,7 @@ class StateStore:
         cycle_key: str,
         iso: str,
         policy: str | None = None,
-        campaign_id: int | None = None,
+        campaign_id: str | None = None,
         expected_episode_jobs: int = 1,
         target_ids: Sequence[tuple[int, int, int]] = (),
     ) -> SendToken | BudgetRefusal:
@@ -2522,6 +2616,227 @@ class StateStore:
             acquired_iso=_as_str(entry.get("acquired_iso"), "acquired_iso"),
             lease_expires_iso=_as_str(entry.get("lease_expires_iso"), "lease_expires_iso"),
         )
+
+    # ---------------------------------------------------------- campaigns (M7-b)
+
+    @_mutation
+    def create_campaign(
+        self,
+        campaign_id: str,
+        digest: str,
+        *,
+        max_submissions: int,
+        deadline_iso: str | None,
+        attestation_scope: str,
+        approval_iso: str,
+        iso: str,
+        bindings: Sequence[CampaignBinding] = (),
+    ) -> str:
+        """Persist one **approved** campaign row (the ``campaign approve`` path).
+
+        The approval is bound to the plan file's canonical digest; ``bindings`` are the
+        per-file (id, plan fingerprint, request fingerprint) pairs the plan file carries.
+        A campaign id is unique — re-approving an existing campaign refuses.
+        """
+        _require_iso(iso, "iso")
+        _require_iso(approval_iso, "approval_iso")
+        if deadline_iso is not None:
+            _require_iso(deadline_iso, "deadline_iso")
+        _require_hex64(digest, "digest")
+        if not isinstance(campaign_id, str) or not campaign_id.strip():
+            raise StateError("campaign_id must be a non-empty string")
+        if not isinstance(attestation_scope, str) or not attestation_scope.strip():
+            raise StateError("attestation_scope must be a non-empty string")
+        if _as_int(max_submissions, "max_submissions") < 1:
+            raise StateError("max_submissions must be at least 1")
+        binding_rows = [
+            [int(b.shoko_file_id), b.plan_fingerprint, b.request_fingerprint] for b in bindings
+        ]
+        for binding in bindings:
+            _require_hex64(binding.plan_fingerprint, "binding plan_fingerprint")
+            _require_hex64(binding.request_fingerprint, "binding request_fingerprint")
+        with self._transaction():
+            existing = self._conn.execute(
+                "SELECT 1 FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+            if existing is not None:
+                raise StateError(f"campaign {campaign_id!r} already exists: approve is one-shot")
+            self._conn.execute(
+                "INSERT INTO campaigns (campaign_id, digest, plan_fingerprint_set, max_submissions,"
+                " deadline_iso, attestation_scope, approval_iso, status, status_reason, total_sent,"
+                " last_batch_iso, created_iso)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 0, NULL, ?)",
+                (
+                    campaign_id,
+                    digest,
+                    json.dumps(binding_rows),
+                    max_submissions,
+                    deadline_iso,
+                    attestation_scope,
+                    approval_iso,
+                    CAMPAIGN_STATUS_APPROVED,
+                    iso,
+                ),
+            )
+        return campaign_id
+
+    def get_campaign(self, campaign_id: str) -> CampaignRecord | None:
+        row = self._conn.execute(
+            "SELECT campaign_id, digest, max_submissions, deadline_iso, attestation_scope,"
+            " approval_iso, status, status_reason, total_sent, last_batch_iso,"
+            " created_iso, plan_fingerprint_set FROM campaigns WHERE campaign_id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_campaign(row)
+
+    def list_campaigns(self) -> tuple[CampaignRecord, ...]:
+        rows = self._conn.execute(
+            "SELECT campaign_id, digest, max_submissions, deadline_iso, attestation_scope,"
+            " approval_iso, status, status_reason, total_sent, last_batch_iso, created_iso,"
+            " plan_fingerprint_set FROM campaigns ORDER BY campaign_id",
+        ).fetchall()
+        return tuple(_row_to_campaign(row) for row in rows)
+
+    @_mutation
+    def bind_campaign_files(self, campaign_id: str, iso: str) -> int:
+        """Bind the campaign's plan-file fingerprints onto tracked file rows.
+
+        Only rows that exist and sit in a queue state (``planned``/``mapped``) bind;
+        the stored fingerprints come from the campaign row's ``plan_fingerprint_set``.
+        Returns the number of file rows bound. Binding never advances file state.
+        """
+        _require_iso(iso, "iso")
+        campaign = self.get_campaign(campaign_id)
+        if campaign is None:
+            raise StateError(f"campaign {campaign_id!r} does not exist: nothing to bind")
+        with self._transaction():
+            bound = 0
+            for binding in campaign.bindings:
+                result = self._conn.execute(
+                    "UPDATE files SET campaign_id = ?, plan_fingerprint = ?,"
+                    " request_fingerprint = ?, updated_iso = ?"
+                    " WHERE shoko_file_id = ? AND state IN ('planned', 'mapped')",
+                    (
+                        campaign_id,
+                        binding.plan_fingerprint,
+                        binding.request_fingerprint,
+                        iso,
+                        binding.shoko_file_id,
+                    ),
+                )
+                bound += result.rowcount
+            self._conn.execute(
+                "UPDATE campaigns SET plan_fingerprint_set = ? WHERE campaign_id = ?",
+                (
+                    json.dumps(
+                        [
+                            [b.shoko_file_id, b.plan_fingerprint, b.request_fingerprint]
+                            for b in campaign.bindings
+                        ]
+                    ),
+                    campaign_id,
+                ),
+            )
+        return bound
+
+    @_mutation
+    def set_campaign_status(self, campaign_id: str, status: str, reason: str, *, iso: str) -> None:
+        """Persist a campaign lifecycle change (approved/paused/revoked) with its reason."""
+        _require_iso(iso, "iso")
+        if status not in CAMPAIGN_STATUSES:
+            raise StateError(
+                f"unknown campaign status {status!r}: allowed are {sorted(CAMPAIGN_STATUSES)}"
+            )
+        with self._transaction():
+            result = self._conn.execute(
+                "UPDATE campaigns SET status = ?, status_reason = ? WHERE campaign_id = ?",
+                (status, _clip(reason) if status == CAMPAIGN_STATUS_PAUSED else "", campaign_id),
+            )
+            if result.rowcount == 0:
+                raise StateError(f"campaign {campaign_id!r} does not exist")
+
+    @_mutation
+    def record_campaign_send(self, campaign_id: str, iso: str) -> int:
+        """Count one submitted campaign file (bounded by ``max_submissions``)."""
+        _require_iso(iso, "iso")
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT total_sent, max_submissions FROM campaigns WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+            if row is None:
+                raise StateError(f"campaign {campaign_id!r} does not exist")
+            total = _as_int(row[0], "total_sent")
+            limit = _as_int(row[1], "max_submissions")
+            if total >= limit:
+                raise StateError(
+                    f"campaign {campaign_id!r} reached max_submissions ({limit}): refusing to count"
+                )
+            self._conn.execute(
+                "UPDATE campaigns SET total_sent = total_sent + 1, last_batch_iso = ?"
+                " WHERE campaign_id = ?",
+                (iso, campaign_id),
+            )
+        return total + 1
+
+    def campaign_files(self, campaign_id: str) -> tuple[FileRecord, ...]:
+        rows = self._conn.execute(_SQL_CAMPAIGN_FILES, (campaign_id,)).fetchall()
+        return tuple(_row_to_file_record(row) for row in rows)
+
+    def campaign_progress(self, campaign_id: str) -> dict[str, int]:
+        """Per-state file counts for one campaign (quarantined counted from detail)."""
+        progress = {state.value: 0 for state in FileState}
+        for row in self._conn.execute(
+            "SELECT state, COUNT(*) FROM files WHERE campaign_id = ? GROUP BY state",
+            (campaign_id,),
+        ).fetchall():
+            progress[str(row[0])] = _as_int(row[1], "count")
+        quarantined = self._conn.execute(
+            "SELECT COUNT(*) FROM files WHERE campaign_id = ?"
+            " AND state_detail LIKE 'campaign_quarantine%'",
+            (campaign_id,),
+        ).fetchone()
+        progress["quarantined"] = _as_int(quarantined[0], "quarantined_count")
+        campaign = self.get_campaign(campaign_id)
+        progress["total_sent"] = 0 if campaign is None else campaign.total_sent
+        progress["approved_files"] = 0 if campaign is None else len(campaign.bindings)
+        return progress
+
+    @_mutation
+    def unbind_campaign_files(self, campaign_id: str, reason: str, *, iso: str) -> int:
+        """Revoke path: queued (planned/mapped) bound rows go to ``waiting`` with the reason.
+
+        Rows past ``planned`` (prepared/sent/verifying) are **never** rewound —
+        the sent-row contract (verify/hold, no resubmission) stands.
+        """
+        _require_iso(iso, "iso")
+        with self._transaction():
+            rows = self._conn.execute(
+                "SELECT shoko_file_id, state FROM files WHERE campaign_id = ?"
+                " ORDER BY shoko_file_id",
+                (campaign_id,),
+            ).fetchall()
+            rewound = 0
+            for file_id, raw in rows:
+                current = FileState(_as_str(raw, "state"))
+                if current not in CAMPAIGN_QUEUE_STATES:
+                    continue
+                target = FileState.WAITING
+                validate_transition(current, target)
+                self._conn.execute(
+                    "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?,"
+                    " campaign_id = NULL WHERE shoko_file_id = ?",
+                    (
+                        target.value,
+                        _clip(f"campaign unbound: {reason}"),
+                        iso,
+                        _as_int(file_id, "shoko_file_id"),
+                    ),
+                )
+                rewound += 1
+        return rewound
 
 
 def _encode_holder(holder: LockHolder) -> str:

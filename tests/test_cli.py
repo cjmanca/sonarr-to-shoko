@@ -11,14 +11,13 @@ import pytest
 from shoko_linker.cli import (
     EXIT_APPLY_GATE_REFUSAL,
     EXIT_CONFIG_INVALID,
-    EXIT_NOT_IMPLEMENTED,
     EXIT_OK,
+    EXIT_RUNTIME,
     main,
 )
 
 EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
-STUB_COMMAND_COUNT = 3
 
 
 def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
@@ -44,7 +43,7 @@ def test_validate_refuses_live_read_only_without_network(
 ) -> None:
     code = main(["validate", "--offline", "--live-read-only", str(EXAMPLE_CONFIG)])
     out = capsys.readouterr().out
-    assert code == EXIT_NOT_IMPLEMENTED
+    assert code == EXIT_RUNTIME
     assert "not implemented" in out
     assert "no network call was made" in out
 
@@ -81,14 +80,6 @@ def test_validate_reports_missing_secret(
     assert DUMMY_SHOKO_KEY not in captured.err
 
 
-def test_once_defaults_to_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(["once", str(EXAMPLE_CONFIG)])
-    out = capsys.readouterr().out
-    assert code == EXIT_NOT_IMPLEMENTED
-    assert "dry-run" in out
-    assert "not implemented" in out
-
-
 def test_once_apply_without_operator_opt_in_refuses(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -114,32 +105,6 @@ def test_once_apply_with_config_default_refuses(
     assert "sync.apply_changes" in out
 
 
-def test_once_apply_opens_gate_then_stops_before_writes(
-    base_document: dict[str, Any],
-    write_document: Callable[[dict[str, Any]], Path],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    base_document["sync"]["apply_changes"] = True
-    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
-    code = main(["once", "--apply", str(write_document(base_document))])
-    out = capsys.readouterr().out
-    # Gate opened, and the build has no write path: the engine stub refuses.
-    assert code == EXIT_NOT_IMPLEMENTED
-    assert "live writes=ALLOWED" in out
-    assert "not implemented" in out
-
-
-def test_once_reports_the_selected_policy(
-    base_document: dict[str, Any],
-    write_document: Callable[[dict[str, Any]], Path],
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    path = str(write_document(base_document))
-    assert main(["once", "--policy", "new_arrival", path]) == EXIT_NOT_IMPLEMENTED
-    assert "policy: new arrival" in capsys.readouterr().out
-
-
 def test_once_refuses_an_unknown_policy_name(
     base_document: dict[str, Any],
     write_document: Callable[[dict[str, Any]], Path],
@@ -147,26 +112,6 @@ def test_once_refuses_an_unknown_policy_name(
     with pytest.raises(SystemExit) as excinfo:
         main(["once", "--policy", "not-a-policy", str(write_document(base_document))])
     assert excinfo.value.code == EXIT_CONFIG_INVALID
-
-
-def test_daemon_stub_prints_policy_state(capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(["daemon", str(EXAMPLE_CONFIG)])
-    out = capsys.readouterr().out
-    assert code == EXIT_NOT_IMPLEMENTED
-    assert "requested policy: new arrival" in out
-    assert "sonarr: http://sonarr:8989" in out
-
-
-def test_report_and_mapping_commands_are_honest_stubs(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["report", str(EXAMPLE_CONFIG)]) == EXIT_NOT_IMPLEMENTED
-    assert main(["mappings", "status", str(EXAMPLE_CONFIG)]) == EXIT_NOT_IMPLEMENTED
-    assert main(["mappings", "refresh", "--force", str(EXAMPLE_CONFIG)]) == EXIT_NOT_IMPLEMENTED
-    out = capsys.readouterr().out
-    assert "anime-lists" in out
-    assert "refresh interval: 168 hours" in out
-    assert out.count("not implemented") == STUB_COMMAND_COUNT
 
 
 def test_config_path_command_resolves(

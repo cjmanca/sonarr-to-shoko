@@ -131,13 +131,14 @@ def _shoko_path(file: SpecFile) -> str:
 class ShokoStub:
     """Scripted Shoko v5.3.3 API: discovery, preflight reads, ID chain, queue, POST."""
 
-    def __init__(self, files: list[SpecFile]) -> None:
+    def __init__(self, files: list[SpecFile], blocked_count: int = 0) -> None:
         self.files = {file.shoko_id: file for file in files}
         self.linked: dict[int, list[dict[str, Any]]] = {}
         self.requests: list[httpx.Request] = []
         self.posts: list[dict[str, Any]] = []
         self.fail_post: Exception | None = None
         self.fail_queue = False
+        self.blocked_count = blocked_count
         self.link_on_post = True
         self.post_status: int | None = None
         self.on_post: Callable[[], None] | None = None
@@ -149,7 +150,14 @@ class ShokoStub:
     def _queue(self, request: httpx.Request) -> httpx.Response:
         if self.fail_queue:
             return httpx.Response(503, request=request)
-        return self._json(request, {"WaitingCount": 5, "BlockedCount": 0, "TotalCount": 20})
+        return self._json(
+            request,
+            {
+                "WaitingCount": 5,
+                "BlockedCount": self.blocked_count,
+                "TotalCount": 20,
+            },
+        )
 
     def _respond(self, request: httpx.Request) -> httpx.Response:
         method = request.method
@@ -409,7 +417,21 @@ GEN_A = mapping_xml_mapped((1, 1001), (2, 1002))
 GEN_B = mapping_xml_mapped((1, 2001), (2, 2002))
 
 
-def make_settings(tmp_path: Path, *, apply_changes: bool = True) -> Settings:
+def make_settings(
+    tmp_path: Path,
+    *,
+    apply_changes: bool = True,
+    sync_extra: dict[str, Any] | None = None,
+) -> Settings:
+    # Harness default: the new-file grace window is OFF so cycle tests pin the apply
+    # path they were written for. Grace enforcement is proven by the ``grace`` tests
+    # below, which set the knob explicitly (the shipped default is 300).
+    sync: dict[str, Any] = {
+        "apply_changes": apply_changes,
+        "max_concurrent_links": 4,
+        "new_file_grace_period_seconds": 0,
+    }
+    sync.update(sync_extra or {})
     document = {
         "sonarr": {
             "url": SONARR_BASE,
@@ -419,7 +441,7 @@ def make_settings(tmp_path: Path, *, apply_changes: bool = True) -> Settings:
         "shoko": {"url": SHOKO_BASE, "api_key_env": "SHOKO_API_KEY", "allowed_roots": [SHOKO_ROOT]},
         "paths": {"mappings": [{"sonarr": SONARR_ROOT, "shoko": SHOKO_ROOT}]},
         "mappings": {"source": "anime-lists", "source_url": SOURCE_URL, "refresh_hours": HOURS},
-        "sync": {"apply_changes": apply_changes, "max_concurrent_links": 4},
+        "sync": sync,
         "database": {"path": "/daemon/state.sqlite3"},
     }
     return parse_settings(yaml.safe_dump(document))
@@ -526,6 +548,7 @@ def build_deps(
     max_cycle_seconds: float = 1e9,
     churn_limit: int = 500,
     max_recovery_rows_per_cycle: int = 100,
+    blocked_over: int | None = 0,
     settings: Settings | None = None,
     shoko: ShokoStub | None = None,
     mapping_dir: Path | None = None,
@@ -547,7 +570,7 @@ def build_deps(
         jitter=jitter,
         pid=4242,
         attestation_valid=lambda: attestation,
-        blocked_over=0,
+        blocked_over=blocked_over,
         verification_timeout_seconds=verification_timeout,
         poll_interval_seconds=poll_interval,
         max_verify_polls=20,
@@ -1217,6 +1240,199 @@ def test_max_submissions_counts_posts_not_files(
     assert shoko.posts_count() == COUNT_TWO
     assert report.counts.submitted == COUNT_TWO
     assert report.deferred_planned == COUNT_THREE
+
+
+# ------------------------------------------------------------------ gate: blocked Shoko queue
+# (M7 review P1: a blocked queue must suppress apply in the production wiring)
+
+
+NEW_ARRIVAL_SINGLE = SpecFile(series_id=1, file_id=10, shoko_id=500)
+
+
+def _blocked_queue_new_arrival(
+    tmp_path: Path,
+    *,
+    blocked_count: int,
+    blocked_over: int | None,
+    sync_extra: dict[str, Any] | None = None,
+) -> tuple[ShokoStub, list[SpecFile], Settings]:
+    shoko = ShokoStub([NEW_ARRIVAL_SINGLE], blocked_count=blocked_count)
+    settings = make_settings(tmp_path, sync_extra=sync_extra)
+    return shoko, [NEW_ARRIVAL_SINGLE], settings
+
+
+def test_blocked_queue_tolerance_zero_refuses_all_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wired apply with BlockedCount 3 > tolerance 0: zero POSTs + `queue_blocked:3`."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko, files, settings = _blocked_queue_new_arrival(tmp_path, blocked_count=3, blocked_over=0)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=settings,
+            blocked_over=0,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert report.counts.submitted == 0
+    assert "queue_blocked:3" in report.reasons
+    assert any("preflight_queue_blocked" in reason for reason in report.reasons)
+
+
+def test_blocked_queue_light_cycle_refuses_all_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The safety conjunction is unchanged in light (full=False) cycles."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko, files, settings = _blocked_queue_new_arrival(tmp_path, blocked_count=3, blocked_over=0)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=settings,
+            blocked_over=0,
+        )
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="c1",
+            full=False,
+        )
+    finally:
+        store.close()
+    assert report.full is False
+    assert shoko.posts_count() == 0
+    assert report.counts.submitted == 0
+    assert "queue_blocked:3" in report.reasons
+
+
+def test_unwired_blocked_over_uses_config_tolerance_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DaemonDeps.blocked_over=None must fall back to the config tolerance (default 0)."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko, files, settings = _blocked_queue_new_arrival(
+        tmp_path, blocked_count=3, blocked_over=None
+    )
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=settings,
+            blocked_over=None,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert report.counts.submitted == 0
+    assert "queue_blocked:3" in report.reasons
+
+
+def test_queue_blocked_tolerance_knob_above_blocked_count_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sync.queue_blocked_tolerance = 5 with BlockedCount 3: the knob opens apply."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko, files, settings = _blocked_queue_new_arrival(
+        tmp_path, blocked_count=3, blocked_over=None, sync_extra={"queue_blocked_tolerance": 5}
+    )
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=settings,
+            blocked_over=None,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 1
+    assert report.counts.submitted == 1
+    # The blocked count stays a cycle report; the tolerance opens the preflight gate.
+    assert "queue_blocked:3" in report.reasons
+    assert not any(reason.startswith("preflight_queue_blocked") for reason in report.reasons)
+
+
+def test_queue_read_failure_keeps_queue_unknown_zero_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """queue=None (read failure) stays the independent QUEUE_UNKNOWN fail-closed refusal."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([NEW_ARRIVAL_SINGLE])
+    shoko.fail_queue = True
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[NEW_ARRIVAL_SINGLE],
+            shoko_files=[NEW_ARRIVAL_SINGLE],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            blocked_over=0,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert report.counts.submitted == 0
+    assert "queue_unknown" in report.reasons
+    assert any("preflight_queue_unknown" in reason for reason in report.reasons)
 
 
 # ------------------------------------------------------------------ gate: two-process lock
@@ -3049,3 +3265,222 @@ def test_churn_below_limit_does_not_pause(tmp_path: Path, monkeypatch: pytest.Mo
     finally:
         reopened.close()
     assert "mapping_churn" not in report.reasons
+
+
+# ---------------------------------------------------------- M8 review F2: new-file grace window
+
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
+GRACE_WINDOW_SECONDS = 300.0
+GRACE_ELAPSED_SECONDS = 301.0
+
+
+def _grace_settings(tmp_path: Path, seconds: float) -> Settings:
+    """Harness settings with the grace knob pinned explicitly."""
+    return make_settings(tmp_path, sync_extra={"new_file_grace_period_seconds": seconds})
+
+
+def test_new_arrival_inside_grace_window_defers_with_zero_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2(1): a file first seen THIS cycle (age 0 < 300) is not POSTed. The row stays
+    ``planned`` with the ``grace_period`` reason and is reported as one deferred file."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([new_file])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[new_file],
+            shoko_files=[new_file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=_grace_settings(tmp_path, GRACE_WINDOW_SECONDS),
+            max_submissions=1,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        record = store.get_file(500)
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert report.counts.submitted == 0
+    assert "grace_period" in report.reasons
+    assert report.deferred_planned == 1
+    assert record is not None
+    assert record.state is FileState.PLANNED
+    assert record.first_seen_iso == T0
+
+
+def test_new_arrival_submits_the_cycle_after_grace_elapses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2(2): the same file submits in the first cycle that starts after the window closes."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([new_file])
+    reports: list[Any] = []
+    try:
+        for index, iso in enumerate((T0, _iso_offset_seconds(T0, GRACE_ELAPSED_SECONDS))):
+            deps = build_deps(
+                tmp_path,
+                store=store,
+                sonarr_files=[new_file],
+                shoko_files=[new_file],
+                xml=mapping_xml(),
+                monotonic=Clock([MONO_ZERO + index, MONO_ZERO + index]),
+                advance=Sleeper().advance,
+                shoko=shoko,
+                settings=_grace_settings(tmp_path, GRACE_WINDOW_SECONDS),
+                max_submissions=1,
+            )
+            reports.append(
+                run_cycle(
+                    deps,
+                    now_iso=iso,
+                    mode=CycleMode.APPLY,
+                    policy=RunPolicy.NEW_ARRIVAL,
+                    cycle_key=f"c{index + 1}",
+                )
+            )
+        record = store.get_file(500)
+    finally:
+        store.close()
+    assert reports[0].counts.submitted == 0
+    assert "grace_period" in reports[0].reasons
+    assert shoko.posts_count() == POSTS_ONE
+    assert reports[1].counts.submitted == 1
+    assert record is not None
+    assert record.state is FileState.VERIFIED
+
+
+def test_grace_zero_applies_in_the_arrival_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2(3): the knob at 0 disables the window; the shipped example config says 300."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    example_grace = parse_settings(
+        EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    ).sync.new_file_grace_period_seconds
+    assert example_grace == GRACE_WINDOW_SECONDS
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([new_file])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[new_file],
+            shoko_files=[new_file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=_grace_settings(tmp_path, 0.0),
+            max_submissions=1,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == POSTS_ONE
+    assert report.counts.submitted == 1
+    assert "grace_period" not in report.reasons
+
+
+def test_backlog_row_inside_window_is_not_grace_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2(4): cohort scoping. A BACKLOG row recorded inside the window is excluded by the
+    cohort policy, never by the grace gate: zero posts and NO ``grace_period`` reason."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    aged = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    # Same identity as the baseline → classify_new gives BACKLOG, and the row is first
+    # recorded in this (post-baseline) cycle, i.e. its age is inside the window.
+    seed_baseline(store, [aged], iso=_iso_offset_seconds(T0, -GRACE_ELAPSED_SECONDS))
+    shoko = ShokoStub([aged])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[aged],
+            shoko_files=[aged],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=_grace_settings(tmp_path, GRACE_WINDOW_SECONDS),
+            max_submissions=1,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        record = store.get_file(500)
+    finally:
+        store.close()
+    assert record is not None
+    assert record.cohort is Cohort.BACKLOG
+    assert shoko.posts_count() == 0
+    assert report.counts.submitted == 0
+    assert "grace_period" not in report.reasons
+    assert record.state is FileState.PLANNED
+
+
+def test_grace_deferrals_consume_zero_budget_counters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2(5): grace deferral never reserves a slot — no send rows, no counters, no held slot."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    files = [
+        SpecFile(series_id=1 + index, file_id=10 + index, shoko_id=500 + index)
+        for index in range(COUNT_TWO)
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub(files)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            settings=_grace_settings(tmp_path, GRACE_WINDOW_SECONDS),
+            max_submissions=COUNT_TWO,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        budgets = store.budget_view()
+        held = store.live_send_counts()
+        send_rows = _raw_read(tmp_path / "state.sqlite3", "SELECT COUNT(*) FROM sends")
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert report.deferred_planned == COUNT_TWO
+    assert "grace_period" in report.reasons
+    assert budgets.rolling_new_submissions == 0
+    assert budgets.cycle_new_submissions == 0
+    assert budgets.pending_file_requests == 0
+    assert budgets.pending_episode_jobs == 0
+    assert held == (0, 0)
+    assert send_rows[0][0] == 0

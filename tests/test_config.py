@@ -12,14 +12,37 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 
 from shoko_linker.config import (
+    _CAMPAIGN_KEYS,
+    _DATABASE_KEYS,
+    _MAPPINGS_KEYS,
+    _SAFETY_KEYS,
+    _SERVICE_KEYS,
+    _SYNC_KEYS,
+    _TIMEOUT_KEYS,
+    _TOP_LEVEL_KEYS,
     APPLY_ENV_VAR,
+    DEFAULT_APPLY_LOCK_LEASE_SECONDS,
+    DEFAULT_ATTESTATION_VALIDITY_HOURS,
+    DEFAULT_ATTESTATION_WARN_SECONDS,
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_FULL_RECONCILE_HOURS,
     DEFAULT_INTERVAL_SECONDS,
+    DEFAULT_JITTER_RATIO,
+    DEFAULT_MAPPING_CHURN_LIMIT,
     DEFAULT_MAPPING_SOURCE_URL,
+    DEFAULT_MAX_BATCH_SIZE,
+    DEFAULT_MAX_CAMPAIGN_FILES,
+    DEFAULT_MAX_CYCLE_SECONDS,
+    DEFAULT_MAX_NEW_PER_CYCLE,
+    DEFAULT_MAX_PENDING_EPISODE_JOBS,
+    DEFAULT_MAX_RECOVERY_ROWS_PER_CYCLE,
     DEFAULT_NEW_FILE_GRACE_SECONDS,
+    DEFAULT_QUEUE_BLOCKED_TOLERANCE,
     DEFAULT_READ_TIMEOUT_SECONDS,
     DEFAULT_REFRESH_HOURS,
+    DEFAULT_ROLLING_NEW_LIMIT,
+    DEFAULT_ROLLING_WINDOW_HOURS,
+    DEFAULT_VERIFICATION_TIMEOUT_SECONDS,
     Settings,
     apply_gate,
     apply_gate_status,
@@ -31,6 +54,16 @@ from shoko_linker.errors import ConfigError
 EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
 DUMMY_SONARR_KEY = "dummy-sonarr-key-value-00000000"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
+SMALL_CYCLE_QUOTA = 5
+SMALL_CHURN_LIMIT = 10
+SHORT_WINDOW_HOURS = 48.0
+MID_JITTER_RATIO = 0.25
+LEASE_VALIDITY_HOURS = 24.0
+LEASE_WARN_SECONDS = 60.0
+CAMPAIGN_FILES_50 = 50
+CAMPAIGN_BATCH_3 = 3
+QUEUE_TOLERANCE_5 = 5
+ATTESTED_VERSION_534 = "5.3.4"
 
 
 def test_example_config_loads() -> None:
@@ -359,3 +392,199 @@ def _document_with(*, sonarr_url: str, shoko_url: str) -> dict[str, Any]:
 
 def _dump(document: dict[str, Any]) -> str:
     return cast("str", yaml.safe_dump(document))
+
+
+# ------------------------------------------------------------------ M7-a sync budgets
+
+
+def _sync_document(**sync_extra: Any) -> str:
+    document = _document_with(sonarr_url="http://s:8989", shoko_url="http://k:8111")
+    document["sync"].update(sync_extra)
+    return _dump(document)
+
+
+def test_new_sync_defaults_apply_when_omitted() -> None:
+    settings = parse_settings(_sync_document())
+    sync = settings.sync
+    assert sync.max_new_per_cycle == DEFAULT_MAX_NEW_PER_CYCLE
+    assert sync.rolling_new_limit == DEFAULT_ROLLING_NEW_LIMIT
+    assert sync.rolling_window_hours == DEFAULT_ROLLING_WINDOW_HOURS
+    assert sync.max_pending_episode_jobs == DEFAULT_MAX_PENDING_EPISODE_JOBS
+    assert sync.max_cycle_seconds == DEFAULT_MAX_CYCLE_SECONDS
+    assert sync.max_recovery_rows_per_cycle == DEFAULT_MAX_RECOVERY_ROWS_PER_CYCLE
+    assert sync.verification_timeout_seconds == DEFAULT_VERIFICATION_TIMEOUT_SECONDS
+    assert sync.apply_lock_lease_seconds == DEFAULT_APPLY_LOCK_LEASE_SECONDS
+    assert sync.jitter_ratio == DEFAULT_JITTER_RATIO
+    assert sync.mapping_churn_limit == DEFAULT_MAPPING_CHURN_LIMIT
+    assert sync.queue_blocked_tolerance == DEFAULT_QUEUE_BLOCKED_TOLERANCE
+
+
+def test_example_config_documents_the_new_defaults() -> None:
+    settings = load_settings(EXAMPLE_CONFIG)
+    assert settings.sync.max_new_per_cycle == DEFAULT_MAX_NEW_PER_CYCLE
+    assert settings.sync.jitter_ratio == DEFAULT_JITTER_RATIO
+    assert settings.sync.mapping_churn_limit == DEFAULT_MAPPING_CHURN_LIMIT
+    assert settings.sync.queue_blocked_tolerance == DEFAULT_QUEUE_BLOCKED_TOLERANCE
+
+
+def test_new_sync_values_parse() -> None:
+    settings = parse_settings(
+        _sync_document(
+            max_new_per_cycle=5,
+            rolling_new_limit=50,
+            rolling_window_hours=48,
+            max_pending_episode_jobs=7,
+            max_cycle_seconds=120,
+            max_recovery_rows_per_cycle=25,
+            verification_timeout_seconds=900,
+            apply_lock_lease_seconds=600,
+            jitter_ratio=0.25,
+            mapping_churn_limit=10,
+            queue_blocked_tolerance=5,
+        )
+    )
+    assert settings.sync.max_new_per_cycle == SMALL_CYCLE_QUOTA
+    assert settings.sync.rolling_window_hours == SHORT_WINDOW_HOURS
+    assert settings.sync.jitter_ratio == MID_JITTER_RATIO
+    assert settings.sync.mapping_churn_limit == SMALL_CHURN_LIMIT
+    assert settings.sync.queue_blocked_tolerance == QUEUE_TOLERANCE_5
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "match"),
+    [
+        ("max_new_per_cycle", -1, "must be at least 0"),
+        ("rolling_new_limit", -5, "must be at least 0"),
+        ("max_pending_episode_jobs", -2, "must be at least 0"),
+        ("rolling_window_hours", 0, "must be greater than 0"),
+        ("max_cycle_seconds", -1.0, "must be greater than 0"),
+        ("max_recovery_rows_per_cycle", 0, "must be at least 1"),
+        ("verification_timeout_seconds", 0, "must be greater than 0"),
+        ("apply_lock_lease_seconds", 0, "must be greater than 0"),
+        ("mapping_churn_limit", 0, "must be at least 1"),
+        ("jitter_ratio", 0.6, "must be between 0 and 0.5"),
+        ("jitter_ratio", -0.1, "must be between 0 and 0.5"),
+        ("max_cycle_seconds", float("inf"), "must be a finite number"),
+        ("rolling_window_hours", float("nan"), "must be a finite number"),
+        ("max_new_per_cycle", 2.5, "must be a whole number"),
+        ("queue_blocked_tolerance", -1, "must be at least 0"),
+        ("queue_blocked_tolerance", 1.5, "must be a whole number"),
+    ],
+)
+def test_new_sync_rejects_out_of_range_values(key: str, value: Any, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        parse_settings(_sync_document(**{key: value}))
+
+
+def test_example_config_documents_every_loader_key() -> None:
+    document = cast("dict[str, Any]", yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8")))
+    example_top = set(document)
+    assert example_top == set(_TOP_LEVEL_KEYS)
+    assert set(document["sonarr"]) == set(_SERVICE_KEYS)
+    assert set(document["shoko"]) == set(_SERVICE_KEYS)
+    assert set(document["paths"]) == {"mappings"}
+    assert set(document["mappings"]) == set(_MAPPINGS_KEYS)
+    assert set(document["sync"]) == set(_SYNC_KEYS)
+    assert set(document["sync"]["timeouts"]) == set(_TIMEOUT_KEYS)
+    assert set(document["database"]) == set(_DATABASE_KEYS)
+    assert set(document["safety"]) == set(_SAFETY_KEYS)
+    assert set(document["campaign"]) == set(_CAMPAIGN_KEYS)
+
+
+# ------------------------------------------------- M7-b safety / campaign fields
+
+
+def _safety_document(**safety_extra: Any) -> str:
+    document = _document_with(sonarr_url="http://s:8989", shoko_url="http://k:8111")
+    document["safety"] = safety_extra
+    return _dump(document)
+
+
+def _campaign_document(**campaign_extra: Any) -> str:
+    document = _document_with(sonarr_url="http://s:8989", shoko_url="http://k:8111")
+    document["campaign"] = campaign_extra
+    return _dump(document)
+
+
+def test_safety_and_campaign_defaults_apply_when_sections_omitted() -> None:
+    settings = parse_settings(_sync_document())
+    assert settings.safety.attestation_file is None
+    assert settings.safety.attestation_validity_hours == DEFAULT_ATTESTATION_VALIDITY_HOURS
+    assert settings.safety.attestation_warn_seconds == DEFAULT_ATTESTATION_WARN_SECONDS
+    assert settings.safety.attested_shoko_version is None
+    assert settings.campaign.max_campaign_files == DEFAULT_MAX_CAMPAIGN_FILES
+    assert settings.campaign.max_batch_size == DEFAULT_MAX_BATCH_SIZE
+
+
+def test_example_config_documents_the_m7_b_fields() -> None:
+    settings = load_settings(EXAMPLE_CONFIG)
+    assert settings.safety.attestation_file == "/data/attestation.yaml"
+    assert settings.safety.attestation_validity_hours == DEFAULT_ATTESTATION_VALIDITY_HOURS
+    assert settings.safety.attestation_warn_seconds == DEFAULT_ATTESTATION_WARN_SECONDS
+    assert settings.safety.attested_shoko_version is None
+    assert settings.campaign.max_campaign_files == DEFAULT_MAX_CAMPAIGN_FILES
+    assert settings.campaign.max_batch_size == DEFAULT_MAX_BATCH_SIZE
+
+
+def test_safety_fields_parse() -> None:
+    settings = parse_settings(
+        _safety_document(
+            attestation_file="/data/lease.yaml",
+            attestation_validity_hours=24,
+            attestation_warn_seconds=60,
+            attested_shoko_version=ATTESTED_VERSION_534,
+        )
+    )
+    assert settings.safety.attestation_file == "/data/lease.yaml"
+    assert settings.safety.attestation_validity_hours == LEASE_VALIDITY_HOURS
+    assert settings.safety.attestation_warn_seconds == LEASE_WARN_SECONDS
+    assert settings.safety.attested_shoko_version == ATTESTED_VERSION_534
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ("", "must be null or a non-empty version string"),
+        (5.3, "must be null or a non-empty version string"),
+        (True, "must be null or a non-empty version string"),
+    ],
+)
+def test_attested_shoko_version_rejects_unusable_values(value: Any, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        parse_settings(_safety_document(attested_shoko_version=value))
+
+
+def test_campaign_fields_parse() -> None:
+    settings = parse_settings(_campaign_document(max_campaign_files=50, max_batch_size=3))
+    assert settings.campaign.max_campaign_files == CAMPAIGN_FILES_50
+    assert settings.campaign.max_batch_size == CAMPAIGN_BATCH_3
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "match"),
+    [
+        ("attestation_validity_hours", 0, "must be greater than 0"),
+        ("attestation_validity_hours", -1.0, "must be greater than 0"),
+        ("attestation_warn_seconds", 0, "must be greater than 0"),
+        ("attestation_warn_seconds", "hour", "must be a number"),
+        ("attestation_file", "relative/lease.yaml", "absolute POSIX path"),
+        ("bogus", 1, "unknown setting"),
+    ],
+)
+def test_safety_rejects_out_of_range_values(key: str, value: Any, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        parse_settings(_safety_document(**{"attestation_file": None, key: value}))
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "match"),
+    [
+        ("max_campaign_files", 0, "must be at least 1"),
+        ("max_campaign_files", 1.5, "must be a whole number"),
+        ("max_batch_size", 0, "must be at least 1"),
+        ("max_batch_size", "10", "must be a whole number"),
+    ],
+)
+def test_campaign_rejects_out_of_range_values(key: str, value: Any, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        parse_settings(_campaign_document(**{key: value}))

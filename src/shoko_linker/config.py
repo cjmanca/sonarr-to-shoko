@@ -40,9 +40,25 @@ DEFAULT_FULL_RECONCILE_HOURS: Final[float] = 24.0
 DEFAULT_NEW_FILE_GRACE_SECONDS: Final[float] = 300.0
 DEFAULT_REFRESH_HOURS: Final[float] = 168.0
 DEFAULT_MAX_CONCURRENT_LINKS: Final[int] = 1
+DEFAULT_MAX_NEW_PER_CYCLE: Final[int] = 20
+DEFAULT_ROLLING_NEW_LIMIT: Final[int] = 200
+DEFAULT_ROLLING_WINDOW_HOURS: Final[float] = 168.0
+DEFAULT_MAX_PENDING_EPISODE_JOBS: Final[int] = 10
+DEFAULT_MAX_CYCLE_SECONDS: Final[float] = 300.0
+DEFAULT_MAX_RECOVERY_ROWS_PER_CYCLE: Final[int] = 100
+DEFAULT_VERIFICATION_TIMEOUT_SECONDS: Final[float] = 3600.0
+DEFAULT_APPLY_LOCK_LEASE_SECONDS: Final[float] = 3600.0
+DEFAULT_JITTER_RATIO: Final[float] = 0.1
+DEFAULT_MAPPING_CHURN_LIMIT: Final[int] = 500
+DEFAULT_ATTESTATION_VALIDITY_HOURS: Final[float] = 168.0
+DEFAULT_ATTESTATION_WARN_SECONDS: Final[float] = 3600.0
+DEFAULT_MAX_CAMPAIGN_FILES: Final[int] = 7000
+DEFAULT_MAX_BATCH_SIZE: Final[int] = 10
+DEFAULT_QUEUE_BLOCKED_TOLERANCE: Final[int] = 0
+MAX_JITTER_RATIO: Final[float] = 0.5
 
 _TOP_LEVEL_KEYS: Final[frozenset[str]] = frozenset(
-    {"sonarr", "shoko", "paths", "mappings", "sync", "database"}
+    {"sonarr", "shoko", "paths", "mappings", "sync", "database", "safety", "campaign"}
 )
 _SERVICE_KEYS: Final[frozenset[str]] = frozenset({"url", "api_key_env", "allowed_roots"})
 _SYNC_KEYS: Final[frozenset[str]] = frozenset(
@@ -53,11 +69,31 @@ _SYNC_KEYS: Final[frozenset[str]] = frozenset(
         "apply_changes",
         "max_concurrent_links",
         "timeouts",
+        "max_new_per_cycle",
+        "rolling_new_limit",
+        "rolling_window_hours",
+        "max_pending_episode_jobs",
+        "max_cycle_seconds",
+        "max_recovery_rows_per_cycle",
+        "verification_timeout_seconds",
+        "apply_lock_lease_seconds",
+        "jitter_ratio",
+        "mapping_churn_limit",
+        "queue_blocked_tolerance",
     }
 )
 _MAPPINGS_KEYS: Final[frozenset[str]] = frozenset(
     {"source", "refresh_hours", "overrides_file", "source_url"}
 )
+_SAFETY_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "attestation_file",
+        "attestation_validity_hours",
+        "attestation_warn_seconds",
+        "attested_shoko_version",
+    }
+)
+_CAMPAIGN_KEYS: Final[frozenset[str]] = frozenset({"max_campaign_files", "max_batch_size"})
 _TIMEOUT_KEYS: Final[frozenset[str]] = frozenset({"connect_seconds", "read_seconds"})
 _DATABASE_KEYS: Final[frozenset[str]] = frozenset({"path"})
 _ENV_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -103,7 +139,21 @@ class MappingSettings:
 
 @dataclass(frozen=True)
 class SyncSettings:
-    """Scheduling and write-safety configuration."""
+    """Scheduling, budget and write-safety configuration.
+
+    M7-a budgets map onto :class:`shoko_linker.state.BudgetLimits` as:
+    ``per_cycle_new = max_new_per_cycle``, ``rolling_new = rolling_new_limit``,
+    ``rolling_window_hours = rolling_window_hours``,
+    ``max_pending_episode_jobs = max_pending_episode_jobs`` and
+    ``max_pending_files = max_new_per_cycle`` (a cycle never submits more files than
+    ``max_new_per_cycle``, so pending files are bounded by the same ceiling; 0 disables
+    submissions).
+
+    ``queue_blocked_tolerance`` is the fail-closed Shoko queue guard: when
+    ``GET /Queue`` reports ``BlockedCount`` above the tolerance, apply is refused for
+    the whole cycle (``ManualLinkJob`` delivery cannot be trusted on a blocked queue).
+    Default 0 refuses apply whenever any queue work is blocked.
+    """
 
     interval_seconds: float
     full_reconcile_interval_hours: float
@@ -112,6 +162,17 @@ class SyncSettings:
     max_concurrent_links: int
     connect_timeout_seconds: float
     read_timeout_seconds: float
+    max_new_per_cycle: int
+    rolling_new_limit: int
+    rolling_window_hours: float
+    max_pending_episode_jobs: int
+    max_cycle_seconds: float
+    max_recovery_rows_per_cycle: int
+    verification_timeout_seconds: float
+    apply_lock_lease_seconds: float
+    jitter_ratio: float
+    mapping_churn_limit: int
+    queue_blocked_tolerance: int
 
 
 @dataclass(frozen=True)
@@ -119,6 +180,45 @@ class DatabaseSettings:
     """SQLite state file location (persistent volume)."""
 
     path: str
+
+
+@dataclass(frozen=True)
+class SafetySettings:
+    """Safety attestation lease configuration (M7-b).
+
+    ``attestation_file`` is the operator-created lease record path (``None`` = no lease
+    exists, so every apply stays refused with ``attestation_invalid``). The lease expires
+    after a finite validity window; ``attestation_validity_hours`` is the hard cap on any
+    lease's lifetime (``attestation record --hours`` may not exceed it) and
+    ``attestation_warn_seconds`` is the pre-expiry warning lead. The trust anchor is the
+    operator: the tool cannot prove Docker mounts are read-only, so an unattended
+    indefinite writable daemon is incompatible with an expiring physical attestation —
+    the daemon degrades to read-only reporting after expiry (documented tradeoff).
+
+    ``attested_shoko_version`` pins the exact Shoko version string the operator
+    inspected (``null`` = no pin). When configured, a lease whose recorded version
+    differs from it reports ``stale_version`` and every apply is suppressed until the
+    lease is re-recorded — a Shoko upgrade never silently inherits an old lease.
+    """
+
+    attestation_file: str | None
+    attestation_validity_hours: float
+    attestation_warn_seconds: float
+    attested_shoko_version: str | None = None
+
+
+@dataclass(frozen=True)
+class CampaignSettings:
+    """Backlog-campaign ceilings (M7-b).
+
+    ``max_campaign_files`` bounds one approved plan (and the default ``campaign prepare
+    --limit``); ``max_batch_size`` caps files processed per ``campaign apply``
+    invocation. They do not bypass the write gate, the attestation lease, the budgets in
+    :class:`shoko_linker.state` or the plan approval digest.
+    """
+
+    max_campaign_files: int
+    max_batch_size: int
 
 
 @dataclass(frozen=True)
@@ -137,6 +237,18 @@ class ApplyGateStatus:
         )
 
 
+DEFAULT_SAFETY_SETTINGS: Final[SafetySettings] = SafetySettings(
+    attestation_file=None,
+    attestation_validity_hours=DEFAULT_ATTESTATION_VALIDITY_HOURS,
+    attestation_warn_seconds=DEFAULT_ATTESTATION_WARN_SECONDS,
+    attested_shoko_version=None,
+)
+DEFAULT_CAMPAIGN_SETTINGS: Final[CampaignSettings] = CampaignSettings(
+    max_campaign_files=DEFAULT_MAX_CAMPAIGN_FILES,
+    max_batch_size=DEFAULT_MAX_BATCH_SIZE,
+)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Validated configuration. Frozen, hashable, and free of secret values."""
@@ -148,6 +260,8 @@ class Settings:
     mappings: MappingSettings
     sync: SyncSettings
     database: DatabaseSettings
+    safety: SafetySettings = DEFAULT_SAFETY_SETTINGS
+    campaign: CampaignSettings = DEFAULT_CAMPAIGN_SETTINGS
 
     @property
     def apply_enabled(self) -> bool:
@@ -211,6 +325,8 @@ def parse_settings(text: str, *, config_path: Path | None = None) -> Settings:
     mappings = _mappings(_section(doc, "mappings"))
     sync = _sync(_section(doc, "sync"))
     database = _database(_section(doc, "database"))
+    safety = _safety(doc.get("safety"))
+    campaign = _campaign(doc.get("campaign"))
     settings = Settings(
         config_path=config_path,
         sonarr=sonarr,
@@ -219,6 +335,8 @@ def parse_settings(text: str, *, config_path: Path | None = None) -> Settings:
         mappings=mappings,
         sync=sync,
         database=database,
+        safety=safety,
+        campaign=campaign,
     )
     _require_secret_present(settings)
     return settings
@@ -395,6 +513,47 @@ def _sync(section: Mapping[str, Any]) -> SyncSettings:
         ),
         connect_timeout_seconds=connect_seconds,
         read_timeout_seconds=read_seconds,
+        max_new_per_cycle=_whole_number(
+            section, "max_new_per_cycle", "sync", DEFAULT_MAX_NEW_PER_CYCLE, minimum=0
+        ),
+        rolling_new_limit=_whole_number(
+            section, "rolling_new_limit", "sync", DEFAULT_ROLLING_NEW_LIMIT, minimum=0
+        ),
+        rolling_window_hours=_positive_number(
+            section, "rolling_window_hours", "sync", DEFAULT_ROLLING_WINDOW_HOURS
+        ),
+        max_pending_episode_jobs=_whole_number(
+            section, "max_pending_episode_jobs", "sync", DEFAULT_MAX_PENDING_EPISODE_JOBS, minimum=0
+        ),
+        max_cycle_seconds=_positive_number(
+            section, "max_cycle_seconds", "sync", DEFAULT_MAX_CYCLE_SECONDS
+        ),
+        max_recovery_rows_per_cycle=_whole_number(
+            section,
+            "max_recovery_rows_per_cycle",
+            "sync",
+            DEFAULT_MAX_RECOVERY_ROWS_PER_CYCLE,
+            minimum=1,
+        ),
+        verification_timeout_seconds=_positive_number(
+            section, "verification_timeout_seconds", "sync", DEFAULT_VERIFICATION_TIMEOUT_SECONDS
+        ),
+        apply_lock_lease_seconds=_positive_number(
+            section, "apply_lock_lease_seconds", "sync", DEFAULT_APPLY_LOCK_LEASE_SECONDS
+        ),
+        jitter_ratio=_ratio(
+            section, "jitter_ratio", "sync", DEFAULT_JITTER_RATIO, upper=MAX_JITTER_RATIO
+        ),
+        mapping_churn_limit=_whole_number(
+            section, "mapping_churn_limit", "sync", DEFAULT_MAPPING_CHURN_LIMIT, minimum=1
+        ),
+        queue_blocked_tolerance=_whole_number(
+            section,
+            "queue_blocked_tolerance",
+            "sync",
+            DEFAULT_QUEUE_BLOCKED_TOLERANCE,
+            minimum=0,
+        ),
     )
 
 
@@ -416,6 +575,84 @@ def _timeouts(raw: Any) -> tuple[float, float]:
 def _database(section: Mapping[str, Any]) -> DatabaseSettings:
     _known_keys(section, _DATABASE_KEYS, "database")
     return DatabaseSettings(path=_posix_path(section.get("path"), "database.path"))
+
+
+def _safety(raw: Any) -> SafetySettings:
+    if raw is None:
+        return DEFAULT_SAFETY_SETTINGS
+    if not isinstance(raw, dict):
+        raise ConfigError("safety: expected a mapping")
+    section = cast("Mapping[str, Any]", raw)
+    _known_keys(section, _SAFETY_KEYS, "safety")
+    attestation_raw = section.get("attestation_file")
+    attestation_file = (
+        None if attestation_raw is None else _posix_path(attestation_raw, "safety.attestation_file")
+    )
+    return SafetySettings(
+        attestation_file=attestation_file,
+        attestation_validity_hours=_positive_number(
+            section,
+            "attestation_validity_hours",
+            "safety",
+            DEFAULT_ATTESTATION_VALIDITY_HOURS,
+        ),
+        attestation_warn_seconds=_positive_number(
+            section, "attestation_warn_seconds", "safety", DEFAULT_ATTESTATION_WARN_SECONDS
+        ),
+        attested_shoko_version=_optional_text(section, "attested_shoko_version", "safety"),
+    )
+
+
+def _optional_text(section: Mapping[str, Any], key: str, field_name: str) -> str | None:
+    raw = section.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(f"{field_name}: {key} must be null or a non-empty version string")
+    return raw.strip()
+
+
+def _campaign(raw: Any) -> CampaignSettings:
+    if raw is None:
+        return CampaignSettings(
+            max_campaign_files=DEFAULT_MAX_CAMPAIGN_FILES,
+            max_batch_size=DEFAULT_MAX_BATCH_SIZE,
+        )
+    if not isinstance(raw, dict):
+        raise ConfigError("campaign: expected a mapping")
+    section = cast("Mapping[str, Any]", raw)
+    _known_keys(section, _CAMPAIGN_KEYS, "campaign")
+    return CampaignSettings(
+        max_campaign_files=_whole_number(
+            section, "max_campaign_files", "campaign", DEFAULT_MAX_CAMPAIGN_FILES, minimum=1
+        ),
+        max_batch_size=_whole_number(
+            section, "max_batch_size", "campaign", DEFAULT_MAX_BATCH_SIZE, minimum=1
+        ),
+    )
+
+
+def normalize_service_url(raw: str) -> str:
+    """Canonical URL identity for attestation comparisons (mirrors :func:`_base_url` rules).
+
+    Lowercases scheme and host, strips the path's trailing slash, and drops
+    query/fragment. Raises :class:`ConfigError` for unusable URLs — an attestation
+    endpoint is compared on this identity, never on string equality.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError("URL: must be a non-empty URL string")
+    parts = urlsplit(raw.strip())
+    scheme = parts.scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ConfigError(f"URL: scheme must be http or https (got {parts.scheme!r})")
+    if not parts.hostname:
+        raise ConfigError("URL: must include a host")
+    if parts.query or parts.fragment:
+        raise ConfigError("URL: must not include a query or fragment")
+    host = parts.hostname.lower()
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((scheme, host, parts.path.rstrip("/"), "", ""))
 
 
 def _posix_path(raw: Any, field_name: str) -> str:
@@ -455,6 +692,15 @@ def _non_negative_number(
     value = _number(section, key, field_name, default)
     if value < 0:
         raise ConfigError(f"{field_name}: {key} must not be negative")
+    return value
+
+
+def _ratio(
+    section: Mapping[str, Any], key: str, field_name: str, default: float, *, upper: float
+) -> float:
+    value = _number(section, key, field_name, default)
+    if value < 0 or value > upper:
+        raise ConfigError(f"{field_name}: {key} must be between 0 and {upper:g}")
     return value
 
 

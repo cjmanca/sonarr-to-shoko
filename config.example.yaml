@@ -34,10 +34,14 @@ paths:
 
 mappings:
   # anime-lists is the only supported source in v1; other values are rejected.
+  # The last-known-good cache lives in the ``mappings`` directory next to
+  # ``database.path`` (derived; there is no separate cache-directory setting).
   source: anime-lists
   # Weekly by default; must be > 0. The daemon refreshes on this schedule.
   refresh_hours: 168
-  # Optional user-maintained overrides (may be omitted).
+  # Operator-maintained overrides (optional key: omit it entirely when unused). When the
+  # key is present the file must exist and be valid override YAML — a configured
+  # overrides file that cannot be read is a hard configuration error.
   overrides_file: /config/overrides.yaml
   # Optional: Anime-Lists source URL, fetched at runtime (never bundled).
   # Defaults to the canonical URL below when omitted; validated like a service URL
@@ -45,13 +49,43 @@ mappings:
   source_url: https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-full.xml
 
 sync:
+  # Poll cadence (seconds) and the periodic full-reconcile cadence (hours).
   interval_seconds: 300
   full_reconcile_interval_hours: 24
+  # Files newer than this are not submitted yet (grace window, seconds; >= 0).
   new_file_grace_period_seconds: 300
   # SAFE DEFAULT: false means dry-run. true alone is not enough — see the gate below.
   apply_changes: false
   # Must be >= 1.
   max_concurrent_links: 1
+  # New submissions allowed in one cycle (>= 0; 0 disables submissions). Also bounds
+  # pending file requests (budget max_pending_files = max_new_per_cycle).
+  max_new_per_cycle: 20
+  # New submissions allowed in the rolling window (>= 0).
+  rolling_new_limit: 200
+  # Rolling-window length in hours (> 0).
+  rolling_window_hours: 168
+  # Ceiling on Shoko per-episode jobs currently pending (>= 0).
+  max_pending_episode_jobs: 10
+  # Wall-time budget for one cycle, seconds (> 0); overruns defer work to the next cycle.
+  max_cycle_seconds: 300
+  # Recovery rows (verifying/hold inspections) processed per cycle (> 0).
+  max_recovery_rows_per_cycle: 100
+  # Verification deadline for a submitted link, seconds (> 0).
+  verification_timeout_seconds: 3600
+  # Apply-lock lease length, seconds (> 0); an expired lease is stealable by an operator.
+  apply_lock_lease_seconds: 3600
+  # Sleep jitter fraction, 0..0.5 (0 disables jitter).
+  jitter_ratio: 0.1
+  # Series whose effective mapping targets changed in one activation that pauses
+  # writes for review (>= 1).
+  mapping_churn_limit: 500
+  # Shoko queue guard (whole number >= 0; default 0 = fail closed). Before any apply the
+  # daemon reads GET /Queue; when BlockedCount exceeds this tolerance, every submission
+  # in the cycle is refused (ManualLinkJob delivery cannot be trusted on a blocked
+  # queue). 0 refuses apply when ANY queue work is blocked; a queue read failure is
+  # always refused (queue_unknown).
+  queue_blocked_tolerance: 0
   # Optional; these are the defaults.
   timeouts:
     connect_seconds: 10
@@ -60,8 +94,41 @@ sync:
 database:
   path: /data/state.sqlite3
 
+safety:
+  # SAFETY ATTESTATION LEASE (M7-b). The lease is an operator-created YAML/JSON record
+  # of the physical facts the software cannot observe: the Shoko endpoint identity, the
+  # inspected version, read-only mount summaries, and the recorded safety settings flags
+  # (FileQualityFilterEnabled / RenameOnImport / MoveOnImport / MyListAddFiles — never a
+  # raw settings dump). null (default) means no lease exists, so EVERY apply is refused
+  # with attestation_invalid; build one with `attestation record ... --confirm`.
+  # The lease expires after a finite window; the daemon then degrades to read-only
+  # reporting (no restart loop) — an unattended INDEFINITE writable daemon is incompatible
+  # with an expiring physical attestation (documented tradeoff, PLAN M7).
+  attestation_file: /data/attestation.yaml
+  # Hard cap on any lease lifetime: `attestation record --hours` may not exceed it (hours > 0).
+  attestation_validity_hours: 168
+  # Pre-expiry warning lead in seconds (> 0): valid leases expiring within this
+  # window log a warning and report `warn_before_expiry`.
+  attestation_warn_seconds: 3600
+  # Exact Shoko version string the operator inspected (null = no version pin). When set,
+  # a lease whose recorded version differs (e.g. after a Shoko upgrade) evaluates as
+  # `stale_version` and every apply is suppressed until the lease is re-recorded. Set
+  # this to the version you physically inspected (the pinned compatibility target is
+  # 5.3.3); keep it null only if you accept a lease pinned to the endpoint/scope alone.
+  attested_shoko_version: null
+
+campaign:
+  # Backlog-campaign ceilings (M7-b). A prepared plan file may name at most
+  # `max_campaign_files` files (also the default `campaign prepare --limit`).
+  max_campaign_files: 7000
+  # Cap for `campaign apply --batch-size` (files processed per invocation; default 10).
+  max_batch_size: 10
+
 # WRITE GATE (default-deny). Live Shoko writes require BOTH:
 #   1. sync.apply_changes: true above, AND
 #   2. the operator environment variable SHOKO_LINKER_ALLOW_APPLY=1
 # No command-line flag opens the gate by itself: `once --apply` refuses (exit 3)
-# unless both conditions hold.
+# unless both conditions hold. The safety attestation lease (safety.attestation_file)
+# must additionally be valid and in scope (daemon / campaign:<id>) for ANY apply to
+# submit; campaign apply also requires a campaign approved with the plan file's
+# approval digest supplied separately.
