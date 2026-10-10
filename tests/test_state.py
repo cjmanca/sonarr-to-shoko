@@ -1550,3 +1550,121 @@ def test_seven_thousand_file_insert_and_indexed_queries(tmp_path: Path) -> None:
         cohort_elapsed = time.perf_counter() - start
         assert len(backlog) == BACKLOG_COUNT
         assert cohort_elapsed < SCAN_BUDGET_SECONDS
+
+
+# ------------------------------------------- continuity: link-driven drop accounting
+
+
+def _seed_unrecognized(store: StateStore, count: int, *, start_id: int = 1) -> None:
+    """Seed ``count`` never-linked (discovered) Shoko rows: the Unrecognized baseline."""
+    store.record_files(
+        [
+            FileSeed(
+                file_id,
+                1,
+                file_id,
+                f"/data/media/anime/series-{file_id % 50}/f{file_id}.mkv",
+                100,
+                Cohort.BACKLOG,
+                T0,
+            )
+            for file_id in range(start_id, start_id + count)
+        ]
+    )
+
+
+def _link_files(store: StateStore, file_ids: list[int], *, iso: str) -> None:
+    """Simulate the linker's own accepted links: VERIFYING rows close as VERIFIED."""
+    store.record_files(
+        [
+            FileSeed(
+                file_id,
+                1,
+                file_id,
+                f"/data/media/anime/series-{file_id % 50}/f{file_id}.mkv",
+                100,
+                Cohort.BACKLOG,
+                iso,
+                state=FileState.VERIFYING,
+            )
+            for file_id in file_ids
+        ]
+    )
+    for file_id in file_ids:
+        store.record_verification(file_id, VerificationVerdict.VERIFIED, iso=iso)
+
+
+def test_continuity_accounts_for_link_driven_drop_across_cycles(tmp_path: Path) -> None:
+    """M9-e2e defect: the linker's own accepted links shrink the Unrecognized discovery total.
+
+    Each cycle's drop is exactly the links verified since the last anchor, so continuity is
+    NORMAL, the observation re-anchors, and ``requires_rebaseline`` never wedges apply
+    across a multi-batch campaign.
+    """
+    path = tmp_path / "state.sqlite3"
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        _seed_unrecognized(store, 1000)
+        total = 1000
+        first = store.check_source_continuity(
+            "sonarr-A", "hash-0", iso=T0, roots_fingerprint="roots-1", discovery_total=total
+        )
+        assert first.ok is True  # first observation anchors
+        for cycle_index, iso in enumerate((T0, T1, T2, T3), start=1):
+            _link_files(store, [10_000 + cycle_index * 5 + k for k in range(5)], iso=iso)
+            total -= 5
+            verdict = store.check_source_continuity(
+                "sonarr-A",
+                f"hash-{cycle_index}",
+                iso=iso,
+                roots_fingerprint="roots-1",
+                discovery_total=total,
+            )
+            assert verdict.ok is True, cycle_index
+            assert "discovery_total_drop" not in verdict.reasons, cycle_index
+            assert verdict.requires_rebaseline is False, cycle_index
+            assert store.get_meta("requires_rebaseline") == "0", cycle_index
+
+
+def test_continuity_flags_excess_drop_beyond_expected(tmp_path: Path) -> None:
+    """A drop larger than the linker's own verified links is a genuine discontinuity: flag it,
+    suppress apply, and clear on the next clean full observation."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        _seed_unrecognized(store, 1000)
+        store.check_source_continuity(
+            "sonarr-A", "hash-0", iso=T0, roots_fingerprint="roots-1", discovery_total=1000
+        )
+        _link_files(store, [10_100, 10_101, 10_102, 10_103, 10_104], iso=T0)  # expected drop 5
+        drop = store.check_source_continuity(
+            "sonarr-A", "hash-1", iso=T1, roots_fingerprint="roots-1", discovery_total=985
+        )  # observed drop 15 > 5
+        assert drop.requires_rebaseline is True
+        assert "discovery_total_drop" in drop.reasons
+        assert store.get_meta("requires_rebaseline") == "1"
+        clean = store.check_source_continuity(
+            "sonarr-A", "hash-2", iso=T2, roots_fingerprint="roots-1", discovery_total=1000
+        )
+        assert clean.requires_rebaseline is False
+        assert store.get_meta("requires_rebaseline") == "0"
+
+
+def test_continuity_anchor_basis_persists_across_restart(tmp_path: Path) -> None:
+    """The anchor's accounting basis (verified high-water) is durable: after a restart the
+    already-anchored links are not re-counted, so a fresh external drop still flags."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        _seed_unrecognized(store, 1000)
+        store.check_source_continuity(
+            "sonarr-A", "hash-0", iso=T0, roots_fingerprint="roots-1", discovery_total=1000
+        )
+        _link_files(store, [10_200, 10_201, 10_202, 10_203, 10_204], iso=T0)
+        second = store.check_source_continuity(
+            "sonarr-A", "hash-1", iso=T1, roots_fingerprint="roots-1", discovery_total=995
+        )
+        assert second.requires_rebaseline is False  # drop 5 == expected 5
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        external = store.check_source_continuity(
+            "sonarr-A", "hash-2", iso=T2, roots_fingerprint="roots-1", discovery_total=994
+        )
+        assert external.requires_rebaseline is True
+        assert "discovery_total_drop" in external.reasons

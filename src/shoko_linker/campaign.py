@@ -84,11 +84,14 @@ from .state import (
     CampaignRecord,
     Cohort,
     FileState,
+    LockHeldError,
     SendToken,
     StateError,
     StateStore,
     TransitionError,
     WriteDisabledError,
+    acquire_or_steal_apply_lock,
+    release_apply_lock,
 )
 
 PLAN_SCHEMA: Final[str] = "shoko-linker-campaign-plan/1"
@@ -534,7 +537,9 @@ def prepare_campaign(
     pending-target plans enter with an empty ``shoko_episode_ids`` and their preapproved
     AniDB identities) bounded by ``limit`` (capped by ``campaign.max_campaign_files``).
     Missing/ambiguous mapping answers never enter — the digest covers only included
-    files.
+    files. Prepare runs a ``DRY_RUN`` cycle (the daemon skips the apply lock in that mode,
+    sends nothing) and is intentionally **lock-free**: it opens no writes, so it takes no
+    apply lock.
     """
     if limit < 1:
         raise CampaignError("--limit must be at least 1")
@@ -698,6 +703,47 @@ def _bind_campaign(store: StateStore, campaign_id: str, iso: str) -> int:
     return store.bind_campaign_files(campaign_id, iso)
 
 
+def _acquire_apply_lock(deps: DaemonDeps, now_iso: str) -> tuple[str | None, bool]:
+    """Acquire the daemon's single-process apply lock for one campaign batch (F1).
+
+    Same lease rule and lease source as :func:`shoko_linker.daemon._lock_preflight`:
+    :func:`~shoko_linker.state.acquire_or_steal_apply_lock` steals only a lease expired at
+    ``now_iso`` (audit-recorded) and raises :class:`LockHeldError` for a live lease. The
+    holder is named in the deferral reason; the campaign stays approved and
+    no candidate is sent. ``deps.pid``/``deps.lease_seconds`` carry the CLI-wired
+    ``os.getpid()``/``sync.apply_lock_lease_seconds``.
+    """
+    lease = _parse_iso(now_iso) + timedelta(seconds=deps.lease_seconds)
+    try:
+        acquire_or_steal_apply_lock(
+            deps.store, deps.pid, now_iso, lease_expires_iso=lease.isoformat()
+        )
+    except LockHeldError as exc:
+        holder = exc.holder.owner_pid if exc.holder is not None else "?"
+        return (f"apply_lock_contended:{holder}", False)
+    except WriteDisabledError:
+        return ("writes_disabled", False)
+    return (None, True)
+
+
+def _release_apply_lock(deps: DaemonDeps, now_iso: str) -> None:
+    """Release the campaign apply lock in the ``finally`` (daemon pattern).
+
+    A store that stopped writing mid-batch is tolerated (the persisted lease is recovered
+    by the expiry-steal rule); a lease stolen after a crash past expiry is recorded in the
+    ``last_lock_release_denied`` meta audit (the authoritative surface — the report was
+    built before ``finally`` ran), never propagated, and never wedges the next invocation.
+    """
+    try:
+        release_apply_lock(deps.store, deps.pid, now_iso)
+    except WriteDisabledError:
+        pass
+    except LockHeldError as exc:
+        holder = exc.holder.owner_pid if exc.holder is not None else "unknown"
+        with contextlib.suppress(WriteDisabledError):
+            deps.store.set_meta("last_lock_release_denied", str(holder))
+
+
 def apply_campaign(
     deps: DaemonDeps,
     settings: Settings,
@@ -709,72 +755,97 @@ def apply_campaign(
 ) -> CampaignApplyReport:
     """One bounded batch of the approved campaign through the full guarded path.
 
-    Order: plan file digest == stored approval digest (``plan_drift`` → campaign paused,
+    Order: **apply lock first** (F1/P2-1: the single-process daemon lock, acquired under
+    the same lease rule as ``daemon._lock_preflight`` **before any guard mutation**; a live
+    foreign lease or write-disabled store **defers the whole batch** — zero POSTs, the
+    campaign stays approved, the report reason is ``apply_lock_contended:<holder>`` /
+    ``writes_disabled``, no state mutation beyond the report; released in ``finally``) →
+    plan file digest == stored approval digest (``plan_drift`` → campaign paused,
     zero POSTs) → campaign status / deadline / max-submissions → write gate → attestation
     (campaign scope; persisted pause transition) → sweep (the same daemon DRY_RUN
-    machinery) → eligibility (churn/continuity/budget/mapping conjunction) → approved
-    plan digests == active generation → ≤ ``batch_size`` candidates (capped by
-    ``campaign.max_batch_size``): binding/drift quarantine checks, preflight,
-    ``prepare_send`` → ``mark_sent`` → ``submit_link`` → record → inline verify.
+    machinery) → eligibility (churn/continuity/budget/mapping conjunction) → approved plan
+    digests == active
+    generation → ≤ ``batch_size`` candidates (capped by ``campaign.max_batch_size``):
+    binding/drift quarantine checks, preflight, ``prepare_send`` → ``mark_sent`` →
+    ``submit_link`` → record → inline verify.
     """
     plan, digest = read_plan_file(plan_path)
     campaign = _require_campaign(store, plan.campaign_id)
     size = _batch_size(settings, batch_size)
     reasons: list[str] = []
-    _apply_guards(deps, settings, store, campaign, digest, now_iso, reasons)
-    sweep = _apply_sweep(deps, campaign.campaign_id, now_iso, reasons)
-    active = _apply_mapping(deps, store, plan, campaign.campaign_id, now_iso)
-    counters = _CampaignCounters(sent_running=campaign.total_sent)
-    context = _ApplyContext(
-        deps=deps,
-        settings=settings,
-        store=store,
-        campaign=campaign,
-        sweep=sweep,
-        active=active,
-        resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
-        queue=fetch_queue(deps.shoko),
-        now_iso=now_iso,
-    )
-    for entry in plan.files:
-        if counters.processed - counters.quarantined >= size:
-            counters.deferred += 1
-            reasons.append(f"batch_limit:{entry.shoko_file_id}")
-            continue
-        candidate = _prepare_candidate(context, entry, counters, reasons)
-        if candidate is None:
-            continue
-        tally = _send_one(
-            deps,
-            settings,
-            store,
-            candidate,
-            campaign.campaign_id,
-            sweep.folders,
-            active,
-            context.queue,
-            now_iso,
+    lock_reason, lock_acquired = _acquire_apply_lock(deps, now_iso)
+    if lock_reason is not None:
+        remaining = max(0, len(plan.files) - campaign_send_progress(store, campaign.campaign_id))
+        return CampaignApplyReport(
+            campaign_id=campaign.campaign_id,
+            processed=0,
+            submitted=0,
+            verified=0,
+            quarantined=0,
+            deferred=min(size, len(plan.files)),
+            total_sent=campaign.total_sent,
+            remaining=remaining,
+            reasons=(lock_reason,),
+            stopped=None,
         )
-        counters.processed += 1
-        counters.submitted += tally.submitted
-        counters.verified += tally.verified
-        counters.quarantined += tally.quarantined
-        counters.deferred += tally.deferred
-        counters.sent_running += tally.submitted
-        reasons.extend(tally.reasons)
-    remaining = len(plan.files) - campaign_send_progress(store, campaign.campaign_id)
-    return CampaignApplyReport(
-        campaign_id=campaign.campaign_id,
-        processed=counters.processed,
-        submitted=counters.submitted,
-        verified=counters.verified,
-        quarantined=counters.quarantined,
-        deferred=counters.deferred,
-        total_sent=campaign.total_sent + counters.submitted,
-        remaining=max(0, remaining),
-        reasons=tuple(dict.fromkeys(reasons)),
-        stopped=None if counters.processed < len(plan.files) else "plan_complete",
-    )
+    try:
+        _apply_guards(deps, settings, store, campaign, digest, now_iso, reasons)
+        sweep = _apply_sweep(deps, campaign.campaign_id, now_iso, reasons)
+        active = _apply_mapping(deps, store, plan, campaign.campaign_id, now_iso)
+        counters = _CampaignCounters(sent_running=campaign.total_sent)
+        context = _ApplyContext(
+            deps=deps,
+            settings=settings,
+            store=store,
+            campaign=campaign,
+            sweep=sweep,
+            active=active,
+            resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
+            queue=fetch_queue(deps.shoko),
+            now_iso=now_iso,
+        )
+        for entry in plan.files:
+            if counters.processed - counters.quarantined >= size:
+                counters.deferred += 1
+                reasons.append(f"batch_limit:{entry.shoko_file_id}")
+                continue
+            candidate = _prepare_candidate(context, entry, counters, reasons)
+            if candidate is None:
+                continue
+            tally = _send_one(
+                deps,
+                settings,
+                store,
+                candidate,
+                campaign.campaign_id,
+                sweep.folders,
+                active,
+                context.queue,
+                now_iso,
+            )
+            counters.processed += 1
+            counters.submitted += tally.submitted
+            counters.verified += tally.verified
+            counters.quarantined += tally.quarantined
+            counters.deferred += tally.deferred
+            counters.sent_running += tally.submitted
+            reasons.extend(tally.reasons)
+        remaining = len(plan.files) - campaign_send_progress(store, campaign.campaign_id)
+        return CampaignApplyReport(
+            campaign_id=campaign.campaign_id,
+            processed=counters.processed,
+            submitted=counters.submitted,
+            verified=counters.verified,
+            quarantined=counters.quarantined,
+            deferred=counters.deferred,
+            total_sent=campaign.total_sent + counters.submitted,
+            remaining=max(0, remaining),
+            reasons=tuple(dict.fromkeys(reasons)),
+            stopped=None if counters.processed < len(plan.files) else "plan_complete",
+        )
+    finally:
+        if lock_acquired:
+            _release_apply_lock(deps, now_iso)
 
 
 @dataclass
@@ -1373,7 +1444,7 @@ def campaign_revoke(store: StateStore, campaign_id: str, now_iso: str) -> int:
 def campaign_report(
     store: StateStore, campaign_id: str, plan_path: str | Path | None
 ) -> dict[str, Any]:
-    """Progress/digest/pause payload for ``campaign report``."""
+    """Progress/digest/pause payload for ``campaign report`` (read-only: no writes, no lock)."""
     campaign = _require_campaign(store, campaign_id)
     progress = store.campaign_progress(campaign_id)
     file_digest: str | None = None
@@ -1410,7 +1481,7 @@ def campaign_verify(
 
     A ``DRY_RUN`` cycle consumes persisted ``verifying``/hold rows (XRef GETs only —
     **zero POSTs** by the mode contract); the campaign progress rollup reports the
-    result.
+    result. Verify is **read-only**, so it takes no apply lock (the lock guards sends).
     """
     _require_campaign(store, campaign_id)
     report = run_cycle(

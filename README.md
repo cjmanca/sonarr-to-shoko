@@ -2,15 +2,16 @@
 
 Links unrecognized Shoko files to the correct Shoko episodes using Sonarr's
 file-to-episode records and Anime-Lists TVDB↔AniDB mappings. Read-only against
-Sonarr; Shoko writes are gated. See [PROJECT.md](PROJECT.md) for requirements and
-[AGENTS.md](AGENTS.md) for development rules.
+Sonarr; Shoko writes are gated. See [PROJECT.md](PROJECT.md) for requirements,
+[AGENTS.md](AGENTS.md) for development rules, and
+[docs/deployment.md](docs/deployment.md) for the live-only operator runbook.
 
-**Current state: M7-b.** The command surface, durable SQLite state, the daemon
-cycle engine, the Anime-Lists cache, the safety attestation lease
-(`attestation status|record|invalidate`), the unattended backlog campaign
-(`campaign prepare|approve|apply|verify|report|pause|resume|revoke`) and the
+**Current state: M7-b commands + M9-e2e mocked suite.** The command surface,
+durable SQLite state, the daemon cycle engine, the Anime-Lists cache, the safety
+attestation lease (`attestation status|record|invalidate`), the backlog campaign
+(`campaign prepare|approve|apply|verify|report|pause|resume|revoke`), and the
 read-only existing-link audit (`audit`) are wired with offline tests. GHCR
-publishing (M8) and delta-fetch light cycles (M9) are the remaining slices.
+publishing (M8) and delta-fetch light cycles (M9) remain open.
 
 ## Install
 
@@ -278,6 +279,14 @@ numbers) are refused at load time with exit `2`.
 `report` coverage percentages are computed from **state-DB inventory counts**
 (files tracked vs verified, with explicit denominators) and note that they reflect the
 last cycle inventory.
+
+## Deployment runbook
+
+The live-only operator procedure is in
+[docs/deployment.md](docs/deployment.md): read-only preflight, Shoko safety
+inspection, attestation lease, one-file canary, campaign canary, backup,
+rollback, and live acceptance checks. The mocked M9 end-to-end suite is offline
+evidence only; live validation remains operator work.
 
 ## Deployment safety
 

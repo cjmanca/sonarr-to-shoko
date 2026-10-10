@@ -1,0 +1,341 @@
+# Deployment runbook — live-only operator procedure
+
+This runbook is for a live Sonarr + Shoko deployment. The project suite is mocked
+and offline; the commands below make the live steps explicit and separate
+from test evidence.
+
+Do not enable live writes in one action. First complete read-only reconciliation,
+then inspect Shoko safety, record an attestation lease, apply a one-file canary,
+verify, and only then widen the batch.
+
+## 0. Known live-operation limits
+
+- **No live validation has been run from this workspace.** All test
+  evidence in this build is mocked/offline.
+- **GHCR publication is defined but unverified.** Build the image locally for the
+  first live canary unless a published SHA image has already been validated.
+- **Campaign multi-batch apply is currently defective.** Mocked M9-e2e evidence
+  shows campaign apply can pause the next batch with
+  `source_discontinuity` after the campaign's own accepted links shrink the
+  Shoko `Unrecognized` discovery total. Treat campaign apply as a
+  single canary batch, verify, and stop before scheduling more batches
+  until the defect is fixed.
+- **True delta-fetch light cycles are not implemented.** Light cycles use the
+  same inventories with reduced work budgets.
+
+## 1. Deployment shape
+
+Use a non-root container with one writable path:
+
+- Image: `shoko-sonarr-linker:local` from a local build, or a published
+  `sha-<full-sha>` GHCR tag after publication has been verified.
+- Writable mount: `/data` for SQLite state and the Anime-Lists cache.
+- Config mount: `/config` read-only.
+- API keys: environment variables only, e.g. `SONARR_API_KEY` and
+  `SHOKO_API_KEY`. Config stores only variable names.
+- Network: join the existing Sonarr/Shoko Docker network.
+- No ports are exposed.
+- No media-library mount is needed by this tool.
+
+Example files:
+
+- [`config.example.yaml`](../config.example.yaml)
+- [`compose.example.yaml`](../compose.example.yaml)
+
+## 2. Build the image
+
+From a clean source checkout:
+
+```powershell
+docker build -t shoko-sonarr-linker:local .
+```
+
+Do not deploy a moving tag. Prefer an image pinned by SHA tag, and record the
+repo digest used for the deployment.
+
+## 3. Configure read-only mode
+
+Start from `config.example.yaml`. The safe defaults are:
+
+```yaml
+sync:
+  apply_changes: false
+```
+
+Required choices are deployment-specific:
+
+```yaml
+sonarr:
+  url: http://sonarr:8989
+  api_key_env: SONARR_API_KEY
+  allowed_roots:
+    - /data/media/anime
+
+shoko:
+  url: http://shoko:8111
+  api_key_env: SHOKO_API_KEY
+  allowed_roots:
+    - /anime
+
+paths:
+  mappings:
+    - sonarr: /data/media/anime
+      shoko: /anime
+
+database:
+  path: /data/state.sqlite3
+
+safety:
+  attestation_file: /data/attestation.yaml
+```
+
+Rules:
+
+- Root lists must be non-empty.
+- Path mappings must be component-boundary prefixes and unambiguous.
+- Shoko live-action/manual-drop roots must be excluded by allowing only the
+  Sonarr-owned anime roots.
+- `/data` should be local disk/cache storage. Avoid SMB/NFS for SQLite.
+- The container writes `/data` as UID/GID 1000. Set ownership on the host
+  share; do not run the tool as root.
+
+## 4. Read-only preflight
+
+Set API key env vars in the environment, then run:
+
+```powershell
+uv run shoko-sonarr-linker validate config.yaml
+uv run shoko-sonarr-linker config config.yaml --check
+uv run shoko-sonarr-linker mappings refresh --force config.yaml
+uv run shoko-sonarr-linker mappings status config.yaml --json
+uv run shoko-sonarr-linker once --dry-run config.yaml --max-links 20 --json
+uv run shoko-sonarr-linker audit config.yaml --limit 25 --json
+uv run shoko-sonarr-linker report config.yaml --json
+uv run shoko-sonarr-linker health config.yaml
+```
+
+Expected outcome:
+
+- `mappings refresh --force` exits `0` with outcome `activated` on first run.
+- `once --dry-run` makes zero Shoko POSTs.
+- `audit` makes GETs only and is informational.
+- `report` shows tracked files, cohort counts, mapping generation, safety fields,
+  outstanding jobs, and coverage with explicit denominators.
+- Existing-link audit findings are reviewed manually; the audit never
+  repairs links.
+
+## 5. Shoko safety inspection before an apply lease
+
+The tool never touches media files, but Shoko's server-side
+`ManualLinkJob` chain can trigger media side effects after a link is accepted.
+This step is human-operated and mandatory before recording any lease.
+
+Check the Shoko container's host mounts:
+
+```powershell
+docker inspect --format "{{json .Mounts}}" <shoko-container>
+```
+
+Confirm:
+
+- Shoko media mounts are read-only where required by your deployment policy.
+- Shoko import folders for Sonarr-owned anime paths have `DropFolderType: None`.
+- Shoko settings inspected through Shoko UI/admin only:
+  - `FileQualityFilterEnabled=false`
+  - `Plugins.Renamer.RenameOnImport=false`
+  - `Plugins.Renamer.MoveOnImport=false`
+  - `AniDb.MyList_AddFiles=false`
+- Sonarr API key used by this tool is read-only.
+- Shoko queue is healthy. Apply is fail-closed when queue reads fail
+  or when blocked work exceeds `sync.queue_blocked_tolerance` (default `0`).
+
+Record only inspected facts. Never put raw settings dumps, API keys, media
+file mutations, or secrets into notes.
+
+## 6. Record the daemon lease
+
+Choose a validity window not above `safety.attestation_validity_hours`. For a
+canary, a short window is safer.
+
+```powershell
+uv run shoko-sonarr-linker attestation record config.yaml `
+  --endpoint http://shoko:8111 `
+  --version 5.3.3 `
+  --mounts "/anime read-only (host-inspected)" `
+  --settings "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false" `
+  --hours 24 `
+  --scope daemon `
+  --note "live canary window" `
+  --confirm
+
+uv run shoko-sonarr-linker attestation status config.yaml --json
+```
+
+The lease must be valid for `daemon` apply. If it is absent, invalid, expired,
+scope-mismatched, version-stale, or invalidated, applies are suppressed and the
+daemon degrades to read-only reporting.
+
+## 7. Enable the write gate for a one-file canary
+
+Two independent controls must both be on:
+
+1. Config:
+
+```yaml
+sync:
+  apply_changes: true
+```
+
+2. Process environment:
+
+```powershell
+$env:SHOKO_LINKER_ALLOW_APPLY = "1"
+```
+
+Then apply one file:
+
+```powershell
+uv run shoko-sonarr-linker once --apply config.yaml --max-links 1 --json
+```
+
+Immediately verify:
+
+```powershell
+uv run shoko-sonarr-linker campaign verify config.yaml --campaign-id <id> --json
+uv run shoko-sonarr-linker report config.yaml --json
+uv run shoko-sonarr-linker health config.yaml
+uv run shoko-sonarr-linker audit config.yaml --limit 25 --json
+```
+
+Acceptance for the canary:
+
+- Exactly the intended number of POSTs is recorded.
+- The file reaches `verified` (or stays `verifying` if Shoko's async job
+  has not materialized yet; do not resubmit manually).
+- No indeterminate send remains open.
+- No unexpected existing-link audit drift appears for the canary file.
+- Shoko media state is unchanged by inspection.
+
+If any acceptance check fails:
+
+```powershell
+uv run shoko-sonarr-linker pause-writes config.yaml --reason "canary review" --note "operator stop" --confirm
+uv run shoko-sonarr-linker attestation invalidate config.yaml --note "canary review" --confirm
+```
+
+Do not clear state flags until the report is understood.
+
+## 8. Campaign canary procedure
+
+For backlog campaign work, use a plan file and approval digest. Keep the first
+campaign batch to one file.
+
+```powershell
+uv run shoko-sonarr-linker campaign prepare config.yaml --limit 1 --out plan.json --json
+uv run shoko-sonarr-linker campaign approve config.yaml --plan plan.json --digest <approval-digest> --json
+uv run shoko-sonarr-linker attestation record config.yaml `
+  --endpoint http://shoko:8111 `
+  --version 5.3.3 `
+  --mounts "/anime read-only (host-inspected)" `
+  --settings "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false" `
+  --hours 24 `
+  --scope "campaign:<campaign-id>" `
+  --note "campaign canary" `
+  --confirm
+uv run shoko-sonarr-linker campaign apply config.yaml --plan plan.json --batch-size 1 --json
+uv run shoko-sonarr-linker campaign verify config.yaml --campaign-id <campaign-id> --json
+uv run shoko-sonarr-linker campaign report config.yaml --campaign-id <campaign-id> --plan plan.json --json
+```
+
+Stop after the first campaign batch in this build. The known multi-batch defect
+can pause subsequent campaign apply with `source_discontinuity` after
+the campaign's own accepted links reduce the discovery total.
+
+Campaign rules:
+
+- The plan file digest must match the approval digest.
+- Candidate drift quarantines the file; it is never silently replaced.
+- Pause/resume/revoke are confirmed operator commands.
+- Revoke returns queued planned/mapped rows to `waiting`; rows past `planned`
+  are not rewound.
+
+## 9. Continuous operation
+
+Run the daemon in the container after the canary passes:
+
+```powershell
+docker compose -f compose.example.yaml up -d
+```
+
+Set `SHOKO_LINKER_ALLOW_APPLY=1` only for a writable daemon. Set
+`sync.apply_changes: true` only after the canary passes.
+
+Monitor:
+
+```powershell
+uv run shoko-sonarr-linker report config.yaml --json
+uv run shoko-sonarr-linker health config.yaml --json
+uv run shoko-sonarr-linker attestation status config.yaml --json
+uv run shoko-sonarr-linker mappings status config.yaml --json
+```
+
+Restart behavior:
+
+- The daemon stores schedule, budget, baseline/cohort, send ledger, campaign
+  state, and mapping refresh state in `/data`.
+- A restart does not replay completed sends.
+- A sent-but-unverified file is verified/held, never resubmitted.
+- A persisted `requires_rebaseline` flag blocks apply until the
+  source discontinuity is understood and cleared by the operator command.
+
+Use the read-only report first. Operator close commands are:
+
+```powershell
+uv run shoko-sonarr-linker resolve-send config.yaml --file-id <id> --fingerprint <fp> --release --note "operator close" --confirm
+uv run shoko-sonarr-linker clear-requires-rebaseline config.yaml --note "source checked" --confirm
+uv run shoko-sonarr-linker resume-writes config.yaml --note "resume after review" --confirm
+```
+
+`--release` only after the Shoko-side link, state record, and send fingerprint
+have been checked.
+
+## 10. Backup
+
+Back up only with no active daemon:
+
+```powershell
+Copy-Item -Path "/mnt/user/appdata/shoko-sonarr-linker/data/state.sqlite3*" -Destination <backup-dir> -Recurse
+Copy-Item -Path "/mnt/user/appdata/shoko-sonarr-linker/data/mappings" -Destination <backup-dir> -Recurse
+```
+
+Include SQLite `-wal`/`-shm` siblings when present. Restore is a file copy back
+to a fresh local volume. Never hand-edit the SQLite database.
+
+## 11. Rollback path
+
+Writes are reversible in local state only. Shoko-side links are not unlinked by
+this tool.
+
+```powershell
+uv run shoko-sonarr-linker pause-writes config.yaml --reason "incident" --note "operator pause" --confirm
+uv run shoko-sonarr-linker attestation invalidate config.yaml --note "incident" --confirm
+uv run shoko-sonarr-linker campaign revoke config.yaml --campaign-id <campaign-id> --note "campaign stopped" --confirm
+uv run shoko-sonarr-linker resume-writes config.yaml --note "operator resume" --confirm
+```
+
+If a campaign plan is no longer trustworthy, revoke it. Do not delete the
+plan file; it is part of the audit trail.
+
+## 12. Evidence expectation for live deployment
+
+A live deployment is accepted when the operator has:
+
+1. a clean dry-run cycle with understandable unresolved reasons;
+2. one verified controlled batch with zero unexpected writes;
+3. no touched media files;
+4. Shoko queue and async link jobs in a normal state after the canary;
+5. clean `report`/`health` after daemon restart;
+6. an auditable attestation lease, campaign approval digest where used, and no
+   unexplained indeterminate sends or `requires_rebaseline` flags.
+
+Offline tests do not replace those live observations.

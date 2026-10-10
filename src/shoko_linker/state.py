@@ -116,6 +116,7 @@ META_SONARR_STATUS_SNAPSHOT_ID: Final[str] = "sonarr_status_snapshot_id"
 META_SOURCE_LAST_OBSERVED_ISO: Final[str] = "source_last_observed_iso"
 META_SOURCE_ROOTS_FINGERPRINT: Final[str] = "source_roots_fingerprint"
 META_SOURCE_LAST_DISCOVERY_TOTAL: Final[str] = "source_last_discovery_total"
+META_SOURCE_ANCHOR_BASIS: Final[str] = "source_anchor_verified_basis"
 META_REQUIRES_REBASELINE: Final[str] = "requires_rebaseline"
 META_APPLY_LOCK_STEALS: Final[str] = "apply_lock_steals"
 META_LAST_REFUSAL: Final[str] = "last_refusal"
@@ -1234,10 +1235,6 @@ class StateStore:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params,
             )
-            self._conn.execute(
-                "UPDATE files SET last_verified_iso = ? WHERE shoko_file_id = ?",
-                (iso, shoko_file_id),
-            )
 
     @_mutation
     def record_files(self, rows: Sequence[FileSeed]) -> int:
@@ -2048,11 +2045,22 @@ class StateStore:
             if target is not None and target is not current:
                 validate_transition(current, target)
             new_state = current if target is None else target
-            self._conn.execute(
-                "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?,"
-                " last_verified_iso = ? WHERE shoko_file_id = ?",
-                (new_state.value, _clip(f"verification {verdict.value}"), iso, iso, shoko_file_id),
-            )
+            # Only a link-confirmed verdict (VERIFIED, PARTIAL-with-link) advances the file's
+            # verified high-water: UNKNOWN/PENDING re-polls and CONTRADICTION must not, so a
+            # file stuck in ``verifying`` cannot inflate the continuity expected-drop each cycle.
+            detail = _clip(f"verification {verdict.value}")
+            if target in (FileState.VERIFIED, FileState.PARTIAL):
+                self._conn.execute(
+                    "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?,"
+                    " last_verified_iso = ? WHERE shoko_file_id = ?",
+                    (new_state.value, detail, iso, iso, shoko_file_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?"
+                    " WHERE shoko_file_id = ?",
+                    (new_state.value, detail, iso, shoko_file_id),
+                )
             send_row = self._conn.execute(
                 "SELECT send_id FROM sends WHERE shoko_file_id = ?"
                 " AND outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send')"
@@ -2363,6 +2371,30 @@ class StateStore:
 
     # ---------------------------------------------------------- source identity
 
+    def _linked_count_tx(self) -> int:
+        """Files whose link landed (VERIFIED / PARTIAL): non-null ``last_verified_iso``.
+
+        Read inside the continuity transaction (the store owns the ``files`` table; no new I/O).
+        Cohort-independent; discovery-only rows never count (``record_file`` leaves
+        ``last_verified_iso`` null, and UNKNOWN/PENDING re-polls never set it).
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM files WHERE last_verified_iso IS NOT NULL"
+        ).fetchone()
+        return _as_int(row[0], "linked_count")
+
+    def _expected_drop_tx(self, basis_raw: str | None) -> int:
+        """The linker's own link-driven drops expected since the last anchor.
+
+        A count delta (``linked now - linked at anchor``), **not** a timestamp window: the
+        campaign/daemon can observe several batches at the same ISO instant, and a strict
+        ``>`` timestamp window silently drops same-instant links. Clamped at zero so a
+        store that only ever grows linked rows never under-counts.
+        """
+        current = self._linked_count_tx()
+        anchored = 0 if basis_raw is None else int(basis_raw)
+        return max(0, current - anchored)
+
     def _anchor_source_tx(
         self,
         observation: SourceObservation,
@@ -2371,7 +2403,12 @@ class StateStore:
         clear_flag: bool,
     ) -> None:
         """Persist the observation as the new continuity anchor (re-anchoring on every
-        evaluated cycle; growth/monotonic changes re-anchor, P1-1)."""
+        evaluated cycle; growth/monotonic changes re-anchor, P1-1).
+
+        The anchor carries the accounting basis: the discovery total **plus** the count of landed
+        links at anchor time, so the next cycle's expected drops are the links landed *after* this
+        anchor — not the cumulative links the anchored total already nets out.
+        """
         self._set_meta_tx(META_SOURCE_INSTANCE, observation.instance_identity)
         self._set_meta_tx(META_SONARR_STATUS_SNAPSHOT_ID, observation.snapshot_summary_id)
         self._set_meta_tx(META_SOURCE_LAST_OBSERVED_ISO, iso)
@@ -2379,6 +2416,7 @@ class StateStore:
             self._set_meta_tx(META_SOURCE_ROOTS_FINGERPRINT, observation.roots_fingerprint)
         if observation.discovery_total is not None:
             self._set_meta_tx(META_SOURCE_LAST_DISCOVERY_TOTAL, str(observation.discovery_total))
+        self._set_meta_tx(META_SOURCE_ANCHOR_BASIS, str(self._linked_count_tx()))
         if clear_flag:
             self._set_meta_tx(META_REQUIRES_REBASELINE, "0")
 
@@ -2434,19 +2472,31 @@ class StateStore:
         roots_fingerprint: str = "",
         discovery_total: int | None = None,
         complete: bool = True,
+        tolerance: int = 0,
     ) -> ContinuityVerdict:
         """Structured continuity check — ordinary inventory growth is NORMAL (P1-1).
 
         Continuity is **identity/roots stability plus snapshot discontinuity**:
         ``instance_identity_changed`` (configured identity string moved), ``roots_changed``
         (root-list/allowlist shape moved), ``discovery_total_drop`` (totals regressed below
-        the anchored value) and ``snapshot_marker_missing`` (the expected snapshot summary
-        marker is absent: no discovery total where one was anchored). A moving snapshot
-        summary hash with monotonic totals is growth, not discontinuity: the observation is
-        re-anchored each evaluated cycle so the check never self-wedges on new
+        the anchored value **net of the linker's own links**) and ``snapshot_marker_missing`` (the
+        expected snapshot summary marker is absent: no discovery total where one was anchored). A
+        moving snapshot summary hash with monotonic totals is growth, not discontinuity: the
+        observation is re-anchored each evaluated cycle so the check never self-wedges on new
         arrivals. ``requires_rebaseline`` is set only by the triggers, survives restart,
         and is cleared by the next clean observation (this check clears it when no trigger
         fires) or by :meth:`clear_requires_rebaseline` (operator/M7).
+
+        **Excess-drop rule (M9-e2e defect):** the ``include_only=Unrecognized`` discovery total
+        shrinks as the linker links files (a linked file leaves the unrecognized set). A drop is
+        therefore expected whenever it is explained by the linker's own links since the last anchor:
+        ``expected_drop`` is the count of landed links gained since the anchored basis
+        (cohort-independent, net of the live send ledger; see :meth:`_expected_drop_tx`). Only a
+        drop **beyond** that (``discovery_total < anchor_total - expected_drop - tolerance``) is a
+        genuine discontinuity (external DB restore / identity reset). A drop within the expected
+        budget (``±0`` slack by default; ``tolerance`` widens it) is NORMAL: the observation
+        re-anchors with the new total and the refreshed accounting basis, so a multi-batch campaign
+        never wedges on its own accepted links.
 
         P1-C: anchoring is gated on ``complete``. A **truncated/incomplete** discovery
         (``complete=False``) is not trusted — the check is **neutral**: no anchor, no
@@ -2480,7 +2530,9 @@ class StateStore:
                 if known_total_raw is not None:
                     reasons.append("snapshot_marker_missing")
             elif known_total_raw is not None and discovery_total < int(known_total_raw):
-                reasons.append("discovery_total_drop")
+                expected_drop = self._expected_drop_tx(self.get_meta(META_SOURCE_ANCHOR_BASIS))
+                if discovery_total < int(known_total_raw) - expected_drop - tolerance:
+                    reasons.append("discovery_total_drop")
             requires = bool(reasons)
             # Re-anchor every evaluated cycle: the anchor tracks the source forward, so
             # growth never accumulates as a permanent discontinuity.

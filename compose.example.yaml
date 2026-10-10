@@ -13,9 +13,14 @@ services:
     # Published GHCR image (publishing milestone): ghcr.io/<owner>/shoko-sonarr-linker:sha-<sha>
     image: shoko-sonarr-linker:local
     init: true              # PID-1 signal handling for graceful SIGTERM
-    # NOTE (foundation build): `daemon` is an honest stub that exits 4, so
-    # restart: unless-stopped will re-loop until the daemon ships. Drop the
-    # restart policy (or use the real daemon image) when deploying this example.
+    # The daemon is the real reconcile loop (it shipped with M6 and the M7
+    # wiring): it runs the schedule, holds the single-process apply lock, and
+    # exits on SIGTERM/SIGINT (graceful) or a stop condition. `restart:
+    # unless-stopped` keeps the long-running loop up across host reboots and
+    # crashes (the loop is restart-idempotent: the apply lock and
+    # the durable state DB recover a crashed batch on the next cycle). A
+    # one-shot `once`/campaign run is a CLI invocation, not this long-lived
+    # service, so it does not need a restart policy.
     restart: unless-stopped
     command: ["daemon", "/config/config.yaml"]
     environment:

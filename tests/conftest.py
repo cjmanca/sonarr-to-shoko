@@ -15,6 +15,11 @@ from shoko_linker import logging_setup
 REPO_ROOT: Path = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG: Path = REPO_ROOT / "config.example.yaml"
 
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "slow: measured end-to-end performance scenario")
+
+
 DUMMY_SONARR_KEY = "dummy-sonarr-key-value-00000000"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
 

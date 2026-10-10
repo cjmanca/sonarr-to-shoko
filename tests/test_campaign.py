@@ -13,7 +13,8 @@ refuse; revoke releases queued rows.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,17 +27,21 @@ import yaml  # type: ignore[import-untyped]
 from shoko_linker import cli
 from shoko_linker.attestation import build_record, write_attestation
 from shoko_linker.campaign import (
+    CampaignApplyReport,
     CampaignDigestMismatchError,
     CampaignPlanInvalidError,
+    apply_campaign,
     approve_campaign,
     read_plan_file,
 )
 from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
 from shoko_linker.config import load_settings
+from shoko_linker.daemon import CycleMode, run_cycle
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
-from shoko_linker.state import BaselineFile, FileState, StateStore
+from shoko_linker.policies import RunPolicy
+from shoko_linker.state import BaselineFile, FileState, StateStore, acquire_apply_lock
 
 SONARR_BASE = "http://sonarr:8989"
 SHOKO_BASE = "http://shoko:8111"
@@ -59,6 +64,11 @@ REMAINING_TWO = 2
 BATCH_TWO = 2
 BATCH_THREE = 3
 BLOCKED_QUEUE_COUNT = 3
+FOREIGN_PID = 111
+LEASE_LONG_SECONDS = 7200.0
+LEASE_SHORT_SECONDS = 10.0
+LEASE_EXPIRY_OFFSET_SECONDS = 60.0
+CAMPAIGN_APPLY_MAX = 20
 
 
 @dataclass(frozen=True)
@@ -1051,5 +1061,290 @@ def test_approve_digest_mismatch_exception_carries_both(
             approve_campaign(store, env.tmp_path / "plan.json", ZERO_DIGEST, T0)
         assert excinfo.value.supplied == ZERO_DIGEST
         assert excinfo.value.computed == prepared["approval_digest"]
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------------------ F1: apply lock
+
+# The campaign apply send loop shares the daemon's single-process apply lock
+# (PROJECT: one apply writer per store). Every fixture below supplies ``pid`` and
+# ``lease_seconds`` through :func:`shoko_linker.cli.build_daemon_deps` — the same wiring the
+# CLI uses: ``pid=os.getpid()`` and ``lease_seconds=settings.sync.apply_lock_lease_seconds``
+# (the campaign document leaves the default 3600). No campaign fixture needs a manual
+# ``DaemonDeps``: apply goes through the CLI seam, so the lease inputs are carried by
+# ``DaemonDeps`` itself (pid/os.getpid, lease_seconds/config default).
+
+
+def _campaign_deps(env: Env, store: StateStore, campaign_id: str) -> Any:
+    settings = load_settings(env.config_path)
+    return cli.build_daemon_deps(
+        settings,
+        store=store,
+        mapping_store=cli.open_mapping_store(settings),
+        max_submissions=CAMPAIGN_APPLY_MAX,
+        overrides_text=cli.read_overrides_text(settings),
+        attestation_scope=f"campaign:{campaign_id}",
+    )
+
+
+def test_apply_campaign_defers_batch_when_apply_lock_held_by_foreign_pid(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        acquire_apply_lock(
+            store,
+            pid=FOREIGN_PID,
+            iso=T0,
+            lease_expires_iso=_iso_plus(T0, LEASE_LONG_SECONDS),
+        )
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert report.submitted == 0
+        assert report.processed == 0
+        assert any(
+            reason.startswith("apply_lock_contended:") and str(FOREIGN_PID) in reason
+            for reason in report.reasons
+        )
+        assert env.stubs.posts == []
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "approved"
+        holder = store.lock_holder()
+        assert holder is not None
+        assert holder.owner_pid == FOREIGN_PID
+        daemon_report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="daemon-under-foreign-lock",
+        )
+        assert daemon_report.writes_suppressed
+        assert any("apply_lock_contended" in reason for reason in daemon_report.reasons)
+        assert daemon_report.counts.submitted == 0
+    finally:
+        store.close()
+    assert env.stubs.posts == []
+
+
+def test_apply_campaign_contended_lock_makes_no_guard_mutation(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-1: the lock is acquired before any guard runs — a deferred batch mutates
+    nothing (no attestation-gate meta, no pause transition), daemon-parity ordering."""
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        acquire_apply_lock(
+            store,
+            pid=FOREIGN_PID,
+            iso=T0,
+            lease_expires_iso=_iso_plus(T0, LEASE_LONG_SECONDS),
+        )
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert report.submitted == 0
+        assert any(reason.startswith("apply_lock_contended:") for reason in report.reasons)
+        assert env.stubs.posts == []
+        assert store.get_meta("attestation_gate") is None
+        assert store.budget_view().paused_reason is None
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert campaign.total_sent == 0
+    finally:
+        store.close()
+
+
+def test_apply_campaign_write_disabled_store_defers_with_reason(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-2: a write-disabled store defers the batch (daemon parity) — exit-clean
+    report with reason ``writes_disabled``, no exception, zero POSTs."""
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        store.disable_writes("integrity probe")
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert report.submitted == 0
+        assert report.reasons == ("writes_disabled",)
+        assert env.stubs.posts == []
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_apply_campaign_steals_expired_lease_records_audit_and_releases(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        acquire_apply_lock(
+            store,
+            pid=FOREIGN_PID,
+            iso=T0,
+            lease_expires_iso=_iso_plus(T0, LEASE_SHORT_SECONDS),
+        )
+        expired_now = _iso_plus(T0, LEASE_EXPIRY_OFFSET_SECONDS)
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(
+            deps, load_settings(env.config_path), store, env.tmp_path / "plan.json", expired_now
+        )
+        assert report.submitted == COUNT_TWO
+        assert len(env.stubs.posts) == COUNT_TWO
+        steals = json.loads(str(store.get_meta("apply_lock_steals")))
+        assert any(entry["from_pid"] == FOREIGN_PID for entry in steals)
+        assert store.lock_holder() is None
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_campaign_apply_then_daemon_cycle_share_one_free_lock(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(
+            deps,
+            settings,
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=BATCH_TWO,
+        )
+        assert report.submitted == BATCH_TWO
+        assert store.lock_holder() is None
+        assert len(env.stubs.posts) == BATCH_TWO
+        daemon_report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="daemon-after-campaign",
+        )
+        assert not daemon_report.writes_suppressed
+        assert not any("apply_lock_contended" in reason for reason in daemon_report.reasons)
+        assert store.lock_holder() is None
+    finally:
+        store.close()
+    assert len(env.stubs.posts) == BATCH_TWO
+
+
+def test_apply_campaign_releases_lock_when_a_send_crashes_mid_batch(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+
+        campaign_dict = sys.modules["shoko_linker.campaign"].__dict__
+        real_submit = cast("Callable[..., Any]", campaign_dict["submit_link"])
+
+        def _boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("mid-apply crash")
+
+        monkeypatch.setattr("shoko_linker.campaign.submit_link", _boom)
+        with pytest.raises(RuntimeError, match="mid-apply crash"):
+            apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert store.lock_holder() is None
+        monkeypatch.setattr("shoko_linker.campaign.submit_link", real_submit)
+        second = apply_campaign(
+            deps, settings, store, env.tmp_path / "plan.json", T0, batch_size=BATCH_TWO
+        )
+        assert second.submitted == 1
+        assert len(env.stubs.posts) == 1
+    finally:
+        store.close()
+
+
+def test_cli_campaign_apply_with_contended_lock_exits_zero_with_reason(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        acquire_apply_lock(
+            store,
+            pid=FOREIGN_PID,
+            iso=T0,
+            lease_expires_iso=_iso_plus(T0, LEASE_LONG_SECONDS),
+        )
+    finally:
+        store.close()
+    code = main(
+        [
+            "campaign",
+            "apply",
+            str(env.config_path),
+            "--plan",
+            str(env.tmp_path / "plan.json"),
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    payload = json.loads(captured.out)
+    assert payload["submitted"] == 0
+    assert payload["processed"] == 0
+    assert any(reason.startswith("apply_lock_contended:") for reason in payload["reasons"])
+    assert env.stubs.posts == []
+
+
+def test_apply_campaign_report_is_typed_batch_deferral(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The contended path returns a report (not an exception) with the deferral reason."""
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        acquire_apply_lock(
+            store,
+            pid=FOREIGN_PID,
+            iso=T0,
+            lease_expires_iso=_iso_plus(T0, LEASE_LONG_SECONDS),
+        )
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert isinstance(report, CampaignApplyReport)
+        assert report.campaign_id == prepared["campaign_id"]
+        assert report.deferred == COUNT_TWO
+        assert report.total_sent == 0
+        assert report.remaining == COUNT_TWO
+        assert report.stopped is None
     finally:
         store.close()
