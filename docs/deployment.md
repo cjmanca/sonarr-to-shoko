@@ -175,6 +175,34 @@ The lease must be valid for `daemon` apply. If it is absent, invalid, expired,
 scope-mismatched, version-stale, or invalidated, applies are suppressed and the
 daemon degrades to read-only reporting.
 
+### Apply-ownership fence (one apply writer per state directory)
+
+Exclusive apply ownership is fenced by an **OS advisory lock file** `apply.lock`,
+created next to the state DB (`settings.database.path` directory). The daemon, a
+`campaign apply` batch, and `once --apply` take it before any guard mutation and hold it
+for the whole operation; `store.close()` (and the kernel on process exit) releases it.
+
+- A **live** apply operation never loses ownership just because a lease timer elapsed.
+  `sync.apply_lock_lease_seconds` is **audit/visibility only**, not a lock timeout: a
+  second live process (a restart race, an operator `campaign apply`) is refused with
+  reason `apply_lock_contended:<holder>` and mutates nothing.
+- A long campaign batch that runs past the lease is safe: the OS lock is held for the
+  full batch, so no other live process can overlap it.
+- A **crashed** owner's lock is freed by the kernel automatically; the next cycle takes
+  ownership normally (an expired lease + a free OS lock is a legitimate takeover of a
+  dead owner, recorded in the `apply_lock_steals` audit).
+- `steal-apply-lock` now requires the OS lock to be **free**: a live owner refuses (exit 5,
+  names the holder), so a running daemon can never be fenced out by the operator command.
+  A successful takeover records the `apply_lock_steals` audit and writes an
+  **immediately-expired marker lease**, so the next daemon/campaign acquire takes ownership
+  without a stall window.
+
+Supported deployment: **one container, local (or cache-backed) volume** state directory. As
+with the SQLite caveat, `flock`/byte-range locks are unreliable on SMB/NFS — never place the
+state directory on a network share. **Never delete, move, or replace `apply.lock`**: advisory
+locks bind to the inode, and recreating the file mid-run silently un-fences the current owner
+(treat it exactly like the state DB).
+
 ## 7. Enable the write gate for a one-file canary
 
 Two independent controls must both be on:

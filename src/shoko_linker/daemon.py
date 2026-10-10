@@ -109,6 +109,7 @@ from .state import (
     ATTESTATION_PAUSE_REASON,
     META_ATTESTATION_GATE,
     META_NEXT_FULL_RECONCILE_ISO,
+    ApplyLockUnavailableError,
     BaselineFile,
     BudgetRefusal,
     Cohort,
@@ -1304,7 +1305,9 @@ def _lock_preflight(
     """Apply-lock preflight (APPLY only): returns ``(lock_reason, writes_suppressed, acquired)``.
 
     A contended lock or a writes-disabled store yields a read-only cycle (the caller
-    reports the reason); the lock is held for the duration of the apply cycle.
+    reports the reason); the lock is held for the duration of the apply cycle. Ownership is
+    fenced by the OS advisory lock (F5): the daemon acquires it first and holds it for the
+    whole cycle, so a lease timeout can never hand ownership to a second live process.
     """
     writes_suppressed = deps.store.writes_disabled
     if mode is not CycleMode.APPLY:
@@ -1313,14 +1316,18 @@ def _lock_preflight(
         return ("writes_disabled", True, False)
     lease = _parse_iso(now_iso) + timedelta(seconds=deps.lease_seconds)
     try:
-        # P2-1: steals only a lease expired at ``now`` (audit-recorded in meta); a live
-        # lease is contended (read-only cycle, holder named).
+        # F5: exclusive ownership is the OS advisory lock, taken FIRST; a live owner
+        # (kernel-held lock) is contended — a meta lease expiry never fences it out. The
+        # meta lease is audit/visibility only; an expired lease + a free OS lock steals the
+        # lease of a DEAD owner (audit-recorded). Contention → read-only cycle, holder named.
         acquire_or_steal_apply_lock(
             deps.store, deps.pid, now_iso, lease_expires_iso=lease.isoformat()
         )
     except LockHeldError as exc:
         holder = exc.holder.owner_pid if exc.holder else "?"
         return (f"apply_lock_contended: holder {holder}", False, False)
+    except ApplyLockUnavailableError as exc:
+        return (f"apply_lock_unavailable: {exc}", False, False)
     except WriteDisabledError:
         return ("writes_disabled", True, False)
     return (None, False, True)

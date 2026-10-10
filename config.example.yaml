@@ -73,7 +73,12 @@ sync:
   max_recovery_rows_per_cycle: 100
   # Verification deadline for a submitted link, seconds (> 0).
   verification_timeout_seconds: 3600
-  # Apply-lock lease length, seconds (> 0); an expired lease is stealable by an operator.
+  # Apply-lock lease length, seconds (> 0). AUDIT/VISIBILITY ONLY: exclusive apply
+  # ownership is fenced by the OS advisory lock file `apply.lock` (a sibling of
+  # database.path) held for the whole apply operation and freed by the kernel on exit.
+  # A live owner is never fenced out by this timer; `steal-apply-lock` takes over only a
+  # DEAD owner (a free OS lock + an expired lease). Keep the state dir on a local
+  # (or cache-backed) volume — advisory locks are unreliable on SMB/NFS, like SQLite.
   apply_lock_lease_seconds: 3600
   # Sleep jitter fraction, 0..0.5 (0 disables jitter).
   jitter_ratio: 0.1

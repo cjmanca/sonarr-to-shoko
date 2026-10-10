@@ -1480,6 +1480,40 @@ def test_two_processes_contended_lock_is_read_only(
     assert report.writes_suppressed is True
 
 
+def test_unavailable_apply_lock_defers_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-1: a filesystem failure on apply.lock (here: a directory in its
+    place) is NOT contention and must never crash the loop — the cycle defers read-only
+    with a named reason and zero submissions."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([file])
+    (tmp_path / "apply.lock").mkdir()  # os.open on a directory -> ENOENT/EISDIR
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[file],
+            shoko_files=[file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert report.reasons[0].startswith("apply_lock_unavailable")
+    assert report.writes_suppressed is True
+
+
 # ------------------------------------------------------------------ gate: writes disabled
 
 

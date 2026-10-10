@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import os
 import signal
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +48,7 @@ from shoko_linker.state import (
     FileState,
     StateStore,
     acquire_apply_lock,
+    acquire_or_steal_apply_lock,
     release_apply_lock,
 )
 
@@ -1170,6 +1173,77 @@ def test_steal_apply_lock_refuses_live_lease_and_takes_expired(
     assert code == EXIT_OK
     assert payload["result"]["stolen"] is True
     assert payload["result"]["holder_pid"] == os.getpid()
+    # P2-1: the takeover is audit-recorded with the prior holder named.
+    store = env.open_store()
+    try:
+        steals = json.loads(str(store.get_meta("apply_lock_steals")))
+        assert any(entry["from_pid"] == LOCK_VICTIM_PID for entry in steals)
+        # P2-2: the marker lease expires immediately — the next acquire takes ownership
+        # without a stall window (daemon unblocked on its very next cycle).
+        acquisition = acquire_or_steal_apply_lock(
+            store, os.getpid() + 1, env.now_iso, lease_expires_iso=env.now_iso
+        )
+        assert acquisition.acquired is True
+        assert acquisition.holder.owner_pid == os.getpid() + 1
+    finally:
+        store.close()
+
+
+def _cli_hold_apply_lock(path_str: str) -> None:  # pragma: no cover - runs in a spawned child
+    """Spawned child: take apply ownership with an ALREADY-EXPIRED meta lease.
+
+    The meta lease alone would be stealable; only the OS advisory lock keeps a live owner
+    fenced. The kernel frees the lock when the child exits."""
+    from shoko_linker.state import StateStore
+
+    store = StateStore(path_str)
+    store.acquire_apply_ownership(os.getpid(), T0, T0)
+    time.sleep(30)
+    store.close()
+
+
+def _wait_for_cli_holder(env: Env, owner_pid: int) -> None:
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        store = StateStore(env.state_path, budget_limits=env.limits())
+        try:
+            holder = store.lock_holder()
+        finally:
+            store.close()
+        if holder is not None and holder.owner_pid == owner_pid:
+            return
+        time.sleep(0.2)
+    raise AssertionError("the spawned holder never acquired the apply lease")
+
+
+def test_steal_apply_lock_refused_while_live_holder_holds_the_os_lock(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F5: the operator steal requires a FREE OS lock — a live owner (kernel-held lock
+    with an expired meta lease) is refused, never fenced out."""
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(target=_cli_hold_apply_lock, args=(str(env.state_path),))
+    process.start()
+    assert process.pid is not None
+    owner_pid = process.pid
+    try:
+        _wait_for_cli_holder(env, owner_pid)
+        code = main(["steal-apply-lock", str(env.config_path), "--note", "takeover", "--confirm"])
+        captured = capsys.readouterr()
+        assert code == EXIT_STATE
+        assert "state refused" in captured.err
+        assert str(owner_pid) in captured.err
+        # The live owner's meta record is untouched by the refused steal.
+        store = env.open_store()
+        try:
+            holder = store.lock_holder()
+            assert holder is not None
+            assert holder.owner_pid == owner_pid
+        finally:
+            store.close()
+    finally:
+        process.terminate()
+        process.join(timeout=20)
 
 
 # ------------------------------------------------------------------ docs agreement

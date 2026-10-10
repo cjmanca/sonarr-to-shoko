@@ -63,7 +63,7 @@ uv run python -m pytest -q
 | `audit [--series-anidb N] [--limit N] [--max-requests N] [--json]` | Bounded **read-only** existing-link audit (GETs only, zero writes): classifies already-linked Shoko files against the verified mapping as `linked_consistent` (exact identity-set equality only), `partial_link`, `existing_link_mismatch`, `wrong_first_episode`, `ambiguous_match`, plus `no_sonarr_counterpart`/`audit_incomplete` buckets | Shoko/Sonarr GETs within the request budget |
 | `resolve-send --file-id N --fingerprint FP (--release\|--block) --note TEXT --confirm [--json]` | Operator close of a live terminal-review send (releases the budget slot). Refuses verified/closed rows. A closed send authorizes only a **fresh** re-plan fingerprint | none |
 | `clear-requires-rebaseline --note TEXT --confirm [--json]` | Operator clear of the persisted source-discontinuity flag | none |
-| `steal-apply-lock --note TEXT --confirm [--json]` | Take over an **expired** apply lease; a live lease refuses and names the holder | none |
+| `steal-apply-lock --note TEXT --confirm [--json]` | Take over a **dead** owner's apply lease: it requires the OS advisory lock (`apply.lock`) to be **free**, so a live owner (kernel-held lock) refuses and names the holder. An expired meta lease with a free OS lock is audit-recorded and the OS lock is released | none |
 | `resume-writes --note TEXT --confirm [--json]` | Clear the stopped-writes marker and the write pause | none |
 | `pause-writes --reason TEXT [--hours H] --note TEXT --confirm [--json]` | Persist a write pause with a reason | none |
 
@@ -275,6 +275,15 @@ approval digest.
 
 Out-of-range values (NaN/inf, negatives where nonsense, zero where > 0, non-whole
 numbers) are refused at load time with exit `2`.
+
+`apply_lock_lease_seconds` is an **audit/visibility** window only, never a lock timeout:
+exclusive apply ownership is fenced by an OS advisory lock file (`apply.lock`, a sibling
+of the state DB) that is held for the whole apply operation and freed by the kernel
+when the owning process exits. A live apply operation therefore **never** loses ownership
+because a fixed lease elapsed — a second live process (a restart race, an operator
+campaign) is refused, and `steal-apply-lock` refuses too. The supported deployment is
+one container on a local (or cache-backed) volume state directory; like the SQLite caveat,
+`flock`/byte-range locks are unreliable on SMB/NFS.
 
 `report` coverage percentages are computed from **state-DB inventory counts**
 (files tracked vs verified, with explicit denominators) and note that they reflect the

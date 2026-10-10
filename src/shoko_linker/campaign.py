@@ -79,6 +79,7 @@ from .mapping_store import ActiveMappings, load_active
 from .policies import RunPolicy
 from .shoko import ImportFolder
 from .state import (
+    ApplyLockUnavailableError,
     BudgetRefusal,
     CampaignBinding,
     CampaignRecord,
@@ -704,14 +705,16 @@ def _bind_campaign(store: StateStore, campaign_id: str, iso: str) -> int:
 
 
 def _acquire_apply_lock(deps: DaemonDeps, now_iso: str) -> tuple[str | None, bool]:
-    """Acquire the daemon's single-process apply lock for one campaign batch (F1).
+    """Acquire the daemon's single-process apply lock for one campaign batch (F1, F5).
 
-    Same lease rule and lease source as :func:`shoko_linker.daemon._lock_preflight`:
-    :func:`~shoko_linker.state.acquire_or_steal_apply_lock` steals only a lease expired at
-    ``now_iso`` (audit-recorded) and raises :class:`LockHeldError` for a live lease. The
-    holder is named in the deferral reason; the campaign stays approved and
-    no candidate is sent. ``deps.pid``/``deps.lease_seconds`` carry the CLI-wired
-    ``os.getpid()``/``sync.apply_lock_lease_seconds``.
+    Same ownership entry as :func:`shoko_linker.daemon._lock_preflight`:
+    :func:`~shoko_linker.state.acquire_or_steal_apply_lock` takes the **OS advisory lock
+    first** and holds it for the whole batch, so a batch longer than the meta lease can never
+    be fenced out — a live owner (kernel-held lock) is contended and a meta
+    lease expiry alone never grants ownership. Only a DEAD owner (expired lease + a free OS
+    lock) is stolen (audit-recorded). The holder is named in the deferral reason; the campaign
+    stays approved and no candidate is sent. ``deps.pid``/``deps.lease_seconds`` carry the
+    CLI-wired ``os.getpid()``/``sync.apply_lock_lease_seconds``.
     """
     lease = _parse_iso(now_iso) + timedelta(seconds=deps.lease_seconds)
     try:
@@ -721,18 +724,22 @@ def _acquire_apply_lock(deps: DaemonDeps, now_iso: str) -> tuple[str | None, boo
     except LockHeldError as exc:
         holder = exc.holder.owner_pid if exc.holder is not None else "?"
         return (f"apply_lock_contended:{holder}", False)
+    except ApplyLockUnavailableError as exc:
+        return (f"apply_lock_unavailable:{exc}", False)
     except WriteDisabledError:
         return ("writes_disabled", False)
     return (None, True)
 
 
 def _release_apply_lock(deps: DaemonDeps, now_iso: str) -> None:
-    """Release the campaign apply lock in the ``finally`` (daemon pattern).
+    """Release the campaign apply lock in the ``finally`` (daemon pattern; F5).
 
-    A store that stopped writing mid-batch is tolerated (the persisted lease is recovered
-    by the expiry-steal rule); a lease stolen after a crash past expiry is recorded in the
-    ``last_lock_release_denied`` meta audit (the authoritative surface — the report was
-    built before ``finally`` ran), never propagated, and never wedges the next invocation.
+    Meta ownership is released first, then the OS advisory lock. A store that stopped writing
+    mid-batch is tolerated (the persisted lease is recovered by the expiry-steal rule, and the
+    kernel frees the OS lock at process exit); a lease stolen after a crash past expiry is
+    recorded in the ``last_lock_release_denied`` meta audit (the authoritative surface — the
+    report was built before ``finally`` ran), never propagated, and never wedges the next
+    invocation.
     """
     try:
         release_apply_lock(deps.store, deps.pid, now_iso)

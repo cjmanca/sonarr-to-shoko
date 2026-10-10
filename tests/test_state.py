@@ -17,6 +17,7 @@ import pytest
 
 from shoko_linker.linking import SendOutcome, VerificationVerdict
 from shoko_linker.state import (
+    ApplyProcessLock,
     BaselineFile,
     BudgetLimits,
     BudgetRefusal,
@@ -34,9 +35,11 @@ from shoko_linker.state import (
     TransitionError,
     WriteDisabledError,
     acquire_apply_lock,
+    acquire_or_steal_apply_lock,
     integrity_check,
     open_state,
     release_apply_lock,
+    steal_apply_lock,
     steal_expired_apply_lock,
     validate_transition,
 )
@@ -808,6 +811,121 @@ def test_apply_lock_single_process_is_documented_external_risk() -> None:
     # Deployment-level note, not a code test: SQLite file locks cannot coordinate
     # separate installations (see state.py module docstring; PLAN M6 EXTERNAL).
     assert True
+
+
+# ------------------------------------------------- F5: OS advisory ownership lock
+
+
+def test_apply_ownership_same_process_double_acquire_is_contention(
+    tmp_path: Path,
+) -> None:
+    """Req 5: a live owner never loses ownership to a lease timeout — a
+    same-process re-acquire is contention, with zero meta mutation."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path) as store:
+        acq = store.acquire_apply_ownership(LOCK_PID_A, T0, T1)
+        assert acq.acquired is True
+        assert store.lock_holder() is not None
+        with pytest.raises(LockHeldError) as excinfo:
+            store.acquire_apply_ownership(LOCK_PID_B, T0, T2)
+        assert excinfo.value.holder is not None
+        assert excinfo.value.holder.owner_pid == LOCK_PID_A
+        # Contention mutates nothing: the record still names the first owner.
+        after = store.lock_holder()
+        assert after is not None
+        assert after.owner_pid == LOCK_PID_A
+
+
+def test_apply_ownership_release_then_reacquire_and_close_releases_os_lock(
+    tmp_path: Path,
+) -> None:
+    """Req 5: release frees the OS lock so a re-acquire succeeds; store.close() releases it."""
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, budget_limits=LIMITS)
+    try:
+        store.acquire_apply_ownership(LOCK_PID_A, T0, T1)
+        lock = store._apply_lock
+        assert lock is not None
+        held_after_acquire = lock.held
+        assert held_after_acquire is True
+        assert store.release_apply_ownership(LOCK_PID_A, T1) is True
+        held_after_release = lock.held
+        assert held_after_release is False
+        reacquired = store.acquire_apply_ownership(LOCK_PID_A, T2, T3)
+        assert reacquired.acquired is True
+    finally:
+        store.close()
+    final_lock = store._apply_lock
+    assert final_lock is not None
+    assert final_lock.held is False
+    # The OS lock file is genuinely free for a fresh acquirer after close.
+    probe = ApplyProcessLock(store.apply_lock_path)
+    assert probe.acquire() is True
+    probe.release()
+
+
+def test_apply_process_lock_two_objects_in_one_process_contend(tmp_path: Path) -> None:
+    """Req 5: two independent lock objects on the same file contend (Windows EDEADBR /
+    POSIX EWOULDBLOCK both surface as contention, never as a false acquisition)."""
+    lock_path = tmp_path / "apply.lock"
+    first = ApplyProcessLock(lock_path)
+    second = ApplyProcessLock(lock_path)
+    assert first.acquire() is True
+    assert second.acquire() is False
+    first.release()
+    assert second.acquire() is True
+    second.release()
+
+
+def test_apply_ownership_context_manager_reports_contention(tmp_path: Path) -> None:
+    from shoko_linker.state import ApplyLockContendedError
+
+    lock_path = tmp_path / "apply.lock"
+    with ApplyProcessLock(lock_path) as held:
+        assert held.held is True
+        with pytest.raises(ApplyLockContendedError):
+            ApplyProcessLock(lock_path).__enter__()
+
+
+def test_apply_ownership_expired_lease_with_free_os_lock_steals_and_audits(
+    tmp_path: Path,
+) -> None:
+    """Req 4 (unit): meta lease expired + OS lock FREE (owner dead) → acquire succeeds, steal
+    audit recorded."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path) as store:
+        store.acquire_apply_ownership(LOCK_PID_A, T0, T1)
+    # Owner process ended → the OS lock is free; the meta lease is stale at T2.
+    with open_store(path) as reopened:
+        acq = acquire_or_steal_apply_lock(reopened, LOCK_PID_B, T2, lease_expires_iso=T3)
+        assert acq.holder.owner_pid == LOCK_PID_B
+        audit = json.loads(reopened.get_meta("apply_lock_steals") or "[]")
+        assert audit[0]["from_pid"] == LOCK_PID_A
+        assert audit[0]["owner_pid"] == LOCK_PID_B
+
+
+def test_steal_apply_lock_requires_free_os_lock(tmp_path: Path) -> None:
+    """Req 6 (unit): the operator steal is a point-in-time marker — it takes and releases the
+    OS lock; a live OS-locked owner refuses."""
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, budget_limits=LIMITS)
+    try:
+        store.acquire_apply_ownership(LOCK_PID_A, T0, T1)  # live owner holds the OS lock
+        with pytest.raises(LockHeldError) as excinfo:
+            steal_apply_lock(store, LOCK_PID_B, T2, lease_expires_iso=T3)
+        assert excinfo.value.holder is not None
+        assert excinfo.value.holder.owner_pid == LOCK_PID_A
+        current = store.lock_holder()
+        assert current is not None
+        assert current.owner_pid == LOCK_PID_A
+    finally:
+        store.close()
+    # Owner gone (OS free) + expired lease → takeover, and the OS lock is released again.
+    with open_store(path) as reopened:
+        acq = steal_apply_lock(reopened, LOCK_PID_B, T2, lease_expires_iso=T3)
+        assert acq.holder.owner_pid == LOCK_PID_B
+        assert reopened._apply_lock is not None
+        assert reopened._apply_lock.held is False
 
 
 # ---------------------------------------------------------------- identity

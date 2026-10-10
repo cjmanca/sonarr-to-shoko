@@ -17,6 +17,15 @@ coordinates a *single process installation*; SQLite file locks cannot coordinate
 separate installations pointed at the same Shoko server (deployment-level risk,
 EXTERNAL — see docs/compatibility.md §4 and PROJECT.md M6).
 
+**Apply-ownership fence (F5, P1):** exclusive apply ownership is fenced by an OS
+advisory lock file (``apply.lock``) in the SAME directory as the state DB, held for
+the entire apply operation. The kernel frees it when the owning process exits, so a
+crash recovers; a meta lease expiry on its own NEVER grants ownership, so a live
+apply operation can never be fenced out by a fixed timeout. The meta ``apply_lock``
+lease record is audit/visibility only. The same local-volume caveat applies:
+``flock``/byte-range locks are unreliable on SMB/NFS, so the supported deployment is
+one container on a local (or cache-backed) volume state directory.
+
 Durability contract for the mutation path (M6-b enforces the call order):
 
 1. :meth:`StateStore.prepare_send` commits the ``prepared_not_sent`` row **and**
@@ -88,7 +97,9 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import os
 import sqlite3
+import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -98,6 +109,34 @@ from typing import Any, Final, Literal, ParamSpec, TypeVar, cast
 
 from .errors import LinkerError
 from .linking import SendOutcome, VerificationVerdict
+
+# Platform shim for the OS advisory apply lock (the F5 ownership fence). The kernel
+# releases an advisory lock when the owning process exits, so a crash frees it; a meta
+# lease expiry on its own never grants ownership. Import is per-platform.
+if sys.platform == "win32":
+    import msvcrt  # Windows byte-range advisory locking (LK_NBLCK); import is per-platform
+
+    ADVISORY_LOCK_KIND: Final[str] = "msvcrt.locking (LK_NBLCK, 1 byte)"
+
+    def _acquire_advisory_lock(fd: int) -> None:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _release_advisory_lock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    ADVISORY_LOCK_KIND: Final[str] = "fcntl.flock (LOCK_EX | LOCK_NB)"
+
+    def _acquire_advisory_lock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _release_advisory_lock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+_O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
 SCHEMA_VERSION: Final[int] = 1
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
@@ -130,6 +169,10 @@ META_LAST_FULL_RECONCILE_ISO: Final[str] = "last_full_reconcile_iso"
 META_NEXT_FULL_RECONCILE_ISO: Final[str] = "next_full_reconcile_iso"
 META_ATTESTATION_GATE: Final[str] = "attestation_gate"
 ATTESTATION_PAUSE_REASON: Final[str] = "attestation_expired"
+
+#: OS advisory lock file (the F5 ownership fence) living in the SAME
+#: persistent directory as the SQLite state DB. Its name is deliberately obvious.
+APPLY_LOCK_FILENAME: Final[str] = "apply.lock"
 
 _SYNC_NAMES: Final[Mapping[int, str]] = {0: "off", 1: "normal", 2: "full", 3: "extra"}
 
@@ -182,6 +225,22 @@ class LockHeldError(StateError):
     def __init__(self, message: str, holder: LockHolder | None) -> None:
         super().__init__(message)
         self.holder = holder
+
+
+class ApplyLockContendedError(StateError):
+    """The OS advisory apply lock is held by a live process (context-manager path)."""
+
+    def __init__(self, lock_path: Path) -> None:
+        super().__init__(
+            f"apply lock contended: the OS advisory lock {lock_path} is held by a live process"
+        )
+        self.lock_path = lock_path
+
+
+class ApplyLockUnavailableError(StateError):
+    """The apply lock file cannot be opened (P3-1): a filesystem failure, NOT contention.
+
+    Apply paths must defer (read-only cycle, named reason) — never crash the daemon."""
 
 
 class FileState(Enum):
@@ -669,6 +728,66 @@ class IntegrityReport:
     detail: str
 
 
+class ApplyProcessLock:
+    """OS advisory lock file held for the duration of one apply ownership (the F5 fence).
+
+    ``acquire()`` is **non-blocking**: it opens ``apply.lock`` (in the same directory as
+    the state DB) and takes the platform advisory lock. Contention (a live owner — a
+    same-process re-acquire, a second process, a restart race) returns ``False``; the
+    kernel frees the lock when the owning process exits, so a crash recovers automatically.
+    A meta lease expiry on its own NEVER grants ownership — takeover requires this OS
+    lock to be acquirable.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fd: int | None = None
+        self.held = False
+
+    def acquire(self) -> bool:
+        """Non-blocking take. ``False`` on contention (never raises on a busy lock).
+
+        Filesystem failures (open/create/mkdir) raise :class:`ApplyLockUnavailableError`
+        (P3-1) so apply paths defer with a named reason instead of crashing the loop.
+        """
+        if self.held:
+            return False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT | _O_BINARY, 0o600)
+        except OSError as exc:
+            raise ApplyLockUnavailableError(
+                f"apply lock file {self.path} cannot be opened ({exc}); deferring apply"
+            ) from exc
+        try:
+            _acquire_advisory_lock(fd)
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        self.held = True
+        return True
+
+    def release(self) -> None:
+        """Release the advisory lock and close the descriptor (idempotent, never raises)."""
+        fd = self._fd
+        self._fd = None
+        self.held = False
+        if fd is None:
+            return
+        with contextlib.suppress(OSError):
+            _release_advisory_lock(fd)
+        os.close(fd)
+
+    def __enter__(self) -> ApplyProcessLock:
+        if not self.acquire():
+            raise ApplyLockContendedError(self.path)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
 # ----------------------------------------------------------------- schema
 
 
@@ -1041,6 +1160,7 @@ class StateStore:
         self.budget_limits = budget_limits
         self._writes_disabled = False
         self._writes_reason = ""
+        self._apply_lock: ApplyProcessLock | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.isolation_level = None  # explicit transactions only
@@ -1056,6 +1176,10 @@ class StateStore:
     # ------------------------------------------------------------- lifecycle
 
     def close(self) -> None:
+        """Release the OS advisory apply lock (if this store ever held it) and close the DB."""
+        lock = self._apply_lock
+        if lock is not None:
+            lock.release()
         self._conn.close()
 
     @property
@@ -2669,6 +2793,92 @@ class StateStore:
             lease_expires_iso=_as_str(entry.get("lease_expires_iso"), "lease_expires_iso"),
         )
 
+    # ------------------------------------------------- apply ownership (OS lock + meta)
+
+    @property
+    def apply_lock_path(self) -> Path:
+        """The OS advisory lock file path (sibling of the state DB)."""
+        return self.path.parent / APPLY_LOCK_FILENAME
+
+    def _process_lock(self) -> ApplyProcessLock:
+        lock = self._apply_lock
+        if lock is None:
+            lock = ApplyProcessLock(self.apply_lock_path)
+            self._apply_lock = lock
+        return lock
+
+    def _os_lock_contention(self, action: str) -> LockHeldError:
+        holder = self._lock_holder()
+        context = (
+            f"meta records holder pid {holder.owner_pid} "
+            f"(acquired {holder.acquired_iso}, lease expires {holder.lease_expires_iso})"
+            if holder is not None
+            else "no apply lease is recorded in meta"
+        )
+        return LockHeldError(
+            f"apply lock contended: the OS advisory lock {self.apply_lock_path} "
+            f"({ADVISORY_LOCK_KIND}) is held by a live process, so {action} is refused "
+            f"({context}); a meta lease expiry alone never grants ownership",
+            holder,
+        )
+
+    def acquire_apply_ownership(
+        self, pid: int, iso: str, lease_expires_iso: str
+    ) -> LockAcquisition:
+        """Take exclusive apply ownership: the OS advisory lock FIRST, then the meta lease.
+
+        Contention on the OS lock (a live owner) raises :class:`LockHeldError` with the
+        meta holder context and mutates NOTHING. Once the OS lock is ours, the meta lease is
+        taken/replaced/stolen under the existing rule (an expired lease + a free OS lock is a
+        legitimate takeover of a DEAD owner, audit-recorded); a live meta lease releases the OS
+        lock and raises. The OS lock handle is retained for the store's lifetime (released by
+        :meth:`release_apply_ownership` or on process exit).
+        """
+        lock = self._process_lock()
+        if not lock.acquire():
+            raise self._os_lock_contention("apply ownership")
+        try:
+            return self.acquire_or_steal_apply_lock_tx(pid, iso, lease_expires_iso)
+        except BaseException:
+            lock.release()
+            raise
+
+    def release_apply_ownership(self, pid: int, iso: str) -> bool:
+        """Release meta ownership first, then the OS advisory lock.
+
+        The OS lock is released only AFTER the meta release succeeds (not-owner / write-stopped
+        refusals propagate and keep the OS lock, which the kernel frees at process exit)."""
+        released = self.release_apply_lock_tx(pid, iso)
+        self._process_lock().release()
+        return released
+
+    def steal_apply_ownership(
+        self, pid: int, iso: str, lease_expires_iso: str | None = None
+    ) -> LockAcquisition:
+        """Operator point-in-time takeover marker (the ``steal-apply-lock`` path).
+
+        Refuses when the OS lock is held (a live owner — the kernel has NOT freed it); when the
+        OS lock is free it records the meta steal audit (prior holder named, P2-1) and
+        writes an **immediately-expired** lease marker (P2-2), then RELEASES the OS lock.
+        The command does not run apply: the next daemon/campaign acquire sees the marker lease
+        expired at ``iso`` and takes ownership normally — the operator command never stalls
+        the daemon.
+        """
+        lock = self._process_lock()
+        if not lock.acquire():
+            raise self._os_lock_contention("an operator steal")
+        prior_holder = self._lock_holder()
+        marker_lease = lease_expires_iso if lease_expires_iso is not None else iso
+        try:
+            acquisition = self.steal_expired_apply_lock_tx(pid, iso, marker_lease)
+        except BaseException:
+            lock.release()
+            raise
+        if prior_holder is not None:
+            self._record_lock_steal_tx(prior_holder, pid, iso)
+        lock.release()
+        return acquisition
+
     # ---------------------------------------------------------- campaigns (M7-b)
 
     @_mutation
@@ -2940,29 +3150,52 @@ def open_state(
 def acquire_apply_lock(
     store: StateStore, pid: int, iso: str, *, lease_expires_iso: str
 ) -> LockAcquisition:
-    """Acquire the single-process apply lock, or raise :class:`LockHeldError` naming
-    the current holder."""
+    """Meta-only apply-lock acquire (a held lease raises :class:`LockHeldError`).
+
+    Low-level primitive used to seed/inspect a meta lease record; it does NOT take the OS
+    advisory lock. Daemon/campaign apply uses :func:`acquire_or_steal_apply_lock`."""
     return store.acquire_apply_lock_tx(pid, iso, lease_expires_iso)
 
 
 def acquire_or_steal_apply_lock(
     store: StateStore, pid: int, iso: str, *, lease_expires_iso: str
 ) -> LockAcquisition:
-    """Acquire the apply lock, stealing an *expired* lease (audit-recorded); a live
-    lease raises :class:`LockHeldError` naming the holder (P2-1 daemon path)."""
-    return store.acquire_or_steal_apply_lock_tx(pid, iso, lease_expires_iso)
+    """Take exclusive apply ownership: the OS advisory lock FIRST, then the meta lease.
+
+    Contention on the OS lock (a live apply process — a restart race, a concurrent operator
+    campaign) raises :class:`LockHeldError` naming the meta holder and mutates NOTHING: a meta
+    lease expiry on its own NEVER grants ownership, so a live apply operation can never
+    be fenced out by a fixed timeout. When the OS lock is acquirable, the meta
+    lease is taken/replaced/stolen under the existing rule (an expired lease + a free OS lock is
+    a legitimate takeover of a DEAD owner, audit-recorded). Daemon/campaign apply path (F5)."""
+    return store.acquire_apply_ownership(pid, iso, lease_expires_iso)
 
 
 def release_apply_lock(store: StateStore, pid: int, iso: str) -> bool:
-    """Release the lock when held by ``pid``; False when no lock is held."""
-    return store.release_apply_lock_tx(pid, iso)
+    """Release meta ownership (pid must be the owner) then the OS advisory lock.
+
+    Returns False when no lock is held; raises :class:`LockHeldError` for a non-owner release."""
+    return store.release_apply_ownership(pid, iso)
 
 
 def steal_expired_apply_lock(
     store: StateStore, pid: int, iso: str, *, lease_expires_iso: str | None = None
 ) -> LockAcquisition:
-    """Explicitly take over an expired lease (recovery of a crashed holder)."""
+    """Explicitly take over an expired meta lease (recovery of a crashed holder).
+
+    Meta-only primitive: it does NOT consult the OS advisory lock. The operator
+    ``steal-apply-lock`` command uses :func:`steal_apply_lock` (which requires a free OS lock)."""
     return store.steal_expired_apply_lock_tx(pid, iso, lease_expires_iso)
+
+
+def steal_apply_lock(
+    store: StateStore, pid: int, iso: str, *, lease_expires_iso: str | None = None
+) -> LockAcquisition:
+    """Operator takeover marker (``steal-apply-lock``): requires a FREE OS advisory lock.
+
+    A live owner (OS lock held) raises :class:`LockHeldError`; an expired meta lease with a free
+    OS lock is audit-recorded as a steal, and the OS lock is released immediately after."""
+    return store.steal_apply_ownership(pid, iso, lease_expires_iso)
 
 
 def integrity_check(store: StateStore) -> IntegrityReport:

@@ -1165,6 +1165,31 @@ def test_apply_campaign_contended_lock_makes_no_guard_mutation(
         store.close()
 
 
+def test_apply_campaign_unavailable_lock_defers_without_crash(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P3-1: a filesystem failure on apply.lock (here: a directory in its place) defers
+    the batch with a named reason — never a crash, zero POSTs, campaign stays approved."""
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    (env.tmp_path / "apply.lock").mkdir()
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert report.submitted == 0
+        assert any(reason.startswith("apply_lock_unavailable:") for reason in report.reasons)
+        assert env.stubs.posts == []
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert campaign.total_sent == 0
+    finally:
+        store.close()
+
+
 def test_apply_campaign_write_disabled_store_defers_with_reason(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:

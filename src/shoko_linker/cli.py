@@ -147,7 +147,7 @@ from .state import (
     StateError,
     StateStore,
     WriteDisabledError,
-    steal_expired_apply_lock,
+    steal_apply_lock,
 )
 
 type CommandHandler = Callable[[argparse.Namespace], int]
@@ -1046,11 +1046,12 @@ def _run_clear_requires_rebaseline(args: argparse.Namespace) -> int:
 
 
 def _run_steal_apply_lock(args: argparse.Namespace) -> int:
-    def action(settings: Settings, store: StateStore, iso: str) -> Mapping[str, Any]:
-        # Only an EXPIRED lease is stealable (state API); a live lease
-        # raises LockHeldError naming the holder pid and lease expiry (exit 5).
-        lease = _iso_plus(iso, settings.sync.apply_lock_lease_seconds)
-        acquisition = steal_expired_apply_lock(store, os.getpid(), iso, lease_expires_iso=lease)
+    def action(_settings: Settings, store: StateStore, iso: str) -> Mapping[str, Any]:
+        # F5: the OS advisory lock is the fence. A live owner (kernel-held lock) refuses
+        # (LockHeldError naming the holder meta, exit 5); only a DEAD owner (expired lease
+        # with a FREE OS lock) is taken over — audit-recorded, with an immediately-expired
+        # marker lease so the next daemon/campaign acquire takes ownership without a stall.
+        acquisition = steal_apply_lock(store, os.getpid(), iso, lease_expires_iso=iso)
         return {
             "stolen": True,
             "holder_pid": acquisition.holder.owner_pid,
@@ -1770,7 +1771,8 @@ def _add_clear_requires_rebaseline(
 
 def _add_steal_apply_lock(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser(
-        "steal-apply-lock", help="Take over an EXPIRED apply lease (live leases refuse)."
+        "steal-apply-lock",
+        help="Take over a dead owner's lease (needs a free OS lock; a live owner refuses).",
     )
     _add_config_argument(parser)
     _add_confirm_note_arguments(parser)

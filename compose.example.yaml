@@ -14,11 +14,13 @@ services:
     image: shoko-sonarr-linker:local
     init: true              # PID-1 signal handling for graceful SIGTERM
     # The daemon is the real reconcile loop (it shipped with M6 and the M7
-    # wiring): it runs the schedule, holds the single-process apply lock, and
+    # wiring): it runs the schedule, holds the OS advisory apply-ownership lock
+    # (`apply.lock`, a sibling of the state DB) for the whole apply operation, and
     # exits on SIGTERM/SIGINT (graceful) or a stop condition. `restart:
     # unless-stopped` keeps the long-running loop up across host reboots and
-    # crashes (the loop is restart-idempotent: the apply lock and
-    # the durable state DB recover a crashed batch on the next cycle). A
+    # crashes (the loop is restart-idempotent: the kernel frees the apply lock
+    # on exit and the durable state DB recovers a crashed batch on the next
+    # cycle — a live owner is never fenced out by the lease timer). A
     # one-shot `once`/campaign run is a CLI invocation, not this long-lived
     # service, so it does not need a restart policy.
     restart: unless-stopped
