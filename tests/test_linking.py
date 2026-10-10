@@ -191,6 +191,7 @@ def file_json(
     size: int = SONARR_SIZE,
     locations: list[dict[str, Any]] | None = None,
     xrefs: list[dict[str, Any]] | None = None,
+    imported: str | None = "2024-01-01T00:00:00",
 ) -> dict[str, Any]:
     places = (
         locations
@@ -202,7 +203,7 @@ def file_json(
         "Size": size,
         "IsIgnored": False,
         "IsVariation": False,
-        "Imported": "2024-01-01T00:00:00",
+        "Imported": imported,
         "Hashes": {"ED2K": f"ed2k-{id_}", "SHA1": None, "CRC32": id_, "MD5": None},
         "Locations": places,
         "SeriesIDs": [] if xrefs is None else xrefs,
@@ -1202,11 +1203,20 @@ def test_pending_target_plan_never_reaches_preflight(
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [("IsIgnored", True), ("IsVariation", True), ("Imported", None)],
+    ("field", "value", "reason"),
+    [
+        ("IsIgnored", True, PreflightReason.NOT_CANDIDATE),
+        ("IsVariation", True, PreflightReason.NOT_CANDIDATE),
+        ("Hashes", None, PreflightReason.NOT_CANDIDATE),
+        ("Imported", 12345, PreflightReason.MALFORMED),
+    ],
 )
 def test_preflight_blocks_when_fresh_read_flags_file_out_of_candidacy(
-    base_document: dict[str, Any], write_document: Writer, field: str, value: Any
+    base_document: dict[str, Any],
+    write_document: Writer,
+    field: str,
+    value: Any,
+    reason: PreflightReason,
 ) -> None:
     settings = base_settings(base_document, write_document)
     plan = linkable_plan()
@@ -1217,7 +1227,40 @@ def test_preflight_blocks_when_fresh_read_flags_file_out_of_candidacy(
     stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = body
     verdict = run_preflight(stub, plan, settings)
     assert verdict.ok is False
-    assert PreflightReason.NOT_CANDIDATE in verdict.reasons
+    assert reason in verdict.reasons
+
+
+def test_preflight_accepts_fully_hashed_imported_null_candidate(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # Imported=null is diagnostic only: a fully hashed, zero-XRef, size-matching,
+    # fully-owned candidate passes fresh preflight despite never having been imported.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(imported=None)
+    verdict = run_preflight(stub, plan, settings)
+    assert verdict.ok is True
+    assert PreflightReason.NOT_CANDIDATE not in verdict.reasons
+
+
+def test_apply_path_links_fully_hashed_imported_null_candidate(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # A valid AniDB mapping yields a proposed link, and mocked apply accepts the
+    # Imported=null candidate: preflight ok → exactly one POST to the link endpoint.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(imported=None)
+    result = reconcile(stub, plan, settings, dry_run=False)
+    assert result.stage is ReconcileStage.SUBMITTED
+    assert result.send is not None
+    assert result.send.outcome is SendOutcome.ACCEPTED_UNVERIFIED
+    assert len(stub.posts()) == 1
+    assert stub.post_bodies == [{"EpisodeIDs": [777, 778]}]
 
 
 def test_preflight_blocks_on_echoed_file_id_mismatch(

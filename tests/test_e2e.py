@@ -1319,6 +1319,57 @@ def test_campaign_canary_batches_quarantine_and_revoke(
     assert code == cli.EXIT_APPLY_GATE_REFUSAL
 
 
+# ------------------------------------------- 17b. Imported=null backlog progress
+
+
+def _set_representative_imported_null(world: eh.World) -> set[int]:
+    # Mark a deterministic portion of the fully hashed backlog as never-imported
+    # (Imported=null); the rest keep real timestamps (mixed, as in the real backlog).
+    null_ids: set[int] = set()
+    for file_id, row in world.shoko.rows.items():
+        if file_id % 2 == 0:
+            row.imported = None
+            null_ids.add(file_id)
+    return null_ids
+
+
+def test_imported_null_backlog_files_progress_through_full_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    xml = eh.xml_document(eh.range_entry(4001, 300001, 1, N_TEN))
+    world, clock, _lease = _lease_world(tmp_path, xml)
+    eh.seed_backlog(world, N_SERIES, N_TEN)
+    null_ids = _set_representative_imported_null(world)
+    assert null_ids
+    assert null_ids < set(world.shoko.rows)
+    env = _campaign_env(
+        tmp_path, world, clock, monkeypatch, capsys, campaign_max=LIMIT_TWENTY, batch=N_TEN
+    )
+    prepared = env.prepare(limit=N_TEN)
+    assert prepared["files"] == N_TEN
+    assert world.shoko.posts_count() == 0
+    env.approve(str(prepared["approval_digest"]))
+    code, payload = env.apply(batch=N_TEN)
+    assert code == cli.EXIT_OK
+    assert payload["submitted"] == N_TEN
+    assert payload["verified"] == N_TEN
+    assert world.shoko.posts_count() == N_TEN
+    linked = {file_id for file_id, _ids in world.shoko.posts}
+    assert null_ids <= linked
+    methods = {method for method, _path in world.shoko.requests}
+    assert methods <= {"GET", "POST"}
+    store = env.open_store()
+    try:
+        verified_null = [store.get_file(file_id) for file_id in sorted(null_ids)]
+    finally:
+        store.close()
+    assert verified_null
+    for record in verified_null:
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+
+
 # ------------------------------------------------- 18. lease-expiry degradation
 
 

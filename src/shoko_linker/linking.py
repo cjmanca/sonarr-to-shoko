@@ -64,6 +64,7 @@ from .shoko import (
     ImportFolder,
     ShokoFile,
     ShokoLocation,
+    has_available_hashes,
     join_location_path,
     parse_file_entries,
     select_reverse_mapping,
@@ -872,13 +873,21 @@ def _preflight_file(
             "untrustworthy response, no POST",
         )
         return
-    if item.is_ignored or item.is_variation or item.imported is None:
+    disqualifier: str | None = None
+    if item.is_ignored or item.is_variation:
+        disqualifier = (
+            f"(IsIgnored={item.is_ignored}, IsVariation={item.is_variation}): "
+            "the M3 candidacy gate must pass on the fresh read too — never a link target"
+        )
+    elif not has_available_hashes(item):
+        disqualifier = (
+            "with no available hashes: identity incomplete (hashing not settled), "
+            "never a link target"
+        )
+    if disqualifier is not None:
         add(
             PreflightReason.NOT_CANDIDATE,
-            f"file {plan.shoko_file_id} is no longer a qualifying candidate "
-            f"(IsIgnored={item.is_ignored}, IsVariation={item.is_variation}, "
-            f"Imported={item.imported!r}): the M3 candidacy gate must pass on the fresh "
-            "read too — never a link target",
+            f"file {plan.shoko_file_id} is no longer a qualifying candidate {disqualifier}",
         )
         return
     if absolute_missing or xrefs_missing:

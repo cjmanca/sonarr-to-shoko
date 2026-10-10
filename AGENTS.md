@@ -20,7 +20,7 @@
 
 ## Context compaction and delegated-task recovery
 
-- After compaction or a resumed assignment, **re-read `AGENTS.md`**, the current **self-contained task brief**, the relevant portions of **`PROJECT.md`**, and the source/tests needed for that task. A compaction summary is a hint, not an authoritative replacement for instructions or code evidence.
+- After compaction or a resumed assignment, **re-read `AGENTS.md`**, the current **self-contained task brief**, **`PROJECT.md`**, and the source/tests needed for that task. A compaction summary is a hint, not an authoritative replacement for instructions or code evidence.
 - Re-establish the assigned file boundaries, safety constraints, outstanding defects, and acceptance checks before continuing. Inspect affected files and `git diff` so interrupted edits are not repeated or assumed complete; rerun only checks whose results cannot be verified.
 - Before an intentional context reset, preserve the concrete changes, checks/results, remaining review findings, and next step in a concise handoff **to the orchestrator**. If the brief was lost or is incomplete, request a refreshed scoped brief rather than inferring project-wide next steps.
 - Do not perform project-wide progress bookkeeping or redefine the assigned milestone during recovery. The main orchestrator owns that coordination.

@@ -734,6 +734,10 @@ def _seed_series(world: World, series: SeriesSpec, file_offset: int) -> list[Fil
                         absolute=shoko_path(series.series_id, file_id),
                     )
                 ],
+                # Representative unrecognized backlog: Shoko only sets DateTimeImported
+                # after AniDB identification, so a deterministic portion of fully
+                # hashed files stays Imported=null forever (mixed with real timestamps).
+                imported=None if index % 2 == 0 else "2024-01-01T00:00:00",
             )
         )
     world.sonarr.episodes[series.series_id] = episode_rows

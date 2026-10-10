@@ -14,8 +14,12 @@ duplicate file IDs, a short page that leaves IDs missing, transport failures, a
 malformed ``ListResult`` envelope, a page-cap hit, or a server that ignored
 ``include=AbsolutePaths`` / ``include=XRefs`` mark the snapshot **incomplete**, and
 :func:`match_shoko_files` refuses an incomplete snapshot. Files that are simply not
-candidates (carrying XRefs, variations, never-imported files, files with no
-locations) are recorded as categorized exclusions and keep the snapshot complete.
+candidates (carrying XRefs, variations, ignored files, files with no locations, files
+with no available hashes) are recorded as categorized exclusions and keep the snapshot
+complete. Shoko's ``Imported``
+(``DateTimeImported``) field is **diagnostic only**: it is set once a file is identified
+via AniDB, so a fully hashed file with ``Imported=null`` stays a valid candidate
+forever — candidacy never depends on it.
 
 Ownership is strict and per-file: **every** location of a Shoko file must be
 accessible, inside a configured ``shoko.allowed_roots`` entry, belong to an import
@@ -86,8 +90,8 @@ class ExclusionReason(Enum):
     XREF_PRESENT = "xref_present"
     VARIATION = "variation"
     IGNORED = "ignored"
-    NEVER_IMPORTED = "never_imported"
     NO_LOCATIONS = "no_locations"
+    NO_HASHES = "no_hashes"
     MIXED_OWNERSHIP = "mixed_ownership"
     INACCESSIBLE_LOCATION = "inaccessible_location"
     LOCATION_PATH_MISMATCH = "location_path_mismatch"
@@ -870,14 +874,14 @@ def _candidate_gate(item: ShokoFile) -> tuple[ExclusionReason, str] | None:
             ExclusionReason.IGNORED,
             f"file {item.id} is marked IsIgnored: never requested, never a link candidate",
         )
-    elif item.imported is None:
-        gate = (
-            ExclusionReason.NEVER_IMPORTED,
-            f"file {item.id} has Imported=null (never imported): unrecognized is not "
-            "'ready to link'; import-limbo adjacent",
-        )
     elif not item.locations:
         gate = (ExclusionReason.NO_LOCATIONS, f"file {item.id} reports no locations")
+    elif _has_no_hash(item):
+        gate = (
+            ExclusionReason.NO_HASHES,
+            f"file {item.id} reports no available hashes: identity incomplete "
+            "(hashing not settled), never a link candidate",
+        )
     return gate
 
 
@@ -1195,6 +1199,15 @@ def _parse_location(item: Any, file_id: int | None) -> tuple[ShokoLocation, bool
     )
 
 
+def has_available_hashes(item: ShokoFile) -> bool:
+    """True when Shoko reported at least one file hash (identity evidence settled)."""
+    return any(value is not None for value in _hash_tuple_values(item.hashes))
+
+
+def _has_no_hash(item: ShokoFile) -> bool:
+    return not has_available_hashes(item)
+
+
 def _file_problems(
     file_id: int | None,
     size: int | None,
@@ -1218,6 +1231,10 @@ def _file_problems(
 
 def _hash_tuple(identity: ShokoFileIdentity) -> tuple[str | int | None, ...]:
     return (identity.ed2k, identity.sha1, identity.crc32, identity.md5)
+
+
+def _hash_tuple_values(hashes: ShokoHashes) -> tuple[str | int | None, ...]:
+    return (hashes.ed2k, hashes.sha1, hashes.crc32, hashes.md5)
 
 
 def _safe_path(path: str) -> str:

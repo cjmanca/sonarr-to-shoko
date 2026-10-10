@@ -120,6 +120,20 @@ imported), `Created`, `Updated`, `SeriesIDs[]` (**present only with `include=XRe
 **Absent at v5.3.3 (legacy v1/v2 names):** `Hash`, `Priority`, `SufficientlyHashed`,
 `LastFileImported`, tolerant-path/drop-folder location fields — do not use them.
 
+- **`Imported` (`DateTimeImported`) is diagnostic only.** `ProcessFileJob` sets it once a
+  file is successfully identified through AniDB, so a fully hashed file whose hashes are
+  unknown to AniDB keeps `Imported=null` **indefinitely** — hashed, stable, zero
+  cross-references. That is exactly the unrecognized backlog this linker links, so
+  **candidacy never depends on `Imported`** (a null is *not* "incomplete", and a
+  non-string/non-null garbage value stays a malformed-file failure at parse time).
+  Eligibility = zero episode cross-references + at least one available hash (an absent
+  `Hashes` key / null hashes are a recorded detail and exclude the file as
+  `no_hashes` — identity not settled; a present-but-garbage `Hashes` object is a
+  parse-time malformed-file failure) + all locations passing strict
+  ownership + exact Sonarr path+size
+  correspondence + a valid AniDB→Shoko episode mapping + complete/consistent snapshots
+  (and, at write time, fresh preflight re-checks these; grace periods apply).
+
 - `Locations[]` element: `ID` (`VideoLocal_Place_ID`), `FileID`, `ImportFolderID`,
   `RelativePath` (relative to import folder), `AbsolutePath` (requires
   `include=AbsolutePaths`), `IsAccessible`. **One file = N locations** confirmed

@@ -52,7 +52,7 @@ SHOKO_ROOT = "/anime"
 MAPPING = {"sonarr": SONARR_ROOT, "shoko": SHOKO_ROOT}
 FILE_PATH = "/api/v3/File"
 FOLDER_PATH = "/api/v3/ImportFolder"
-IMPORT_LIMBO_PAGE = 3
+IMPORTED_NULL_PAGES = 3
 SMALL_TOTAL = 5
 SMALL_PAGE_SIZE = 2
 SMALL_PAGES = 3
@@ -774,9 +774,12 @@ def test_ignored_files_are_never_candidates(
     ]
 
 
-def test_never_imported_file_is_not_treated_as_ready(
+def test_fully_hashed_imported_null_file_is_a_candidate(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
+    # Shoko sets DateTimeImported only after AniDB identification, so a fully hashed
+    # file with Imported=null stays a valid candidate forever. Imported is diagnostic
+    # only; candidacy must not depend on it.
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
     entry = shoko_file(
@@ -785,10 +788,36 @@ def test_never_imported_file_is_not_treated_as_ready(
     stub.pages = {1: envelope([entry], 1)}
     discovery = discover(stub)
     assert discovery.verdict.complete is True
-    result = reconcile(discovery, (), shoko_settings(base_document, write_document))
+    assert discovery.files[0].imported is None
+    files = sonarr_files((7, 40, f"{SONARR_ROOT}/a.mkv", 1000))
+    result = reconcile(discovery, files, shoko_settings(base_document, write_document))
+    assert [item.reason for item in result.exclusions] == []
+    assert [match.shoko_file_id for match in result.matches] == [110]
+
+
+def test_file_without_available_hashes_is_excluded(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # Eligibility requires at least one available hash: an all-null Hashes object is
+    # identity-not-settled (hashing still in flight), never a link candidate.
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    entry = shoko_file(
+        112,
+        1000,
+        [location(1120, 112, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
+        imported=None,
+        hashes={"ED2K": None, "SHA1": None, "CRC32": None, "MD5": None},
+    )
+    stub.pages = {1: envelope([entry], 1)}
+    discovery = discover(stub)
+    assert discovery.verdict.complete is True
+    files = sonarr_files((7, 40, f"{SONARR_ROOT}/a.mkv", 1000))
+    result = reconcile(discovery, files, shoko_settings(base_document, write_document))
     assert [(item.shoko_file_id, item.reason) for item in result.exclusions] == [
-        (110, ExclusionReason.NEVER_IMPORTED)
+        (112, ExclusionReason.NO_HASHES)
     ]
+    assert result.matches == ()
 
 
 def test_file_without_locations_is_excluded(
@@ -1305,6 +1334,20 @@ def test_absent_hashes_key_is_recorded_without_failing_the_page() -> None:
     assert any("Hashes key absent" in detail for detail in discovery.verdict.details)
 
 
+def test_non_string_imported_value_is_malformed_file() -> None:
+    # Imported is diagnostic-only (null is eligible), but a present non-string/non-null
+    # value is a malformed-file failure: the parse-level Imported TYPE check stays.
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    entry = shoko_file(403, 10, [location(4030, 403, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")])
+    entry["Imported"] = 12345
+    stub.pages = {1: envelope([entry], 1)}
+    discovery = discover(stub)
+    assert SnapshotReason.MALFORMED_FILE in discovery.verdict.reasons
+    assert any("invalid Imported" in detail for detail in discovery.verdict.details)
+    assert discovery.files == ()
+
+
 def test_location_file_id_cross_reference_must_match_the_file() -> None:
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
@@ -1315,9 +1358,12 @@ def test_location_file_id_cross_reference_must_match_the_file() -> None:
     assert discovery.files == ()
 
 
-def test_import_limbo_pages_are_not_treated_as_ready(
+def test_imported_null_files_are_never_excluded_as_never_imported(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
+    # Imported=null is diagnostic only, never a candidacy signal: these files clear the
+    # candidacy gate and are then judged on correspondence (here an absent Sonarr
+    # inventory), not on the Imported field.
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
     rows = [
@@ -1327,13 +1373,14 @@ def test_import_limbo_pages_are_not_treated_as_ready(
             [location(6000 + page, 500 + page, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
             imported=None,
         )
-        for page in range(1, IMPORT_LIMBO_PAGE + 1)
+        for page in range(1, IMPORTED_NULL_PAGES + 1)
     ]
     stub.pages = {page: envelope([row], len(rows)) for page, row in enumerate(rows, start=1)}
     discovery = discover(stub, page_size=1)
     result = reconcile(discovery, (), shoko_settings(base_document, write_document))
-    assert all(item.reason is ExclusionReason.NEVER_IMPORTED for item in result.exclusions)
-    assert len(result.exclusions) == IMPORT_LIMBO_PAGE
+    reasons = {item.reason for item in result.exclusions}
+    assert reasons == {ExclusionReason.NOT_IN_INVENTORY}
+    assert len(result.exclusions) == IMPORTED_NULL_PAGES
 
 
 # ---------------------------------------------------- review-driven gap coverage
