@@ -1,10 +1,15 @@
 # Basic CI: validate every push/PR, build the image, never publish.
-# GHCR publishing (per-commit SHA tags, least-privilege publish job, latest
-# promotion) is a later milestone — this workflow deliberately has
+# GHCR publishing lives in publish.yml (per-commit SHA tags, least-privilege
+# publish job, latest promotion) — this workflow deliberately has
 # NO packages:write permission and no registry login.
 #
-# Note: action refs pinned by tag here; SHA-pinning (commit SHAs for
-# actions/checkout, actions/setup-python) is required by the publishing milestone.
+# Action pins (M8 security review F9) — every `uses:` ref below is pinned to a
+# full commit SHA with the tag noted in a trailing comment. SHAs fetched 2026-10-09
+# from the GitHub public refs API (git/matching-refs/tags/v<MAJOR>.), newest
+# patch release of the major version in use:
+#   actions/checkout    v4.4.0  11d5960a326750d5838078e36cf38b85af677262
+#   actions/setup-python v5.6.0 a26af69be951a213d495a4c3e4e4022e16d87065
+#   astral-sh/setup-uv  v4.2.0  38f3f104447c67c051c4a08e39b64a148898af3a
 
 name: CI
 
@@ -21,26 +26,22 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
       - name: Install (locked dev group)
         run: uv sync --frozen
-      - name: Ruff check
-        run: uv run ruff check .
-      - name: Ruff format check
-        run: uv run ruff format --check .
-      - name: Mypy
-        run: uv run mypy
-      - name: Pytest
-        run: uv run pytest -q
+      # Shared check list (M8): the exact same commands the per-SHA publish
+      # legs run (scripts/ci_checks.sh), so CI and publish verification match.
+      - name: Checks (shared list)
+        run: bash scripts/ci_checks.sh
 
   docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build image
         run: docker build -t shoko-sonarr-linker:ci .
       - name: Smoke (CLI help + offline config validate + default-deny gate)

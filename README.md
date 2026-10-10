@@ -329,16 +329,74 @@ A sent-but-unverified file is verified/held, never resubmitted; close it with
 
 ## Images (GHCR)
 
-Publishing lands in **M8**. Until then build locally
-(`docker build -t shoko-sonarr-linker:local .`). The publishing policy (PROJECT.md §6):
-an immutable **SHA-tagged image for every pushed commit** (including commits inside
-multi-commit pushes), `latest` only for the newest successfully built default-branch
-revision, never from untrusted pull requests, least-privilege `GITHUB_TOKEN`.
+Publishing is defined by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
+and the publishing policy in PROJECT.md §6: an immutable **SHA-tagged image for every
+pushed commit** (including commits inside multi-commit pushes), `latest` only for the
+newest successfully built default-branch revision, never from untrusted pull requests,
+least-privilege `GITHUB_TOKEN`.
+
+> **EXTERNAL/UNVERIFIED:** the workflow is validated offline (enumeration tests,
+> YAML structural tests, permission gates). No GHCR publication has been performed from
+> this session — no pushes were made and publishing was never exercised against GitHub.
+
+**Publishing semantics.** The `plan` job runs `scripts/enumerate_introduced.py`
+over the push event (`before..after`; first-push from the first-buildable boundary
+`aa6b85e` inclusive, older history skipped; force-push/non-ancestor falls back to the
+merge-base; branch pushes enumerate from `merge-base(main, head)` so shared history
+is never re-tagged). Each enumerated SHA becomes one matrix leg: checkout that SHA,
+**re-run the full check list for that commit** (`scripts/ci_checks.sh` — same commands
+as CI, per commit, never a cached pass), then build & push
+`ghcr.io/<owner>/shoko-sonarr-linker:sha-<full-sha>` (provenance on, labels point at
+the commit, registry cache scoped per SHA so builds can't contaminate each other).
+A failing intermediate SHA skips only its own tag and is reported in the job summary;
+the rest of the push publishes normally. PR events run the read-only test job only —
+publish/promote jobs are gated to push/schedule/dispatch and fork PRs get a read-only
+token, so untrusted code can never publish. SHA-tag publishing is serialized **per
+ref** (`concurrency: publish-<ref>` with `cancel-in-progress: false`) so a queued
+commit's `sha-` tag is never silently dropped by a cancel. `latest` is promoted **only** from the
+default branch by `promote-latest`, serialized (`concurrency: latest-promotion`,
+`cancel-in-progress: false`) and guarded: it aborts if the run's SHA is no longer
+`git ls-remote`-confirmed head of main, so a queued old run can never revert `latest`.
+SHA tags are immutable in practice: names are derived from the commit SHA and backfill
+skips already-tagged SHAs, so tags are never overwritten.
+
+**Shell-injection hygiene & trust boundary.** No `${{ }}` expression is expanded inside
+a `run:` script body — `github.*`/`inputs.*` values reach the shell only through job/step
+`env:` indirection, and dispatch `from_sha`/`to_sha` inputs are validated as 40-char
+lowercase hex before use. Dispatch trust boundary: `workflow_dispatch` requires repository
+**write access**, and write access is already a code-execution trust boundary (anyone who can
+dispatch can run code here), so the dispatch gates are defense-in-depth, not a secret
+boundary: the plan additionally refuses any range whose `to_sha` is not an ancestor of the
+current main head (`not-ancestor-of-main`). A non-positive `max_shas` fails closed.
+
+**Action pins.** Every `uses:` ref in `publish.yml`/`ci.yml` is pinned to a full commit
+SHA with its release tag in a trailing comment (SHAs fetched from the GitHub refs API,
+2026-10-09, newest patch of each major). The Dockerfile base image is pinned by digest
+and installs strictly from `uv.lock` (`uv sync --frozen --no-dev`, which fails if the
+lock is stale, with `uv pip check` verifying the environment).
+
+**Auth.** Only `secrets.GITHUB_TOKEN` with `contents: read` + `packages: write` on the
+publish/promote jobs — no repository secrets, no Sonarr/Shoko keys exist in CI.
+
+**Event gap.** GitHub does **not** fire `push` workflows for commits created by
+workflows using `GITHUB_TOKEN` (merge queues, auto-commits). This project never
+self-commits; if such a commit ever lands, recovery is via the weekly `schedule`
+backfill or a dispatch — capped per run (10 by default; `max_shas` must be positive,
+non-positive values fail closed), oldest-first, overflow
+reported and recovered, never dropped:
+
+```powershell
+gh workflow run publish.yml -f backfill=true -f from_sha=<sha> -f to_sha=<sha>
+gh workflow run publish.yml -f backfill=true   # whole-history tag-gap scan
+```
+
 Pin deployments to the SHA tag (and record the image digest) — `latest` is a moving
 label, not a safety boundary:
 
 ```yaml
 image: ghcr.io/<owner>/shoko-sonarr-linker:sha-<full-sha>   # + record the repo digest
+# strongest: pin the digest directly, immune to tag movement:
+image: ghcr.io/<owner>/shoko-sonarr-linker@sha256:<digest>
 ```
 
 ## Not implemented in this build
@@ -347,4 +405,5 @@ image: ghcr.io/<owner>/shoko-sonarr-linker:sha-<full-sha>   # + record the repo 
 - Delta-fetching **light** cycles: light cycles poll the same inventories with reduced
   work budgets (halved recovery-row cap and submission cap); true Sonarr/Shoko delta
   endpoints are not invented and remain the M9 optimization.
-- GHCR publishing workflow (M8) — the image is built locally today.
+- GHCR publishing runs in GitHub Actions — publication has not yet been exercised
+  live (EXTERNAL/UNVERIFIED); build locally with `docker build -t shoko-sonarr-linker:local .`.
