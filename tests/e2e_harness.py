@@ -876,6 +876,8 @@ def build_deps(
     overrides_text: str | None = None,
     monotonic: Callable[[], float] | None = None,
     advance: Callable[[float], None] | None = None,
+    now: Callable[[], str] | None = None,
+    shutdown_requested: Callable[[], bool] | None = None,
 ) -> DaemonDeps:
     sonarr, shoko, source = world.endpoints()
 
@@ -902,6 +904,10 @@ def build_deps(
         advance=advance if advance is not None else clock.advance,
         jitter=clock.jitter,
         pid=4242,
+        now=now if now is not None else clock.iso,
+        shutdown_requested=shutdown_requested
+        if shutdown_requested is not None
+        else (lambda: False),
         attestation_valid=valid,
         attestation_verdict=verdict,
         blocked_over=blocked_over,

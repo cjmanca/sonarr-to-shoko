@@ -132,6 +132,9 @@ class Stubs:
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     shoko_requests: list[httpx.Request] = field(default_factory=list)
     post_hook: Callable[[int], None] | None = None
+    #: P2-1: fired on every Shoko GET with the request path — simulates a slow preflight
+    #: network phase (authorization state flips mid-call, before the POST).
+    get_hook: Callable[[str], None] | None = None
 
     def size(self, spec: SpecFile) -> int:
         return self.sizes.get(spec.shoko_id, FILE_SIZE)
@@ -242,6 +245,8 @@ class Stubs:
     def shoko(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911
         self.shoko_requests.append(request)
         path = request.url.path
+        if self.get_hook is not None and request.method == "GET":
+            self.get_hook(path)
         if request.method == "POST" and path.endswith("/Link"):
             file_id = int(path.split("/")[4])
             self.posts.append(json.loads(request.content))
@@ -384,7 +389,14 @@ class Env:
         finally:
             store.close()
 
-    def write_campaign_lease(self, campaign_id: str) -> None:
+    def write_campaign_lease(
+        self, campaign_id: str, *, hours: float = 24.0, expired: bool = False
+    ) -> None:
+        inspected = self.now_iso if not expired else _iso_plus(self.now_iso, -7200.0)
+        expiry_hours = hours if not expired else 1.0  # expires = inspected+1h = one hour ago
+        expires_iso = (
+            datetime.fromisoformat(inspected) + timedelta(hours=expiry_hours)
+        ).isoformat()
         record = build_record(
             endpoint=SHOKO_BASE,
             version="5.3.3",
@@ -395,8 +407,8 @@ class Env:
                 "MoveOnImport": False,
                 "MyListAddFiles": False,
             },
-            inspected_iso=self.now_iso,
-            expires_iso=(datetime.fromisoformat(self.now_iso) + timedelta(hours=24)).isoformat(),
+            inspected_iso=inspected,
+            expires_iso=expires_iso,
             scope=f"campaign:{campaign_id}",
             operator_note="campaign lease",
         )
@@ -3654,3 +3666,410 @@ def test_campaign_report_surfaces_authorization_identity(
     assert code == EXIT_OK
     out = capsys.readouterr().out
     assert "drain authorization: authorized" in out
+
+
+# ------------------------------------------------------------------ F11: per-submission freshness
+
+
+def _extra_source_xml() -> bytes:
+    """A mapping document that changes the target/structure digests (a new generation)."""
+    return _source_xml().replace(
+        b"</anime-list>",
+        b"<anime anidbid='999' tvdbid='11111' defaulttvdbseason='1'>"
+        b"<mapping-list><mapping anidbseason='1' tvdbseason='1'>;1-1;</mapping></mapping-list>"
+        b"</anime></anime-list>",
+    )
+
+
+def _swap_mapping_generation(env: Env) -> None:
+    """Activate a NEW mapping generation on disk (what a concurrent refresh does mid-batch)."""
+    store = MappingStore(env.tmp_path / "mappings")
+    client = httpx.Client(
+        base_url="https://raw.githubusercontent.com/",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, headers={"ETag": '"s"'}, content=_extra_source_xml(), request=request
+            )
+        ),
+        follow_redirects=False,
+        timeout=httpx.Timeout(5.0),
+    )
+    endpoint = ApiEndpoint(client, lambda: {"Accept-Encoding": "identity"})
+    try:
+        mapping_refresh(
+            store, endpoint, now=datetime.fromisoformat(T0), refresh_hours=168.0, force=True
+        )
+    finally:
+        endpoint.client.close()
+
+
+def test_f11_deadline_expires_mid_batch_stops_later_sends(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F11: the deadline is re-evaluated with a FRESH clock before each POST. A deadline that
+    passes mid-batch auto-pauses (``deadline_exceeded``), the remainder stays queueable (no
+    quarantine), and zero POSTs follow the batch-start authorization."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys, deadline_hours="1")
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+
+        def _past_deadline(file_id: int) -> None:
+            env.now_iso = _iso_plus(T0, 2 * 3600.0)  # fake clock: deadline passed during file 500
+
+        env.stubs.post_hook = _past_deadline
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert env.stubs.posted_files == [500]  # the deadline never authorizes file 501
+        assert report.submitted == 1
+        assert report.quarantined == 0  # a stale authorization defers, never quarantines
+        assert any(r.startswith("send_stale:501:deadline_exceeded") for r in report.reasons)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "deadline_exceeded"
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state is FileState.PLANNED  # remainder stays queueable
+        assert len(env.stubs.posts) == 1
+    finally:
+        store.close()
+
+
+def test_f11_operator_pause_mid_batch_stops_later_sends(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F11: campaign status is re-read from the store before each POST. A concurrent
+    operator pause (second store handle) stops the batch with zero POSTs after the change."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+
+        def _pause(file_id: int) -> None:
+            other = env.open_store()  # the concurrent CLI writing the same SQLite DB
+            try:
+                other.set_campaign_status(campaign_id, "paused", "operator_paused", iso=T0)
+            finally:
+                other.close()
+
+        env.stubs.post_hook = _pause
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert env.stubs.posted_files == [500]
+        assert report.submitted == 1
+        assert report.quarantined == 0
+        assert any(r.startswith("send_stale:501:campaign_paused") for r in report.reasons)
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert len(env.stubs.posts) == 1
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status_reason == "operator_paused"
+    finally:
+        store.close()
+
+
+def test_f11_shutdown_flag_stops_campaign_batch_without_replaying_the_sent_row(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F11: the batch loop honors the shutdown flag before starting a new POST; the deferred
+    remainder stays queueable and a restart finishes the batch WITHOUT re-POSTing the sent file."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        shutdown = {"value": False}
+        env.stubs.post_hook = lambda file_id: shutdown.__setitem__("value", True)
+        deps = replace(
+            _campaign_deps(env, store, campaign_id),
+            shutdown_requested=lambda: shutdown["value"],
+        )
+        report = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert report.submitted == 1
+        assert env.stubs.posted_files == [500]
+        # The batch-loop shutdown check fires before the next preflight (no network reads
+        # during shutdown); the deferral is non-destructive either way.
+        assert any(r.startswith("shutdown_requested:501") for r in report.reasons)
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state is FileState.PLANNED  # non-destructive deferral
+        # Restart with the shutdown cleared: the sent row is durably tracked and
+        # never replayed; only the deferred file POSTs.
+        env.stubs.post_hook = None
+        shutdown["value"] = False
+        second = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert second.submitted == 1
+        assert sum(1 for posted in env.stubs.posted_files if posted == 500) == 1  # no replay
+        assert 501 in env.stubs.posted_files
+    finally:
+        store.close()
+
+
+def test_f11_mapping_generation_swap_mid_batch_defers_and_stops(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F11: the guard-time generation identity is re-checked per submission. A concurrent
+    mapping refresh mid-batch stops the batch (defer, queueable) — no POST rides the stale
+    digest equality."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        env.stubs.post_hook = lambda file_id: _swap_mapping_generation(env)
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert env.stubs.posted_files == [500]
+        assert report.submitted == 1
+        assert report.quarantined == 0
+        assert any(
+            r.startswith("send_stale:501:mapping_generation_changed") for r in report.reasons
+        )
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert len(env.stubs.posts) == 1
+    finally:
+        store.close()
+
+
+def test_f11_send_rows_use_fresh_timestamps_per_submission(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F11: submission timestamps (prepare_send intent / attempted anchor) come from the fresh
+    clock per submission, never the batch-start snapshot."""
+    _set_campaign(env, max_batch_size=COUNT_THREE)
+    _set_sync(
+        env, max_new_per_cycle=COUNT_THREE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    env.seed(specs(COUNT_THREE))
+    prepared = prepare(env, capsys, limit=str(COUNT_THREE))
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        ticks = {"n": 0}
+
+        def _now() -> str:
+            ticks["n"] += 1
+            return _iso_plus(T0, 60.0 * ticks["n"])
+
+        deps = replace(_campaign_deps(env, store, campaign_id), now=_now)
+        report = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_THREE,
+        )
+        assert report.submitted == COUNT_THREE
+        rows = store._conn.execute(
+            "SELECT shoko_file_id, attempted_iso FROM sends ORDER BY send_id"
+        ).fetchall()
+        stamps = [str(row[1]) for row in rows]
+        assert len(stamps) == COUNT_THREE
+        assert stamps == sorted(stamps)
+        assert len(set(stamps)) == COUNT_THREE  # strictly increasing: fresh time per submission
+        assert stamps[0] != T0  # never the batch-start timestamp
+    finally:
+        store.close()
+
+
+# ----- P2-1: authorization expiring DURING the preflight network phase (slow GETs) -----
+
+
+def test_f11_shutdown_during_preflight_network_phase_stops_the_post(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-1: preflight's network phase (File + per-episode GETs) is slow. A shutdown that lands
+    DURING it must not authorize the POST: the local freshness re-evaluation runs after preflight
+    and before ``prepare_send``, defers the file non-destructively, and stops the batch — zero
+    POSTs."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        shutdown = {"value": False}
+
+        def _flip_on_preflight_read(path: str) -> None:
+            if path.startswith(f"/api/v3/File/{500}"):
+                shutdown["value"] = True  # SIGTERM lands mid-preflight of file 500
+
+        env.stubs.get_hook = _flip_on_preflight_read
+        deps = replace(
+            _campaign_deps(env, store, campaign_id),
+            shutdown_requested=lambda: shutdown["value"],
+        )
+        report = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        env.stubs.get_hook = None
+        assert env.stubs.posts == []  # zero POSTs: the expired authorization never sent
+        assert report.submitted == 0
+        assert report.quarantined == 0
+        assert any(r.startswith("send_stale:500:shutdown_requested") for r in report.reasons)
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.PLANNED  # non-destructive deferral
+        record2 = store.get_file(501)
+        assert record2 is not None
+        assert record2.state is FileState.PLANNED
+        # Nothing was durably in-flight: no send rows exist to replay.
+        rows = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
+        assert int(rows[0]) == 0
+    finally:
+        store.close()
+
+
+def test_f11_lease_expiry_during_preflight_defers_without_post(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-1: a campaign lease that expires DURING preflight's network phase must not ride the
+    pre-preflight verdict into a POST. The lease/gate verdict is re-taken locally
+    before ``prepare_send`` (transient safety: defer, no quarantine, no batch stop), and a
+    re-attestation finishes the file with zero replay."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+
+        def _expire_on_preflight_read(path: str) -> None:
+            if path.startswith(f"/api/v3/File/{500}"):
+                env.write_campaign_lease(campaign_id, expired=True)  # lease dies mid-preflight
+
+        env.stubs.get_hook = _expire_on_preflight_read
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        env.stubs.get_hook = None
+        assert 500 not in env.stubs.posted_files  # the expired lease never authorized a POST
+        assert report.quarantined == 0  # F8 semantics: transient safety defers
+        assert any(r.startswith("preflight_deferred:500:blocked_safety") for r in report.reasons)
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        rows = store._conn.execute(
+            "SELECT COUNT(*) FROM sends WHERE shoko_file_id = 500"
+        ).fetchone()
+        assert int(rows[0]) == 0  # nothing durably in-flight for the deferred file
+        # Re-attestation: the never-sent files complete normally (exactly one POST each).
+        env.write_campaign_lease(campaign_id, hours=24.0)
+        second = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert second.submitted == COUNT_TWO
+        assert env.stubs.posted_files.count(500) == 1
+        assert sorted(env.stubs.posted_files) == [500, 501]
+    finally:
+        store.close()
+
+
+def test_f11_deadline_expires_during_preflight_stops_the_post(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-1: the deadline is re-checked on a fresh clock after preflight's network phase. A fake
+    clock that passes the deadline during the preflight GETs must not POST — the campaign
+    auto-pauses (``deadline_exceeded``) and the rows stay queueable."""
+    _set_campaign(env, max_batch_size=COUNT_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys, deadline_hours="1")
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+
+        def _past_deadline_on_read(path: str) -> None:
+            if path.startswith(f"/api/v3/File/{500}"):
+                env.now_iso = _iso_plus(T0, 2 * 3600.0)  # deadline passes mid-preflight
+
+        env.stubs.get_hook = _past_deadline_on_read
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        env.stubs.get_hook = None
+        assert env.stubs.posts == []
+        assert report.submitted == 0
+        assert any(r.startswith("send_stale:500:deadline_exceeded") for r in report.reasons)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "deadline_exceeded"
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        rows = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
+        assert int(rows[0]) == 0
+    finally:
+        store.close()

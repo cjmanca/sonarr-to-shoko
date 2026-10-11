@@ -102,6 +102,7 @@ from .daemon import (
     CycleMode,
     CycleReport,
     DaemonDeps,
+    _no_shutdown_requested,
     compute_eligibility,
     full_cycle_due,
     run_cycle,
@@ -376,6 +377,7 @@ def build_daemon_deps(
     max_submissions: int,
     overrides_text: str | None = None,
     attestation_scope: str = SCOPE_DAEMON,
+    shutdown_requested: Callable[[], bool] | None = None,
 ) -> DaemonDeps:
     """Wire one :class:`~shoko_linker.daemon.DaemonDeps` from validated settings."""
     return DaemonDeps(
@@ -390,6 +392,8 @@ def build_daemon_deps(
         advance=sleep,
         jitter=time_rng_unit,
         pid=os.getpid(),
+        now=current_iso,
+        shutdown_requested=shutdown_requested or _no_shutdown_requested,
         attestation_valid=lambda: attestation_input(settings, scope=attestation_scope),
         attestation_verdict=lambda: attestation_verdict_for(
             settings,
@@ -748,6 +752,7 @@ def _run_daemon(args: argparse.Namespace) -> int:
             mapping_store=open_mapping_store(settings),
             max_submissions=settings.sync.max_new_per_cycle,
             overrides_text=read_overrides_text(settings),
+            shutdown_requested=state.should_stop,
         )
         index, last_cycle_key = -1, "cycle-0"
 

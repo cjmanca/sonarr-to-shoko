@@ -17,7 +17,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | F8 — daemon/campaign attestation scope mutual exclusion | P1 | PASS (pending final gate) |
 | F9 — campaign submission budgets never reset between batches | P1 | PASS (pending final gate) |
 | F10 — canary authorization inferred from attempted submissions | P1 | PASS (pending final gate) |
-| F11 — campaign batches reuse stale safety/timing decisions | P1 | TODO |
+| F11 — campaign batches reuse stale safety/timing decisions | P1 | PASS (pending final gate) |
 | F12 — GHCR provenance fetches manifests as blobs | P2 | TODO |
 | F13 — empty hashes pass file-readiness check | P2 | TODO |
 | F14 — deployment docs inconsistent campaign instructions | P2 | TODO |
@@ -53,6 +53,16 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 **Evidence:** `uv run pytest -q` 884 passed; ruff check pass; format --check clean; mypy clean (44 files); git diff --check clean. 16 new F10 tests: newly-approved not drained (zero POSTs) while manual apply works; attempted-unverified canary refused; indeterminate/partial/conflict canaries refused; verified-without-confirmation not drained; confirmation opens bounded drain; revocation stops submissions; digest change invalidates (zero POSTs); fingerprint refresh clears; restart preserves. Docs updated (README, docs/deployment.md §8, config.example.yaml). Offline only.
 
+## F11 — PASS (local commit this round)
+
+**Design:** Per-submission freshness on every POST path. Campaign `_send_one` runs `_campaign_send_staleness` (shutdown flag, campaign status re-read, deadline vs fresh clock, mapping generation identity) before preflight, then `_post_preflight_send_staleness` re-takes `deps.now()` and re-runs the full LOCAL evaluation (shutdown/status/deadline/generation + lease verdict + gate) between preflight and `prepare_send` (intent commit) — no network between re-check and POST. Daemon `_process_candidate` mirrors via `_candidate_freshness_guard` + `_post_preflight_freshness_guard` (shutdown/generation/lease/gate). Fresh `deps.now()` stamps for prepare_send/attempted_iso/record/verify/budget writes; `attempted_iso` strictly increasing per submission. Shutdown wiring: `DaemonDeps.shutdown_requested` is the live bound method `StopState.should_stop` (cli `_run_daemon`), visible to campaign `_campaign_scoped_deps` replace() copies; SIGTERM stops new submissions in both loops; in-flight POST never aborted; sent rows durably tracked, no replay (sends-table assertions). Mapping generation identity = (revision, content_sha256, targets_digest, structure_digest) meta tuple vs guards' validated ActiveMappings — benign UNCHANGED/304 refreshes never stop batches; tampered/missing active fails closed. Deferrals non-destructive (queueable, no quarantine, zero send rows when nothing sent); lease/gate expiry defers per-file (F8 semantics), deadline/status/shutdown/generation stops the batch; F9 progress accounting intact.
+
+**Review:** round 1 ACCEPTABLE with P2-1 TOCTOU (one POST possible after authorization expiry during slow preflight — preflight GETs, 10s/30s timeouts) + 2 P3s → fixed via post-preflight re-check (RED-first: 5 mid-preflight tests, each failed pre-fix with exactly one POST, all green post-fix). Round 2 re-review: **ACCEPTABLE**, no findings; confirmed intent-commit ordering, no network between re-check and POST, durability order prepare_send→mark_sent→submit preserved.
+
+**Deferred P3s:** deadline comparison strict `>` (send at exactly deadline_iso permitted); prepare-time audit/lock stamps use batch-start iso (bookkeeping only, bounded by max_cycle_seconds).
+
+**Evidence:** `uv run pytest -q` 874 passed; ruff check pass; format --check clean; mypy clean (44 files); git diff --check clean. 11 F11 tests incl mid-preflight shutdown/lease/deadline flips (zero POSTs, zero send rows), operator pause mid-batch via second store handle (WAL autocommit read visibility confirmed), mapping swap mid-batch deferral, daemon shutdown-flag stop with no-replay, fresh-timestamp monotonicity. Offline only.
+
 ## Constraints
 
 - Sequential model agents only (single-slot local inference endpoint).
@@ -62,4 +72,4 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 ## Next action
 
-Implement F11 (fresh per-submission safety/timing/shutdown evaluation) via a self-contained delegated brief.
+Implement F12 (GHCR OCI manifest traversal + unknown-provenance tag policy) via a self-contained delegated brief.

@@ -40,7 +40,7 @@ import hashlib
 import json
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -56,6 +56,7 @@ from .daemon import (
     attestation_gate,
     compute_eligibility,
     effective_blocked_over,
+    mapping_generation_stale,
     run_cycle,
     verify_and_close,
 )
@@ -730,6 +731,9 @@ class _SendTally:
     deferred: int
     reasons: tuple[str, ...]
     budget_blocked: bool = False
+    #: F11: a per-submission freshness refusal (deadline/status/shutdown/generation swap) stops
+    #: the batch — the remainder is deferred non-destructively (queueable), never quarantined.
+    stop_batch: bool = False
 
 
 def _bind_campaign(store: StateStore, campaign_id: str, iso: str) -> int:
@@ -781,6 +785,29 @@ def _release_apply_lock(deps: DaemonDeps, now_iso: str) -> None:
         holder = exc.holder.owner_pid if exc.holder is not None else "unknown"
         with contextlib.suppress(WriteDisabledError):
             deps.store.set_meta("last_lock_release_denied", str(holder))
+
+
+def _defer_remaining(
+    files: Sequence[CampaignFile],
+    counters: _CampaignCounters,
+    reasons: list[str],
+    prefix: str,
+) -> None:
+    """Defer the unprocessed tail of a stopped batch (F9/F11): non-destructive by design —
+    every row stays queueable (never quarantined) for a later batch to re-validate."""
+    for deferred in files:
+        counters.deferred += 1
+        reasons.append(f"{prefix}:{deferred.shoko_file_id}")
+
+
+def _fold_tally(counters: _CampaignCounters, tally: _SendTally, reasons: list[str]) -> None:
+    """Fold one submission's tally into the batch counters and reason list."""
+    counters.submitted += tally.submitted
+    counters.verified += tally.verified
+    counters.quarantined += tally.quarantined
+    counters.deferred += tally.deferred
+    counters.sent_running += tally.submitted
+    reasons.extend(tally.reasons)
 
 
 def apply_campaign(
@@ -871,16 +898,17 @@ def apply_campaign(
         # Deferred/remaining files are never quarantined — they stay queueable for later batches.
         for index, entry in enumerate(plan.files):
             if counters.attempts - counters.quarantined >= size:
-                for deferred in plan.files[index:]:
-                    counters.deferred += 1
-                    reasons.append(f"batch_limit:{deferred.shoko_file_id}")
+                _defer_remaining(plan.files[index:], counters, reasons, "batch_limit")
                 break
             if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
                 # Wall-time cap (same semantics as daemon ``_apply``): stop starting new
                 # submissions (never interrupts an in-flight send); the rest stay queueable.
-                for deferred in plan.files[index:]:
-                    counters.deferred += 1
-                    reasons.append(f"batch_time_limit:{deferred.shoko_file_id}")
+                _defer_remaining(plan.files[index:], counters, reasons, "batch_time_limit")
+                break
+            if deps.shutdown_requested():
+                # F11: a shutdown request (SIGTERM) stops starting new submissions mid-batch;
+                # the remainder defers non-destructively (queueable — recovery completes them).
+                _defer_remaining(plan.files[index:], counters, reasons, "shutdown_requested")
                 break
             candidate = _prepare_candidate(context, entry, counters, reasons)
             if candidate is None:
@@ -895,19 +923,14 @@ def apply_campaign(
                 sweep.folders,
                 active,
                 context.queue,
-                now_iso,
                 batch_cycle_key,
             )
-            counters.submitted += tally.submitted
-            counters.verified += tally.verified
-            counters.quarantined += tally.quarantined
-            counters.deferred += tally.deferred
-            counters.sent_running += tally.submitted
-            reasons.extend(tally.reasons)
-            if tally.budget_blocked:
-                # F9 zero-progress: a campaign-wide budget refusal is NOT progress. The window
-                # is exhausted, so every remaining file refuses identically — stop starting
-                # new submissions (no full-plan preflight storm) and defer the rest (queueable).
+            _fold_tally(counters, tally, reasons)
+            if tally.stop_batch or tally.budget_blocked:
+                # F11: the guard-time authorization went stale (deadline/status/shutdown/
+                # generation swap) — F9: a campaign-wide budget refusal is NOT progress. Stop
+                # starting new submissions; the remainder defers non-destructively (queueable,
+                # the next cycle re-validates every input).
                 counters.deferred += len(plan.files) - index - 1
                 break
             counters.processed += 1
@@ -1417,63 +1440,107 @@ def _target_key(target: LinkTarget) -> tuple[int, int, int, int, str, str]:
     )
 
 
-def _send_one(
+def _campaign_send_staleness(
+    deps: DaemonDeps,
+    store: StateStore,
+    campaign_id: str,
+    active: ActiveMappings,
+    send_iso: str,
+) -> str | None:
+    """F11: the inputs a batch-start guard could not see, re-evaluated before each POST.
+
+    Returns the refusal reason (the candidate defers non-destructively and the batch stops) or
+    ``None`` when the POST stays authorized. The lease and the write gate are already fresh per
+    submission inside :func:`~shoko_linker.linking.preflight` (P2-4), and the file/XRef identity
+    is re-read there; this covers the clock-bound and store-bound inputs: the operator shutdown,
+    the campaign deadline, the campaign status, and the active mapping generation identity.
+    """
+    if deps.shutdown_requested():
+        return "shutdown_requested"
+    campaign = store.get_campaign(campaign_id)
+    if campaign is None:
+        return "campaign_missing"
+    if campaign.deadline_iso is not None and _parse_iso(send_iso) > _parse_iso(
+        campaign.deadline_iso
+    ):
+        _pause_campaign(store, campaign_id, "deadline_exceeded", send_iso)
+        return "deadline_exceeded"
+    if campaign.status != CAMPAIGN_STATUS_APPROVED:
+        return f"campaign_{campaign.status}"
+    if mapping_generation_stale(deps, active, send_iso):
+        return "mapping_generation_changed"
+    return None
+
+
+def _preflight_tally(
+    verdict: Any, store: StateStore, plan: LinkPlan, send_iso: str
+) -> _SendTally | None:
+    """The preflight verdict as a tally: ``None`` when the send may proceed.
+
+    A deferring reason (transient safety/queue) keeps the row queueable (F1/P2-4); a hard
+    preflight block quarantines the candidate (never silently replaced).
+    """
+    if verdict.ok:
+        return None
+    reason = verdict.reasons[0].value if verdict.reasons else "preflight_blocked"
+    if any(item in _DEFERRING_PREFLIGHT_REASONS for item in verdict.reasons):
+        return _SendTally(0, 0, 0, 1, (f"preflight_deferred:{plan.shoko_file_id}:{reason}",))
+    _quarantine(store, plan.shoko_file_id, f"preflight_{reason}", send_iso)
+    return _SendTally(
+        0,
+        0,
+        1,
+        0,
+        (f"campaign_quarantine:{plan.shoko_file_id}:preflight_{reason}",),
+    )
+
+
+def _post_preflight_send_staleness(
     deps: DaemonDeps,
     settings: Settings,
     store: StateStore,
-    plan: LinkPlan,
     campaign_id: str,
-    folders: Mapping[int, ImportFolder],
     active: ActiveMappings,
-    queue: QueueSnapshot | None,
-    now_iso: str,
-    cycle_key: str,
-) -> _SendTally:
-    """One approved candidate through the guarded path; zero writes unless preflight passes."""
-    verdict = preflight(
-        deps.shoko,
-        plan,
-        settings,
-        folders,
-        # P2-4: the campaign lease/gate is re-checked per submission, so a lease that expires
-        # mid-batch stops later files (no POST) instead of riding the guard-time verdict.
-        attestation_valid=deps.attestation_valid(),
-        apply_gate_open=apply_gate(settings),
-        queue=queue,
-        active_targets_digest=active.targets_digest,
-        active_structure_digest=active.structure_digest,
-        blocked_over=effective_blocked_over(deps),
-        mapping_index=active.index,
-    )
-    if not verdict.ok:
-        reason = verdict.reasons[0].value if verdict.reasons else "preflight_blocked"
-        if any(item in _DEFERRING_PREFLIGHT_REASONS for item in verdict.reasons):
-            return _SendTally(0, 0, 0, 1, (f"preflight_deferred:{plan.shoko_file_id}:{reason}",))
-        _quarantine(store, plan.shoko_file_id, f"preflight_{reason}", now_iso)
-        return _SendTally(
+    plan: LinkPlan,
+) -> tuple[str, _SendTally | None]:
+    """P2-1: the local re-evaluation between preflight's network phase and the intent commit.
+
+    Preflight's File + per-episode GETs are slow (10s connect / 30s read), so a shutdown,
+    deadline pass, status change, generation swap, lease expiry, or gate close that lands DURING
+    them must not ride the pre-preflight verdict into ``prepare_send``. The clock is re-taken
+    and every check is local (store re-read, disk lease, config gate) — no network, no polling.
+    Returns the fresh submission timestamp and the deferral tally (``None`` when the POST stays
+    authorized).
+    """
+    send_iso = deps.now()
+    stale = _campaign_send_staleness(deps, store, campaign_id, active, send_iso)
+    if stale is not None:
+        return send_iso, _SendTally(
+            0,
             0,
             0,
             1,
-            0,
-            (f"campaign_quarantine:{plan.shoko_file_id}:preflight_{reason}",),
+            (f"send_stale:{plan.shoko_file_id}:{stale}",),
+            stop_batch=True,
         )
-    prepared = store.prepare_send(
-        plan.shoko_file_id,
-        plan.fingerprint,
-        request_fingerprint(plan),
-        targets_digest=plan.targets_digest,
-        structure_digest=plan.structure_digest,
-        mapping_revision=str(active.revision),
-        cycle_key=cycle_key,
-        iso=now_iso,
-        policy=plan.policy,
-        campaign_id=campaign_id,
-        expected_episode_jobs=len(plan.episode_ids),
-        target_ids=tuple(
-            (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
-            for target in plan.targets
-        ),
-    )
+    if not deps.attestation_valid() or not apply_gate(settings):
+        # F8 semantics: a transient lease/gate expiry defers the file (row stays queueable).
+        return send_iso, _SendTally(
+            0, 0, 0, 1, (f"preflight_deferred:{plan.shoko_file_id}:blocked_safety",)
+        )
+    return send_iso, None
+
+
+def _commit_send(
+    deps: DaemonDeps,
+    store: StateStore,
+    plan: LinkPlan,
+    campaign_id: str,
+    cycle_key: str,
+    send_iso: str,
+    prepared: SendToken | BudgetRefusal,
+) -> _SendTally:
+    """Durably commit the send intent, submit once, and inline-verify — never replay (P1-3)."""
     if isinstance(prepared, BudgetRefusal):
         # F9-1d: only campaign-wide refusals break the batch. A per-file
         # ``pending_episode_jobs_exhausted`` depends on this file's own episode count, so the
@@ -1489,21 +1556,94 @@ def _send_one(
         )
     token: SendToken = prepared
     # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
-    store.mark_sent(token, iso=now_iso)
+    store.mark_sent(token, iso=send_iso)
     send = submit_link(deps.shoko, plan, clock=deps.monotonic)
     store.record_send_outcome(
-        token, send.outcome, iso=now_iso, http_status=send.http_status, detail=send.detail
+        token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
     )
-    store.record_campaign_send(campaign_id, now_iso)
+    store.record_campaign_send(campaign_id, send_iso)
     if send.outcome is SendOutcome.AMBIGUOUS_SEND:
         return _SendTally(
             1, 0, 0, 0, (f"ambiguous_send:{plan.shoko_file_id} - verify, never resubmit",)
         )
     if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
         return _SendTally(1, 0, 0, 0, (f"send_{send.outcome.value}:{plan.shoko_file_id}",))
-    detail = verify_and_close(deps, plan, plan.shoko_file_id, cycle_key, now_iso)
+    detail = verify_and_close(deps, plan, plan.shoko_file_id, cycle_key, send_iso)
     verified = 1 if detail.endswith(":verified") else 0
     return _SendTally(1, verified, 0, 0, (detail,))
+
+
+def _send_one(
+    deps: DaemonDeps,
+    settings: Settings,
+    store: StateStore,
+    plan: LinkPlan,
+    campaign_id: str,
+    folders: Mapping[int, ImportFolder],
+    active: ActiveMappings,
+    queue: QueueSnapshot | None,
+    cycle_key: str,
+) -> _SendTally:
+    """One approved candidate through the guarded path; zero writes unless preflight passes.
+
+    F11/P2-1: the submission runs on a **fresh** clock — staleness is evaluated before preflight
+    (to skip network reads when authorization is already gone) AND re-evaluated locally after
+    preflight's network phase, immediately before the intent commit; every submission timestamp
+    (prepare intent, attempted anchor, campaign progress) comes from ``deps.now()``, never from
+    the batch-start snapshot.
+    """
+    send_iso = deps.now()
+    stale = _campaign_send_staleness(deps, store, campaign_id, active, send_iso)
+    if stale is not None:
+        return _SendTally(
+            0,
+            0,
+            0,
+            1,
+            (f"send_stale:{plan.shoko_file_id}:{stale}",),
+            stop_batch=True,
+        )
+    verdict = preflight(
+        deps.shoko,
+        plan,
+        settings,
+        folders,
+        # P2-4: the campaign lease/gate is re-checked per submission, so a lease that expires
+        # mid-batch stops later files (no POST) instead of riding the guard-time verdict.
+        attestation_valid=deps.attestation_valid(),
+        apply_gate_open=apply_gate(settings),
+        queue=queue,
+        active_targets_digest=active.targets_digest,
+        active_structure_digest=active.structure_digest,
+        blocked_over=effective_blocked_over(deps),
+        mapping_index=active.index,
+    )
+    blocked = _preflight_tally(verdict, store, plan, send_iso)
+    if blocked is not None:
+        return blocked
+    send_iso, stale_after = _post_preflight_send_staleness(
+        deps, settings, store, campaign_id, active, plan
+    )
+    if stale_after is not None:
+        return stale_after
+    prepared = store.prepare_send(
+        plan.shoko_file_id,
+        plan.fingerprint,
+        request_fingerprint(plan),
+        targets_digest=plan.targets_digest,
+        structure_digest=plan.structure_digest,
+        mapping_revision=str(active.revision),
+        cycle_key=cycle_key,
+        iso=send_iso,
+        policy=plan.policy,
+        campaign_id=campaign_id,
+        expected_episode_jobs=len(plan.episode_ids),
+        target_ids=tuple(
+            (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
+            for target in plan.targets
+        ),
+    )
+    return _commit_send(deps, store, plan, campaign_id, cycle_key, send_iso, prepared)
 
 
 # ------------------------------------------------------------------ lifecycle

@@ -168,9 +168,14 @@ class ShokoStub:
         self.post_status: int | None = None
         self.on_post: Callable[[], None] | None = None
         self.unmaterialized: set[int] = set()  # AniDB episode ids whose Shoko metadata is not ready
+        #: P2-1: fired on every GET with the request path — simulates a slow preflight network
+        #: phase (authorization state flips mid-call, before the POST).
+        self.on_get: Callable[[str], None] | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if request.method == "GET" and self.on_get is not None:
+            self.on_get(request.url.path)
         return self._respond(request)
 
     def _queue(self, request: httpx.Request) -> httpx.Response:
@@ -581,6 +586,8 @@ def build_deps(
     settings: Settings | None = None,
     shoko: ShokoStub | None = None,
     mapping_dir: Path | None = None,
+    now: Callable[[], str] = lambda: T0,
+    shutdown_requested: Callable[[], bool] = lambda: False,
 ) -> DaemonDeps:
     settings = settings or make_settings(tmp_path)
     mapping_directory = mapping_dir if mapping_dir is not None else tmp_path / "mappings"
@@ -609,6 +616,8 @@ def build_deps(
         max_cycle_seconds=max_cycle_seconds,
         churn_limit=churn_limit,
         max_recovery_rows_per_cycle=max_recovery_rows_per_cycle,
+        now=now,
+        shutdown_requested=shutdown_requested,
     )
 
 
@@ -4258,3 +4267,147 @@ def test_daemon_lease_expiry_mid_cycle_stops_later_new_arrivals(
     assert state_b is not None
     assert state_b.state is FileState.PLANNED  # deferred, NOT quarantined
     assert any("attestation_invalid" in reason for reason in report.reasons)
+
+
+def test_shutdown_flag_stops_daemon_apply_loop_new_submissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F11: the daemon apply loop checks the shutdown flag before each new submission. A SIGTERM
+    that lands mid-cycle stops the remaining new arrivals (zero further POSTs); the deferred rows
+    stay planned (queueable), never quarantined, and the already-sent row stays durably tracked."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    a = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    b = SpecFile(series_id=2, file_id=20, shoko_id=501)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([a, b])
+    state = {"stopped": False}
+    shoko.on_post = lambda: state.__setitem__("stopped", True)  # SIGTERM lands during file 500
+    sleeper = Sleeper()
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[a, b],
+            shoko_files=[a, b],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=sleeper.advance,
+            shoko=shoko,
+            shutdown_requested=lambda: state["stopped"],
+            max_submissions=2,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        state_a = store.get_file(500)
+        state_b = store.get_file(501)
+        sent_rows = store._conn.execute(
+            "SELECT outcome FROM sends WHERE shoko_file_id = 500"
+        ).fetchall()
+    finally:
+        store.close()
+    assert len(shoko.posts) == 1  # the shutdown stops later submissions, never the in-flight one
+    assert state_a is not None
+    assert state_a.state is FileState.VERIFIED  # the in-flight send completed normally
+    assert state_b is not None
+    assert state_b.state is FileState.PLANNED  # deferred, NOT quarantined
+    # Durably tracked exactly once: the completed row is closed (verified), never replayable.
+    assert len(sent_rows) == 1
+    assert str(sent_rows[0][0]) == "verified"
+    assert any("shutdown_requested" in reason for reason in report.reasons)
+
+
+def test_shutdown_during_preflight_network_phase_stops_the_daemon_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-1: a shutdown that lands DURING preflight's slow network phase (File + episode GETs)
+    must not authorize the POST. The local freshness guard runs again after preflight, before
+    ``prepare_send`` — the candidate defers (stays planned), zero POSTs, zero send rows."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    a = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([a])
+    state = {"stopped": False}
+
+    def _flip_on_preflight_read(path: str) -> None:
+        if path.startswith("/api/v3/File/500"):
+            state["stopped"] = True  # SIGTERM lands mid-preflight
+
+    shoko.on_get = _flip_on_preflight_read
+    sleeper = Sleeper()
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[a],
+            shoko_files=[a],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=sleeper.advance,
+            shoko=shoko,
+            shutdown_requested=lambda: state["stopped"],
+            max_submissions=2,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        record = store.get_file(500)
+        rows = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
+    finally:
+        store.close()
+    assert len(shoko.posts) == 0  # the expired authorization never sent
+    assert record is not None
+    assert record.state is FileState.PLANNED  # deferred, NOT quarantined
+    assert int(rows[0]) == 0  # nothing durably in-flight to replay
+    assert any("shutdown_requested" in reason for reason in report.reasons)
+
+
+def test_lease_expiry_during_preflight_network_phase_defers_daemon_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-1: a lease that expires DURING preflight's network phase must not ride the
+    pre-preflight verdict into a POST — the lease/gate verdict is re-taken locally before
+    ``prepare_send``; the candidate defers (stays planned), zero POSTs."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    a = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([a])
+    lease = {"valid": True}
+
+    def _expire_on_preflight_read(path: str) -> None:
+        if path.startswith("/api/v3/File/500"):
+            lease["valid"] = False  # the lease dies mid-preflight
+
+    shoko.on_get = _expire_on_preflight_read
+    sleeper = Sleeper()
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[a],
+            shoko_files=[a],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=sleeper.advance,
+            shoko=shoko,
+            attestation_valid=lambda: lease["valid"],
+            max_submissions=2,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        record = store.get_file(500)
+        rows = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
+    finally:
+        store.close()
+    assert len(shoko.posts) == 0
+    assert record is not None
+    assert record.state is FileState.PLANNED
+    assert int(rows[0]) == 0
+    assert any("attestation_expired" in reason for reason in report.reasons)

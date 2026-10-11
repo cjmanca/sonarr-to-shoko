@@ -105,6 +105,9 @@ from .mapping_store import (
 from .mapping_store import (
     refresh as mapping_refresh,
 )
+from .mapping_store import (
+    status as mapping_status,
+)
 from .mappings import MappingIndex, ResolutionStatus, TargetIdentity, effective_targets
 from .mappings import resolve as resolve_mapping
 from .policies import RunPolicy
@@ -174,6 +177,16 @@ def _no_attestation_verdict() -> AttestationVerdict | None:
     return None
 
 
+def _current_wall_iso() -> str:
+    """The wall clock for per-submission timestamps (test seam: a fake clock)."""
+    return datetime.now(UTC).isoformat()
+
+
+def _no_shutdown_requested() -> bool:
+    """No shutdown seam (CLI/once paths): the flag stays False."""
+    return False
+
+
 @dataclass(frozen=True)
 class AttestationScopeHooks:
     """Per-campaign attestation callables (F7 daemon drain, campaign-scope lease).
@@ -224,6 +237,10 @@ class DaemonDeps:
     churn_limit: int = 500
     max_recovery_rows_per_cycle: int = 100
     campaign_attestation: Callable[[str], AttestationScopeHooks] | None = None
+    #: F11: the fresh wall clock per submission (never the batch/cycle-start snapshot) and the
+    #: SIGTERM flag wired by the daemon runner. Defaults are safe for test/once paths.
+    now: Callable[[], str] = _current_wall_iso
+    shutdown_requested: Callable[[], bool] = _no_shutdown_requested
 
 
 @dataclass(frozen=True)
@@ -1272,6 +1289,53 @@ def _recovery_sort_key(deps: DaemonDeps, row: Any) -> str:
     return record.updated_iso if record is not None else ""
 
 
+def _candidate_freshness_guard(
+    deps: DaemonDeps, active: ActiveMappings, send_iso: str
+) -> _ApplyOutcome | None:
+    """F11: per-candidate freshness refusals — deferral (stays ``planned``/queueable), never
+    a quarantine, never a POST. The lease/gate freshness is owned by the
+    per-candidate eligibility + preflight below (F2/P2-4)."""
+    if deps.shutdown_requested():
+        return _ApplyOutcome(0, 1, ("shutdown_requested",), ())
+    if mapping_generation_stale(deps, active, send_iso):
+        # The plan was frozen against the guard-time generation: a swap defers the candidate
+        # (the next cycle re-validates), never POSTs on the stale digests.
+        return _ApplyOutcome(0, 1, ("mapping_generation_changed",), ())
+    return None
+
+
+def _post_preflight_freshness_guard(
+    deps: DaemonDeps, active: ActiveMappings, send_iso: str
+) -> _ApplyOutcome | None:
+    """P2-1: the guard re-run between preflight's network phase and the intent commit.
+
+    Preflight's File + per-episode GETs are slow (10s connect / 30s read), so a
+    shutdown, generation swap, lease expiry, or gate close that lands DURING them must not ride the
+    pre-preflight verdict into ``prepare_send``. This re-evaluation is purely local (store meta +
+    the disk lease + config gate) — no network, no polling.
+    """
+    guard = _candidate_freshness_guard(deps, active, send_iso)
+    if guard is not None:
+        return guard
+    if not deps.attestation_valid() or not apply_gate(deps.settings):
+        # Transient safety (F8 semantics): defer, never quarantine.
+        return _ApplyOutcome(0, 1, ("attestation_expired",), ())
+    return None
+
+
+def _close_send(
+    deps: DaemonDeps, plan: LinkPlan, file_id: int, cycle_key: str, send_iso: str, send: Any
+) -> _ApplyOutcome:
+    """Close the durable send row's outcome: inline verify on acceptance, no resubmit ever."""
+    if send.outcome is SendOutcome.AMBIGUOUS_SEND:
+        return _ApplyOutcome(
+            1, 0, (), (f"ambiguous_send: file {file_id} - verify, never resubmit",)
+        )
+    if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
+        return _ApplyOutcome(1, 0, (), ())
+    return _ApplyOutcome(1, 0, (), (_verify_and_close(deps, plan, file_id, cycle_key, send_iso),))
+
+
 def _process_candidate(
     deps: DaemonDeps,
     plan: LinkPlan,
@@ -1281,17 +1345,23 @@ def _process_candidate(
     folders: Mapping[int, ImportFolder],
     queue: QueueSnapshot | None,
     cycle_key: str,
-    now_iso: str,
 ) -> _ApplyOutcome:
-    """One file's guarded send: eligibility → preflight → prepare → mark_sent → submit → verify."""
+    """One file's guarded send: fresh safety inputs → eligibility → preflight → prepare →
+    mark_sent → submit → verify (F11: every submission timestamp comes from the fresh clock)."""
     # F2: the attestation lease and the apply gate are re-evaluated per candidate, not from the
     # cycle-start snapshot, so a lease that expires (or a gate that closes) mid-cycle stops the
     # remaining submissions. A blocked candidate defers (stays planned) — never quarantined.
     attestation_ok = deps.attestation_valid()
     gate_open = apply_gate(deps.settings)
+    # F11: fresh per-submission time + live safety inputs. A cycle-start snapshot must never
+    # authorize a POST after a shutdown lands or the mapping generation swaps mid-cycle.
+    send_iso = deps.now()
+    stale = _candidate_freshness_guard(deps, active, send_iso)
+    if stale is not None:
+        return stale
     verdict = deps.store.can_auto_apply(
         file_id,
-        now=now_iso,
+        now=send_iso,
         attestation_valid=attestation_ok,
         gate_open=gate_open,
         budgets_ok=flags.budgets_ok,
@@ -1317,9 +1387,16 @@ def _process_candidate(
         reason = gate.reasons[0].value if gate.reasons else "preflight_blocked"
         drift: tuple[str, ...] = ()
         if PreflightReason.MAPPING_CHANGED in gate.reasons:
-            _advance(deps, file_id, FileState.WAITING, "mapping_drift", now_iso)
+            _advance(deps, file_id, FileState.WAITING, "mapping_drift", send_iso)
             drift = (f"mapping_changed: file {file_id} in-flight plan drift, no POST",)
         return _ApplyOutcome(0, 0, (f"preflight_{reason}",), drift)
+    # P2-1: preflight's network phase is slow — re-take the fresh clock and re-run the LOCAL
+    # evaluation (shutdown, generation swap, lease verdict, gate) immediately before the intent
+    # commit, so an authorization that expired mid-preflight never authorizes this POST.
+    send_iso = deps.now()
+    stale_after = _post_preflight_freshness_guard(deps, active, send_iso)
+    if stale_after is not None:
+        return stale_after
     prepared = deps.store.prepare_send(
         file_id,
         plan.fingerprint,
@@ -1328,7 +1405,7 @@ def _process_candidate(
         structure_digest=plan.structure_digest,
         mapping_revision=str(active.revision),
         cycle_key=cycle_key,
-        iso=now_iso,
+        iso=send_iso,
         policy=plan.policy,
         # P2-4: reserve the plan's real episode-job count; P1-3: persist the expected
         # verification triples so a persisted row survives restarts (re-poll/re-inspect).
@@ -1342,18 +1419,39 @@ def _process_candidate(
         return _ApplyOutcome(0, 1, ("budget_refusal",), ())
     token: SendToken = prepared
     # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
-    deps.store.mark_sent(token, iso=now_iso)
+    deps.store.mark_sent(token, iso=send_iso)
     send = submit_link(deps.shoko, plan, clock=deps.monotonic)
     deps.store.record_send_outcome(
-        token, send.outcome, iso=now_iso, http_status=send.http_status, detail=send.detail
+        token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
     )
-    if send.outcome is SendOutcome.AMBIGUOUS_SEND:
-        return _ApplyOutcome(
-            1, 0, (), (f"ambiguous_send: file {file_id} - verify, never resubmit",)
-        )
-    if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
-        return _ApplyOutcome(1, 0, (), ())
-    return _ApplyOutcome(1, 0, (), (_verify_and_close(deps, plan, file_id, cycle_key, now_iso),))
+    return _close_send(deps, plan, file_id, cycle_key, send_iso, send)
+
+
+def mapping_generation_identity(deps: DaemonDeps, now_iso: str) -> tuple[int, str, str, str] | None:
+    """The disk-active generation's identity tuple, ``None`` when the active cache is absent.
+
+    Cheap by design (meta + content digest read, no index parse): F11 re-checks it per submission
+    so a mapping refresh that swaps generations mid-batch is observed *before* the next POST.
+    """
+    status = mapping_status(deps.mapping_store, _parse_iso(now_iso))
+    if not status.active_present or status.content_sha256 is None:
+        return None
+    return (
+        status.revision,
+        status.content_sha256,
+        status.targets_digest or "",
+        status.structure_digest or "",
+    )
+
+
+def mapping_generation_stale(deps: DaemonDeps, active: ActiveMappings, now_iso: str) -> bool:
+    """True when the disk-active generation is no longer the one the guards validated against."""
+    return mapping_generation_identity(deps, now_iso) != (
+        active.revision,
+        active.content_sha256,
+        active.targets_digest,
+        active.structure_digest,
+    )
 
 
 def _grace_period_active(deps: DaemonDeps, record: FileRecord, now_iso: str) -> bool:
@@ -1416,12 +1514,18 @@ def _apply(
         if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
             deferred += len(ordered) - index
             break
+        if deps.shutdown_requested():
+            # F11: a shutdown request stops starting NEW submissions mid-cycle (never
+            # aborts an in-flight send); the remainder stays planned (queueable, non-destructive).
+            deferred += len(ordered) - index
+            reasons.append("shutdown_requested")
+            break
         if _grace_period_active(deps, record, now_iso):
             deferred += 1
             reasons.append(GRACE_PERIOD_REASON)
             continue
         outcome = _process_candidate(
-            deps, plans[file_id], file_id, flags, active, folders, queue, cycle_key, now_iso
+            deps, plans[file_id], file_id, flags, active, folders, queue, cycle_key
         )
         submitted += outcome.submitted
         deferred += outcome.deferred
@@ -1454,6 +1558,8 @@ _FILE_SCOPED_REASON_PREFIXES: Final[tuple[str, ...]] = (
     "campaign_quarantine:",
     "preflight_deferred:",
     "budget_refusal:",
+    "send_stale:",
+    "shutdown_requested:",
 )
 
 #: Consecutive zero-progress drain cycles before the campaign auto-pauses
