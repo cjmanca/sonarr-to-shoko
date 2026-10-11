@@ -32,12 +32,16 @@ verify, and only then widen the batch.
   assertions in `tests/test_workflows.py` (permissions, gates, PR isolation,
   SHA pins, env-indirection hygiene, image-reference validation, registry
   discovery wiring, historical fallback) plus manual review stand in for them.
-- **Campaign multi-batch apply is currently defective.** Mocked M9-e2e evidence
-  shows campaign apply can pause the next batch with
-  `source_discontinuity` after the campaign's own accepted links shrink the
-  Shoko `Unrecognized` discovery total. Treat campaign apply as a
-  single canary batch, verify, and stop before scheduling more batches
-  until the defect is fixed.
+- **Campaign apply progresses across many bounded batches (F9).** One approval
+  covers the whole finite campaign; each apply cycle processes a bounded batch
+  (≤ `campaign.max_batch_size`) through the same guarded path, and durable,
+  restart-resilient per-cycle ids mean a restart never replays a completed
+  send. A batch that makes zero progress pauses with a persisted reason and zero
+  POSTs; `source_discontinuity` is a **named deferral** in that set (the campaign's
+  own accepted links shrink the Shoko `Unrecognized` discovery total), not a build
+  defect. The automatic daemon drain needs the explicit `campaign authorize-drain`
+  confirmation on a settled canary, and re-evaluates the applicable lease before
+  every submission (per-submission freshness, F11).
 - **True delta-fetch light cycles are not implemented.** Light cycles use the
   same inventories with reduced work budgets.
 
@@ -193,6 +197,32 @@ The lease must be valid for `daemon` apply. If it is absent, invalid, expired,
 scope-mismatched, version-stale, or invalidated, applies are suppressed and the
 daemon degrades to read-only reporting.
 
+### Daemon and campaign leases are separate attestations
+
+Two independent safety attestations gate writes, each recorded and evaluated
+by scope:
+
+- The **daemon lease** is the file at `safety.attestation_file`
+  (`/data/attestation.yaml`), scope `daemon`. It gates `once --apply` and the
+  daemon's own new-arrival/backlog apply.
+- Each **campaign lease** is a sibling in the same directory named
+  `<stem>.campaign-<id>.yaml` — for the example above,
+  `/data/attestation.campaign-<campaign-id>.yaml` — with scope `campaign:<id>`. It
+  gates that campaign's batches: a manual `campaign apply` **and** the daemon's
+  automatic drain of the same campaign.
+
+`attestation record`, `status`, and `invalidate` all take `--scope` (default
+`daemon`). Recording a campaign lease never clobbers the daemon lease, and
+`invalidate --scope "campaign:<id>"` never touches the daemon lease. Each lease
+expires and pauses **only its own scope**, and both survive a restart: a campaign
+can drain under a valid campaign lease even when the daemon lease is invalid, and
+vice versa. Evaluate a scope's verdict explicitly:
+
+```powershell
+uv run shoko-sonarr-linker attestation status config.yaml --scope daemon --json
+uv run shoko-sonarr-linker attestation status config.yaml --scope "campaign:<campaign-id>" --json
+```
+
 ### Apply-ownership fence (one apply writer per state directory)
 
 Exclusive apply ownership is fenced by an **OS advisory lock file** `apply.lock`,
@@ -273,12 +303,20 @@ Do not clear state flags until the report is understood.
 
 ## 8. Campaign canary procedure
 
-For backlog campaign work, use a plan file and approval digest. Keep the first
-campaign batch to one file.
+Prepare the **complete intended campaign first**, then canary a small subset from
+the *approved* plan. The approved plan is a finite backlog: there is no
+un-approved "remainder" — every file the daemon may later drain is already in the
+approved plan, and the canary is just the first `--batch-size 1` slice of it.
 
 ```powershell
-uv run shoko-sonarr-linker campaign prepare config.yaml --limit 1 --out plan.json --json
+# Prepare the whole finite campaign. No --limit ⇒ campaign.max_campaign_files
+# (default 7000); --limit N narrows the plan, --deadline-hours H bounds the
+# campaign window (default 168), --out FILE writes the canonical plan. This is a
+# zero-write dry-run reconciliation that prints the approval digest.
+uv run shoko-sonarr-linker campaign prepare config.yaml --out plan.json --json
+# Approve by supplying the printed approval digest SEPARATELY from the file.
 uv run shoko-sonarr-linker campaign approve config.yaml --plan plan.json --digest <approval-digest> --json
+# Record THIS campaign's own lease (scope campaign:<id>; a sibling of the daemon lease).
 uv run shoko-sonarr-linker attestation record config.yaml `
   --endpoint http://shoko:8111 `
   --version 5.3.3 `
@@ -288,9 +326,12 @@ uv run shoko-sonarr-linker attestation record config.yaml `
   --scope "campaign:<campaign-id>" `
   --note "campaign canary" `
   --confirm
+uv run shoko-sonarr-linker attestation status config.yaml --scope "campaign:<campaign-id>" --json
+# Apply ONLY a one-file canary subset from the approved campaign.
 uv run shoko-sonarr-linker campaign apply config.yaml --plan plan.json --batch-size 1 --json
 uv run shoko-sonarr-linker campaign verify config.yaml --campaign-id <campaign-id> --json
 uv run shoko-sonarr-linker campaign report config.yaml --campaign-id <campaign-id> --plan plan.json --json
+# After the canary settles and physical-media inspection passes, authorize the drain.
 uv run shoko-sonarr-linker campaign authorize-drain config.yaml --campaign-id <campaign-id> `
   --note "canary inspected: renames/deletions/MyList side effects reviewed" --confirm
 ```
@@ -324,10 +365,6 @@ Campaign drain rules the daemon enforces every batch (identical to `campaign app
 - Pause/resume/revoke are confirmed operator commands and take effect on the next cycle: a paused
   or revoked campaign is skipped mid-drain; revoke returns queued planned/mapped rows to `waiting`
   and refuses future applies.
-
-Stop after the first campaign batch in this build. The known multi-batch defect
-can pause subsequent campaign apply with `source_discontinuity` after
-the campaign's own accepted links reduce the discovery total.
 
 Campaign rules:
 

@@ -20,7 +20,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | F11 — campaign batches reuse stale safety/timing decisions | P1 | PASS (pending final gate) |
 | F12 — GHCR provenance fetches manifests as blobs | P2 | PASS (pending final gate) |
 | F13 — empty hashes pass file-readiness check | P2 | PASS (pending final gate) |
-| F14 — deployment docs inconsistent campaign instructions | P2 | TODO |
+| F14 — deployment docs inconsistent campaign instructions | P2 | PASS (pending final gate) |
 | Final validation (full checks + simulated campaign + adversarial review) | Gate | TODO |
 
 ## F8 — PASS (local commit this round)
@@ -83,6 +83,14 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 **Evidence:** `uv run pytest -q` 944 passed; ruff check pass; format --check clean (48 files); mypy clean (45 files); git diff --check clean. 43 new gate tests across snapshot/preflight/apply covering all 8 plan scenarios (empty/whitespace/malformed/missing/complete/Imported=null/numeric crc32/partial). Offline only.
 
+## F14 — PASS (local commit this round)
+
+**Design (docs-only):** `docs/deployment.md` §8 rewritten to the complete-campaign flow: `campaign prepare` with NO `--limit` (defaults to `campaign.max_campaign_files`) → approve → record + verify the campaign-scope lease → `campaign apply --batch-size 1` canary → verify/report → `campaign authorize-drain --confirm` → daemon drains the rest. §0 obsolete "multi-batch apply is defective / single canary batch and stop" bullet replaced with honest F9/F10/F11 behavior (bounded restart-resilient cycles, zero-progress pauses, drain authorization, per-submission freshness; `source_discontinuity` described as a named deferral). §8 "Stop after the first campaign batch in this build" removed. §6 gained the daemon↔campaign lease duality subsection (sibling `<stem>.campaign-<id>.yaml`, `--scope` on record/status/invalidate, independent expiry/pause, cross-scope isolation, restart survival, `attestation status --scope ...` examples). README lease lifecycle scoped; Rollback shorthand expanded with all required flags (`--note`, `--campaign-id`, `--file-id/--fingerprint`).
+
+**Review:** read-only reviewer verified all 62 doc command lines against `build_parser().parse_args` + per-command `--help`; behavioral claims grep-verified against source; §4/§5 operator-safety gate untouched; README↔deployment consistent; verdict **ACCEPTABLE**, only P3 was the pre-existing README Rollback shorthand — fixed inline in this slice.
+
+**Evidence:** full suite stays green (docs-only): `uv run pytest -q` exit 0 (944 collected); ruff check pass; format --check clean; mypy clean; git diff --check clean. Live operator-runs remain EXTERNAL/UNVERIFIED by design.
+
 ## Constraints
 
 - Sequential model agents only (single-slot local inference endpoint).
@@ -92,4 +100,4 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 ## Next action
 
-Implement F13 (hash-readiness validation) via a self-contained delegated brief.
+Run Phase D final validation (full checks, ≥100-file simulated campaign across cycle boundaries, GHCR regression, adversarial cross-cutting review, final STATUS.md evidence).

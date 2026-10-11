@@ -51,7 +51,7 @@ uv run python -m pytest -q
 | `mappings refresh [--force] [--json]` | Due-gated conditional GET of the Anime-Lists source only. Exit 0 for `activated`/`unchanged` (304)/`not_due`; exit 4 on failure (the last-known-good generation stays active) | mapping source only |
 | `attestation status [--scope S] [--json]` | Evaluate the configured safety lease **offline** (no network): `valid`/`absent`/`invalid`/`expired`/`stale_version`, the record fields, digest, seconds-to-expiry and the warn-lead flag. Scope is `daemon` (default) or `campaign:<id>` | none |
 | `attestation record --endpoint URL --version VER --mounts ITEMS --settings FLAGS [--hours H] [--scope S] --note TEXT --confirm [--json]` | Operator builds the lease from the facts **they physically inspected** (read-only mounts, Shoko version, safety settings flags). Expiry is capped by `safety.attestation_validity_hours`; 0600 is attempted where the platform supports it | none |
-| `attestation invalidate --note TEXT --confirm [--json]` | Move the lease aside to `…​.revoked` (the audit trail is never overwritten) and record the action. Applies stay closed until a new lease is recorded | none |
+| `attestation invalidate [--scope S] --note TEXT --confirm [--json]` | Move the lease for the requested scope (`daemon` default, `campaign:<id>`) to `…​.revoked` (the audit trail is never overwritten) and record the action; a campaign-scope invalidate never touches the daemon lease. Applies stay closed in that scope until a new lease is recorded | none |
 | `campaign prepare [--limit N] [--deadline-hours H] --out FILE [--json]` | Full **dry-run** reconciliation (zero writes) → canonical plan file of backlog candidates with resolved mappings. Prints the **approval digest** (canonical SHA-256 of the plan file) | Sonarr/Shoko reads only |
 | `campaign approve --plan FILE --digest HEX [--json]` | Approve the campaign by supplying the digest **separately from the file**; a mismatch refuses (exit 2) and prints both digests. Persists the approved campaign row + per-file bindings | none |
 | `campaign apply --plan FILE [--batch-size N] [--json]` | One bounded batch (default/cap `campaign.max_batch_size`) of **approved** candidates through the guarded path. Repeated invocations consume the one approval. Campaign-state refusals (not-approved/revoked/paused/deadline/max-submissions/plan drift/attestation/gate/eligibility) exit 3 with zero POSTs; a malformed plan file exits 2. A queue blocked beyond `sync.queue_blocked_tolerance` **defers** every candidate (zero POSTs, no quarantine) | guarded path for approved files only |
@@ -114,6 +114,21 @@ SHA-256 digest: **the trust anchor is the operator**, so the digest is tamper
 *evidence*, not a security boundary. Keep the file readable only by the operator
 (0600 where the platform supports it; the tool attempts it and warns when it cannot).
 
+Two **independent** leases gate writes, each evaluated by scope:
+
+- The **daemon lease** lives at `safety.attestation_file` (scope `daemon`) and gates
+  `once --apply` and the daemon's own new-arrival/backlog apply.
+- Each **campaign lease** lives at the sibling `<stem>.campaign-<id>.yaml` in the same
+  directory (scope `campaign:<id>`, e.g. `attestation.campaign-<id>.yaml` for
+  `attestation.yaml`) and gates that campaign's batches — both a manual `campaign apply`
+  and the daemon's automatic drain of the same campaign.
+
+`attestation record|status|invalidate` all take `--scope` (default `daemon`); recording a
+campaign lease never clobbers the daemon lease, and a campaign-scope `invalidate` never
+touches the daemon lease. Each lease expires and pauses **only its own scope**, and both
+survive a restart: a campaign can drain under a valid campaign lease even when the daemon
+lease is invalid, and vice versa.
+
 Lifecycle:
 
 1. Inspect the deployment (see [Deployment safety](#deployment-safety)), then
@@ -121,16 +136,16 @@ Lifecycle:
    `--hours` may not exceed `safety.attestation_validity_hours` (default 168). When
    `safety.attested_shoko_version` is configured, the lease's `--version` must equal it
    (a Shoko upgrade therefore requires re-inspection + a new lease, never an inherited one).
-2. `attestation status` evaluates the lease offline; a valid lease expiring within
+2. `attestation status [--scope S]` evaluates the lease offline; a valid lease expiring within
    `safety.attestation_warn_seconds` (default 3600) reports `warn_before_expiry` and
    the daemon logs a warning — apply still proceeds.
-3. When the lease is absent/invalid/expired/scope-mismatched/stale-version, **every**
-   apply is suppressed: the daemon persists exactly one write pause
-   (`attestation_expired`) per valid→invalid transition, warns, and **stays alive
-   reporting read-only** (never a restart loop). A re-recorded lease clears only a
-   pause whose reason is `attestation_expired`.
-4. `attestation invalidate --confirm` moves the lease to `…​.revoked` (audit trail
-   preserved) and records the operator action; applies stay closed.
+3. When the daemon lease is absent/invalid/expired/scope-mismatched/stale-version, the daemon
+   suppresses its own applies, persists exactly one write pause (`attestation_expired`) per
+   valid→invalid transition, warns, and **stays alive reporting read-only** (never a restart
+   loop); a re-recorded lease clears only a pause whose reason is `attestation_expired`. A
+   campaign-scope lease transition pauses only that campaign (never a global write pause).
+4. `attestation invalidate --scope S --confirm` moves that scope's lease to `…​.revoked`
+   (audit trail preserved) and records the operator action; applies stay closed in that scope.
 
 **Documented tradeoff (PLAN M7):** a completely unattended *indefinite* writable
 daemon is incompatible with an expiring physical-safety attestation. The daemon
@@ -372,11 +387,12 @@ those files. Never edit the SQLite file by hand.
 ### Rollback
 
 Writes are reversible in *state* only — Shoko-side links are never unlinked by
-this tool (out of scope): `pause-writes --reason … --confirm` (stops all apply),
-`attestation invalidate --confirm` (applies closed), `campaign revoke --confirm`
-(queued approved rows return to `waiting`), `resume-writes --confirm` to re-open.
+this tool (out of scope): `pause-writes --reason "<why>" --note "<audit note>" --confirm` (stops all apply),
+`attestation invalidate [--scope "campaign:<id>"] --note "<audit note>" --confirm` (applies closed),
+`campaign revoke --campaign-id <id> --note "<audit note>" --confirm`
+(queued approved rows return to `waiting`), `resume-writes --note "<audit note>" --confirm` to re-open.
 A sent-but-unverified file is verified/held, never resubmitted; close it with
-`resolve-send --release --confirm` after inspection.
+`resolve-send --file-id <id> --fingerprint "<fingerprint>" --release --note "<audit note>" --confirm` after inspection.
 
 ## Images (GHCR)
 
