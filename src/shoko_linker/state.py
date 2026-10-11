@@ -196,6 +196,9 @@ META_ATTESTATION_GATE: Final[str] = "attestation_gate"
 #: Per-campaign attestation gate bookkeeping key prefix (F8: campaign-scope lease
 #: transitions are tracked per campaign, never as the global daemon write pause).
 META_CAMPAIGN_ATTESTATION_GATE: Final[str] = "campaign_attestation_gate"
+#: Per-campaign zero-progress breaker counter key prefix (F7): consecutive drain cycles with
+#: zero real progress. Cleared when the campaign reaches a terminal state (plan complete/revoke).
+META_CAMPAIGN_ZERO_PROGRESS: Final[str] = "campaign_zero_progress"
 ATTESTATION_PAUSE_REASON: Final[str] = "attestation_expired"
 
 #: OS advisory lock file (the F5 ownership fence) living in the SAME
@@ -1338,6 +1341,11 @@ class StateStore:
             " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    @_mutation
+    def clear_meta(self, key: str) -> None:
+        """Delete one meta key (bounded terminal-state bookkeeping cleanup; no-op if absent)."""
+        self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     @_mutation
     def disable_writes(self, reason: str) -> None:

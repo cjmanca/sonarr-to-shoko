@@ -118,6 +118,7 @@ from .state import (
     CAMPAIGN_STATUS_PAUSED,
     META_ATTESTATION_GATE,
     META_CAMPAIGN_ATTESTATION_GATE,
+    META_CAMPAIGN_ZERO_PROGRESS,
     META_NEXT_FULL_RECONCILE_ISO,
     ApplyLockUnavailableError,
     BaselineFile,
@@ -650,8 +651,13 @@ def _persist_gate_pause(
                 campaign_id, CAMPAIGN_STATUS_PAUSED, ATTESTATION_PAUSE_REASON, iso=now_iso
             )
     if gate != "paused":
+        # F8 review: the gate pauses writes ONLY when no global pause is already active. A
+        # foreign pause (mapping churn, source break, queue anomaly, an operator pause-writes
+        # reason) KEEPS its own reason: overwriting it with ``attestation_expired`` would arm
+        # the origin-gated campaign bypass (gate meta "paused" + reason "attestation_expired")
+        # on a churn-paused deployment and relabel the operator's kill switch.
         with contextlib.suppress(WriteDisabledError, StateError):
-            if not is_campaign:
+            if not is_campaign and deps.store.budget_view().paused_reason is None:
                 deps.store.pause(ATTESTATION_PAUSE_REASON, now_iso)
             deps.store.set_meta(gate_key, "paused")
         log.warning(
@@ -685,8 +691,11 @@ def attestation_gate(
 
     F8 scope separation: the **daemon** scope persists a global write pause
     (``attestation_expired`` via :meth:`shoko_linker.state.StateStore.pause`) under
-    ``META_ATTESTATION_GATE``; the invalid→valid transition clears it only when the pause reason
-    is exactly ``attestation_expired`` (a mapping-churn pause is never cleared here). The
+    ``META_ATTESTATION_GATE`` only when no global pause is already active — a foreign pause
+    (churn/source/queue/operator) keeps its reason, so the origin-gated campaign bypass never
+    arms on a churn- or operator-paused deployment; the invalid→valid transition clears it only
+    when the pause reason is exactly ``attestation_expired`` (a mapping-churn pause is never
+    cleared here). The
     **campaign** scope never touches the global write pause — it records a per-campaign gate
     (``META_CAMPAIGN_ATTESTATION_GATE:<id>``) and idempotently pauses the campaign via
     ``set_campaign_status`` so a campaign-lease failure stops only that campaign's submissions,
@@ -1560,6 +1569,7 @@ _FILE_SCOPED_REASON_PREFIXES: Final[tuple[str, ...]] = (
     "budget_refusal:",
     "send_stale:",
     "shutdown_requested:",
+    "drain_authorization_revoked:",
 )
 
 #: Consecutive zero-progress drain cycles before the campaign auto-pauses
@@ -1597,7 +1607,7 @@ def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str, reas
     files are unqueueable, ``no_budget_progress`` (F9) for one whose submissions were every
     budget-refused — a budget-exhausted campaign must trip the breaker, not stall forever.
     Returns True when the campaign was auto-paused."""
-    key = f"campaign_zero_progress:{campaign_id}"
+    key = f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}"
     raw = deps.store.get_meta(key)
     try:
         count = int(raw) if raw is not None else 0
@@ -1624,6 +1634,9 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
     POSTs, the daemon stays alive read-only), queue snapshot fail-closed, mapping/drift
     revalidation, eligibility, binding quarantine, preflight → prepare_send → mark_sent →
     submit_link → record → inline verify, and restart recovery via the durable rows.
+    ``daemon_drain=True`` reconsults the F10 drain authorization before every submission, so a
+    mid-batch ``campaign revoke-drain`` stops the running batch at the next POST (deferral,
+    remainder queueable).
 
     A missing plan path or an unreadable/malformed plan file defers (a named reason, no
     crash, no POSTs); a campaign-state refusal defers the batch and is reported. Returns
@@ -1633,6 +1646,7 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
         CampaignError,
         CampaignPlanInvalidError,
         apply_campaign,
+        clear_campaign_terminal_meta,
         select_next_daemon_campaign,
     )
 
@@ -1653,6 +1667,7 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
             campaign.plan_path,
             now_iso,
             lock_held=True,
+            daemon_drain=True,
         )
     except CampaignPlanInvalidError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}:plan_unreadable")
@@ -1675,7 +1690,7 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
             reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
         return None
     reasons.extend(_aggregate_campaign_reasons(report.reasons))
-    key = f"campaign_zero_progress:{campaign.campaign_id}"
+    key = f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign.campaign_id}"
     # P2: the breaker keys on REAL progress (submissions/verifications/quarantines), not the
     # scan counter — a batch of per-file budget deferrals or pending-target walks makes zero
     # submissions and must trip the breaker, not reset it every cycle.
@@ -1690,6 +1705,10 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
         )
         if _record_zero_progress(deps, campaign.campaign_id, now_iso, zero_reason):
             reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
+    elif report.stopped == "plan_complete":
+        # P3: a campaign drained to plan_complete is terminal — its gate/zero-progress metas are
+        # cleared (inside apply_campaign); do not re-create the counter key here.
+        clear_campaign_terminal_meta(deps.store, campaign.campaign_id)
     else:
         with contextlib.suppress(WriteDisabledError, StateError):
             deps.store.set_meta(key, "0")

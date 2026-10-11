@@ -84,6 +84,7 @@ from .state import (
     CAMPAIGN_STATUS_APPROVED,
     CAMPAIGN_STATUS_REVOKED,
     META_CAMPAIGN_ATTESTATION_GATE,
+    META_CAMPAIGN_ZERO_PROGRESS,
     ApplyLockUnavailableError,
     BudgetRefusal,
     CampaignBinding,
@@ -819,6 +820,7 @@ def apply_campaign(
     *,
     batch_size: int | None = None,
     lock_held: bool = False,
+    daemon_drain: bool = False,
 ) -> CampaignApplyReport:
     """One bounded batch of the approved campaign through the full guarded path.
 
@@ -838,8 +840,11 @@ def apply_campaign(
 
     ``lock_held=True`` (F7 daemon drain): the caller already owns this process's OS apply
     lock, so the acquire/release pair is skipped (a same-process re-acquire self-contends).
-    Every other guard runs unchanged. The CLI ``campaign apply`` path keeps the default
-    ``lock_held=False`` and its own lock-first acquire/release.
+    Every other guard runs unchanged. The CLI ``campaign apply`` path keeps ``lock_held=False``
+    and its own lock-first acquire/release. ``daemon_drain=True`` (the daemon's
+    :func:`~shoko_linker.daemon._drain_campaign` only) reconsults the F10 drain authorization
+    before **every** submission, so a mid-batch ``campaign revoke-drain`` stops the running
+    batch; manual ``campaign apply`` never requires the authorization.
     """
     plan, digest = read_plan_file(plan_path)
     campaign = _require_campaign(store, plan.campaign_id)
@@ -924,6 +929,7 @@ def apply_campaign(
                 active,
                 context.queue,
                 batch_cycle_key,
+                daemon_drain=daemon_drain,
             )
             _fold_tally(counters, tally, reasons)
             if tally.stop_batch or tally.budget_blocked:
@@ -941,6 +947,11 @@ def apply_campaign(
         persisted_progress = campaign_send_progress(store, campaign.campaign_id)
         remaining = max(0, len(plan.files) - persisted_progress)
         progress = counters.submitted + counters.verified + counters.quarantined
+        plan_complete = persisted_progress >= len(plan.files)
+        if plan_complete:
+            # P3: the plan is drained to completion — drop the campaign's gate/zero-progress
+            # drain metas (bounded bookkeeping cleanup; semantics of the report unchanged).
+            clear_campaign_terminal_meta(store, campaign.campaign_id)
         return CampaignApplyReport(
             campaign_id=campaign.campaign_id,
             processed=counters.processed,
@@ -952,7 +963,7 @@ def apply_campaign(
             total_sent=campaign.total_sent + counters.submitted,
             remaining=remaining,
             reasons=tuple(dict.fromkeys(reasons)),
-            stopped="plan_complete" if persisted_progress >= len(plan.files) else None,
+            stopped="plan_complete" if plan_complete else None,
         )
     finally:
         if lock_acquired and not lock_held:
@@ -1440,6 +1451,21 @@ def _target_key(target: LinkTarget) -> tuple[int, int, int, int, str, str]:
     )
 
 
+def _daemon_drain_staleness(store: StateStore, campaign_id: str) -> str | None:
+    """Cross-cutting review P2 (Finding 2): the **daemon drain path** reconsults the F10 drain
+    authorization before every submission, so a mid-batch ``campaign revoke-drain`` (or any
+    authorization withdrawal/digest invalidation) stops the running batch at the next POST.
+    Manual ``campaign apply`` never consults this guard — it is exempt by construction.
+    """
+    campaign = store.get_campaign(campaign_id)
+    if campaign is None:
+        return "campaign_missing"
+    selection = campaign_drain_selection(campaign)
+    if selection == "authorized":
+        return None
+    return f"drain_authorization_revoked:{campaign_id}:{selection}"
+
+
 def _campaign_send_staleness(
     deps: DaemonDeps,
     store: StateStore,
@@ -1453,7 +1479,8 @@ def _campaign_send_staleness(
     ``None`` when the POST stays authorized. The lease and the write gate are already fresh per
     submission inside :func:`~shoko_linker.linking.preflight` (P2-4), and the file/XRef identity
     is re-read there; this covers the clock-bound and store-bound inputs: the operator shutdown,
-    the campaign deadline, the campaign status, and the active mapping generation identity.
+    the campaign deadline, the campaign status, and the active mapping generation identity. The
+    daemon drain adds the F10 authorization per submission via :func:`_daemon_drain_staleness`.
     """
     if deps.shutdown_requested():
         return "shutdown_requested"
@@ -1502,18 +1529,23 @@ def _post_preflight_send_staleness(
     campaign_id: str,
     active: ActiveMappings,
     plan: LinkPlan,
+    *,
+    daemon_drain: bool = False,
 ) -> tuple[str, _SendTally | None]:
     """P2-1: the local re-evaluation between preflight's network phase and the intent commit.
 
     Preflight's File + per-episode GETs are slow (10s connect / 30s read), so a shutdown,
-    deadline pass, status change, generation swap, lease expiry, or gate close that lands DURING
-    them must not ride the pre-preflight verdict into ``prepare_send``. The clock is re-taken
-    and every check is local (store re-read, disk lease, config gate) — no network, no polling.
+    deadline pass, status change, generation swap, lease expiry, gate close, or daemon-drain
+    revocation that lands DURING them must not ride the pre-preflight verdict into
+    ``prepare_send``. The clock is re-taken and every check is local (store re-read, disk
+    lease, config gate) — no network, no polling.
     Returns the fresh submission timestamp and the deferral tally (``None`` when the POST stays
     authorized).
     """
     send_iso = deps.now()
     stale = _campaign_send_staleness(deps, store, campaign_id, active, send_iso)
+    if stale is None and daemon_drain:
+        stale = _daemon_drain_staleness(store, campaign_id)
     if stale is not None:
         return send_iso, _SendTally(
             0,
@@ -1583,6 +1615,8 @@ def _send_one(
     active: ActiveMappings,
     queue: QueueSnapshot | None,
     cycle_key: str,
+    *,
+    daemon_drain: bool = False,
 ) -> _SendTally:
     """One approved candidate through the guarded path; zero writes unless preflight passes.
 
@@ -1590,10 +1624,13 @@ def _send_one(
     (to skip network reads when authorization is already gone) AND re-evaluated locally after
     preflight's network phase, immediately before the intent commit; every submission timestamp
     (prepare intent, attempted anchor, campaign progress) comes from ``deps.now()``, never from
-    the batch-start snapshot.
+    the batch-start snapshot. ``daemon_drain=True`` (the F7 daemon drain) also reconsults the
+    F10 drain authorization per submission; manual apply does not.
     """
     send_iso = deps.now()
     stale = _campaign_send_staleness(deps, store, campaign_id, active, send_iso)
+    if stale is None and daemon_drain:
+        stale = _daemon_drain_staleness(store, campaign_id)
     if stale is not None:
         return _SendTally(
             0,
@@ -1622,7 +1659,7 @@ def _send_one(
     if blocked is not None:
         return blocked
     send_iso, stale_after = _post_preflight_send_staleness(
-        deps, settings, store, campaign_id, active, plan
+        deps, settings, store, campaign_id, active, plan, daemon_drain=daemon_drain
     )
     if stale_after is not None:
         return stale_after
@@ -1647,6 +1684,18 @@ def _send_one(
 
 
 # ------------------------------------------------------------------ lifecycle
+
+
+def clear_campaign_terminal_meta(store: StateStore, campaign_id: str) -> None:
+    """P3: a campaign at a terminal state (``plan_complete`` / revoked) sheds its drain
+    bookkeeping metas — the per-campaign attestation gate marker and the zero-progress
+    counter. Best-effort: cleanup never changes campaign semantics and never fails a batch."""
+    for key in (
+        f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}",
+        f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}",
+    ):
+        with contextlib.suppress(WriteDisabledError, StateError):
+            store.clear_meta(key)
 
 
 def campaign_pause(
@@ -1695,6 +1744,8 @@ def campaign_revoke(store: StateStore, campaign_id: str, now_iso: str) -> int:
     _require_campaign(store, campaign_id)
     store.set_campaign_status(campaign_id, "revoked", "operator_revoked", iso=now_iso)
     unbound = store.unbind_campaign_files(campaign_id, "campaign_revoked", iso=now_iso)
+    # P3: a revoked campaign is terminal — drop its gate/zero-progress drain metas.
+    clear_campaign_terminal_meta(store, campaign_id)
     logger.warning(
         "campaign %s revoked: %d queued row(s) returned to waiting", campaign_id, unbound
     )

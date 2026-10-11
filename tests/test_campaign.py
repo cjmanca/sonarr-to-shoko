@@ -46,6 +46,7 @@ from shoko_linker.campaign import (
     authorize_campaign_drain,
     campaign_drain_selection,
     campaign_report,
+    campaign_revoke,
     campaign_send_progress,
     read_plan_file,
     revoke_campaign_drain,
@@ -3113,6 +3114,115 @@ def test_attestation_pause_lets_campaign_drain(
         store.close()
 
 
+MAPPING_CHURN_PAUSE_REASON = "mapping_churn"
+OPERATOR_PAUSE_REASON = "disk_review"
+LEASE_EXPIRY_CYCLE_KEYS = ("churn-expiry", "operator-expiry", "churn-reattested")
+
+
+def test_daemon_lease_expiry_keeps_mapping_churn_pause_and_blocks_drain(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Cross-cutting review P2 (Finding 1): the daemon-scope valid->invalid transition must NOT
+    overwrite an active foreign pause. A mapping-churn pause + daemon lease expiry keeps reason
+    'mapping_churn' (gate meta 'paused' is still recorded), so the F8/F9 origin-gated campaign
+    bypass stays DISARMED and an authorized campaign drain makes zero POSTs."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
+        store.pause(MAPPING_CHURN_PAUSE_REASON, env.now_iso)  # the churn pause is active
+        env.write_daemon_lease(hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        posts_before = len(env.stubs.posts)
+        cycle = env.daemon_cycle(store, LEASE_EXPIRY_CYCLE_KEYS[0])
+        assert store.budget_view().paused_reason == MAPPING_CHURN_PAUSE_REASON  # never relabeled
+        assert store.get_meta("attestation_gate") == "paused"  # gate transition IS recorded
+        assert cycle.counts.submitted == 0  # daemon gated by the churn pause
+        assert cycle.campaign is None  # bypass disarmed: the drain is gated too
+        assert any(reason.startswith("campaign_deferred:") for reason in cycle.reasons)
+        assert len(env.stubs.posts) == posts_before  # zero campaign POSTs
+    finally:
+        store.close()
+
+
+def test_daemon_lease_expiry_keeps_operator_pause_writes_reason(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 1: an operator pause-writes kill switch is never silently relabeled into the
+    bypassable 'attestation_expired' reason — campaign drain AND daemon writes stay gated."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
+        assert (
+            main(
+                [
+                    "pause-writes",
+                    str(env.config_path),
+                    "--reason",
+                    OPERATOR_PAUSE_REASON,
+                    "--note",
+                    "operator kill switch during media review",
+                    "--confirm",
+                    "--json",
+                ]
+            )
+            == EXIT_OK
+        )
+        capsys.readouterr()
+        env.write_daemon_lease(hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        posts_before = len(env.stubs.posts)
+        cycle = env.daemon_cycle(store, LEASE_EXPIRY_CYCLE_KEYS[1])
+        assert store.budget_view().paused_reason == OPERATOR_PAUSE_REASON  # kill switch intact
+        assert store.get_meta("attestation_gate") == "paused"
+        assert cycle.counts.submitted == 0  # daemon blocked
+        assert cycle.campaign is None  # campaign blocked (no bypass on a foreign reason)
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_reattested_lease_clears_gate_without_resuming_foreign_pause(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 1: the invalid->valid transition clears the gate meta but must NEVER resume a
+    foreign pause — the churn-paused deployment stays gated (campaign and daemon) after
+    re-attestation, and the pause reason is untouched."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
+        store.pause(MAPPING_CHURN_PAUSE_REASON, env.now_iso)
+        env.write_daemon_lease(hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        posts_before = len(env.stubs.posts)
+        expired = env.daemon_cycle(store, "churn-reattested-expiry")
+        assert expired.campaign is None
+        assert store.get_meta("attestation_gate") == "paused"
+        # Re-attest the daemon lease while the churn pause remains active.
+        env.now_iso = T0
+        env.write_daemon_lease(hours=24.0)
+        cycle = env.daemon_cycle(store, "churn-reattested")
+        assert store.get_meta("attestation_gate") == "valid"  # gate cleared
+        assert store.budget_view().paused_reason == MAPPING_CHURN_PAUSE_REASON  # NOT resumed
+        assert "attestation_resumed" not in cycle.reasons
+        assert cycle.counts.submitted == 0  # daemon stays gated by the foreign reason
+        assert cycle.campaign is None  # campaign stays gated by the foreign reason
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
 def test_resume_then_lease_expiry_repauses_campaign(
     dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3241,7 +3351,10 @@ def test_campaign_gate_clear_reports_accurate_reason(
         )
         assert "campaign_attestation_gate_cleared" in report.reasons
         assert "attestation_resumed" not in report.reasons
-        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "valid"
+        # P3 terminal-state cleanup: this batch drains the 2-file plan to plan_complete, so
+        # the gate meta is cleared (removed), not left as a lingering "valid" marker.
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") is None
+        assert report.stopped == "plan_complete"
     finally:
         store.close()
 
@@ -3870,6 +3983,148 @@ def test_f11_mapping_generation_swap_mid_batch_defers_and_stops(
         assert record is not None
         assert record.state is FileState.PLANNED
         assert len(env.stubs.posts) == 1
+    finally:
+        store.close()
+
+
+def test_f11_daemon_drain_mid_batch_revoke_stops_later_posts(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Cross-cutting review P2 (Finding 2): ``campaign revoke-drain`` fired DURING the first
+    drain POST stops the RUNNING batch at the next submission. The daemon drain path reconsults
+    the F10 authorization per submission — zero campaign POSTs land after the operator's stop
+    command, the remainder stays queueable (no quarantine), and the report names the revocation."""
+    campaign_id = _f10_campaign(env, capsys)  # 5 files, max_batch_size 2
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)  # file 500: the manual canary
+        _authorize(env, store, campaign_id)
+        posts_before = len(env.stubs.posts)
+
+        def _revoke(file_id: int) -> None:
+            other = env.open_store()  # the concurrent operator CLI (campaign revoke-drain)
+            try:
+                revoke_campaign_drain(
+                    other, campaign_id, env.now_iso, note="side effects under review"
+                )
+            finally:
+                other.close()
+
+        env.stubs.post_hook = _revoke  # fires between the 501 POST and the 502 attempt
+        cycle = _daemon_cycle(env, store, campaign_id, "mid-batch-revoke")
+        env.stubs.post_hook = None
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == BATCH_ONE  # only 501 rode the pre-revoke grant
+        assert len(env.stubs.posts) == posts_before + BATCH_ONE  # ZERO POSTs after the revoke
+        assert 502 not in env.stubs.posted_files[posts_before:]
+        assert any("drain_authorization_revoked" in reason for reason in cycle.campaign.reasons)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == CAMPAIGN_STATUS_APPROVED  # revoke withdraws the grant only
+        assert campaign_drain_selection(campaign) == "drain_revoked"
+        record = store.get_file(502)
+        assert record is not None
+        assert record.state is FileState.PLANNED  # the remainder stays queueable
+        # The queuehead resumes after a fresh authorization — the deferral was non-destructive.
+        _authorize(env, store, campaign_id)
+        resumed = _daemon_cycle(env, store, campaign_id, "mid-batch-revoke-regrant")
+        assert resumed.campaign is not None
+        assert resumed.campaign.submitted == BATCH_TWO  # 502 + 503 drain
+        assert 502 in env.stubs.posted_files
+    finally:
+        store.close()
+
+
+def test_f11_manual_apply_stays_exempt_after_drain_revocation(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 2 boundary: the per-submission authorization recheck is daemon-drain-only. A
+    revoked drain authorization never blocks a manual ``campaign apply`` batch."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        revoke_campaign_drain(store, campaign_id, env.now_iso, note="side effects under review")
+        posts_before = len(env.stubs.posts)
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            env.now_iso,
+            batch_size=BATCH_TWO,
+        )
+        assert report.submitted == BATCH_TWO  # manual apply stays authorized
+        assert not any("drain_authorization_revoked" in reason for reason in report.reasons)
+        assert len(env.stubs.posts) == posts_before + BATCH_TWO
+    finally:
+        store.close()
+
+
+def test_f11_daemon_drain_stops_at_next_cycle_after_revoke(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 2 (selection path, preserved): a revoke that lands BETWEEN drain cycles keeps the
+    existing selection-time stop — the campaign drops out with zero campaign POSTs."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        posts_before = len(env.stubs.posts)
+        revoke_campaign_drain(store, campaign_id, env.now_iso, note="side effects under review")
+        cycle = _daemon_cycle(env, store, campaign_id, "between-cycles-revoke")
+        assert cycle.campaign is None  # selection-time skip (drain_revoked)
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_campaign_revoke_clears_drain_bookkeeping_metas(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P3 (bounded cleanup): a revoked campaign sheds its ``campaign_attestation_gate:<id>`` and
+    ``campaign_zero_progress:<id>`` metas; campaign semantics are otherwise untouched."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        _daemon_cycle(env, store, campaign_id, "meta-before-revoke")
+        store.set_meta(f"campaign_zero_progress:{campaign_id}", "2")
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") is not None
+        campaign_revoke(store, campaign_id, env.now_iso)
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") is None
+        assert store.get_meta(f"campaign_zero_progress:{campaign_id}") is None
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == CAMPAIGN_STATUS_REVOKED  # semantics preserved
+    finally:
+        store.close()
+
+
+def test_plan_complete_clears_campaign_drain_bookkeeping_metas(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P3: a campaign drained to ``plan_complete`` clears its gate/zero-progress metas, so a
+    finished campaign leaves no per-campaign bookkeeping behind."""
+    campaign_id = _f10_campaign(env, capsys)  # 5 files: 1 canary + 2 + 2
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        _daemon_cycle(env, store, campaign_id, "complete-1")
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") is not None
+        assert store.get_meta(f"campaign_zero_progress:{campaign_id}") is not None
+        last = _daemon_cycle(env, store, campaign_id, "complete-2")
+        assert last.campaign is not None
+        assert last.campaign.stopped == "plan_complete"
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") is None
+        assert store.get_meta(f"campaign_zero_progress:{campaign_id}") is None
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_FIVE  # progress truth preserved
     finally:
         store.close()
 
