@@ -17,6 +17,10 @@ import pytest
 
 from shoko_linker.linking import SendOutcome, VerificationVerdict
 from shoko_linker.state import (
+    BUDGET_CYCLE_RETENTION,
+    GLOBAL_BUDGET_KEY,
+    META_BUDGET_RUN_ID,
+    META_BUDGET_SEQ,
     ApplyProcessLock,
     BaselineFile,
     BudgetLimits,
@@ -74,6 +78,7 @@ WIDE_LIMITS = BudgetLimits(
 LOCK_PID_A = 111
 LOCK_PID_B = 222
 RESERVED_TWO = 2
+RESERVED_THREE = 3
 JOBS_TWO = 2
 JOBS_FOUR = 4
 PENDING_ONE = 1
@@ -739,6 +744,128 @@ def test_prepare_send_atomically_refuses_and_leaves_file_planned(tmp_path: Path)
         assert state_of(store, 102) is FileState.PLANNED
         sends = second_view(path, "SELECT COUNT(*) FROM sends WHERE shoko_file_id = 102")
         assert sends[0][0] == 0
+
+
+# ------------------------------------------------------------------ F9: durable budget cycles
+
+
+def test_f9_begin_cycle_keys_unique_across_restart_and_monotonic(tmp_path: Path) -> None:
+    """Scenario 9: window keys are unique across restarts, monotonic, and durably persisted.
+
+    (A 7000-file campaign plan is not built in unit tests — it is too slow; this key
+    property plus the campaign drain scenarios are the scale proof.)
+    """
+    path = tmp_path / "state.sqlite3"
+    with open_store(path) as store:
+        keys = [store.begin_cycle("cycle", T0) for _ in range(RESERVED_THREE)]
+        assert len(set(keys)) == RESERVED_THREE
+        run_id = store.get_meta(META_BUDGET_RUN_ID)
+        assert run_id is not None
+        assert len(run_id) == 32
+        for index, key in enumerate(keys, start=1):
+            assert key == f"cycle-{run_id}-{index}"
+        seq_first = int(str(store.get_meta(META_BUDGET_SEQ)))
+    with open_store(path) as reopened:
+        assert reopened.get_meta(META_BUDGET_RUN_ID) == run_id  # nonce stable across restart
+        new_key = reopened.begin_cycle("campaign-abcd1234", T1)
+        assert new_key not in keys  # no collision with a prior run's persisted rows
+        assert new_key == f"campaign-abcd1234-{run_id}-{seq_first + 1}"
+        assert int(str(reopened.get_meta(META_BUDGET_SEQ))) > seq_first
+
+
+def test_f9_begin_cycle_prunes_old_rows_and_preserves_live_and_global(tmp_path: Path) -> None:
+    """Scenario 8: old completed window rows are bounded; the live window and the global rolling
+    row (with its counters and pause marker) are never touched."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        for _ in range(BUDGET_CYCLE_RETENTION + 5):
+            store.begin_cycle("cycle", T0)
+        current = store.begin_cycle("cycle", T0)
+        assert isinstance(store.try_reserve_slot(current, T0), SlotReservation)
+        store.pause("keep me", T0)
+        rows = second_view(path, "SELECT window_key FROM budgets")
+        window_keys = {str(row[0]) for row in rows}
+        assert GLOBAL_BUDGET_KEY in window_keys
+        assert current in window_keys
+        assert len(window_keys) <= BUDGET_CYCLE_RETENTION + 2
+        view = store.budget_view()
+        assert view.paused_reason == "keep me"
+        assert view.pending_file_requests == 1
+        assert view.rolling_new_submissions == 1
+
+
+def test_f9_crash_recovery_prepared_row_from_old_window_completes_once(tmp_path: Path) -> None:
+    """Scenario 7: a prepared/possible-delivery row from a prior batch's window_key survives a
+    restart; verification closes it with no second POST and no re-reservation."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        walk_to_planned(store, 101)
+        old_key = store.begin_cycle("campaign-abcd1234", T0)
+        token = prepare(store, 101, req_fp=REQ_FP, cycle_key=old_key)
+        assert isinstance(token, SendToken)
+        store.mark_sent(token, iso=T0)
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        new_key = store.begin_cycle("campaign-abcd1234", T1)
+        assert new_key != old_key
+        replay = prepare(store, 101, req_fp=REQ_FP, cycle_key=new_key, iso=T1)
+        assert isinstance(replay, BudgetRefusal)
+        assert replay.reason == "duplicate_request_fingerprint"
+        assert state_of(store, 101) is FileState.REQUEST_MAY_HAVE_BEEN_SENT
+        store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T1)
+        assert state_of(store, 101) is FileState.VERIFYING
+        store.record_verification(101, VerificationVerdict.VERIFIED, iso=T1)
+        assert state_of(store, 101) is FileState.VERIFIED
+        assert store.budget_view().pending_file_requests == 0
+
+
+def test_f9_rolling_exhaustion_stops_and_resumes_across_fresh_cycles(tmp_path: Path) -> None:
+    """Scenario 4: the per-cycle window_key reset never bypasses the global rolling budget.
+
+    Every fresh cycle/batch gets new per-cycle counters, yet the ``_global`` rolling ceiling keeps
+    applying across them; after the rolling window passes, submissions resume."""
+    path = tmp_path / "state.sqlite3"
+    limits = BudgetLimits(
+        max_pending_files=10,
+        max_pending_episode_jobs=10,
+        per_cycle_new=10,
+        rolling_new=3,
+        rolling_window_hours=24.0,
+    )
+    with open_store(path, limits=limits) as store:
+        cycle_a = store.begin_cycle("cycle", T0)
+        for _ in range(3):
+            assert isinstance(store.try_reserve_slot(cycle_a, T0), SlotReservation)
+        # per-cycle has headroom, but the global rolling ceiling is spent → refuse
+        refusal = store.try_reserve_slot(cycle_a, T0)
+        assert isinstance(refusal, BudgetRefusal)
+        assert refusal.reason == "rolling_new_exhausted"
+        # a brand-new cycle resets per-cycle counters, not the rolling budget
+        cycle_b = store.begin_cycle("cycle", T0)
+        assert cycle_b != cycle_a
+        refusal = store.try_reserve_slot(cycle_b, T0)
+        assert isinstance(refusal, BudgetRefusal)
+        assert refusal.reason == "rolling_new_exhausted"
+        # after the rolling window passes, the same fresh cycle resumes
+        assert isinstance(store.try_reserve_slot(cycle_b, T2), SlotReservation)
+        assert store.budget_view().rolling_new_submissions == 1
+
+
+def test_f9_corrupt_seq_seed_never_reissues_the_first_window(tmp_path: Path) -> None:
+    """F9-2: a corrupted ``budget_cycle_seq`` meta must NOT restart at 1 and re-issue the first
+    persisted window key; the seed is derived from the highest existing suffix for the run."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path, limits=WIDE_LIMITS) as store:
+        first = store.begin_cycle("cycle", T0)
+        assert first.endswith("-1")
+        assert isinstance(store.try_reserve_slot(first, T0), SlotReservation)  # materializes row
+        rows = {str(row[0]) for row in second_view(path, "SELECT window_key FROM budgets")}
+        assert first in rows
+        # corrupt the persisted counter (as a torn write / tampering would)
+        store.set_meta(META_BUDGET_SEQ, "not-a-number")
+        second = store.begin_cycle("cycle", T0)
+        assert second != first  # no collision with the first window row
+        assert second not in rows
+        assert int(str(store.get_meta(META_BUDGET_SEQ))) > 1  # repaired to a monotone value
 
 
 # ---------------------------------------------------------------- apply lock

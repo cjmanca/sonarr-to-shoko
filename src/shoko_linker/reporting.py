@@ -667,6 +667,7 @@ def campaign_apply_payload(report: CampaignApplyReport) -> dict[str, Any]:
         "verified": report.verified,
         "quarantined": report.quarantined,
         "deferred": report.deferred,
+        "progress": report.progress,
         "total_sent": report.total_sent,
         "remaining": report.remaining,
         "stopped": report.stopped,
@@ -677,7 +678,7 @@ def campaign_apply_payload(report: CampaignApplyReport) -> dict[str, Any]:
 def campaign_apply_summary_line(report: CampaignApplyReport) -> str:
     """One human-readable ``campaign apply`` summary line (no secrets)."""
     return (
-        f"campaign {report.campaign_id}: processed={report.processed} submitted={report.submitted} "
+        f"campaign {report.campaign_id}: progress={report.progress} submitted={report.submitted} "
         f"verified={report.verified} quarantined={report.quarantined} deferred={report.deferred} "
         f"total_sent={report.total_sent} remaining={report.remaining}"
         f"{f' stopped={report.stopped}' if report.stopped else ''}"

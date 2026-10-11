@@ -1445,6 +1445,7 @@ def _campaign_scoped_deps(deps: DaemonDeps, campaign_id: str) -> DaemonDeps:
 #: a full backlog plan must not flood the persisted per-cycle reason surface).
 _FILE_SCOPED_REASON_PREFIXES: Final[tuple[str, ...]] = (
     "batch_limit:",
+    "batch_time_limit:",
     "max_submissions_reached:",
     "file_missing:",
     "unbound:",
@@ -1483,10 +1484,13 @@ def _pause_deferred_campaign(deps: DaemonDeps, campaign_id: str, reason: str, no
         deps.store.set_campaign_status(campaign_id, CAMPAIGN_STATUS_PAUSED, reason, iso=now_iso)
 
 
-def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str) -> bool:
+def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str, reason: str) -> bool:
     """Count consecutive zero-progress drain cycles; pause at the bound.
 
-    Returns True when the campaign was auto-paused for ``no_queueable_candidates``."""
+    ``reason`` names the auto-pause: ``no_queueable_candidates`` for a campaign whose remaining
+    files are unqueueable, ``no_budget_progress`` (F9) for one whose submissions were every
+    budget-refused — a budget-exhausted campaign must trip the breaker, not stall forever.
+    Returns True when the campaign was auto-paused."""
     key = f"campaign_zero_progress:{campaign_id}"
     raw = deps.store.get_meta(key)
     try:
@@ -1497,7 +1501,7 @@ def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str) -> b
     with contextlib.suppress(WriteDisabledError, StateError):
         deps.store.set_meta(key, str(count))
     if count >= ZERO_PROGRESS_PAUSE_CYCLES:
-        _pause_deferred_campaign(deps, campaign_id, "no_queueable_candidates", now_iso)
+        _pause_deferred_campaign(deps, campaign_id, reason, now_iso)
         with contextlib.suppress(WriteDisabledError, StateError):
             deps.store.set_meta(key, "0")
         return True
@@ -1556,11 +1560,29 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
     except CampaignError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}")
         log.warning("campaign %s drain deferred: %s", campaign.campaign_id, exc)
+        # F9: a campaign the eligibility gate refuses purely on budget exhaustion makes zero
+        # submissions every cycle — feed the same zero-progress breaker so it
+        # auto-pauses (``no_budget_progress``) instead of churning full sweeps forever.
+        if "budgets_exhausted" in str(exc) and _record_zero_progress(
+            deps, campaign.campaign_id, now_iso, "no_budget_progress"
+        ):
+            reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
         return None
     reasons.extend(_aggregate_campaign_reasons(report.reasons))
     key = f"campaign_zero_progress:{campaign.campaign_id}"
-    if report.processed == 0:
-        if _record_zero_progress(deps, campaign.campaign_id, now_iso):
+    # P2: the breaker keys on REAL progress (submissions/verifications/quarantines), not the
+    # scan counter — a batch of per-file budget deferrals or pending-target walks makes zero
+    # submissions and must trip the breaker, not reset it every cycle.
+    if report.progress == 0:
+        # F9: a zero-progress batch driven purely by budget refusals pauses as
+        # ``no_budget_progress`` (the campaign is budget-blocked, not unqueueable);
+        # any other zero-progress stall keeps the existing ``no_queueable_candidates``.
+        zero_reason = (
+            "no_budget_progress"
+            if any(reason.startswith("budget_refusal:") for reason in report.reasons)
+            else "no_queueable_candidates"
+        )
+        if _record_zero_progress(deps, campaign.campaign_id, now_iso, zero_reason):
             reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
     else:
         with contextlib.suppress(WriteDisabledError, StateError):

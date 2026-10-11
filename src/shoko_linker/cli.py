@@ -480,6 +480,19 @@ def _start_cycle_meta(store: StateStore, cycle_key: str, iso: str, interval_seco
         store.set_meta(META_NEXT_CYCLE_DUE_ISO, _iso_plus(iso, interval_seconds))
 
 
+def _begin_budget_cycle(store: StateStore, label: str, iso: str, fallback: str) -> str:
+    """Allocate this cycle's durable budget-window key (F9), best-effort.
+
+    The key is unique across process restarts (persisted run-id + monotonic sequence), so a
+    new process never collides with a prior run's persisted per-cycle counters. A stopped store
+    falls back to a label-derived key for reporting only — with writes disabled no
+    submission reserves a slot, so the fallback row is inert.
+    """
+    with contextlib.suppress(WriteDisabledError, StateError):
+        return store.begin_cycle(label, iso)
+    return fallback
+
+
 def _set_cycle_campaign_meta(store: StateStore, report: CycleReport) -> None:
     """Persist a bounded per-cycle campaign-batch summary (F7) on the cycle-meta path.
 
@@ -603,13 +616,14 @@ def _run_once(args: argparse.Namespace) -> int:
             overrides_text=read_overrides_text(settings),
         )
         started = current_iso()
-        _start_cycle_meta(store, "once-1", started, settings.sync.interval_seconds)
+        cycle_key = _begin_budget_cycle(store, "once", started, "once-1")
+        _start_cycle_meta(store, cycle_key, started, settings.sync.interval_seconds)
         report = run_cycle(
             deps,
             now_iso=started,
             mode=mode,
             policy=request.policy,
-            cycle_key="once-1",
+            cycle_key=cycle_key,
         )
         ended = current_iso()
         eligibility = compute_eligibility(deps, started)
@@ -730,15 +744,15 @@ def _run_daemon(args: argparse.Namespace) -> int:
             max_submissions=settings.sync.max_new_per_cycle,
             overrides_text=read_overrides_text(settings),
         )
-        index = -1
+        index, last_cycle_key = -1, "cycle-0"
 
         def now_iso() -> str:
-            nonlocal index
+            nonlocal index, last_cycle_key
             index += 1
             iso = current_iso()
-            cycle_key = _daemon_cycle_key(index)
-            _start_cycle_meta(store, cycle_key, iso, settings.sync.interval_seconds)
-            logging.getLogger(__name__).info("cycle %s starting (%s)", cycle_key, iso)
+            last_cycle_key = _begin_budget_cycle(store, "cycle", iso, _daemon_cycle_key(index))
+            _start_cycle_meta(store, last_cycle_key, iso, settings.sync.interval_seconds)
+            logging.getLogger(__name__).info("cycle %s starting (%s)", last_cycle_key, iso)
             return iso
 
         def on_cycle_complete(report: CycleReport) -> None:
@@ -776,7 +790,7 @@ def _run_daemon(args: argparse.Namespace) -> int:
 
         daemon_report = run_daemon(
             deps,
-            cycle_key=_daemon_cycle_key,
+            cycle_key=lambda _index: last_cycle_key,
             now_iso=now_iso,
             interval_seconds=settings.sync.interval_seconds,
             stop_after_cycles=stop_after,

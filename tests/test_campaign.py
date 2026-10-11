@@ -16,7 +16,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +25,7 @@ import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker import campaign as campaign_mod
 from shoko_linker import cli
 from shoko_linker.attestation import (
     SCOPE_DAEMON,
@@ -39,11 +40,12 @@ from shoko_linker.campaign import (
     CampaignPlanInvalidError,
     apply_campaign,
     approve_campaign,
+    campaign_send_progress,
     read_plan_file,
 )
 from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
 from shoko_linker.config import load_settings
-from shoko_linker.daemon import CycleMode, run_cycle
+from shoko_linker.daemon import ZERO_PROGRESS_PAUSE_CYCLES, CycleMode, run_cycle
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
@@ -52,6 +54,7 @@ from shoko_linker.state import (
     ATTESTATION_PAUSE_REASON,
     CAMPAIGN_STATUS_APPROVED,
     BaselineFile,
+    BudgetRefusal,
     FileState,
     StateStore,
     acquire_apply_lock,
@@ -84,6 +87,10 @@ LEASE_LONG_SECONDS = 7200.0
 LEASE_SHORT_SECONDS = 10.0
 LEASE_EXPIRY_OFFSET_SECONDS = 60.0
 CAMPAIGN_APPLY_MAX = 20
+COUNT_HUNDRED = 100
+COUNT_TWELVE = 12
+CAP_THREE = 3
+ROLLING_WINDOW_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -1117,6 +1124,19 @@ def _set_campaign(env: Env, **campaign: Any) -> None:
     env.config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
 
 
+def _set_sync(env: Env, **sync: Any) -> None:
+    """Rewrite the fixture config's sync section (budget ceilings per scenario)."""
+    document = _document(env.lease_path)
+    document["sync"] = {**document["sync"], **sync}
+    env.config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+
+def _budget_window_keys(store: StateStore) -> set[str]:
+    """Persisted per-cycle budget window keys (the F9 durable-cycle identity rows)."""
+    rows = store._conn.execute("SELECT window_key FROM budgets").fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def _daemon_cycle(env: Env, store: StateStore, campaign_id: str, cycle_key: str) -> Any:
     deps = _campaign_deps(env, store, campaign_id)
     return run_cycle(
@@ -2028,6 +2048,477 @@ def test_daemon_drain_aggregates_per_file_reasons(
         ]
         expected = f"batch_limit:x{COUNT_FIVE - BATCH_TWO - 1}:first=batch_limit:503"
         assert batch_limit_entries == [expected]
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------------------ F9: per-batch budget reset
+
+# The per-cycle submission budget used to key every batch of a campaign to a constant window
+# (``campaign-<short>``), so its counter accumulated forever and any campaign past
+# ``sync.max_new_per_cycle`` stalled permanently. F9 gives every campaign batch (and every
+# reconciliation cycle) a durable window_key unique across restarts, so the per-cycle cap is
+# per batch, not per campaign.
+
+
+def test_f9_campaign_per_cycle_budget_resets_each_batch(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Scenario 1: 100 approved files under a per-cycle cap of 5 — daemon drain batches keep
+    progressing past 5/10/20/50 (cap resets each batch) and the campaign completes."""
+    _set_campaign(env, max_batch_size=BATCH_THREE)
+    _set_sync(env, max_new_per_cycle=5, max_pending_episode_jobs=100, rolling_new_limit=1000)
+    specs_list = specs(COUNT_HUNDRED)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys, limit=str(COUNT_HUNDRED))
+    assert prepared["files"] == COUNT_HUNDRED
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        assert _campaign_sent(store, campaign_id) == 1
+        milestones: list[int] = []
+        for index in range(40):
+            cycle = _daemon_cycle(env, store, campaign_id, f"drain-{index}")
+            if cycle.campaign is None:
+                break
+            milestones.append(_campaign_sent(store, campaign_id))
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_HUNDRED
+        assert campaign.status == "paused"  # max_submissions_reached
+        for threshold in (5, 10, 20, 50):
+            assert any(count > threshold for count in milestones)
+        posted = env.stubs.posted_files
+        assert len(posted) == COUNT_HUNDRED
+        assert len(set(posted)) == COUNT_HUNDRED
+    finally:
+        store.close()
+
+
+def test_f9_daemon_restart_new_cycle_keys_never_collide(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Scenario 2: a store reopen mid-drain (new process) allocates cycle keys that never collide
+    with the persisted pre-restart rows, and the campaign continues to completion."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _daemon_cycle(env, store, campaign_id, "pre-restart")
+        keys_before = _budget_window_keys(store)
+    finally:
+        store.close()
+    reopened = env.open_store()
+    try:
+        new_key = reopened.begin_cycle("cycle", env.now_iso)
+        assert new_key not in keys_before  # fresh process never reuses a persisted window row
+        cycle = _daemon_cycle(env, reopened, campaign_id, "post-restart")
+        assert cycle.campaign is not None
+        campaign = reopened.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_FIVE
+        posted = env.stubs.posted_files
+        assert len(set(posted)) == COUNT_FIVE  # no file re-sent
+    finally:
+        reopened.close()
+
+
+def test_f9_manual_apply_invocations_each_get_a_fresh_batch_key(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Scenario 3: repeated one-shot ``campaign apply`` invocations each allocate a fresh batch
+    key and make progress (the old constant key stalled every batch after the first cap)."""
+    _set_campaign(env, max_batch_size=3)
+    _set_sync(env, max_new_per_cycle=2)  # cap of 2 < batch of 3: only resets let it progress
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        total = 0
+        for _ in range(3):
+            result = apply(env, capsys, batch="3")
+            assert result["exit"] == EXIT_OK
+            campaign = store.get_campaign(campaign_id)
+            assert campaign is not None
+            assert campaign.total_sent > total  # progress on every invocation
+            total = campaign.total_sent
+        assert total == COUNT_FIVE
+        assert len(env.stubs.posts) == COUNT_FIVE
+    finally:
+        store.close()
+
+
+def test_f9_outstanding_job_cap_enforced_across_batches(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Scenario 5: the outstanding async-job ceiling keeps applying across batches — sends
+    that stay in ``verifying`` hold their jobs, so a later batch defers at the cap."""
+    _set_campaign(env, max_batch_size=5)
+    _set_sync(env, max_new_per_cycle=5, max_pending_episode_jobs=2, rolling_new_limit=1000)
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs_list}  # never verify → jobs held
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)  # 1 job held
+        first = _daemon_cycle(env, store, campaign_id, "j1")
+        assert first.campaign is not None
+        assert first.campaign.submitted == 1  # 2nd job fills the ceiling
+        blocked = _daemon_cycle(env, store, campaign_id, "j2")
+        assert blocked.campaign is None  # jobs exhausted → the batch defers
+        assert any("budgets_exhausted" in reason for reason in blocked.reasons)
+    finally:
+        store.close()
+
+
+def test_f9_budget_blocked_campaign_trips_zero_progress(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Scenario 6: a campaign whose submissions are every budget-refused makes zero successful
+    submissions across consecutive drains and auto-pauses via the zero-progress breaker (the old
+    accounting counted refused attempts as processed and stalled the campaign forever)."""
+    _set_campaign(env, max_batch_size=5)
+    # The canary's single submission spends the global rolling budget (window 168h), so every
+    # later drain is budget-blocked: zero successful submissions, permanently (until the window).
+    _set_sync(env, max_new_per_cycle=1, rolling_new_limit=1)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)  # the one submission that opens the drain
+        posts_before = len(env.stubs.posts)
+        assert posts_before == 1
+        for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
+            cycle = _daemon_cycle(env, store, campaign_id, key)
+            assert cycle.campaign is None  # budget-blocked batches defer
+            assert any("budgets_exhausted" in reason for reason in cycle.reasons)
+            campaign = store.get_campaign(campaign_id)
+            assert campaign is not None
+            if index < ZERO_PROGRESS_PAUSE_CYCLES - 1:
+                assert campaign.status == "approved"
+            else:
+                assert campaign.status == "paused"
+                assert campaign.status_reason == "no_budget_progress"
+        assert len(env.stubs.posts) == posts_before  # zero further POSTs
+        after = _daemon_cycle(env, store, campaign_id, "after-pause")
+        assert after.campaign is None  # drops out of drain selection
+    finally:
+        store.close()
+
+
+def test_f9_batch_loop_preflights_are_bounded_by_attempts(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F9-1(a): 12-file plan, per-cycle cap 3, batch 12. Submissions stop at the cap and the
+    batch never walks the whole plan — preflight network reads stay O(cap), not O(len(plan))."""
+    _set_campaign(env, max_batch_size=COUNT_TWELVE)
+    _set_sync(
+        env, max_new_per_cycle=CAP_THREE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    env.seed(specs(COUNT_TWELVE))
+    prepared = prepare(env, capsys, limit=str(COUNT_TWELVE))
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+
+    preflight_calls = 0
+    real_preflight = campaign_mod.preflight  # type: ignore[attr-defined]
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_mod, "preflight", _spy)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        preflight_calls = 0  # measure only the drain batch
+        cycle = _daemon_cycle(env, store, campaign_id, "cap3-batch12")
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == CAP_THREE
+        assert len(env.stubs.posts) == CAP_THREE + 1  # 3 drain + 1 canary
+        # bounded by ~cap (the accepted files + one refused stop), never the 12-file plan
+        assert preflight_calls <= CAP_THREE + 1
+        assert preflight_calls < COUNT_TWELVE
+    finally:
+        store.close()
+
+
+def test_f9_batch_loop_stops_at_the_wall_time_bound(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F9-1(c): a monotonic clock past ``max_cycle_seconds`` stops starting new submissions;
+    the deferred remainder stays queueable (non-destructive) with zero further POSTs."""
+    _set_campaign(env, max_batch_size=COUNT_TWELVE)
+    _set_sync(
+        env, max_new_per_cycle=CAP_THREE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    env.seed(specs(COUNT_TWELVE))
+    prepared = prepare(env, capsys, limit=str(COUNT_TWELVE))
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        base = _campaign_deps(env, store, campaign_id)
+        clock = {"value": 0.0}
+
+        def _fake_monotonic() -> float:
+            current = clock["value"]
+            clock["value"] += 100.0  # every reading crosses the 10s bound
+            return current
+
+        deps = replace(base, monotonic=_fake_monotonic, max_cycle_seconds=10.0)
+        posts_before = len(env.stubs.posts)
+        report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        assert report.submitted == 0  # the clock is past the bound before the first submission
+        assert any(reason.startswith("batch_time_limit:") for reason in report.reasons)
+        assert len(env.stubs.posts) == posts_before  # zero POSTs after the bound
+        planned = [
+            record
+            for record in store.campaign_files(campaign_id)
+            if record.state is FileState.PLANNED
+        ]
+        assert len(planned) == COUNT_TWELVE  # the whole plan stays queueable (no quarantine)
+    finally:
+        store.close()
+
+
+def test_f9_pending_target_scan_is_bounded_by_batch_size(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F9-1c: an all-pending-target plan must not walk every file's AniDB→Shoko chain each
+    batch. Resolution attempts count toward the batch bound, so the resolver GET chain is
+    O(batch size), files stay queueable, and later batches progress once targets exist."""
+    _set_campaign(env, max_batch_size=CAP_THREE)
+    _set_sync(
+        env, max_new_per_cycle=CAP_THREE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    specs_list = specs(COUNT_TWELVE)
+    env.stubs.pending = {spec.shoko_id for spec in specs_list}  # Shoko metadata not materialized
+    env.seed(specs_list)
+    prepared = prepare(env, capsys, limit=str(COUNT_TWELVE))
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+
+    resolve_calls = 0
+    real_resolve = campaign_mod._resolve_and_rebuild  # the apply-batch pending resolution path
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_mod, "_resolve_and_rebuild", _spy)
+    store = env.open_store()
+    try:
+        first = apply(env, capsys, batch=str(CAP_THREE))
+        assert first["exit"] == EXIT_OK
+        assert first["payload"]["submitted"] == 0  # nothing materialized yet
+        # bounded by the batch (3), not the 12-file plan
+        assert resolve_calls <= CAP_THREE
+        assert resolve_calls < COUNT_TWELVE
+        assert len(env.stubs.posts) == 0
+        bound = [
+            record
+            for record in store.campaign_files(campaign_id)
+            if record.state in (FileState.MAPPED, FileState.PLANNED)
+        ]
+        assert len(bound) == COUNT_TWELVE  # every file stays queueable (no quarantine)
+
+        resolve_calls = 0
+        env.stubs.pending.clear()  # Shoko metadata materialized
+        second = apply(env, capsys, batch=str(CAP_THREE))
+        assert second["exit"] == EXIT_OK
+        assert second["payload"]["submitted"] == CAP_THREE  # later batches progress
+    finally:
+        store.close()
+
+
+def test_f9_head_job_exhaustion_defers_only_that_file(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F9-1d: a per-file ``pending_episode_jobs_exhausted`` (a multi-episode head file over the
+    job cap) must NOT starve the campaign — healthy later files send, the head file defers
+    (stays queueable, never quarantined), and the campaign is not auto-paused."""
+    _set_campaign(env, max_batch_size=COUNT_FIVE)
+    _set_sync(
+        env, max_new_per_cycle=COUNT_FIVE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    head_id = specs_list[0].shoko_id
+
+    store = env.open_store()
+    real_prepare = store.prepare_send
+
+    def _fake_prepare(file_id: int, *args: Any, **kwargs: Any) -> Any:
+        # Simulate the head multi-episode file exceeding ``max_pending_episode_jobs``; every
+        # other (1-episode) file reserves through the real path.
+        if file_id == head_id:
+            return BudgetRefusal(False, "pending_episode_jobs_exhausted", "forced per-file probe")
+        return real_prepare(file_id, *args, **kwargs)
+
+    monkeypatch.setattr(store, "prepare_send", _fake_prepare)
+    try:
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_FIVE,
+        )
+        assert report.submitted == COUNT_FIVE - 1  # healthy files all sent
+        assert any(
+            reason.startswith(f"budget_refusal:{head_id}:pending_episode_jobs_exhausted")
+            for reason in report.reasons
+        )
+        head = store.get_file(head_id)
+        assert head is not None
+        assert head.state is FileState.PLANNED  # deferred, never quarantined
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"  # not starved into a zero-progress pause
+        assert len(env.stubs.posts) == COUNT_FIVE - 1
+        assert head_id not in env.stubs.posted_files
+    finally:
+        store.close()
+
+
+def _force_job_exhaustion(
+    store: StateStore, monkeypatch: pytest.MonkeyPatch, *, exclude: set[int]
+) -> None:
+    """Force a per-file ``pending_episode_jobs_exhausted`` refusal on every file except
+    ``exclude`` (the reviewer's P2 probe: deferrals must never count as progress)."""
+    real_prepare = store.prepare_send
+
+    def _fake_prepare(file_id: int, *args: Any, **kwargs: Any) -> Any:
+        if file_id in exclude:
+            return real_prepare(file_id, *args, **kwargs)
+        return BudgetRefusal(False, "pending_episode_jobs_exhausted", "forced per-file probe")
+
+    monkeypatch.setattr(store, "prepare_send", _fake_prepare)
+
+
+def test_f9_all_refused_batch_is_not_plan_complete(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: a batch where every file is per-file budget-refused must NOT report plan_complete."""
+    _set_campaign(env, max_batch_size=COUNT_FIVE)
+    _set_sync(
+        env, max_new_per_cycle=COUNT_FIVE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    _force_job_exhaustion(store, monkeypatch, exclude=set())
+    try:
+        report = apply_campaign(
+            _campaign_deps(env, store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_FIVE,
+        )
+        assert report.submitted == 0
+        assert report.progress == 0  # zero real progress
+        assert report.stopped != "plan_complete"  # scan activity is not completion
+        assert report.stopped is None
+        assert len(env.stubs.posts) == 0
+        queueable = [
+            record
+            for record in store.campaign_files(campaign_id)
+            if record.state in (FileState.PLANNED, FileState.MAPPED)
+        ]
+        assert len(queueable) == COUNT_FIVE  # every file stays queueable
+    finally:
+        store.close()
+
+
+def test_f9_per_file_refusals_trip_zero_progress_breaker(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2: after the canary, every later file is per-file budget-refused → zero submissions
+    every drain cycle → the breaker trips ``no_budget_progress`` by the 3rd consecutive cycle."""
+    _set_campaign(env, max_batch_size=COUNT_FIVE)
+    _set_sync(
+        env, max_new_per_cycle=COUNT_FIVE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)  # opens the drain with one real submission
+        canary_files = set(env.stubs.posted_files)
+        _force_job_exhaustion(store, monkeypatch, exclude=canary_files)
+        posts_before = len(env.stubs.posts)
+        assert posts_before == 1
+        for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
+            cycle = _daemon_cycle(env, store, campaign_id, key)
+            assert cycle.campaign is not None  # the drain runs (campaign is drain-eligible)
+            assert cycle.campaign.submitted == 0
+            assert cycle.campaign.progress == 0  # per-file refusals make zero real progress
+            campaign = store.get_campaign(campaign_id)
+            assert campaign is not None
+            if index < ZERO_PROGRESS_PAUSE_CYCLES - 1:
+                assert campaign.status == "approved"
+            else:
+                assert campaign.status == "paused"
+                assert campaign.status_reason == "no_budget_progress"
+        assert len(env.stubs.posts) == posts_before  # zero further POSTs across the cycles
+    finally:
+        store.close()
+
+
+def test_f9_plan_complete_reflects_persisted_progress(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1: ``plan_complete`` is reported only when persisted campaign progress covers the plan."""
+    _set_campaign(env, max_batch_size=COUNT_FIVE)
+    _set_sync(
+        env, max_new_per_cycle=COUNT_FIVE, max_pending_episode_jobs=100, rolling_new_limit=1000
+    )
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        report = apply_campaign(
+            _campaign_deps(env, store, prepared["campaign_id"]),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_FIVE,
+        )
+        assert report.submitted == COUNT_FIVE
+        assert report.progress > 0
+        assert report.remaining == 0
+        assert report.stopped == "plan_complete"  # all 5 files have persisted send progress
+        assert campaign_send_progress(store, prepared["campaign_id"]) == COUNT_FIVE
     finally:
         store.close()
 

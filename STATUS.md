@@ -15,7 +15,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | Finding | Severity | Status |
 | --- | --- | --- |
 | F8 — daemon/campaign attestation scope mutual exclusion | P1 | PASS (pending final gate) |
-| F9 — campaign submission budgets never reset between batches | P1 | TODO |
+| F9 — campaign submission budgets never reset between batches | P1 | PASS (pending final gate) |
 | F10 — canary authorization inferred from attempted submissions | P1 | TODO |
 | F11 — campaign batches reuse stale safety/timing decisions | P1 | TODO |
 | F12 — GHCR provenance fetches manifests as blobs | P2 | TODO |
@@ -33,6 +33,16 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 **Evidence:** `uv run pytest -q` 829 passed (exit 0); `uv run ruff check .` pass; `uv run ruff format --check .` 47 files clean; `uv run mypy` clean (44 files); `git diff --check` clean. Real-file scenario tests cover: daemon-only, campaign-only, both valid, each expired independently, both expired, endpoint mismatch, stale version, scope mismatch fail-closed, scoped invalidate, backward-compat legacy records, restart-equivalence (fresh loader read), mid-batch/mid-cycle lease expiry (zero POSTs after expiry, non-destructive deferral), resume→expiry→re-pause. Offline only; no live Shoko/Sonarr writes.
 
+## F9 — PASS (local commit this round)
+
+**Design:** `StateStore.begin_cycle(prefix, iso)` allocates durable window keys `<label>-<run_id>-<seq>` from persisted meta `budget_run_id` (per-install uuid nonce) + `budget_cycle_seq` (monotonic, advanced before submissions; corruption-safe seed via floor scan of existing window rows). Daemon cycles use `cycle-<run>-<seq>`; every campaign batch (daemon drain + manual CLI apply) allocates one fresh `campaign-<short>-<run>-<seq>` key per batch, threaded through prepare_send/verify/mark_completed. Completed per-cycle budget rows pruned to newest 64 at cycle start (global `_global` rolling row + current window never touched; pending accounting lives only on `_global` via send-row release funnels; `sends`-row request-fingerprint dedup untouched → no replay, no lost intent). Campaign batch loop bounded by an attempts counter (incl. resolve-chain scans) and a monotonic wall-time cap (`max_cycle_seconds`, clock starts before the sweep). Campaign-wide budget refusals (paused / pending_files_exhausted / cycle_new_exhausted / rolling_new_exhausted) break the batch and defer the remainder non-destructively (queueable, never quarantined); per-file `pending_episode_jobs_exhausted` is a per-file deferral that never starves healthy files. Zero-progress breaker keyed on REAL progress (`report.progress = submitted+verified+quarantined`), not scan counts: per-file job refusals and non-materializing pending targets trip campaign auto-pause (`no_budget_progress` / `no_queueable_candidates`) in 3 cycles with resume working. `plan_complete` reports derive only from persisted `campaign_send_progress >= len(plan.files)` — an all-refused batch is never reported complete.
+
+**Review history:** round 1 BLOCKING (P2 preflight GET amplification via processed-keyed guard + no wall-time cap; P3 corrupt seq) → fixed (attempts bound, time cap, corruption floor). Round 2 BLOCKING (P2 resolver-walk amplification relocated to `_resolve_and_rebuild`; P2 per-file job-ceiling refusal broke whole batch → head-of-line starvation) → fixed (scan-attempt counting, `_CAMPAIGN_WIDE_BUDGET_REFUSALS` classification). Round 3 BLOCKING (P1 false `plan_complete` from scan counter; P2 breaker bypassed by deferrals) → fixed (persisted-progress completion, `report.progress`). Round 4: **ACCEPTABLE**, remaining findings P3 only.
+
+**Deferred P3s:** `report.progress` sums submitted+verified+quarantined so verified sends double-count the operator-facing metric (sole functional use is the `==0` breaker check); mass-drift quarantine resolves are cap-neutral (amortized, wall-time bounded); zero-progress reason label imprecise for mixed budget+pending deferrals.
+
+**Evidence:** `uv run pytest -q` 847 passed; `uv run ruff check .` pass; `uv run ruff format --check .` clean; `uv run mypy` clean (44 files); `git diff --check` clean. 17+ `test_f9_*` regression tests incl: 100-file campaign / per-cycle cap 5 progressing past 5/10/20/50 across daemon batches; restart key-collision freedom; repeated manual applies fresh keys; rolling exhaustion stop/resume; outstanding-job cap across batches; budget-blocked zero-progress auto-pause; crash-mid-batch single-completion (no replay); bounded preflight/resolve calls (spy counts ≤ batch size); wall-time bound; all-refused ≠ plan_complete. Offline only; no live writes.
+
 ## Constraints
 
 - Sequential model agents only (single-slot local inference endpoint).
@@ -42,4 +52,4 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 ## Next action
 
-Implement F9 (unique durable budget-cycle identifiers) via a self-contained delegated brief.
+Implement F10 (explicit operator canary confirmation for automatic drain authorization) via a self-contained delegated brief.

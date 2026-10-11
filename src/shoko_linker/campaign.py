@@ -136,6 +136,18 @@ STOP_CONDITIONS: Final[tuple[str, ...]] = (
 _CAMPAIGN_QUEUE_STATES: Final[frozenset[FileState]] = frozenset(
     {FileState.PLANNED, FileState.MAPPED}
 )
+#: Budget refusals that are campaign-wide — every later file in the batch refuses identically,
+#: so the batch stops and defers the rest (F9-1d). A per-file ``pending_episode_jobs_exhausted``
+#: depends on *that file's* episode count and does NOT stop the batch (healthy later files
+#: still send); it is a non-destructive per-file deferral.
+_CAMPAIGN_WIDE_BUDGET_REFUSALS: Final[frozenset[str]] = frozenset(
+    {
+        "paused",
+        "pending_files_exhausted",
+        "cycle_new_exhausted",
+        "rolling_new_exhausted",
+    }
+)
 _DEFERRING_PREFLIGHT_REASONS: Final[frozenset[PreflightReason]] = frozenset(
     {
         PreflightReason.QUEUE_UNKNOWN,
@@ -686,7 +698,14 @@ def approve_campaign(
 
 @dataclass(frozen=True)
 class CampaignApplyReport:
-    """One bounded ``campaign apply`` invocation outcome (every number is persisted truth)."""
+    """One bounded ``campaign apply`` invocation outcome (every number is persisted truth).
+
+    ``processed`` is a **scan** counter (files the batch examined: submissions, per-file budget
+    deferrals and pending-target resolutions) — never submission progress.
+    ``progress`` is the real progress the batch produced: submissions + verifications +
+    quarantines. The zero-progress breaker keys off ``progress`` (zero real progress → pause),
+    and ``stopped = "plan_complete"`` reflects **persisted** campaign progress, never a scan count.
+    """
 
     campaign_id: str
     processed: int
@@ -694,6 +713,7 @@ class CampaignApplyReport:
     verified: int
     quarantined: int
     deferred: int
+    progress: int
     total_sent: int
     remaining: int
     reasons: tuple[str, ...]
@@ -707,6 +727,7 @@ class _SendTally:
     quarantined: int
     deferred: int
     reasons: tuple[str, ...]
+    budget_blocked: bool = False
 
 
 def _bind_campaign(store: StateStore, campaign_id: str, iso: str) -> int:
@@ -812,16 +833,23 @@ def apply_campaign(
             verified=0,
             quarantined=0,
             deferred=min(size, len(plan.files)),
+            progress=0,
             total_sent=campaign.total_sent,
             remaining=remaining,
             reasons=(lock_reason,),
             stopped=None,
         )
     try:
+        # P3-2: the batch wall-time budget starts at batch start, BEFORE the DRY_RUN sweep, so
+        # the whole cycle (sweep + apply) respects ``max_cycle_seconds`` (daemon ``_apply`` parity).
+        cycle_start_mono = deps.monotonic()
         _apply_guards(deps, settings, store, campaign, digest, now_iso, reasons)
         sweep = _apply_sweep(deps, campaign.campaign_id, now_iso, reasons)
         active = _apply_mapping(deps, store, plan, campaign.campaign_id, now_iso)
         counters = _CampaignCounters(sent_running=campaign.total_sent)
+        # F9: a fresh durable budget-window key for this batch (unique across restarts), so the
+        # per-cycle submission cap is per batch — never a constant key that accumulates forever.
+        batch_cycle_key = store.begin_cycle(f"campaign-{_short(campaign.campaign_id)}", now_iso)
         context = _ApplyContext(
             deps=deps,
             settings=settings,
@@ -832,15 +860,30 @@ def apply_campaign(
             resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
             queue=fetch_queue(deps.shoko),
             now_iso=now_iso,
+            cycle_key=batch_cycle_key,
         )
-        for entry in plan.files:
-            if counters.processed - counters.quarantined >= size:
-                counters.deferred += 1
-                reasons.append(f"batch_limit:{entry.shoko_file_id}")
-                continue
+        # F9-1: bounded batch loop. The per-cycle cap resets each batch (F9), but the batch
+        # itself must stay O(size) network reads: the batch-limit guard keys on scan ATTEMPTS
+        # (not successes — a pending-target resolution and a send both count), a wall-time cap
+        # mirrors the daemon cycle bound, and a campaign-wide budget refusal stops the batch.
+        # Deferred/remaining files are never quarantined — they stay queueable for later batches.
+        for index, entry in enumerate(plan.files):
+            if counters.attempts - counters.quarantined >= size:
+                for deferred in plan.files[index:]:
+                    counters.deferred += 1
+                    reasons.append(f"batch_limit:{deferred.shoko_file_id}")
+                break
+            if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
+                # Wall-time cap (same semantics as daemon ``_apply``): stop starting new
+                # submissions (never interrupts an in-flight send); the rest stay queueable.
+                for deferred in plan.files[index:]:
+                    counters.deferred += 1
+                    reasons.append(f"batch_time_limit:{deferred.shoko_file_id}")
+                break
             candidate = _prepare_candidate(context, entry, counters, reasons)
             if candidate is None:
                 continue
+            counters.attempts += 1
             tally = _send_one(
                 deps,
                 settings,
@@ -851,15 +894,28 @@ def apply_campaign(
                 active,
                 context.queue,
                 now_iso,
+                batch_cycle_key,
             )
-            counters.processed += 1
             counters.submitted += tally.submitted
             counters.verified += tally.verified
             counters.quarantined += tally.quarantined
             counters.deferred += tally.deferred
             counters.sent_running += tally.submitted
             reasons.extend(tally.reasons)
-        remaining = len(plan.files) - campaign_send_progress(store, campaign.campaign_id)
+            if tally.budget_blocked:
+                # F9 zero-progress: a campaign-wide budget refusal is NOT progress. The window
+                # is exhausted, so every remaining file refuses identically — stop starting
+                # new submissions (no full-plan preflight storm) and defer the rest (queueable).
+                counters.deferred += len(plan.files) - index - 1
+                break
+            counters.processed += 1
+        # P1/P2: real progress is persisted submissions/verifications/quarantines, never a scan
+        # count. ``plan_complete`` reflects persisted campaign progress; the
+        # zero-progress breaker (daemon) reads ``progress`` so per-file deferrals and
+        # pending-target walks with zero submissions trip it instead of resetting every cycle.
+        persisted_progress = campaign_send_progress(store, campaign.campaign_id)
+        remaining = max(0, len(plan.files) - persisted_progress)
+        progress = counters.submitted + counters.verified + counters.quarantined
         return CampaignApplyReport(
             campaign_id=campaign.campaign_id,
             processed=counters.processed,
@@ -867,10 +923,11 @@ def apply_campaign(
             verified=counters.verified,
             quarantined=counters.quarantined,
             deferred=counters.deferred,
+            progress=progress,
             total_sent=campaign.total_sent + counters.submitted,
-            remaining=max(0, remaining),
+            remaining=remaining,
             reasons=tuple(dict.fromkeys(reasons)),
-            stopped=None if counters.processed < len(plan.files) else "plan_complete",
+            stopped="plan_complete" if persisted_progress >= len(plan.files) else None,
         )
     finally:
         if lock_acquired and not lock_held:
@@ -887,6 +944,7 @@ class _CampaignCounters:
     quarantined: int = 0
     deferred: int = 0
     sent_running: int = 0
+    attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -902,6 +960,7 @@ class _ApplyContext:
     resolver: EpisodeIdResolver
     queue: QueueSnapshot | None
     now_iso: str
+    cycle_key: str
 
 
 def _batch_size(settings: Settings, batch_size: int | None) -> int:
@@ -1118,6 +1177,11 @@ def _resolve_and_rebuild(
     """Resolve a pending-target plan; the exact-identity rule, fail closed (no POST on drift)."""
     store, now_iso, file_id = context.store, context.now_iso, entry.shoko_file_id
     resolved_plan, reason = _resolved_pending_plan(candidate, entry, context.resolver)
+    # P3: every pending-target resolution runs the AniDB→Shoko chain GETs before the branch, so
+    # count ONE scan attempt here (pending_metadata, quarantine and success paths alike). This
+    # bounds the resolve-chain quarantine walks too — an all-pending plan can never walk all N
+    # files per batch, and a quarantined resolve no longer slips past the batch cap.
+    counters.attempts += 1
     if reason == "pending_metadata":
         counters.processed += 1
         counters.deferred += 1
@@ -1361,6 +1425,7 @@ def _send_one(
     active: ActiveMappings,
     queue: QueueSnapshot | None,
     now_iso: str,
+    cycle_key: str,
 ) -> _SendTally:
     """One approved candidate through the guarded path; zero writes unless preflight passes."""
     verdict = preflight(
@@ -1397,7 +1462,7 @@ def _send_one(
         targets_digest=plan.targets_digest,
         structure_digest=plan.structure_digest,
         mapping_revision=str(active.revision),
-        cycle_key=f"campaign-{_short(campaign_id)}",
+        cycle_key=cycle_key,
         iso=now_iso,
         policy=plan.policy,
         campaign_id=campaign_id,
@@ -1408,7 +1473,18 @@ def _send_one(
         ),
     )
     if isinstance(prepared, BudgetRefusal):
-        return _SendTally(0, 0, 0, 1, (f"budget_refusal:{plan.shoko_file_id}:{prepared.reason}",))
+        # F9-1d: only campaign-wide refusals break the batch. A per-file
+        # ``pending_episode_jobs_exhausted`` depends on this file's own episode count, so the
+        # healthy later files must still send — defer this file, keep the batch running.
+        campaign_wide = prepared.reason in _CAMPAIGN_WIDE_BUDGET_REFUSALS
+        return _SendTally(
+            0,
+            0,
+            0,
+            1,
+            (f"budget_refusal:{plan.shoko_file_id}:{prepared.reason}",),
+            budget_blocked=campaign_wide,
+        )
     token: SendToken = prepared
     # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
     store.mark_sent(token, iso=now_iso)
@@ -1423,9 +1499,7 @@ def _send_one(
         )
     if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
         return _SendTally(1, 0, 0, 0, (f"send_{send.outcome.value}:{plan.shoko_file_id}",))
-    detail = verify_and_close(
-        deps, plan, plan.shoko_file_id, f"campaign-{_short(campaign_id)}", now_iso
-    )
+    detail = verify_and_close(deps, plan, plan.shoko_file_id, cycle_key, now_iso)
     verified = 1 if detail.endswith(":verified") else 0
     return _SendTally(1, verified, 0, 0, (detail,))
 

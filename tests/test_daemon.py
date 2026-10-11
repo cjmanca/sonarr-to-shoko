@@ -28,6 +28,7 @@ from shoko_linker.attestation import AttestationVerdict
 from shoko_linker.campaign import (
     apply_campaign,
     approve_campaign,
+    campaign_send_progress,
     prepare_campaign,
     write_plan_file,
 )
@@ -35,6 +36,7 @@ from shoko_linker.cli import StopState, persist_cycle_meta
 from shoko_linker.config import Settings, parse_settings
 from shoko_linker.daemon import (
     DAEMON_HISTORY_MAXLEN,
+    ZERO_PROGRESS_PAUSE_CYCLES,
     CycleMode,
     DaemonDeps,
     attestation_gate,
@@ -55,6 +57,7 @@ from shoko_linker.reporting import (
     META_CYCLE_SUBMITTED,
 )
 from shoko_linker.state import (
+    META_CAMPAIGN_ATTESTATION_GATE,
     META_LAST_FULL_RECONCILE_ISO,
     META_NEXT_FULL_RECONCILE_ISO,
     BaselineFile,
@@ -163,6 +166,7 @@ class ShokoStub:
         self.link_on_post = True
         self.post_status: int | None = None
         self.on_post: Callable[[], None] | None = None
+        self.unmaterialized: set[int] = set()  # AniDB episode ids whose Shoko metadata is not ready
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -324,6 +328,8 @@ class ShokoStub:
 
     def _chain_second(self, request: httpx.Request, path: str) -> httpx.Response:
         ep_id = int(path.split("/")[5])
+        if ep_id in self.unmaterialized:
+            return httpx.Response(404, json={"title": "not materialized"}, request=request)
         shoko_ep = SHOKO_EP
         for file in self.files.values():
             for _season, _number, anidb_ep, file_shoko in file.episodes:
@@ -4107,6 +4113,89 @@ def test_daemon_campaign_drain_skipped_when_disabled(
     # Drain disabled: the daemon never advances the campaign beyond the canary.
     assert campaign.total_sent == 1
     assert all(cycle.campaign is None for cycle in report.cycles)
+
+
+def test_campaign_pending_target_deferrals_trip_zero_progress_then_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2: a campaign whose remaining files never materialize (pending targets) makes zero
+    submissions every drain cycle, so the breaker trips; once targets materialize, submits resume
+    and the counter resets (no pause false-positive)."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    head = SpecFile(series_id=1, file_id=10, shoko_id=500, episodes=((1, 1, ANIDB_EP, SHOKO_EP),))
+    pending = [
+        SpecFile(
+            series_id=2 + index,
+            file_id=20 + index,
+            shoko_id=501 + index,
+            episodes=((1, 2 + index, ANIDB_EP + 1 + index, SHOKO_EP + 1 + index),),
+        )
+        for index in range(4)
+    ]
+    files = [head, *pending]
+    xml = (
+        "<anime-list>"
+        f"<anime anidbid='{ANIME_ID}' tvdbid='{TVDB_SERIES}' defaulttvdbseason='1'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1'>;1-1;2-2;3-3;4-4;5-5;</mapping>"
+        "</mapping-list></anime></anime-list>"
+    )
+    activate_mapping(tmp_path, xml)
+    settings = _drain_settings(tmp_path, batch=5)
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    store.set_meta("budget_last_cycle_key", "cycle-1")
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    # The remaining AniDB episodes never materialize → prepare builds genuine pending-target plans.
+    shoko.unmaterialized = {ANIDB_EP + 1 + index for index in range(4)}
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=xml,
+        monotonic=Clock([MONO_ZERO, MONO_ZERO, MONO_ZERO]),
+        advance=Sleeper().advance,
+        settings=settings,
+        max_submissions=10,
+        shoko=shoko,
+    )
+    plan, digest = prepare_campaign(deps, settings, store, T0, limit=5, deadline_hours=168.0)
+    write_plan_file(tmp_path / "plan.json", plan)
+    approve_campaign(store, tmp_path / "plan.json", digest, T0)
+    campaign_id = plan.campaign_id
+    try:
+        canary = apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
+        assert canary.submitted == 1  # the materialized head opens the drain
+        assert campaign_send_progress(store, campaign_id) == 1
+        posts_before = len(shoko.posts)
+        for index, key in enumerate(("p1", "p2", "p3")):
+            report = run_cycle(
+                deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.BACKLOG, cycle_key=key
+            )
+            campaign = store.get_campaign(campaign_id)
+            assert campaign is not None
+            assert report.campaign is not None
+            assert report.campaign.submitted == 0  # zero submissions every cycle
+            assert report.campaign.progress == 0  # pending-target deferrals make no progress
+            if index < ZERO_PROGRESS_PAUSE_CYCLES - 1:
+                assert campaign.status == "approved"
+            else:
+                assert campaign.status == "paused"
+                assert campaign.status_reason == "no_queueable_candidates"
+        assert len(shoko.posts) == posts_before  # zero POSTs across the zero-progress cycles
+
+        # Targets materialize; the operator resumes → later batches progress, counter resets.
+        shoko.unmaterialized = set()
+        store.set_campaign_status(campaign_id, "approved", "resumed", iso=T0)
+        store.set_meta(f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}", "valid")
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.BACKLOG, cycle_key="resume"
+        )
+        assert report.campaign is not None
+        assert report.campaign.submitted > 0  # submissions resumed, no pause false-positive
+        assert len(shoko.posts) > posts_before
+    finally:
+        store.close()
 
 
 def test_attestation_gate_campaign_scope_requires_campaign_id() -> None:

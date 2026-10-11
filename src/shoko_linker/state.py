@@ -83,6 +83,14 @@ F7 (also schema v1, unshipped — no image shipped with v1 columns has ever been
 drains an approved campaign against the same file the ``plan_drift`` digest gate re-verifies;
 it is appended to ``_SCHEMA_SQL`` with **no** migration entry.
 
+F9 (also schema v1, unshipped — no released image exists): the per-cycle budget window_key is
+made durable-unique. :meth:`StateStore.begin_cycle` allocates ``<label>-<run_id>-<seq>`` window
+keys from two meta rows (``budget_run_id`` nonce + ``budget_cycle_seq`` monotonic counter), so
+every reconciliation cycle and campaign batch gets a fresh budget row and a new process never
+collides with a prior run's persisted counters. No new table columns are added — the
+``budgets`` rows keyed by ``window_key`` and the global ``_global`` rolling row are unchanged in
+shape; completed per-cycle rows beyond :data:`BUDGET_CYCLE_RETENTION` are pruned on cycle start.
+
 **Operator-only indirect chain (P3-B):** the transition graph contains the path
 ``indeterminate_write → waiting → planned → prepared_not_sent → request_may_have_been_sent``,
 so a held row can reach a re-submittable state **only via the operator's explicit
@@ -104,6 +112,7 @@ import json
 import os
 import sqlite3
 import sys
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -166,6 +175,18 @@ META_LAST_REFUSAL: Final[str] = "last_refusal"
 META_SLOT_RELEASE_NOOPS: Final[str] = "slot_release_noops"
 META_BASELINE_COMPLETED_ISO: Final[str] = "baseline_completed_iso"
 META_BUDGET_CYCLE_KEY: Final[str] = "budget_last_cycle_key"
+#: Durable budget-cycle identity (F9). ``budget_run_id`` is a random nonce written once
+#: per install; ``budget_cycle_seq`` is a monotonic counter advanced at every
+#: reconciliation-cycle / campaign-batch start. Combined with the label prefix they give every
+#: executing cycle/batch a window_key that is unique across process restarts, so a new
+#: process never reuses a prior process's persisted per-cycle budget counters.
+META_BUDGET_RUN_ID: Final[str] = "budget_run_id"
+META_BUDGET_SEQ: Final[str] = "budget_cycle_seq"
+#: Bounded retention for *completed* per-cycle budget rows: on every cycle/batch start
+#: the newest ``BUDGET_CYCLE_RETENTION`` window rows (plus the global rolling row and the
+#: freshly allocated current window) are kept; older per-cycle counters are pruned so a
+#: multi-thousand-file campaign never grows the ``budgets`` table without bound.
+BUDGET_CYCLE_RETENTION: Final[int] = 64
 META_LAST_CYCLE_START_ISO: Final[str] = "last_cycle_start_iso"
 META_LAST_CYCLE_END_ISO: Final[str] = "last_cycle_end_iso"
 META_NEXT_CYCLE_DUE_ISO: Final[str] = "next_cycle_due_iso"
@@ -1673,6 +1694,82 @@ class StateStore:
                 " VALUES (?, 0, 0, 0)",
                 (GLOBAL_BUDGET_KEY,),
             )
+
+    @_mutation
+    def begin_cycle(self, prefix: str, iso: str) -> str:
+        """Allocate this cycle's/batch's durable budget-window identity (F9).
+
+        The window_key is ``<label>-<run_id>-<seq>``: ``run_id`` is a per-install nonce written
+        at first use, ``seq`` is a persisted monotonic counter advanced **before** any
+        submission. Combining them means every reconciliation cycle and every campaign batch
+        gets a distinct durable row that is unique across process restarts — a new process
+        starts fresh per-cycle counters instead of colliding with a prior run's persisted
+        ``cycle-1`` / constant campaign key. The key stays stable for the whole executing
+        cycle/batch (the caller threads it through every ``prepare_send`` / ``mark_completed``).
+
+        Only *completed* per-cycle rows beyond :data:`BUDGET_CYCLE_RETENTION` are pruned; the
+        ``_global`` rolling row and the freshly allocated window are never touched, so the
+        global/rolling ceilings keep applying across everything and live/pending accounting
+        (which lives on the ``_global`` row via the send-row release funnels) is intact.
+        """
+        _require_iso(iso, "iso")
+        label = prefix.strip()
+        if not label:
+            raise StateError("begin_cycle prefix must be a non-empty label")
+        with self._transaction():
+            self._ensure_global_budget_tx()
+            run_id = self.get_meta(META_BUDGET_RUN_ID)
+            if run_id is None:
+                run_id = uuid.uuid4().hex
+                self._set_meta_tx(META_BUDGET_RUN_ID, run_id)
+            raw_seq = self.get_meta(META_BUDGET_SEQ)
+            try:
+                parsed_seq = int(raw_seq) if raw_seq is not None else 0
+            except ValueError:
+                # F9-2: a corrupted counter must NOT silently restart at 1 (that re-issues
+                # ``<label>-<run_id>-1`` and collides with the first persisted window row).
+                # Seed from the highest numeric suffix already present for this run.
+                parsed_seq = 0
+            seq = max(parsed_seq, self._budget_run_seq_floor_tx(run_id)) + 1
+            self._set_meta_tx(META_BUDGET_SEQ, str(seq))
+            window_key = f"{label}-{run_id}-{seq}"
+            self._prune_budget_rows_tx(window_key)
+            self._set_meta_tx(META_BUDGET_CYCLE_KEY, window_key)
+        return window_key
+
+    def _budget_run_seq_floor_tx(self, run_id: str) -> int:
+        """Highest ``-<run_id>-<n>`` window-key suffix in ``budgets`` (F9-2 seed floor).
+
+        Used to make the ``begin_cycle`` sequence monotone even when the persisted
+        counter meta is corrupted, so a fresh key can never collide with an existing row.
+        """
+        marker = f"-{run_id}-"
+        floor = 0
+        for row in self._conn.execute("SELECT window_key FROM budgets").fetchall():
+            text = _as_str(row[0], "budgets.window_key")
+            head, sep, tail = text.rpartition(marker)
+            if sep and head and tail.isdigit():
+                floor = max(floor, int(tail))
+        return floor
+
+    def _prune_budget_rows_tx(self, keep: str) -> None:
+        """Delete *completed* per-cycle budget rows beyond the retention bound (F9).
+
+        Never the ``_global`` rolling row, never the freshly allocated current window. Pending
+        file/job accounting lives only on the ``_global`` row and every live send is closed
+        through the send-row release funnels (F1/P1-A), so dropping an old per-cycle counter row
+        can never strand a pending/prepared row; crash recovery reads the persisted ``sends``
+        rows (request-fingerprint dedup), which this pruning never deletes.
+        """
+        self._conn.execute(
+            "DELETE FROM budgets"
+            " WHERE window_key <> ? AND window_key <> ?"
+            " AND rowid NOT IN ("
+            "SELECT rowid FROM budgets"
+            " WHERE window_key <> ? AND window_key <> ?"
+            " ORDER BY rowid DESC LIMIT ?)",
+            (GLOBAL_BUDGET_KEY, keep, GLOBAL_BUDGET_KEY, keep, BUDGET_CYCLE_RETENTION),
+        )
 
     def _reserve_tx(
         self, cycle_key: str, iso: str, *, expected_episode_jobs: int, campaign: bool = False
