@@ -55,14 +55,20 @@
 #   run — it never publishes against unknown registry state. `package_missing`
 #   (401/404 NAME_UNKNOWN after a successful token exchange) is the documented
 #   first-publish state and is treated as "nothing published yet".
-# * Provenance verification (F3, best-effort bounded): a registry `sha-<fullsha>`
+# * Provenance verification (F3, F12, best-effort bounded): a registry `sha-<fullsha>`
 #   tag counts as published only when the manifest/config chain carries
 #   `org.opencontainers.image.revision` == the full SHA. Up to 10 tags are
-#   verified per run (VERIFY_CAP in scripts/ghcr_tags.py); any fetch/parse
-#   failure yields `unknown_provenance`, which is NOT counted as published, so
-#   the SHA is re-scheduled — `sha-` tags are content-addressed, so re-push
-#   is safe. Registry discovery + provenance need read-only pull scope:
-#   the plan job carries `packages: read` (never `write`).
+#   verified per run (VERIFY_CAP in scripts/ghcr_tags.py). Tag states and their
+#   ONLY allowed actions:
+#     published           -> skip (already published; never re-pushed)
+#     not_published       -> tag is ABSENT -> safe to publish/backfill
+#     unknown_provenance  -> tag EXISTS and is unverifiable -> NEVER
+#                            published/overwritten; the plan ABORTS and lists
+#                            the SHA for operator reconciliation.
+#   A `sha-` tag NAME derived from a commit is NOT proof that the existing
+#   image is immutable/correct, so an unverified existing tag is never
+#   silently replaced. Registry discovery + provenance need read-only pull
+#   scope: the plan job carries `packages: read` (never `write`).
 # * Historical validation (F3): each publish leg checks out its own SHA, so
 #   commits that predate `scripts/ci_checks.sh` (M8) cannot run the shared
 #   check list from their own tree. The plan job uploads `scripts/validate_
@@ -71,9 +77,11 @@
 #   (and only when) `scripts/ci_checks.sh` is absent at that SHA. Historical
 #   commits are never credited with the current commit's checks.
 # * Immutable SHA tags: every introduced commit (including ones inside a
-#   multi-commit push) gets `sha-<fullsha>`. Tag names are derived from the
-#   commit SHA, so one name maps to one commit and backfill skips already-
-#   published SHAs -> published sha- tags are never overwritten in practice.
+#   multi-commit push) gets `sha-<fullsha>`. The plan NEVER pushes a tag name
+#   that already exists in the registry (verified-published SKIPPED,
+#   unverifiable ABORTED with a reconciliation list), so published sha-
+#   tags are never overwritten — tag-name derivation is not the safety
+#   argument, the registry-state gate is.
 # * Fork/PR isolation: this workflow's publish/plan/promote jobs are
 #   gated to push / schedule / workflow_dispatch events; `pull_request`
 #   runs ONLY the read-only test job (GitHub gives PR runs a read-only token,
@@ -275,28 +283,63 @@ jobs:
             exit 0
           fi
           : > unverified.txt
+          : > nonpublished.txt
+          : > absent.txt
+          : > cap_unverified.txt
+          # F12 publication policy for EXISTING registry tags:
+          #   published          -> trusted skip (never re-pushed)
+          #   not_published      -> tag absent -> safe to publish/backfill
+          #   unknown_provenance -> tag EXISTS, unverifiable -> NEVER published;
+          #                        reported for operator reconciliation and the
+          #                        plan ABORTS (a sha- tag NAME derived from a
+          #                        commit is not proof the image is immutable).
+          report_unverified() {
+            [ -s unverified.txt ] || return 0
+            {
+              echo "## Provenance reconciliation required"
+              echo "- existing sha- tag(s) with unverifiable provenance are NEVER published/overwritten"
+              jq -r -n --rawfile unv unverified.txt --rawfile res provenance.json '
+                ($res.results // {}) as $r
+                | [$unv | split("\n")[] | select(length > 0)][]
+                | "- sha-\(.): registry tag state \($r[.] // "unknown_provenance") — reconcile the existing tag (inspect/pin/delete), then re-run backfill"
+              '
+            } >> "$GITHUB_STEP_SUMMARY"
+            die "existing sha- tag(s) with unverifiable provenance: $(tr '\n' ' ' < unverified.txt); refusing to publish over an unverifiable image — reconcile the tag(s) manually, then re-run"
+          }
           if [ "$EVENT_NAME" = "push" ]; then
             python3 scripts/enumerate_introduced.py introduced \
               --repo . --before "$PUSH_BEFORE" --after "$PUSH_SHA" \
               --ref "$PUSH_REF" --default-branch main \
               --first-buildable "$FIRST_BUILDABLE" --max-shas "$MAX" > plan.json
-            # Tag immutability: drop SHAs already published in the registry
-            # (e.g. a recreated branch reports an all-zero `before` and
-            # re-enumerates published history), EXCEPT tags whose provenance
-            # could not be verified — those are re-scheduled, never trusted.
+            # Tag immutability: a SHA whose image already exists in the registry is
+            # NEVER re-pushed. Provenance verification only decides what to REPORT:
+            # verified-published SHAs are skipped, SHAs proven ABSENT stay
+            # publishable, and unverified EXISTING tags abort for reconciliation.
             TAGGED=$(jq -r --rawfile tags known_tags.txt '
               ([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-")
                 | split("^")[0] | ascii_downcase] | map(select(length == 40))) as $pub
               | [.shas[] | select($pub | index(.))][:10] | join(",")' plan.json)
+            # Registry-tagged SHAs beyond the bounded verify cap are LEFT UNTOUCHED
+            # (never overwritten) and reported: their provenance is unconfirmed.
+            jq -r --rawfile tags known_tags.txt '
+              ([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-")
+                | split("^")[0] | ascii_downcase] | map(select(length == 40))) as $pub
+              | [.shas[] | select($pub | index(.))][10:] | .[]' plan.json > cap_unverified.txt
             if [ -n "$TAGGED" ]; then
               python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" --shas "${TAGGED}" > provenance.json
               VSTATUS=$(jq -r '.status' provenance.json)
               [ "$VSTATUS" = "ok" ] || die "provenance verification failed (${VSTATUS}: $(jq -r '.detail' provenance.json)); refusing to publish against unknown registry state"
-              jq -r '.results | to_entries[] | select(.value != "published") | .key' provenance.json > unverified.txt
+              jq -r '.results | to_entries[] | select(.value != "published") | .key' provenance.json > nonpublished.txt
+              jq -r '.results | to_entries[] | select(.value == "not_published") | .key' provenance.json > absent.txt
+              jq -r '.results | to_entries[] | select(.value == "unknown_provenance") | .key' provenance.json > unverified.txt
             fi
-            jq -c --rawfile tags known_tags.txt --rawfile unv unverified.txt \
-              '.shas -= (([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-") | split("^")[0] | ascii_downcase] | map(select(length == 40))) - ([$unv | split("\n")[] | ascii_downcase] | map(select(length == 40))))' \
+            # Drop every SHA that carries a registry tag, EXCEPT the ones
+            # provenance verification proved ABSENT: existing tags are never
+            # overwritten, and unverified ones are excluded before the abort.
+            jq -c --rawfile tags known_tags.txt --rawfile abs absent.txt \
+              '.shas -= (([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-") | split("^")[0] | ascii_downcase] | map(select(length == 40))) - ([$abs | split("\n")[] | ascii_downcase] | map(select(length == 40))))' \
               plan.json > plan.filtered.json && mv plan.filtered.json plan.json
+            report_unverified
           else
             TO="$TO_SHA_INPUT"
             FROM="$FROM_SHA_INPUT"
@@ -316,23 +359,31 @@ jobs:
             run_missing() {
               local args=(missing --repo . --upto "$TO" --known-tags-file known_tags.txt --max-shas "$MAX")
               if [ -n "$FROM" ]; then args+=(--since "$FROM"); fi
-              if [ -s unverified.txt ]; then args+=(--unverified-file unverified.txt); fi
+              # Only SHAs whose registry tag provenance verification proved ABSENT
+              # are re-scheduled; an EXISTING unverified tag never enters the
+              # publish set — the plan aborts and reports it for reconciliation.
+              if [ -s absent.txt ]; then args+=(--unverified-file absent.txt); fi
               python3 scripts/enumerate_introduced.py "${args[@]}" > plan.json
             }
             run_missing
-            # F3 provenance: an existing sha- tag counts as published only when
-            # its revision annotation verifies. Bounded (cap 10 tags/run,
-            # oldest-first from the scan); unverified tags are re-scheduled.
+            # F3 provenance: an existing sha- tag counts as published only when its
+            # revision annotation verifies. Bounded (cap 10 tags/run, oldest-first
+            # from the scan). F12: verification never re-publishes an existing
+            # tag — `not_published` (absent) is re-scheduled, `unknown_provenance`
+            # (existing and unverifiable) is reported and aborts the plan.
             TAGGED=$(jq -r '[.skipped[] | select(.reason == "already-tagged") | .sha][:10] | join(",")' plan.json)
             if [ -n "$TAGGED" ]; then
               python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" --shas "${TAGGED}" > provenance.json
               VSTATUS=$(jq -r '.status' provenance.json)
               [ "$VSTATUS" = "ok" ] || die "provenance verification failed (${VSTATUS}: $(jq -r '.detail' provenance.json)); refusing to publish against unknown registry state"
-              jq -r '.results | to_entries[] | select(.value != "published") | .key' provenance.json > unverified.txt
-              if [ -s unverified.txt ]; then
+              jq -r '.results | to_entries[] | select(.value != "published") | .key' provenance.json > nonpublished.txt
+              jq -r '.results | to_entries[] | select(.value == "not_published") | .key' provenance.json > absent.txt
+              jq -r '.results | to_entries[] | select(.value == "unknown_provenance") | .key' provenance.json > unverified.txt
+              if [ -s absent.txt ]; then
                 run_missing
               fi
             fi
+            report_unverified
           fi
           echo "shas=$(jq -c '.shas' plan.json)" >> "$GITHUB_OUTPUT"
           {
@@ -340,7 +391,9 @@ jobs:
             echo "- publishing: $(jq -r '.shas | join(" ")' plan.json)"
             echo "- skipped: $(jq -r '[.skipped[] | "\(.sha[:12]) (\(.reason))"] | join(", ")' plan.json)"
             echo "- overflow: $(jq -r '.overflow | join(" ")' plan.json)"
-            echo "- re-scheduled (unverified registry tags): $(jq -r '[.skipped[] | select(.reason == "tag-provenance-unverified") | .sha[:12]] | join(", ")' plan.json)"
+            echo "- re-scheduled (registry tag proven ABSENT by verification; safe to publish): $(jq -r '[.skipped[] | select(.reason == "tag-provenance-unverified") | .sha[:12]] | join(", ")' plan.json)"
+            echo "- existing tags not verified-published: $(wc -l < nonpublished.txt) (proven absent: $(wc -l < absent.txt); unverifiable -> reconciliation: $(wc -l < unverified.txt))"
+            echo "- existing tags beyond the verify cap (left untouched, provenance unconfirmed): $(tr '\n' ' ' < cap_unverified.txt)"
             jq -r '.notes[] | "- " + .' plan.json
           } >> "$GITHUB_STEP_SUMMARY"
           OVERFLOW=$(jq '.overflow | length' plan.json)

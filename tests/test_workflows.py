@@ -398,14 +398,26 @@ def test_plan_discovers_registry_tags_not_git_tags() -> None:
 
 def test_plan_verifies_tag_provenance_before_trusting_it() -> None:
     """A registry sha- tag counts as published only when the revision annotation
-    verifies; unverified tags are re-scheduled, never trusted."""
+    verifies. F12 policy: a verified-published tag is SKIPPED, a tag proven
+    ABSENT is publishable, and an EXISTING unverifiable tag is reported for
+    operator reconciliation and ABORTS the plan — never silently overwritten
+    (a sha- tag name derived from a commit is not proof of immutability)."""
     plan_run = _plan_run()
     assert "ghcr_tags.py verify" in plan_run
     assert "provenance verification failed" in plan_run
     assert 'select(.value != "published")' in plan_run
+    assert 'select(.value == "not_published")' in plan_run  # absent -> publishable
+    assert 'select(.value == "unknown_provenance")' in plan_run  # existing -> reconciliation
     assert "unverified.txt" in plan_run
-    assert "--unverified-file unverified.txt" in plan_run
+    assert "--unverified-file absent.txt" in plan_run  # only proven-absent SHAs re-enter the set
+    # F12: an EXISTING unverifiable tag never enters the publish set:
+    assert "--unverified-file unverified.txt" not in plan_run
+    assert "report_unverified" in plan_run
+    assert "cap_unverified.txt" in plan_run  # beyond-cap existing tags reported, never pushed
+    assert "Provenance reconciliation required" in plan_run
+    assert "refusing to publish over an unverifiable image" in plan_run
     assert plan_run.count("ghcr_tags.py verify") == 2  # push path + backfill path
+    assert plan_run.count("report_unverified") == 3  # definition + both event paths
 
 
 def test_plan_uploads_and_publish_downloads_historical_validator() -> None:

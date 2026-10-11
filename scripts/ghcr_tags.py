@@ -29,11 +29,26 @@ Any status outside {ok, package_missing} exits NONZERO, and the plan step must
 ABORT the run on that outcome — never publish against unknown registry state.
 
 Provenance verification (``verify``) is best-effort and bounded. A ``sha-``
-tag counts as published ONLY when the manifest/config blob chain carries the
-OCI annotation ``org.opencontainers.image.revision`` equal to the full SHA.
-Any fetch/parse failure yields ``unknown_provenance``, which is NOT counted as
-published, so the tag is re-scheduled: ``sha-`` tags are content-addressed by
-full commit SHA, so re-pushing the same tag name is safe.
+tag counts as published ONLY when the manifest/config chain carries the OCI
+annotation ``org.opencontainers.image.revision`` equal to the full SHA. A tag
+that the registry answers 404 for is ``not_published`` (absent, safe to
+publish). Any fetch/parse failure yields ``unknown_provenance``: the tag
+EXISTS and its content cannot be verified, so the CONSUMER must NOT re-push or
+overwrite it — a ``sha-`` tag NAME derived from a commit is not proof that the
+existing image is the right or immutable one. Publication policy (skip /
+publish / reconcile) is owned by ``.github/workflows/publish.yml``.
+
+Per the OCI Distribution Spec, manifests are read through
+``GET /v2/<name>/manifests/<reference>`` and blobs through
+``GET /v2/<name>/blobs/<digest>``. buildx publishes attestation-enabled
+images as OCI image INDEXES whose descriptors mix runnable image
+manifests with in-toto ATTESTATION manifests, so index children are fetched
+from ``/manifests/`` (never ``/blobs/``) and the runnable descriptor is
+selected by platform presence (attestation descriptors carry no usable
+platform and/or attestation annotations). Every digest-addressed document is
+verified strictly: the digest string must be ``sha256:<64 lowercase hex>``
+(non-conformant digests such as ``sha512:``/``notadigest``/empty fail closed
+to ``unknown_provenance``) and the fetched body must hash to it.
 
 The token is read from an environment variable (``--token-env``) and reaches
 the registry ONLY as a Basic ``username:password`` header (password = token);
@@ -54,13 +69,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 REGISTRY = "https://ghcr.io"
 PACKAGE = "shoko-sonarr-linker"
 USER_AGENT = "shoko-sonarr-linker-ghcr-tags/1.0"
 NAME_SEGMENT = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+DIGEST_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 LINK_NEXT = re.compile(r'^<([^>]+)>\s*;\s*rel\s*=\s*"?next"?$', flags=re.IGNORECASE)
 
 STATUS_OK = "ok"
@@ -100,6 +116,28 @@ _INDEX_TYPES = frozenset(
         "application/vnd.docker.distribution.manifest.list.v2+json",
     }
 )
+_IMAGE_MANIFEST_TYPES = frozenset(
+    {
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    }
+)
+ACCEPT_CONFIG = ", ".join(
+    (
+        "application/vnd.oci.image.config.v1+json",
+        "application/vnd.docker.container.image.v1+json",
+    )
+)
+# Descriptor-annotation markers that identify an in-toto ATTESTATION manifest
+# (buildx attaches these to the attestation descriptors of an index).
+_ATTESTATION_ANNOTATION_KEY_MARKERS = ("attestation", "in-toto.io/")
+_ATTESTATION_ANNOTATION_VALUE_MARKERS = ("attestation", "in-toto")
+# Deterministic runnable-descriptor preference when an index carries several
+# platform-bearing image manifests: bare linux/amd64 (EMPTY variant, so
+# linux/amd64/v4 is not the preferred rank) first, then (os, architecture,
+# variant) alphabetical, then list order — so the chosen chain is stable.
+_PREFERRED_PLATFORM = ("linux", "amd64", "")
+MAX_INDEX_DEPTH = 4
 
 
 class AuthFailureError(RuntimeError):
@@ -127,6 +165,8 @@ class PlanAbortedError(RuntimeError):
 
 
 class Response(Protocol):
+    """The subset of ``http.client.HTTPResponse`` the transport depends on."""
+
     def read(self) -> bytes: ...
 
     def getheaders(self) -> list[tuple[str, str]]: ...
@@ -134,10 +174,15 @@ class Response(Protocol):
     @property
     def status(self) -> int: ...
 
+    def __enter__(self) -> Response: ...
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None: ...
+
 
 def _open(request: urllib.request.Request, timeout: float) -> Response:
     """Single seam for the HTTP opener so tests can monkeypatch it."""
-    return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - ghcr.io https only (see _registry_url)
+    response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - ghcr.io https only
+    return cast(Response, response)  # URL host/scheme enforced by _registry_url
 
 
 class Transport(Protocol):
@@ -267,8 +312,8 @@ def _result(status: str, tags: list[str], detail: str) -> dict[str, Any]:
 
 def _tags_page_outcome(
     transport: Transport, url: str, bearer: str, timeout: float
-) -> tuple[list[str], str | None] | None:
-    """Return (tags, next_url) for a page, or None to signal a classified failure."""
+) -> tuple[list[str], str | None]:
+    """Return (tags, next_url) for a page; classified failures RAISE, never return None."""
     headers = {
         "Authorization": f"Bearer {bearer}",
         "Accept": "application/json",
@@ -331,11 +376,15 @@ def list_tags(
 
 
 def _fetch_json(
-    transport: Transport, url: str, bearer: str, timeout: float
+    transport: Transport,
+    url: str,
+    bearer: str,
+    timeout: float,
+    accept: str = ACCEPT_MANIFESTS,
 ) -> tuple[int, dict[str, str], Any, bytes]:
     headers = {
         "Authorization": f"Bearer {bearer}",
-        "Accept": ACCEPT_MANIFESTS,
+        "Accept": accept,
         "User-Agent": USER_AGENT,
     }
     status, response_headers, body = transport.get(url, headers, timeout)
@@ -348,11 +397,24 @@ def _fetch_json(
         raise RegistryUnavailableError(msg) from exc
 
 
+def _require_digest_format(digest: str) -> None:
+    """Fail closed on any digest that cannot be verified as sha256.
+
+    ``/blobs/`` and child-manifest URLs are built from registry-supplied
+    digest strings, and provenance trust must never rest on an unverified
+    document: ``sha512:...``, empty, uppercase-hex, or free-form strings are
+    REJECTED (RegistryUnavailableError -> ``unknown_provenance``), not silently
+    accepted. Matching is case-sensitive lowercase hex.
+    """
+    if not DIGEST_SHA256.fullmatch(digest):
+        msg = f"digest {digest!r} is not a verifiable sha256 digest"
+        raise RegistryUnavailableError(msg)
+
+
 def _require_digest(digest: str, body: bytes) -> None:
-    """Bounded integrity check for digest-addressed blobs."""
-    if digest.startswith("sha256:") and hashlib.sha256(body).hexdigest() != digest.removeprefix(
-        "sha256:"
-    ):
+    """Bounded integrity check for digest-addressed blobs and child manifests."""
+    _require_digest_format(digest)
+    if hashlib.sha256(body).hexdigest() != digest.removeprefix("sha256:"):
         raise RegistryUnavailableError(f"blob digest {digest} does not match its content")
 
 
@@ -387,8 +449,15 @@ def _fetch_config_revision(
     if not isinstance(config, dict) or not isinstance(config.get("digest"), str):
         raise RegistryUnavailableError("manifest is missing config.digest")
     digest = str(config["digest"])
+    # Format is validated BEFORE the URL is built: an unverifiable digest must
+    # never become a request path, and never yield provenance trust.
+    _require_digest_format(digest)
     url = f"{REGISTRY}/v2/{owner}/{package}/blobs/{digest}"
-    blob_headers = {"Authorization": f"Bearer {bearer}", "User-Agent": USER_AGENT}
+    blob_headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Accept": ACCEPT_CONFIG,
+        "User-Agent": USER_AGENT,
+    }
     status, _, body = transport.get(url, blob_headers, timeout)
     if status != HTTP_OK:
         msg = f"config blob fetch returned {status}"
@@ -407,6 +476,96 @@ def _fetch_config_revision(
     return revision
 
 
+def _descriptor_platform(descriptor: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Runnable-image signature: a usable ``platform`` object in the index descriptor.
+
+    Attestation manifests carry ``os``/``architecture`` of ``unknown`` (or no
+    platform at all), so they never produce a usable platform tuple.
+    """
+    platform = descriptor.get("platform")
+    if not isinstance(platform, dict):
+        return None
+    os_name = platform.get("os")
+    architecture = platform.get("architecture")
+    if not isinstance(os_name, str) or not isinstance(architecture, str):
+        return None
+    os_name = os_name.strip().lower()
+    architecture = architecture.strip().lower()
+    if not os_name or not architecture:
+        return None
+    if os_name == "unknown" or architecture == "unknown":
+        return None
+    variant = platform.get("variant")
+    variant = variant.strip().lower() if isinstance(variant, str) else ""
+    return os_name, architecture, variant
+
+
+def _is_attestation_descriptor(descriptor: dict[str, Any]) -> bool:
+    """True when the descriptor is annotated as an in-toto attestation manifest."""
+    annotations = descriptor.get("annotations")
+    if not isinstance(annotations, dict):
+        return False
+    for key, value in annotations.items():
+        if not isinstance(key, str):
+            continue
+        lowered_key = key.lower()
+        if any(marker in lowered_key for marker in _ATTESTATION_ANNOTATION_KEY_MARKERS):
+            return True
+        if isinstance(value, str):
+            lowered_value = value.lower()
+            if any(marker in lowered_value for marker in _ATTESTATION_ANNOTATION_VALUE_MARKERS):
+                return True
+    return False
+
+
+def _select_runnable_descriptor(manifests: list[Any]) -> dict[str, Any] | None:
+    """Pick the runnable image manifest descriptor of an index (attestations skipped).
+
+    Candidates must carry a usable platform and (when mediaType is present) a
+    manifest media type. Ranking is ``(preference, platform, list-order)``:
+
+    * ``linux/amd64`` is preferred only in its bare form — ``_PREFERRED_PLATFORM``
+      has an EMPTY variant, so ``linux/amd64/v4`` is NOT the preferred rank and
+      falls into the alphabetical group (the build host image is plain amd64).
+    * Remaining candidates sort by ``(os, architecture, variant)`` alphabetically,
+      then by list index, so the chosen chain is stable across runs.
+    * A descriptor whose mediaType is present but is NOT an image-manifest type is
+      skipped — this includes nested INDEX media types, so an index-of-index with
+      typed descriptors has no candidate and fails closed (``unknown_provenance``)
+      rather than trusting a non-image child. Untyped (mediaType-less) descriptors
+      that resolve to a nested index are recursed into by ``_index_revision``.
+    """
+    ranked: list[tuple[tuple[int, tuple[str, str, str], int], dict[str, Any]]] = []
+    for index, descriptor in enumerate(manifests):
+        if not isinstance(descriptor, dict) or not isinstance(descriptor.get("digest"), str):
+            continue
+        media_type = descriptor.get("mediaType")
+        if (
+            isinstance(media_type, str)
+            and media_type.strip()
+            and media_type not in _IMAGE_MANIFEST_TYPES
+        ):
+            # Non-image media types (nested index, artifact/attestation-only types)
+            # are never treated as the runnable image.
+            continue
+        if _is_attestation_descriptor(descriptor):
+            continue
+        platform = _descriptor_platform(descriptor)
+        if platform is None:
+            continue
+        rank = (0 if platform == _PREFERRED_PLATFORM else 1, platform, index)
+        ranked.append((rank, descriptor))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _child_media_type(headers: dict[str, str], document: dict[str, Any]) -> str:
+    content_type = str(headers.get("content-type", "")).split(";")[0].strip()
+    return content_type or str(document.get("mediaType", ""))
+
+
 def _index_revision(
     transport: Transport,
     owner: str,
@@ -414,29 +573,44 @@ def _index_revision(
     bearer: str,
     document: dict[str, Any],
     timeout: float,
+    depth: int = 0,
 ) -> str | None:
-    """Resolve the revision of an image index (annotations, else first manifest's chain)."""
+    """Resolve the revision of an image index (annotations, else the runnable manifest chain)."""
     revision = _annotation_revision(document)
     if revision is not None:
         return revision
+    if depth >= MAX_INDEX_DEPTH:
+        raise RegistryUnavailableError(
+            f"image index nesting exceeds the depth bound {MAX_INDEX_DEPTH}"
+        )
     manifests = document.get("manifests")
     if not isinstance(manifests, list) or not manifests:
         raise RegistryUnavailableError("image index carries no manifests")
-    first = manifests[0]
-    if not isinstance(first, dict) or not isinstance(first.get("digest"), str):
-        raise RegistryUnavailableError("image index entry is missing digest")
-    digest = str(first["digest"])
-    inner_status, _, inner, inner_body = _fetch_json(
-        transport, f"{REGISTRY}/v2/{owner}/{package}/blobs/{digest}", bearer, timeout
+    descriptor = _select_runnable_descriptor(manifests)
+    if descriptor is None:
+        raise RegistryUnavailableError(
+            "image index carries no identifiable runnable image manifest (attestation-only?)"
+        )
+    digest = str(descriptor["digest"])
+    # Validated BEFORE the URL is built: an unverifiable descriptor
+    # digest is a fail-closed (unknown_provenance), never a request path.
+    _require_digest_format(digest)
+    # OCI Distribution Spec: child MANIFESTS come from /manifests/, not /blobs/.
+    manifest_url = f"{REGISTRY}/v2/{owner}/{package}/manifests/{digest}"
+    inner_status, inner_headers, inner, inner_body = _fetch_json(
+        transport, manifest_url, bearer, timeout
     )
     if inner_status != HTTP_OK:
-        raise RegistryUnavailableError("nested manifest fetch failed")
+        msg = f"nested manifest fetch returned {inner_status}"
+        raise RegistryUnavailableError(msg)
     if not isinstance(inner, dict):
         raise RegistryUnavailableError("nested manifest fetch is not a JSON object")
     _require_digest(digest, inner_body)
     revision = _annotation_revision(inner)
     if revision is not None:
         return revision
+    if _child_media_type(inner_headers, inner) in _INDEX_TYPES:
+        return _index_revision(transport, owner, package, bearer, inner, timeout, depth + 1)
     return _fetch_config_revision(transport, owner, package, bearer, inner, timeout)
 
 
@@ -458,6 +632,10 @@ def verify_sha_tag(
     tag = f"sha-{full_sha}"
     try:
         bearer = _exchange_token(http, owner, package, token, timeout)
+        # Trust boundary: the tag-addressed top document is the registry's own
+        # answer (TLS/auth-bound, no client-side digest to check). Every
+        # digest-addressed document it references — child manifests and config
+        # blobs — is format-validated and hash-verified before use.
         manifest_url = f"{REGISTRY}/v2/{owner}/{package}/manifests/{tag}"
         status, headers, document, _raw = _fetch_json(http, manifest_url, bearer, timeout)
         if status == HTTP_NOT_FOUND:
@@ -486,8 +664,10 @@ def verify_sha_tag(
         NetworkFailureError,
         RegistryUnavailableError,
     ):
-        # Conservative: an unverifiable tag is NOT counted as published; the
-        # sha- tag is content-addressed, so re-pushing the same name is safe.
+        # Conservative: an unverifiable tag is NOT counted as published.
+        # The tag EXISTS and its content is unknown, so the consumer must not
+        # re-push/overwrite it — operator reconciliation is required (see the
+        # publication policy in .github/workflows/publish.yml).
         return PROVENANCE_UNKNOWN
 
 

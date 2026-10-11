@@ -16,6 +16,7 @@ import io
 import json
 import sys
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 ZERO_DIGEST = "sha256:" + "0" * 64
 TOKEN = "ghp-token-123"
+REVISION_KEY = "org.opencontainers.image.revision"
 
 
 def _load_module() -> Any:
@@ -291,6 +293,101 @@ def _config_blob(revision: str) -> tuple[int, dict[str, str], bytes]:
     return 200, {"content-type": "application/vnd.oci.image.config.v1+json"}, body.encode()
 
 
+# --- F12: OCI index fixtures (buildx attestation-enabled images) ---------------
+
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
+DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+DOCKER_CONFIG = "application/vnd.docker.container.image.v1+json"
+INTOTO_CONFIG = "application/vnd.in-toto+json"
+PREFERRED_PLATFORM = {"os": "linux", "architecture": "amd64"}
+ARM_PLATFORM = {"os": "linux", "architecture": "arm64", "variant": "v8"}
+# Real buildx shape: attestation descriptors carry an UNKNOWN platform.
+ATTESTATION_PLATFORM = {"os": "unknown", "architecture": "unknown"}
+ATTESTATION_ANNOTATIONS = {
+    "in-toto.io/predicate-type": "https://slsa.dev/provenance/v0.2",
+    "k8s.io/attestation/provenance": "true",
+}
+
+
+def _digest_of(body: bytes) -> str:
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _paths(transport: FakeTransport) -> list[str]:
+    return [urllib.parse.urlsplit(url).path for url, _ in transport.calls]
+
+
+def _accepts(transport: FakeTransport) -> list[str]:
+    return [headers.get("Accept", "") for _, headers in transport.calls]
+
+
+def _config(
+    media_type: str = OCI_CONFIG, revision: str | None = SHA_A
+) -> tuple[int, dict[str, str], bytes]:
+    """Image config blob: OCI ``annotations`` shape or docker ``config.Labels`` shape."""
+    if revision is None:
+        payload: dict[str, Any] = {"architecture": "amd64"}
+    elif media_type == DOCKER_CONFIG:
+        payload = {"architecture": "amd64", "config": {"Labels": {REVISION_KEY: revision}}}
+    else:
+        payload = {"architecture": "amd64", "annotations": {REVISION_KEY: revision}}
+    return 200, {"content-type": media_type}, json.dumps(payload).encode()
+
+
+def _child(
+    config_body: bytes,
+    config_media_type: str = OCI_CONFIG,
+    media_type: str = OCI_MANIFEST,
+    annotations: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    payload: dict[str, Any] = {
+        "mediaType": media_type,
+        "config": {"mediaType": config_media_type, "digest": _digest_of(config_body)},
+        "layers": [],
+    }
+    if annotations is not None:
+        payload["annotations"] = annotations
+    return _manifest(media_type, payload)
+
+
+def _attestation_manifest() -> tuple[int, dict[str, str], bytes]:
+    payload = {
+        "mediaType": OCI_MANIFEST,
+        "subject": {"mediaType": OCI_MANIFEST, "digest": ZERO_DIGEST},
+        "config": {"mediaType": INTOTO_CONFIG, "digest": ZERO_DIGEST},
+        "layers": [{"mediaType": INTOTO_CONFIG, "digest": ZERO_DIGEST, "size": 7}],
+    }
+    return _manifest(OCI_MANIFEST, payload)
+
+
+def _descriptor(
+    body: bytes,
+    media_type: str,
+    platform: dict[str, str] | None = None,
+    annotations: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"mediaType": media_type, "digest": _digest_of(body), "size": len(body)}
+    if platform is not None:
+        entry["platform"] = platform
+    if annotations is not None:
+        entry["annotations"] = annotations
+    return entry
+
+
+def _index(
+    descriptors: list[dict[str, Any]],
+    annotations: dict[str, str] | None = None,
+    media_type: str = OCI_INDEX,
+) -> tuple[int, dict[str, str], bytes]:
+    payload: dict[str, Any] = {"mediaType": media_type, "manifests": descriptors}
+    if annotations is not None:
+        payload["annotations"] = annotations
+    return _manifest(media_type, payload)
+
+
 def test_verify_index_manifest_chain_published() -> None:
     config = _config_blob(SHA_A)
     config_digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
@@ -306,7 +403,9 @@ def test_verify_index_manifest_chain_published() -> None:
         "application/vnd.oci.image.index.v1+json",
         {
             "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": [{"digest": inner_digest, "platform": {"os": "linux"}}],
+            "manifests": [
+                {"digest": inner_digest, "platform": {"os": "linux", "architecture": "amd64"}}
+            ],
         },
     )
     transport = FakeTransport([_token_ok(), index, inner, config])
@@ -314,6 +413,10 @@ def test_verify_index_manifest_chain_published() -> None:
         SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
     ) == (tags.PROVENANCE_PUBLISHED)
     assert len(transport.calls) == 4
+    paths = _paths(transport)
+    # OCI Distribution Spec: child MANIFESTS via /manifests/, config blob via /blobs/.
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{inner_digest}"
+    assert paths[3] == f"/v2/octo/shoko-sonarr-linker/blobs/{config_digest}"
 
 
 def test_verify_index_annotation_revision_published() -> None:
@@ -484,3 +587,533 @@ def test_urllib_transport_maps_http_and_network_errors(monkeypatch: pytest.Monke
     monkeypatch.setattr(tags, "_open", boom)
     with pytest.raises(tags.NetworkFailureError):
         transport.get("https://ghcr.io/v2/x/tags/list", {}, 1.0)
+
+
+# --- F12: OCI index provenance (manifests endpoint, runnable-descriptor selection) ---
+
+
+def _attestation_descriptor(attestation_body: bytes) -> dict[str, Any]:
+    return _descriptor(
+        attestation_body, OCI_MANIFEST, ATTESTATION_PLATFORM, ATTESTATION_ANNOTATIONS
+    )
+
+
+def test_verify_attestation_index_fetches_child_manifest_via_manifests_endpoint() -> None:
+    """F12 P2 root cause: buildx publishes attestation-enabled images as OCI indexes.
+    The runnable child manifest MUST be read from /manifests/<digest> (OCI
+    Distribution Spec), never /blobs/, and the attestation descriptor skipped."""
+    config = _config(OCI_CONFIG, SHA_A)
+    child = _child(config[2])
+    attestation = _attestation_manifest()
+    index = _index(
+        [
+            _attestation_descriptor(attestation[2]),
+            _descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM),
+            _descriptor(child[2], OCI_MANIFEST, ARM_PLATFORM),
+        ]
+    )
+    transport = FakeTransport([_token_ok(), index, child, config])
+    outcome = tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert outcome == tags.PROVENANCE_PUBLISHED
+    paths = _paths(transport)
+    child_digest = _digest_of(child[2])
+    assert paths[1] == f"/v2/octo/shoko-sonarr-linker/manifests/sha-{SHA_A}"
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{child_digest}"
+    assert paths[3] == f"/v2/octo/shoko-sonarr-linker/blobs/{_digest_of(config[2])}"
+    assert _digest_of(attestation[2]) not in "".join(paths)  # attestation never fetched
+    accepts = _accepts(transport)
+    assert accepts[2] == tags.ACCEPT_MANIFESTS  # manifest endpoints negotiate manifest types
+    assert accepts[3] == tags.ACCEPT_CONFIG  # blob endpoint negotiates config types
+
+
+def test_verify_attestation_first_descriptor_still_publishes() -> None:
+    """Descriptor ordering variation: attestation manifest listed first, no platform."""
+    config = _config(OCI_CONFIG, SHA_A)
+    child = _child(config[2])
+    attestation = _attestation_manifest()
+    index = _index(
+        [
+            _descriptor(attestation[2], OCI_MANIFEST, None, ATTESTATION_ANNOTATIONS),
+            _descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM),
+        ]
+    )
+    transport = FakeTransport([_token_ok(), index, child, config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    assert _paths(transport)[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(child[2])}"
+
+
+def test_verify_index_multiple_platforms_prefers_linux_amd64() -> None:
+    """arm64 listed first must NOT be chosen: linux/amd64 is the documented preference."""
+    arm_config = _config(OCI_CONFIG, SHA_B)
+    arm_child = _child(arm_config[2])
+    amd_config = _config(OCI_CONFIG, SHA_A)
+    amd_child = _child(amd_config[2])
+    index = _index(
+        [
+            _descriptor(arm_child[2], OCI_MANIFEST, ARM_PLATFORM),
+            _descriptor(amd_child[2], OCI_MANIFEST, PREFERRED_PLATFORM),
+        ]
+    )
+    transport = FakeTransport([_token_ok(), index, amd_child, amd_config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    paths = _paths(transport)
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(amd_child[2])}"
+    assert _digest_of(arm_child[2]) not in "".join(paths)
+
+
+def test_verify_index_multiple_platforms_tie_break_is_alphabetical() -> None:
+    """No linux/amd64 present: deterministic (os, architecture) alphabetical pick."""
+    ppc_config = _config(OCI_CONFIG, SHA_B)
+    ppc_child = _child(ppc_config[2])
+    arm_config = _config(OCI_CONFIG, SHA_A)
+    arm_child = _child(arm_config[2])
+    index = _index(
+        [
+            _descriptor(ppc_child[2], OCI_MANIFEST, {"os": "linux", "architecture": "ppc64le"}),
+            _descriptor(arm_child[2], OCI_MANIFEST, ARM_PLATFORM),
+        ]
+    )
+    transport = FakeTransport([_token_ok(), index, arm_child, arm_config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    assert (
+        _paths(transport)[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(arm_child[2])}"
+    )
+
+
+def test_verify_index_attestation_only_is_unknown_not_published() -> None:
+    """No runnable descriptor -> fail closed (unknown), never a crash and never published."""
+    attestation = _attestation_manifest()
+    index = _index([_attestation_descriptor(attestation[2])])
+    transport = FakeTransport([_token_ok(), index])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2  # no child fetch attempted
+
+
+def test_verify_index_descriptor_without_platform_is_unknown() -> None:
+    """A descriptor with no platform object is not identifiable as runnable."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    descriptor = {"mediaType": OCI_MANIFEST, "digest": _digest_of(child[2]), "size": len(child[2])}
+    transport = FakeTransport([_token_ok(), _index([descriptor])])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+def test_verify_index_without_manifests_list_is_unknown() -> None:
+    index = _manifest(OCI_INDEX, {"mediaType": OCI_INDEX})
+    transport = FakeTransport([_token_ok(), index])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+def test_verify_index_child_404_is_unknown_not_not_published() -> None:
+    """A 404 on the CHILD manifest means the index is broken, NOT that the tag is absent."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    index = _index([_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)])
+    not_found: tuple[int, dict[str, str], bytes] = (
+        404,
+        {},
+        b'{"errors":[{"code":"BLOB_UNKNOWN"}]}',
+    )
+    transport = FakeTransport([_token_ok(), index, not_found])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert _paths(transport)[2].startswith("/v2/octo/shoko-sonarr-linker/manifests/")
+
+
+def test_verify_index_child_digest_mismatch_is_unknown() -> None:
+    """Digest verification is exercised on every fetched child manifest."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    tampered_body = child[2].replace(b'"layers": []', b'"layers": [{"digest": "sha256:1111"}]')
+    assert tampered_body != child[2]
+    index = _index([_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)])
+    tampered = (200, {"content-type": OCI_MANIFEST}, tampered_body)
+    transport = FakeTransport([_token_ok(), index, tampered])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 3  # chain stops at the failed digest check
+
+
+def test_verify_index_config_digest_mismatch_is_unknown() -> None:
+    """Digest verification is exercised on the config blob too."""
+    config = _config(OCI_CONFIG, SHA_A)
+    child = _child(config[2])
+    tampered_config = (200, dict(config[1]), config[2].replace(b"amd64", b"amd65"))
+    assert tampered_config[2] != config[2]
+    index = _index([_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)])
+    transport = FakeTransport([_token_ok(), index, child, tampered_config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert _paths(transport)[3] == f"/v2/octo/shoko-sonarr-linker/blobs/{_digest_of(config[2])}"
+
+
+def test_verify_index_child_annotation_published_without_config_fetch() -> None:
+    """Child annotations satisfy the chain; index annotation wins when present."""
+    config = _config(OCI_CONFIG, "f" * 40)
+    child = _child(config[2], annotations={REVISION_KEY: SHA_A})
+    descriptors = [_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)]
+    transport = FakeTransport([_token_ok(), _index(descriptors), child])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    assert len(transport.calls) == 3  # no config fetch once the child annotation is found
+    annotated_index = _index(descriptors, annotations={REVISION_KEY: SHA_A})
+    transport2 = FakeTransport([_token_ok(), annotated_index])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport2)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    assert len(transport2.calls) == 2  # index-level annotation wins: no child fetch
+
+
+def test_verify_index_missing_revision_labels_is_unknown_without_crash() -> None:
+    """Config carries no revision label -> revision None -> unknown (no crash)."""
+    config = _config(OCI_CONFIG, None)
+    child = _child(config[2])
+    index = _index([_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)])
+    transport = FakeTransport([_token_ok(), index, child, config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert _paths(transport)[3] == f"/v2/octo/shoko-sonarr-linker/blobs/{_digest_of(config[2])}"
+
+
+def test_verify_docker_manifest_list_chain_published() -> None:
+    """Docker manifest list (descriptors without mediaType) -> schema2 child -> config Labels."""
+    config = _config(DOCKER_CONFIG, SHA_A)
+    child = _child(config[2], config_media_type=DOCKER_CONFIG, media_type=DOCKER_MANIFEST)
+    digest = _digest_of(child[2])
+    index = _index(
+        [
+            {"digest": digest, "size": len(child[2]), "platform": ARM_PLATFORM},
+            {"digest": digest, "size": len(child[2]), "platform": PREFERRED_PLATFORM},
+        ],
+        media_type=DOCKER_LIST,
+    )
+    transport = FakeTransport([_token_ok(), index, child, config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    paths = _paths(transport)
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{digest}"
+    assert paths[3] == f"/v2/octo/shoko-sonarr-linker/blobs/{_digest_of(config[2])}"
+    assert DOCKER_CONFIG in _accepts(transport)[3]
+
+
+def test_verify_nested_index_recurses_through_manifests_endpoint() -> None:
+    """Index -> nested index -> runnable manifest: every hop uses /manifests/."""
+    config = _config(OCI_CONFIG, SHA_A)
+    child = _child(config[2])
+    inner = _index(
+        [
+            _attestation_descriptor(_attestation_manifest()[2]),
+            _descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM),
+        ]
+    )
+    inner_descriptor = {
+        "digest": _digest_of(inner[2]),
+        "size": len(inner[2]),
+        "platform": PREFERRED_PLATFORM,
+    }
+    outer = _manifest(OCI_INDEX, {"mediaType": OCI_INDEX, "manifests": [inner_descriptor]})
+    transport = FakeTransport([_token_ok(), outer, inner, child, config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    paths = _paths(transport)
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(inner[2])}"
+    assert paths[3] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(child[2])}"
+    assert paths[4] == f"/v2/octo/shoko-sonarr-linker/blobs/{_digest_of(config[2])}"
+
+
+def test_verify_index_nesting_beyond_depth_bound_is_unknown() -> None:
+    """Bounded recursion: an over-deep index chain fails closed, never crashes."""
+    leaf = _child(_config(OCI_CONFIG, SHA_A)[2])
+    document = _index([_descriptor(leaf[2], OCI_MANIFEST, PREFERRED_PLATFORM)])
+    chain: list[tuple[int, dict[str, str], bytes]] = []
+    for _ in range(tags.MAX_INDEX_DEPTH + 2):
+        chain.append(document)
+        nested_descriptor = {
+            "digest": _digest_of(document[2]),
+            "size": len(document[2]),
+            "platform": PREFERRED_PLATFORM,
+        }
+        document = _manifest(OCI_INDEX, {"mediaType": OCI_INDEX, "manifests": [nested_descriptor]})
+    transport = FakeTransport([_token_ok(), *reversed(chain)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    paths = _paths(transport)
+    assert all(path.startswith("/v2/octo/shoko-sonarr-linker/manifests/") for path in paths[1:])
+    assert not any("/blobs/" in path for path in paths)
+
+
+def test_verify_published_index_is_stable_across_repeated_backfills() -> None:
+    """Workflow policy input: a repeated backfill re-verifies published -> skip (no push)."""
+    config = _config(OCI_CONFIG, SHA_A)
+    child = _child(config[2])
+    index = _index(
+        [
+            _attestation_descriptor(_attestation_manifest()[2]),
+            _descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM),
+        ]
+    )
+    for _ in range(2):
+        transport = FakeTransport([_token_ok(), index, child, config])
+        assert (
+            tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+            == tags.PROVENANCE_PUBLISHED
+        )
+        assert _paths(transport)[2].startswith("/v2/octo/shoko-sonarr-linker/manifests/")
+
+
+def test_verify_index_permission_failure_is_unknown() -> None:
+    """403 on the manifest fetch: authenticated-not-permitted stays unknown, not absent."""
+    forbidden: tuple[int, dict[str, str], bytes] = (
+        403,
+        {},
+        b'{"errors":[{"code":"DENIED"}]}',
+    )
+    transport = FakeTransport([_token_ok(), forbidden])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+# --- F12 review P2: strict sha256 digest validation (fail closed, never fail open) ---
+
+
+def test_verify_index_sha512_descriptor_digest_is_unknown_without_fetch() -> None:
+    """A non-sha256 descriptor digest cannot be verified: fail closed, no child fetch."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    forged = _manifest(
+        OCI_INDEX,
+        {
+            "mediaType": OCI_INDEX,
+            "manifests": [
+                {
+                    "mediaType": OCI_MANIFEST,
+                    "digest": "sha512:" + "a" * 128,
+                    "size": len(child[2]),
+                    "platform": PREFERRED_PLATFORM,
+                    "annotations": {REVISION_KEY: SHA_A},
+                }
+            ],
+        },
+    )
+    transport = FakeTransport([_token_ok(), forged])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2  # chain stops at validation: no forged fetch
+    assert not any("sha512:" in path for path in _paths(transport))
+
+
+def test_verify_index_uppercase_descriptor_digest_is_unknown() -> None:
+    """Digest matching is case-sensitive lowercase hex: uppercase fails closed."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    uppercase = "sha256:" + hashlib.sha256(child[2]).hexdigest().upper()
+    forged = _index(
+        [
+            {
+                "mediaType": OCI_MANIFEST,
+                "digest": uppercase,
+                "size": len(child[2]),
+                "platform": PREFERRED_PLATFORM,
+            }
+        ]
+    )
+    transport = FakeTransport([_token_ok(), forged])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+def test_verify_index_trailing_newline_descriptor_digest_is_unknown() -> None:
+    """Digest validation is fullmatch-strict: a trailing newline cannot slip past."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    padded = _index(
+        [
+            {
+                "mediaType": OCI_MANIFEST,
+                "digest": _digest_of(child[2]) + "\n",
+                "size": len(child[2]),
+                "platform": PREFERRED_PLATFORM,
+            }
+        ]
+    )
+    transport = FakeTransport([_token_ok(), padded])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+def test_verify_index_short_descriptor_digest_is_unknown() -> None:
+    """A 63-hex sha256 digest is not verifiable: fail closed, no child fetch."""
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    short = "sha256:" + hashlib.sha256(child[2]).hexdigest()[:63]
+    forged = _index(
+        [
+            {
+                "mediaType": OCI_MANIFEST,
+                "digest": short,
+                "size": len(child[2]),
+                "platform": PREFERRED_PLATFORM,
+            }
+        ]
+    )
+    transport = FakeTransport([_token_ok(), forged])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+def test_verify_index_empty_descriptor_digest_is_unknown() -> None:
+    child = _child(_config(OCI_CONFIG, SHA_A)[2])
+    forged = _index(
+        [
+            {
+                "mediaType": OCI_MANIFEST,
+                "digest": "",
+                "size": len(child[2]),
+                "platform": PREFERRED_PLATFORM,
+            }
+        ]
+    )
+    transport = FakeTransport([_token_ok(), forged])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+def test_verify_config_malformed_digest_is_unknown_without_blob_fetch() -> None:
+    """A manifest naming a non-sha256 config digest is unverifiable: fail closed, no blob GET."""
+    child = _manifest(
+        OCI_MANIFEST,
+        {
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": OCI_CONFIG, "digest": "notadigest"},
+            "layers": [],
+        },
+    )
+    transport = FakeTransport([_token_ok(), child])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    paths = _paths(transport)
+    assert len(paths) == 2  # token + manifest only
+    assert not any("/blobs/" in path for path in paths)
+
+
+def test_verify_config_empty_digest_is_unknown_without_blob_fetch() -> None:
+    child = _manifest(
+        OCI_MANIFEST,
+        {
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": OCI_CONFIG, "digest": ""},
+            "layers": [],
+        },
+    )
+    transport = FakeTransport([_token_ok(), child])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert not any("/blobs/" in path for path in _paths(transport))
+
+
+def test_verify_index_config_sha512_digest_is_unknown_after_child_fetch() -> None:
+    """Index chain: valid child manifest, sha512 config digest -> unknown, no blob GET."""
+    child = _manifest(
+        OCI_MANIFEST,
+        {
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": OCI_CONFIG, "digest": "sha512:" + "b" * 128},
+            "layers": [],
+        },
+    )
+    index = _index([_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)])
+    transport = FakeTransport([_token_ok(), index, child])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    paths = _paths(transport)
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(child[2])}"
+    assert not any("/blobs/" in path for path in paths)
+
+
+def test_verify_docker_schema2_sha512_config_digest_is_unknown() -> None:
+    """Single-manifest path keeps the same fail-closed digest rule."""
+    manifest = _manifest(
+        DOCKER_MANIFEST,
+        {
+            "mediaType": DOCKER_MANIFEST,
+            "config": {"mediaType": DOCKER_CONFIG, "digest": "sha512:" + "c" * 128},
+        },
+    )
+    transport = FakeTransport([_token_ok(), manifest])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert not any("/blobs/" in path for path in _paths(transport))
+
+
+def test_verify_digest_format_still_accepts_valid_chain() -> None:
+    """Regression guard: the strict rule does not break the conformant chain/paths."""
+    config = _config(OCI_CONFIG, SHA_A)
+    child = _child(config[2])
+    index = _index(
+        [
+            _attestation_descriptor(_attestation_manifest()[2]),
+            _descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM),
+        ]
+    )
+    transport = FakeTransport([_token_ok(), index, child, config])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+    paths = _paths(transport)
+    assert paths[2] == f"/v2/octo/shoko-sonarr-linker/manifests/{_digest_of(child[2])}"
+    assert paths[3] == f"/v2/octo/shoko-sonarr-linker/blobs/{_digest_of(config[2])}"

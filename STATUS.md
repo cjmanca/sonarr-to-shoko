@@ -18,7 +18,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | F9 — campaign submission budgets never reset between batches | P1 | PASS (pending final gate) |
 | F10 — canary authorization inferred from attempted submissions | P1 | PASS (pending final gate) |
 | F11 — campaign batches reuse stale safety/timing decisions | P1 | PASS (pending final gate) |
-| F12 — GHCR provenance fetches manifests as blobs | P2 | TODO |
+| F12 — GHCR provenance fetches manifests as blobs | P2 | PASS (pending final gate) |
 | F13 — empty hashes pass file-readiness check | P2 | TODO |
 | F14 — deployment docs inconsistent campaign instructions | P2 | TODO |
 | Final validation (full checks + simulated campaign + adversarial review) | Gate | TODO |
@@ -63,6 +63,16 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 **Evidence:** `uv run pytest -q` 874 passed; ruff check pass; format --check clean; mypy clean (44 files); git diff --check clean. 11 F11 tests incl mid-preflight shutdown/lease/deadline flips (zero POSTs, zero send rows), operator pause mid-batch via second store handle (WAL autocommit read visibility confirmed), mapping swap mid-batch deferral, daemon shutdown-flag stop with no-replay, fresh-timestamp monotonicity. Offline only.
 
+## F12 — PASS (local commit this round)
+
+**Design:** OCI-spec-conformant provenance traversal in `scripts/ghcr_tags.py`: top-level manifests by tag, index child manifests, and nested indexes fetched via `GET /v2/<name>/manifests/<digest>` with `ACCEPT_MANIFESTS`; image config via `/blobs/<digest>` with `ACCEPT_CONFIG`. Runnable-descriptor selection: platform-bearing (os+architecture, `unknown` rejected), `mediaType` (when present) must be an image-manifest type, attestation descriptors skipped (in-toto/k8s.io predicate annotations); deterministic order linux/amd64 (empty variant) → alphabetical platform → list order; MAX_INDEX_DEPTH=4 recursion; no runnable descriptor / malformed structure → fail closed (unknown, no crash). Digest verification hardening: `_require_digest_format` strict `sha256:[0-9a-f]{64}` fullmatch validated BEFORE URL construction, then `_require_digest` format-then-hash on every child manifest and config blob; non-conforming → unknown, zero-GET for malformed digests (forged paths never requested). Publication policy in `.github/workflows/publish.yml`: `published` → skip; `not_published` (proven-absent) → publish/backfill (only pushable state); `unknown_provenance` (existing unverifiable tag) → EXCLUDED from push set, reconciliation summary listing SHAs, plan dies (`refusing to publish over an unverifiable image`); cap-overflow tagged SHAs left untouched. Old "sha- names are content-addressed so re-push is safe" claims rewritten. Permissions/latest-serialization/provenance:true/caps untouched.
+
+**Review:** round 1 ACCEPTABLE with P2 (fail-open `_require_digest` on non-sha256) + 4 P3s → P2 fixed (format gate) + annotations fixed (mypy clean on scripts/ghcr_tags.py; Response protocol typing-only). Round 2 scoped re-review: **ACCEPTABLE**, zero findings; probes: local http.server fixture chain (Accept negotiation, attestation never fetched, tamper→unknown), digest-format adversarial matrix, 9-scenario bash policy simulation under `set -euo pipefail` (unknown never pushed, published never re-pushed, cap safe, empty-file safe), `bash -n` on all 18 run bodies.
+
+**Deferred P3s:** `_require_digest` message says "blob digest" for child-manifest mismatches (cosmetic); backfill reconciliation list is cap-bounded (reporting completeness only — unverified tags beyond window are excluded from pushes anyway); enumerator reason label `tag-provenance-unverified` reused for proven-absent tags (out-of-scope script).
+
+**Evidence:** `uv run pytest -q` 901 passed (test_ghcr_tags 60, incl. exact /manifests//blobs path assertions, attestation-first ordering, multi-platform determinism, nested index, digest tamper/format, docker schema2 + manifest list, missing/mismatched revision labels, auth classification, repeated-backfill stability); ruff check pass; format clean; mypy clean (44 files + scripts/ghcr_tags.py strict); git diff --check clean. Offline fake transports only — GHCR live behavior EXTERNAL/UNVERIFIED.
+
 ## Constraints
 
 - Sequential model agents only (single-slot local inference endpoint).
@@ -72,4 +82,4 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 ## Next action
 
-Implement F12 (GHCR OCI manifest traversal + unknown-provenance tag policy) via a self-contained delegated brief.
+Implement F13 (hash-readiness validation) via a self-contained delegated brief.
