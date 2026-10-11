@@ -21,7 +21,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | F12 — GHCR provenance fetches manifests as blobs | P2 | PASS (pending final gate) |
 | F13 — empty hashes pass file-readiness check | P2 | PASS (pending final gate) |
 | F14 — deployment docs inconsistent campaign instructions | P2 | PASS (pending final gate) |
-| Final validation (full checks + simulated campaign + adversarial review) | Gate | TODO |
+| Final validation (full checks + simulated campaign + adversarial review) | Gate | PASS |
 
 ## F8 — PASS (local commit this round)
 
@@ -91,6 +91,33 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 **Evidence:** full suite stays green (docs-only): `uv run pytest -q` exit 0 (944 collected); ruff check pass; format --check clean; mypy clean; git diff --check clean. Live operator-runs remain EXTERNAL/UNVERIFIED by design.
 
+## Final validation — PASS (this round)
+
+**Configured checks at final HEAD `b377743` (2026-10-11):**
+- `uv run pytest -q` → exit 0, **962 passed** (807 baseline at 6d4183b + 155 new F8–F14/final-suite tests)
+- `uv run ruff check .` → All checks passed
+- `uv run ruff format --check .` → 49 files already formatted
+- `uv run mypy` → Success, no issues in 46 source files (strict)
+- `git diff --check 6d4183b..HEAD` → exit 0
+- `docker build -t shoko-sonarr-linker:review .` → exit 0 (image sha256:82268e96a8...)
+- PLAN.md SHA-256 re-verified equal to baseline digest `b427ae7e909442d0638bb79ac37c0e47b0ed7456fba112c7c47046fc0529fab6` — **immutable, unmodified**
+
+**Simulated campaign suite** (`tests/test_f_campaign_e2e.py`, 10 tests, real F8 sibling lease files through unpatched CLI resolver, `max_new_per_cycle=5`, `max_batch_size=10`): 100-file campaign drains across many bounded cycles (progress strictly past 5/10/20/50/100, exactly 100 unique POSTs, plan_complete from persisted progress); restart halfway with pending `prepared_not_sent` + `request_may_have_been_sent` rows (no replay, single completion); scope never widens (POSTs ⊆ plan digest set; plan rewrite pauses with zero POSTs); authorization gate + digest staleness skips; campaign lease revocation pauses only the campaign while daemon new-arrivals continue (F8 isolation); shutdown flag stops new submissions, restart completes without duplicates; mapping generation swap defers then recovers via re-prepare/re-approve; outstanding-jobs cap honored per cycle (no bypass); all-pending campaign trips zero-progress pause in 3 cycles then resumes.
+
+**GHCR regression:** `tests/test_ghcr_tags.py` 60 tests + workflow/historical/enumeration suites (53) green, exact `/manifests/` vs `/blobs/` path assertions, attestation-descriptor skipping, strict sha256 digest-format fail-closed, publication policy (unverified existing tags never pushed, plan abort, cap-overflow untouched). Live GHCR/network behavior EXTERNAL/UNVERIFIED.
+
+**Cross-cutting adversarial review (all POST-submission / campaign-authorization / durable-SQLite changes, `6d4183b..HEAD`):** round 1 BLOCKING — P2 foreign-pause overwrite armed the campaign bypass; P2 mid-batch `revoke-drain` didn't stop the running batch → fixed (commit b377743: foreign pauses survive attestation transitions; per-submission drain-authorization check on the daemon drain path, manual apply exempt; terminal meta cleanup P3s). Round 2 scoped verification: **ACCEPTABLE** — both prior reproductions probe-blocked (44/44 probe matrix), origin gate double-checked at daemon + store, flag threading unspoofable, no weakened assertions (2 removed assert lines replaced by stricter equivalents).
+
+**Local commit chain (main, nothing pushed):** `bac8e4c` baseline docs → `39f5bcc` F8 → `72820d0` F9 → `8caf027` F10 → `c2cb530` F11 → `3dcaf39` F12 → `a52a573` F13 → `9a32461` F14 → `7bec0a9` final suite → `b377743` cross-cutting fixes.
+
+**Open items (all deferred P3, recorded in per-finding sections):** report.progress sum semantics; campaign in-memory gate reads; label imprecision items; README/deploy cap-bounded reconciliation list reporting; meta-key edge notes; F13 name-segment leniencies (no decision authority); fingerprint-drift recovery for long campaigns (re-prepare/re-approve — documented).
+
+**EXTERNAL/UNVERIFIED (by design, no authorization):** live Sonarr/Shoko integration, live Docker deployment smoke, GHCR publication runs, Unraid deployment, operator physical-media safety preflight, production apply mode.
+
+## Completion state
+
+PLAN.md §Completion criteria 1–12: all met offline with evidence above (1–8 per-finding sections; 9 suite green; 10 reviews ACCEPTABLE; 11 this ledger; 12 PLAN.md digest unchanged). No pushes, publications, deployments, or live Shoko/Sonarr writes performed.
+
 ## Constraints
 
 - Sequential model agents only (single-slot local inference endpoint).
@@ -100,4 +127,4 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 ## Next action
 
-Run Phase D final validation (full checks, ≥100-file simulated campaign across cycle boundaries, GHCR regression, adversarial cross-cutting review, final STATUS.md evidence).
+Round complete (F8–F14 + final validation all PASS, tree clean at `b377743`). Awaiting operator: authorized push/publish decision, live Sonarr/Shoko canary per docs/deployment.md, and operator physical-media safety attestation before production apply.
