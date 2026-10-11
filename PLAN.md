@@ -1,164 +1,687 @@
-# Implementation Plan — shoko-sonarr-linker (frozen v9 — scheduled mapping refresh)
+# Sonarr-to-Shoko — Second Independent Review Handoff
 
-**Audience:** Main orchestrator only. **[PROJECT.md](PROJECT.md)** defines the product requirements; **[AGENTS.md](AGENTS.md)** defines how implementing/reviewing agents work; this **PLAN.md** defines the fixed milestone sequence, acceptance gates, and safety constraints. **[STATUS.md](STATUS.md)** holds all mutable progress, test evidence, findings, blockers, and resume checkpoints.
+Repository: https://github.com/cjmanca/sonarr-to-shoko
 
-**Immutability contract:** Do not edit PLAN.md during project execution—not for milestone status, progress notes, test results, or discovered blockers. The orchestrator alone reads PLAN.md and updates STATUS.md. Subagents receive scoped task briefs and must neither read nor modify PLAN.md or STATUS.md. If a genuine requirement or acceptance-gate change becomes necessary, record a proposed change in STATUS.md for user approval; prepare a separate versioned replacement plan only when explicitly authorized. Do not silently rewrite a frozen plan to make an implementation pass.
+Reviewed commit: `6d4183b408ee9835c65d035b0e9fb7ec6df9d962`
 
-**Reviewed:** 2026-10-08. **Planning assumptions:** Sonarr and Shoko are existing Docker services. Missing production credentials, running Shoko/Sonarr access, or GitHub write permission must not block offline implementation; they remain externally unverified unless observed. Automatic persistent Anime-Lists XML updates are in scope, including restart recovery, on-demand refresh, safe activation of mapping changes, and reevaluation as anime mappings are added. No external scheduler is required.
+Review date: 2026-10-10
 
-## 0. Non-negotiable boundaries
+## Objective
 
-1. **No media management.** Sonarr owns its files; the linker may only submit supported Shoko metadata-link requests after safeguards pass. Do not rename/move/delete media, change Sonarr, or alter the Shoko DB directly.
-2. **Fail closed.** A Sonarr series must match an explicitly allowed anime root *before* per-series queries; Shoko files must pass all-location ownership checks and precise Docker path translation. Unknown identifiers, mapping conflicts, missing XRefs, or incomplete snapshots prohibit writes. Never use title/filename guesses as authoritative links.
-3. **Protect existing links.** Shoko's `POST /api/v3/File/{id}/Link` can replace prior manual associations and enqueues jobs. Never call it when *any* existing link is present. Inspect `include=XRefs` immediately beforehand. This is not atomic against other Shoko clients; document the remaining race.
-4. **Shoko-side effects matter.** In v5.3.3, `ManualLinkJob` may invoke a quality filter capable of deleting media, schedule renaming/moving, write AniDB MyList, and call plugin listeners. The linker's lack of media mounts does **not** prevent these actions. **No live apply** until the deployment safety gate in §5 is satisfied; the agent must not self-approve it.
-5. **No unreviewed mass actions.** Initial backlog ≠ new arrivals. A daemon cannot treat a newly seen Shoko record as new if its Sonarr file predates the baseline. Backlog needs an approved, finite campaign; normal newly arriving files can run automatically only under explicit bounded policy and a valid safety attestation.
-6. **Async and crash uncertainty.** A 2xx response is acceptance, not verification. One multi-episode call may schedule several jobs. Persist write intent before sending; never blindly replay a possibly-sent POST. Verify full intended Shoko and AniDB identity sets.
-7. **Dry-run is the default** and must perform zero *remote* writes, including no Shoko metadata refresh. Local cache/state creation is allowed but must be documented. Safe network reads must not leak secrets to redirects.
-8. **No fabricated passes.** Offline mock tests, static review, and container builds do not prove live Shoko/Plex, Docker mount safety, or GHCR publishing. Report external validations separately.
-9. **Sequential agent work.** Inspect → micro-plan → change → targeted test → separate read-only review → fix → retest/re-review → checkpoint → local commit. No concurrent AI reviewers or parallel agent sessions against the single-slot inference server. Do not push, deploy, change live Shoko/Sonarr, or mutate remote GitHub settings without explicit authorization.
-10. **Keep overhead bounded.** Prefer direct Python, a few modules, SQLite, and polling. Do not add Redis/Celery, a web UI, multiple services, sophisticated plugin frameworks, or tests for static tables. If a requirement appears in both documents, avoid re-explaining it at every milestone.
-11. **Mapping maintenance is automatic, independent of media polling.** Keep an approved last-known-good Anime-Lists snapshot locally and refresh it on a configurable cadence; a newly added mapping must become discoverable without rebuilding the container. Mapping updates cannot silently change approved targets or existing links.
+Address the remaining defects discovered after implementation of remediation F1–F7.
 
-## 1. Fixed milestone sequence and completion criteria
+The previous remediation is substantially successful. Do not rewrite working subsystems or repeat completed implementation unnecessarily.
 
-Milestone IDs and deliverables below are fixed. **STATUS.md**, maintained by the main orchestrator, is the only location for `TODO`/`ACTIVE`/`PASS`/`BLOCKED` outcomes, command results, review findings, blockers, and the current task. A `PASS` requires actual command outcomes, an inspected diff, and gate evidence. Unavailable live checks are `EXTERNAL/UNVERIFIED`, not passes. The orchestrator selects the earliest unfinished actionable milestone using STATUS.md and verifies claims against code and test evidence.
+Focus on the findings below, particularly automatic backlog campaigns and production write safety.
 
-| ID | Deliverable |
-| --- | --- |
-| M0 | Versioned API and mapping-contract investigation |
-| M1 | Installable Python skeleton, **first buildable Docker commit**, basic CI |
-| M2 | Scoped Sonarr file/episode inventory and baseline |
-| M3 | Safe Shoko discovery and exact file correspondence |
-| M4 | Verified AniDB↔TVDB reverse mapping and cache |
-| M5 | Shoko ID resolution, guarded asynchronous linking |
-| M6 | Durable SQLite daemon, recovery, bounded policy |
-| M7 | Usable CLI, reports, audit, and **backlog campaign** |
-| M8 | Per-commit GHCR publishing and CI recovery |
-| M9 | End-to-end offline test, adversarial review, deployment handoff |
+## Operating instructions
 
-**Slice loop:** State the intended behavior and minimal proof, implement one coherent part, run tests, inspect the actual diff (especially mutation paths), record P0–P3 review findings with path/line/impact, fix P0/P1 and gate-blocking P2, retest, then **the orchestrator records a checkpoint in STATUS.md** and commits. After two identical failures investigate; after three unproductive rounds record a reproducible blocker and work on independent safe tasks. P3 can be deferred with reason. Do not silently weaken tests, change requirements, claim tests ran, or erase unrelated user work. Each committed application-code SHA from M1 onward must remain Docker-buildable. STATUS.md checkpoints should be short and useful after compaction.
+The main orchestrator must follow `ORCHESTRATION.md`.
 
-### M0 — Confirm contracts from primary sources (read-only)
+Document responsibilities remain unchanged:
 
-- Inspect git status/history and available tooling. Do not assume the repository exists or that its default branch has a base SHA. Record the **first Docker-buildable commit boundary** once M1 creates it.
-- Verify Sonarr's v3 series, episode-file, and episode endpoints; `rootFolderPath`, series `tvdbId`, episode `tvdbId` (individual TVDB episode ID), `episodeFileId`, `absoluteEpisodeNumber`, file path and byte size. Treat fields as installation/version-specific until corroborated.
-- Verify Shoko v3: `GET /File?include_only=Unrecognized` with pagination (`List`,`Total`), `/ImportFolder`, `GET /File/{id}?include=XRefs,AbsolutePaths` (supported include spelling), `Series/AniDB/{id}/Series`, per-series episodes, per-episode AniDB identity, `POST /File/{id}/Link` body (`EpisodeIDs` are **Shoko internal** IDs), and optional series-refresh semantics. In v5.3.3, XRefs live under `File.SeriesIDs[].EpisodeIDs[]`, whose `.ID` can be null; Shoko files may have **multiple physical locations**. `Unrecognized` means no XRefs, not necessarily ready-to-link. Note import limbo separately.
-- Review the whole v5.3.3 link job and settings, including `FileQualityFilterEnabled`, `Plugins.Renamer.RenameOnImport` / `MoveOnImport`, MyList additions, `OnFileMatched`, and queue effects. The derived `RelocateOnImport` is not reliably serialized. `GET /api/v3/Settings` is admin-restricted and may contain secrets: parse only required boolean fields; never log the full response. Verify read-only `GET /Queue` and `/Queue/Types`; detailed `/Queue/Items` may require admin. **Never invoke Queue Pause/Resume/Clear.** Installed-version differences block production apply, not offline development.
-- Study the authoritative Anime-Lists README and minimal genuine examples without redistributing its full XML. Verify the maintained source for `anime-list-full.xml` and its update URL (currently `https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-full.xml`), including conditional-fetch support where available. Confirm `defaulttvdbseason`, `episodeoffset`, ranges, `anidbseason`, absolute season `a`, explicit mappings, TVDB episode `0` exclusions, special T/O numbering, and `+` multi-episode notation. Reverse mapping is not always one-to-one. Check licensing/attribution before redistributing data.
-- Record verified source URLs/commit identifiers, assumptions, and unsupported cases in short `docs/compatibility.md`; do not encode speculative API shapes. Decide whether actual installation exposes stable instance/database identifiers; if not, use configured instance identity and conservative sampled identity-change detection, never an invented endpoint.
+* `PROJECT.md`: authoritative product requirements.
+* `PLAN.md`: immutable implementation plan. Never modify.
+* `STATUS.md`: mutable progress and verification evidence.
+* `AGENTS.md`: general engineering procedures.
+* `ORCHESTRATION.md`: main orchestrator workflow.
 
-**Gate:** API schema/id spaces, version differences, manual-link side effects, mapping precedence, and live-only checks are explicitly documented. Contradictions with PROJECT.md are surfaced and minimally clarified there; AGENTS.md remains process-only.
+Subagents receive self-contained assignments. They must not read or modify `PLAN.md`, `STATUS.md`, or `ORCHESTRATION.md`.
 
-### M1 — Foundation, Docker, first buildable commit
+For each finding:
 
-- Build a Python 3.12+ installable package with typed settings, safe YAML parser, env-referenced secrets, strict nonempty root/path allowlists, conservative defaults, HTTP clients with explicit timeouts, and a minimal `--help` / offline validation command. Preserve reverse-proxy URL bases; do not attach API keys to other-origin redirects or transparently retry uncertain mutation POSTs.
-- Provide Dockerfile **in this first application-code commit** (non-root, correct signals, writable persistent `/data`, no media mounts/privileged mode/Docker socket), `.dockerignore`, example Compose and testable container startup. Pin dependencies reasonably and validate bind-mount ownership on Unraid.
-- Establish `ruff`, focused `pytest`, configured type checker, secret-redaction test, and basic test/build workflow. Reserve one default-deny apply-safety gate so no command accidentally enables live writes.
-- Keep a single code path for one-shot and daemon reconciliation; represent backlog, new-arrival, and approved-campaign policies distinctly from the beginning.
+1. Verify the root cause against current HEAD.
+2. Implement the smallest complete correction.
+3. Add focused regression tests.
+4. Run relevant tests.
+5. Perform an independent read-only review.
+6. Fix blocking findings and retest.
+7. Update `STATUS.md`.
+8. Commit locally.
+9. Continue to the next finding.
 
-**Gate:** `python -m ... --help`, config-invalid case, lint/tests/type check where configured, Docker build and smoke run have actual recorded results. Commit locally *only after* the image builds. Earlier documentation-only commits are outside the first-buildable boundary and documented as such.
+Run model agents sequentially.
 
-### M2 — Sonarr eligibility and stable inventory
+Do not push, publish, deploy, or perform live Shoko/Sonarr writes without explicit authorization.
 
-- `GET /api/v3/series` and **filter first** by an exact configured anime `rootFolderPath`. Fetch episodes/files only for eligible series; do not use `seriesType` to exclude `standard` anime or fetch live-action episode files. Validate configured roots against Sonarr's root-folder list when possible.
-- Index files by Sonarr series/file ID, **exact full path**, byte size, and *all* episodes sharing `episodeFileId`. Handle season 0, multiple episodes per file, empty/malformed relationships, series moves, and naming/path changes. Reject files whose component-aware paths escape their allowed root.
-- Require complete, stable Sonarr enumeration for the initial **Sonarr-file baseline**; persist the cohort before daemon auto-apply. A preexisting Sonarr file imported into Shoko *later* remains backlog, not a newly downloaded file. Distinguish new file identity from renamed/moved/replaced records; a substantially changed inventory or reused ID may signal source DB restore and requires safe rebaseline.
+---
 
-**Gate:** Offline fixtures prove excluded series never trigger secondary API requests, `/anime` does not match `/anime-old`, per-file episode groups are correct, and incomplete initial snapshots or source-ID reuse stop automatic writes.
+# F8 — P1: Daemon and campaign safety attestations are mutually exclusive
 
-### M3 — Shoko inventory, all-location ownership, and file matching
+## Affected files
 
-- Page unrecognized Shoko files and import folders; demand stable/complete pagination, detect changing totals, duplicate/missing IDs, API errors, and unknown XRef or hash readiness. Prefer Shoko `Locations[].AbsolutePath` where supported; cross-check import-folder+relative path, reject mismatches, escapes, unknown locations, and inaccessible paths. Do not guess through symlinks or an alternate writable mount.
-- Treat one Shoko file ID as potentially representing **multiple locations**. Inspect *every* location and drop-folder type. All must be within approved `DropFolderType.None` Sonarr-owned paths and map to the same exact eligible Sonarr file identity; any manual/drop/out-of-scope alias blocks the Shoko file ID. Do not choose a convenient first path and ignore the others.
-- Translate Sonarr↔Shoko Docker paths with explicit, component-aware mapping (including nested/conflicting mappings and actual case-sensitivity). Require exact normalized full path **and identical byte size**. Multiple files with same basename are not a match. Path+size is not a cryptographic identity guarantee; check stable identity/hash/mtime across two sufficiently spaced observations and again before write. A same-path/same-size replacement remains a documented residual risk.
-- Index both sets so the ~7,000-file reconciliation is approximately linear, not repeated API scans per file.
+* `src/shoko_linker/attestation.py`
+* `src/shoko_linker/cli.py`
+* `src/shoko_linker/daemon.py`
+* `src/shoko_linker/campaign.py`
+* Related configuration and tests
 
-**Gate:** Tests cover duplicate names, wrong size, partial/changing pagination, mixed-ownership aliases, missing XRefs, nested roots, symlink uncertainty, and renames/replacements. **No writes.**
+## Root cause
 
-### M4 — Anime-Lists reverse mapping with provenance
+The application currently stores one safety attestation in the path configured by:
 
-- **Download and periodically refresh at runtime:** default source `anime-list-full.xml` from Anime-Lists, with a configurable refresh interval (`refresh_hours: 168`, weekly by default). On startup, use the cached verified snapshot immediately; if missing, download before attempting any map-based linking; if stale, schedule a refresh without blocking read-only reconciliation unnecessarily. The long-running daemon checks for due updates on its own schedule—not through cron, manual image rebuilds, or media polling frequency. Support a one-shot manual `mappings refresh [--force]` command and an inspection/status command.
-- **Network efficiency and integrity:** Prefer conditional HTTPS requests (`ETag`/`If-None-Match`, `Last-Modified`/`If-Modified-Since` when supported). Persist last attempted/successful check, HTTP validators, active content SHA-256, active mapping revision, and next due time under `/data`. `304 Not Modified` preserves the active mapping. Apply reasonable download size/time limits and safe XML parsing; stage, fully parse, structurally validate and build the index **before atomically activating** a new snapshot. No partial XML or half-built index is ever visible to a linking batch. Keep the prior last-known-good snapshot on network failure, invalid XML, truncated download or failed activation. Retry download failures with bounded backoff rather than fetching every reconciliation cycle. Do not ship a full XML snapshot in source or GHCR unless rights are established. Minimal synthetic/original fixtures are appropriate.
-- **Activation semantics:** Compare *effective, resolved target sets* (not merely XML timestamps or SHA values). If unchanged, activate/retain without a mass reprocessing wave. On meaningful changes, publish one durable mapping generation/version; in-flight approved plans/campaigns retain their original target authorization and are revalidated against the current mapping before write. Changed/removed mappings enter quarantine or drift reports; never relink existing Shoko records automatically. A previously missing mapping that is now available is retried promptly: normal new-arrival files may proceed under existing safety/budget policy, but preexisting-backlog files **must not be silently added to an approved campaign**; report them for a newly approved plan/campaign. A mapping fetch or refresh alone makes no Shoko/Sonarr writes.
-- Correctly invert **AniDB → TVDB**: per-season defaults, offsets, explicit overrides/ranges, split series, absolute `defaulttvdbseason="a"` using Sonarr's authoritative absolute number when necessary, specials, T/O encodings, and a literal `0` meaning *no equivalent* (never fall back to an offset in that case). `;1-1+2;` maps one AniDB episode to TVDB 1 and 2; `;1-1;2-1;` represents two AniDB parts corresponding to one TVDB episode. Keep explicit precedence, candidate lists, and conflicts. Don't infer equivalence from title or filename.
-- Build the inverse over **finite eligible Sonarr episodes**, not by expanding an unbounded mapping. If one Sonarr episode maps to multiple legitimate AniDB entries, retain their explicit relationship; unrelated collisions remain ambiguous. Require every episode in a multi-episode file to resolve before linking the file.
-- Add validated local overrides, precedence checks, rule provenance, mapping/parser/config revision digests and conflict reporting. Compare **effective target sets** after mapping updates: harmless formatting changes are okay; changed or lost targets quarantine unlinked items and only *report* drift for already linked ones. Global anomalous churn or candidate concentration stops writes pending review.
-- Where Shoko exposes external TVDB episode IDs, use exact unambiguous agreement as corroboration; disagreement blocks. Their absence does not mean an episode is impossible. Do **not** silently switch to a speculative second mapping engine.
+`safety.attestation_file`
 
-**Gate:** Frozen synthetic mapping fixtures exercise split seasons, absolute numbering, ranges, explicit-vs-offset precedence, `0`, T/O types, multi-maps, collisions, startup with no cache, cached startup during network outage, scheduled refresh due/unchanged `304`/new XML, download or parse failure retaining last-known-good, restart-persistent refresh timing, forced manual refresh, automatic re-evaluation of newly mapped files, backlog campaign non-expansion, in-flight generation change, mapping refresh/circuit breaker and missing metadata. The Attack on Titan `S04E26 / 085 / Traitor` case must be checked against a **real verified mapping**, not hardcoded guesses. Record mapping coverage and the major reasons for misses without promising a percentage before seeing actual data.
+That record contains a scope:
 
-### M5 — Shoko ID lookup and protected async write
+* `daemon`
+* `campaign:<campaign-id>`
 
-- Resolve each `(AniDB anime ID, type, episode number)` to a **Shoko internal episode ID**, verify that ID still represents the intended AniDB anime/episode ID, and cache per series with invalidation. Missing series metadata may be refreshed/created through a verified API only when separately configured and apply-authorized; throttle AniDB use and queue occupancy. A dry-run must never create/refresh series.
-- Build the **complete sorted target set** and canonical preview fingerprint (Sonarr/Shoko scoped identities, root/path/size, source episode IDs, mapping/version/overrides, **authoritative AniDB target identities** and resolved Shoko IDs *when already available*, safety-relevant policy; exclude credentials). If any target is unverified, skip the entire file.
-- Immediately before each POST: read current Shoko file with explicit `XRefs` and all locations; verify still unrecognized, source identity/path/size, all approved roots and drop exclusions, target Shoko IDs **and corresponding AniDB identities**, unchanged effective mapping, safe deployment attestation, and acceptable global queue. A protected existing XRef, partial snapshot, expired attestation, unsafe settings, or changed plan candidate blocks that POST.
-- Post only `POST /api/v3/File/{fileID}/Link` with exact `{"EpisodeIDs":[...]}`. This endpoint is **not atomic conditionally**, may remove existing manual links, and schedules one job per target episode: no generic POST retry. Persist ambiguous send outcomes and inspect before attempting any safe recovery. Limit pending unverified **files and episode jobs** plus per-cycle/rolling submissions. Shoko's global queue can contain benign jobs; don't treat every nonzero queue as a failure, and don't alter the queue.
-- After submission, poll `GET /File/{id}?include=XRefs` for the exact expected full set of **Shoko and AniDB** identities, allowing bounded async settling. Missing subsets are pending until deadline; contradictions/partial/completed-but-different sets are escalated without overwriting them. A file leaving `Unrecognized` does not prove success. Late plugin/rename side effects may occur after verification and are covered by deployment monitoring, not assumed impossible.
+The attestation loader requires an exact scope match.
 
-**Gate:** Mock transport tests prove zero writes in dry-run; existing-link and mixed-location rejection; per-episode ID and AniDB verification; mapping conflict refusal; accepted-but-unfinished jobs; timeout-after-send; restart with unknown outcome; non-retry; negative global-queue/safety cases. Mutation paths receive an explicit read-only adversarial review.
+However, the automatic campaign daemon uses two independent authorization paths.
 
-### M6 — SQLite recovery, baseline, daemon and budgets
+First, the daemon computes its ordinary apply eligibility:
 
-- SQLite on a persistent **local** `/data` volume, with schema versioning, suitable WAL/synchronous durability, transaction boundaries, single-process apply lock, and durable state: scoped source IDs/path/size/hash, source episode set, mapping revisions, backlog/new cohort, plan/campaign ID, target IDs, timestamps, retries, operator lease, and verified/current status. On SQLite corruption/disk-full/commit failure, stop writes; do not fall back to in-memory submission tracking. Warn against DB on SMB/NFS and test an Unraid cache-backed mount.
-- State transitions: `discovered → matched → mapped → planned → prepared_not_sent → request_may_have_been_sent → verifying → verified`, with `waiting`, `ambiguous`, `conflict`, `partial`, `indeterminate_write`, `blocked_safety` and permanent/retryable reasons. Durable `prepared_not_sent` before transport; durably advance to `request_may_have_been_sent` **before handing bytes to HTTP**. A recovered definitely-not-sent item can be replanned with fresh checks. A possibly-sent item is verified/held rather than blindly resubmitted.
-- Startup baseline requires full eligible Sonarr inventory and a consistent Shoko observation. Separate preexisting backlog from files first discovered in Sonarr after that baseline; late Shoko discovery of old Sonarr files stays backlog. Never activate auto-apply on an incomplete baseline or unexplained source identity reset/DB restore.
-- Poll periodically and do occasional full reconciliation; cache Sonarr per-series data by TTL/change, refresh new/changed series promptly and prevent starvation. Keep bounded cycle runtime, backoff+jitter, timeouts, `Retry-After`, and graceful SIGTERM. No remote writes if either service produces a partial/inconsistent source snapshot.
-- **Mapping refresh scheduler:** Persist the last successful source check/active generation and next due check in local state so restarts neither disable refreshes nor create a tight re-download loop. Run the due check independently of the Sonarr/Shoko reconciliation interval; reschedule on success, `304`, or error with appropriate backoff. A successfully activated changed generation invalidates and re-evaluates only affected missing/unresolved candidates promptly, respecting existing workload bounds; do not wait for the next daily full scan and do not requeue already verified links for mutation. Freeze one active generation per apply decision and revalidate it immediately before each POST.
-- Apply ceiling: max pending file requests, expected pending per-episode Shoko jobs, per-cycle and rolling-window new submissions. **Persist budgets across restart**. Pause writes on anomalous mapping churn, conflicting Shoko queue work, exhausted safety lease, source DB discontinuity or global errors; continue read-only reporting. Detect separate installations/volumes pointing at same Shoko as an external unsafe deployment risk; SQLite file locks cannot coordinate them.
-- Audit preexisting verified links for drift/orphans without relinking/unlinking. Distinguish liveness (process alive), reconciliation readiness (snapshots fresh), and apply eligibility (safety/budgets permit writes).
+`daemon.py`, approximately lines 1683–1719.
 
-**Gate:** Fake clock/mock HTTP + SQLite tests cover 7,000-file performance; no accidental first-run backlog submissions; late Shoko imports; crash before/after possible POST; partial queued jobs; database corruption; two local apply instances; stale ID reuse; source outage; mapping changes; scheduled update and `304` across restart; newly resolvable unmapped files retried without bypassing backlog approvals; budgets over restart; no busy loop; recovery and graceful shutdown.
+This requires a valid daemon-scoped attestation before `apply_running` becomes true.
 
-### M7 — CLI, reporting, **unattended backlog campaign**, and operator controls
+Second, automatic campaign processing uses:
 
-- Commands: `validate` (`--offline` vs live-read-only), `once --dry-run`, `once --apply`, `daemon`, `report`, **`mappings refresh [--force]`** and **`mappings status`** (plus optional cheap `health`). Mapping commands perform HTTPS reads and local validated cache/state updates only, **never Shoko/Sonarr writes**. `mappings status` shows active version/hash, age, last successful/attempted refresh, next due refresh, source availability, and affected unresolved/changed mapping counts. Clear exit codes, default-deny writes, nonsecret JSON and human-readable results. Reports must show queued/verified/indeterminate, excluded paths, mapping conflicts, **first-run backlog vs new arrivals**, safety lease, outstanding jobs, operator-actionable pause reasons, and coverage percentages based on **actual** eligible inventory.
-- **One approval, many small batches.** An operator reviews an exported canonical dry-run plan, runs a 5–10-file canary, and approves **one finite backfill campaign**, supplying an approval digest *separately* from the file. The campaign binds each approved file identity and its **exact mapped AniDB target identities**, resolved Shoko IDs if available, source instance and mapping revisions, total maximum submissions, deadline, safety attestation, rate/rolling limits, and stop conditions. **Mapped-but-not-yet-created Shoko episodes** can stay in the approved campaign as pending targets: resolve their Shoko IDs later, verify they represent precisely the preapproved AniDB identities, and apply only after normal safety and fresh file preflight. Missing or ambiguous AniDB mappings cannot be implicitly added later. Creation/refresh of missing Shoko metadata requires a separately enabled and rate-limited campaign option; it does not authorize new AniDB targets. It then processes those candidates **unattended in small batches**, persisting progress across restarts; 7,000 files must not require hundreds of manual approvals. A changed candidate is skipped/quarantined, not silently replaced; global mapping drift or unsafe deployment pauses the campaign. Additional/new candidates require a new preview/approval. Campaigns can be paused/revoked; avoid adding a job server.
-- **New-arrival daemon policy** is separate: only eligible Sonarr files absent from the original baseline can be auto-linked, with all other safety gates and persisted caps. A daemon starting with `apply_changes=true` must never run a 7,000-file backlog automatically.
-- **Read-only existing-link audit** (bounded/on-demand): For eligible Sonarr files, optionally enumerate the matching Shoko files **including already recognized/manually linked records**, compare their existing AniDB episode associations with the verified Sonarr mapping, and report `existing_link_mismatch`, ambiguous matches and partial/wrong-episode-1 cases. This diagnostic must not automatically unlink or repair; it must not mark an existing link `correct` merely because it exists. Rate-limit the audit so normal incremental linking is not slowed.
-- Safety attestation is specific to Shoko endpoint/identity/version and inspected mounts/plugins, expires after a **configurable finite validity period**, and is invalidated on safety-relevant changes. The Python process cannot prove Docker mounts are read-only without extra privileges. Prefer observable settings checks when permitted; otherwise only the operator may attest. Warn before expiry; afterward remain alive in read-only degraded mode, not a restart loop. A completely unattended *indefinite* writable daemon is incompatible with an unobservable, expiring physical-safety attestation—document this tradeoff rather than promising both.
-- Compose/readme must explain separate Docker networks, media paths, `/data` persistence, UID/GID, read-only Shoko mounts, Shoko quality-filter/renamer/plugin hazards, GHCR auth, SHA/digest pinning, backup/restore, approval/campaign commands, and rollback. No exposed HTTP port required.
+`_campaign_scoped_deps()`
 
-**Gate:** CLI docs and commands agree; `--max-links` counts **submissions** not enumerated files; one campaign works through several bounded batches without repeated approval, handles delayed Shoko metadata resolution without expanding approved AniDB targets, changes/restart/pause, and cannot escape authorized candidates; an existing wrong link appears in audit without being mutated; safety lease expiry pauses only writes; `docker build/run` and JSON reports are tested.
+This requires a campaign-scoped attestation.
 
-### M8 — GHCR publish **each pushed commit**, securely and recoverably
+Both lookups use the same configured attestation file.
 
-- CI on pushes/PRs/manual dispatch: run lint, focused/full tests as appropriate, type checks and Docker smoke against the **actual candidate SHA**. PRs, especially forks, **never** get package-write credentials or publish. Use a separate trusted publish job with least-privilege `GITHUB_TOKEN` (`contents: read`, `packages: write`), Docker Buildx/login/metadata/build-push maintained actions, and OCI `source`/`revision` labels. No live Sonarr/Shoko secrets are required in CI.
-- On push, enumerate introduced commits with a sufficient git graph, including multi-commit pushes, first default-branch push (no `before` or merge base), new feature branches, force-push/non-ancestor, and a **recorded first-buildable-commit boundary**. Limit chunk/matrix size; don't drop overflow silently. At each buildable introduced SHA, checkout that SHA, run that commit's configured checks, publish immutable `ghcr.io/<owner>/shoko-sonarr-linker:sha-<fullsha>` only if passing. Report failures without pretending “every commit” succeeded. Set up bounded manual/scheduled backfill of missing SHA tags.
-- **Important event gap:** GitHub does **not** start a new ordinary push-triggered workflow for commits pushed by another workflow using `GITHUB_TOKEN`. Do not rely on a follow-on `push` event for automated commits; avoid CI self-commits, or explicitly include those commits in the current authenticated publishing/backfill path. `workflow_dispatch`/`repository_dispatch` are allowed exceptions. Document and test this case as distinct from normal git pushes.
-- Serialize only promotion of mutable `latest` (not independent SHA builds); recheck that the candidate is the **current** default-branch head before promotion, avoid canceling pending per-SHA jobs, and use `queue: max` only where supported, with bounded retry/audit for queue overflow. `latest` should remain the last verified image when current head has not passed, never knowingly revert to an older head. Confirm existing GHCR package linkage and permissions; avoid tag overwrite that changes immutable SHA provenance. Every publish action is external/UNVERIFIED until a user-authorized push is actually run.
-- Do not bundle Anime-Lists XML unless redistribution permission is established; download it at runtime. Pin normal dependencies/base images, inspect build context and caches for secrets, and ensure action code cannot turn untrusted PR input into GHCR publication.
+Consequently:
 
-**Gate:** Offline workflow fixtures for one/multi SHA, first-ever push, fork PR, non-ancestor, failing intermediate commit, missing-tag backfill, automatic `GITHUB_TOKEN` push suppression, queue overflow and stale latest. Lint YAML and build Docker locally. Actual GHCR images are a separately labeled live validation.
+* A daemon-scoped attestation cannot authorize the campaign.
+* A campaign-scoped attestation cannot authorize the daemon's outer apply cycle.
+* Recording a new attestation in the same file does not allow both scopes to remain valid simultaneously.
 
-### M9 — Acceptance, adversarial review, deploy handoff
+The resulting configuration can prevent automatic campaign processing entirely.
 
-- End-to-end mocked Sonarr/Shoko dataset with: eligible anime and excluded live-action, 7,000-file backlog, new Sonarr file after baseline, old Sonarr file arriving late in Shoko, split cour/absolute/special mappings, explicit `0`, one Sonarr file→many episodes, conflicting/missing external episode IDs, mixed-ownership Shoko locations, previously wrong manual link (read-only audit), weekly refresh due/`304`/new anime mapping with automatic retry of affected unresolved files/invalid XML recovery and override drift, file-ID reuse/DB restore, side-effect safety rejection, async pending/partial jobs, lost POST response, durable SQLite restart, huge Shoko global queue, campaign after canary, and safety-expired degraded daemon.
-- Measure actual simulated ~7,000-file runtime/memory/API request counts; avoid a benchmark that only asserts “did not crash”. Re-run `pytest`, `ruff`, type checker, `git diff --check`, Docker build/smoke and available action linter; don't mark missing tools passed.
-- **Separate review pass:** inspect all I/O and mutation code plus mapping, state machine and GH workflows. Findings must identify severity, file/line, demonstrated impact, and fix. Repeat fix→test→review until no P0/P1 or acceptance-blocking P2 remains. At every milestone, preserve code and concise evidence in STATUS.md rather than generating large prose reports.
-- Prepare live-only deployment sequence: confirm target versions and Shoko settings/permissions/side effects; inspect read-only Sonarr mounts (all aliases), disable Shoko file-quality filtering, review plugins/renaming/MyList/global queue, take a verified Shoko DB + writable-manual-media backup, read-only preflight, inspect mapping coverage and existing-link audit, 5–10-file canary with queue settled and physical-media verification, then authorize a single bounded backlog campaign plus bounded new-arrival policy. Check Plex results. Never perform these against production without explicit authorization.
+The problem is compounded by the global attestation pause mechanism: an invalid daemon attestation can pause writes before the valid campaign attestation is considered.
 
-**Gate:** All PROJECT.md offline requirements have real evidence or a specific blocker, docs and safe defaults agree, no unresolved critical/high review findings, all post-M1 commits are buildable, and STATUS.md names the single next action. Actual Shoko write, Unraid deployment, and GHCR publishing remain `EXTERNAL/UNVERIFIED` until performed with permission.
+## Required correction
 
-## 2. Production safety gate (operator, not unattended agent)
+Support independent, simultaneously valid safety authorizations for daemon and campaign operations.
 
-Before any **real** Shoko link request:
+Choose a simple design that preserves the existing operator-controlled safety model.
 
-- **Physical media protection:** Verify Shoko sees **every Sonarr-owned root read-only**, including overlapping parent binds, symlinks and same-hash/multi-location aliases; no alternate RW path. Inspect the *Shoko container's mounts*, not only the linker's. Protect the **writable manual Shoko collection** separately.
-- **Shoko job side effects:** Verify `FileQualityFilterEnabled=false` (can otherwise delete even unrelated writable copies); inspect `Plugins.Renamer.RenameOnImport` and `MoveOnImport`, MyList auto-add, `OnFileMatched` plugins, and already running/queued operations. Drop Type `None` alone doesn't prevent manual-link-triggered relocation. If a settings response includes secrets, never print/store it raw. If settings cannot be verified, explicitly block or require short-lived, operator-recorded verification; no blind self-approval.
-- **Safeguards:** Backup Shoko DB plus writable manual media, verify restore procedure; document exact target version and plugin behavior; approve a finite safety lease and a small canary. Shoko may queue work after the HTTP response. Verify no unexpected Sonarr/manual media path or content changes after queue drain before authorizing a larger campaign.
-- **Known limitations:** Shoko's POST is not an atomic compare-and-set. External Shoko writers/plugins and Docker mount changes between inspections remain races; the software cannot certify this away. On discovery of any unexpected mutation, stop all linker writes pending operator investigation. A valid campaign/digest does not bypass this gate.
+For example, use separately persisted, scope-specific attestation records under the configured safety directory.
 
-## 3. Execution record (STATUS.md only)
+Alternatively, separate deployment-wide media-safety certification from campaign-specific authorization.
 
-The **main orchestrator**, not implementing or reviewing subagents, owns progress bookkeeping. After each bounded slice and review/fix cycle, update [STATUS.md](STATUS.md) with current milestone/slice, last verified commands and outcomes, issues/fixes, blockers, last local commit, next concrete action, and separately labeled external-only checks. On compaction/resumption, reload STATUS.md and check `git status` and the code before proceeding. **Never write progress back into this plan.**
+Do not weaken the requirement for a valid operator-recorded safety lease.
 
-A mandatory offline gate that cannot be passed must be recorded `PARTIAL/BLOCKED` in STATUS.md; continue with independent safe work where feasible. Never mark unexecuted checks or unavailable production validation as successful.
+The daemon must distinguish:
 
-## 4. Versioned reference starting points
+1. Permission to submit newly arriving episodes.
+2. Permission to process an explicitly approved backlog campaign.
 
-- [Sonarr API v3](https://sonarr.tv/docs/api/) and [API source](https://github.com/Sonarr/Sonarr/tree/develop/src/Sonarr.Api.V3)
-- [Shoko v5.3.3 FileController](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Controllers/FileController.cs) and [ManualLinkJob](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/Scheduling/Jobs/Shoko/ManualLinkJob.cs)
-- [Shoko file/XRef types](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Models/Shoko/File.cs), [episode identity model](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Models/Shoko/Episode.cs), [settings](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Controllers/SettingsController.cs), [queue](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Controllers/QueueController.cs)
-- [Anime-Lists format](https://github.com/Anime-Lists/anime-lists/blob/master/README.md)
-- [GitHub Actions `GITHUB_TOKEN` event rules](https://docs.github.com/en/actions/concepts/security/github_token), [concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency), and [GHCR publishing](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)
+A missing daemon-scope lease must not invalidate an otherwise authorized campaign solely because the service runs inside the daemon process.
+
+Similarly, an invalid campaign lease must not disable unrelated, independently authorized new-arrival processing.
+
+Avoid using one global pause marker for unrelated scope failures unless it represents a genuinely deployment-wide safety issue.
+
+Maintain backward compatibility with existing attestation files where practical.
+
+## Regression tests
+
+Test with real temporary attestation files, not only injected Boolean callbacks.
+
+Required scenarios:
+
+* Valid daemon lease only.
+* Valid campaign lease only.
+* Both leases valid simultaneously.
+* Daemon lease expired, campaign lease valid.
+* Campaign lease expired, daemon lease valid.
+* Both leases expired.
+* Different Shoko endpoint.
+* Different Shoko version.
+* Explicit operator invalidation.
+* Container restart with persisted attestations.
+
+**Acceptance:** An approved, canary-authorized campaign can drain automatically under its own valid safety authorization without disabling unrelated daemon processing.
+
+---
+
+# F9 — P1: Campaign submission budgets never reset between batches
+
+## Affected files
+
+* `src/shoko_linker/campaign.py`
+* `src/shoko_linker/state.py`
+* `src/shoko_linker/daemon.py`
+* `src/shoko_linker/cli.py`
+
+## Root cause
+
+`campaign.py`, approximately line 1383, submits requests using:
+
+```python
+cycle_key=f"campaign-{_short(campaign_id)}"
+```
+
+This key is identical across every batch of the same campaign.
+
+However, `StateStore._reserve_tx()` retrieves the existing `cycle_new_submissions` count using that key.
+
+It increments the stored count after every submission.
+
+The per-cycle limit is checked against the accumulated count.
+
+The default configuration permits:
+
+`sync.max_new_per_cycle = 20`
+
+Consequently, once a campaign has submitted 20 files, every subsequent batch can encounter:
+
+`cycle_new_exhausted`
+
+Because the cycle key never changes, waiting for another daemon cycle does not reset the count.
+
+This can permanently stall a campaign intended to process thousands of files.
+
+A related issue exists in the daemon's cycle identifiers.
+
+The daemon uses identifiers such as:
+
+`cycle-1`, `cycle-2`, etc.
+
+These identifiers restart at `cycle-1` whenever the process restarts.
+
+Old persisted budget rows can therefore be reused accidentally by a new process.
+
+## Required correction
+
+Give every actual reconciliation cycle and campaign batch a distinct durable budget-cycle identity.
+
+Requirements:
+
+* Unique across process restarts.
+* Stable for one executing cycle/batch.
+* Consistent for every submission belonging to that cycle.
+* No collision with previous campaign batches.
+* Does not reset global rolling budgets.
+* Does not permit crash recovery to submit the same request twice.
+
+A persisted run identifier combined with a sequence number, or a UUID-based cycle identifier, would be suitable.
+
+Keep the existing durable send fingerprints and idempotence protections.
+
+Consider bounded cleanup of old completed cycle-budget rows so thousands of campaigns do not cause unlimited SQLite metadata growth.
+
+Also examine zero-progress handling.
+
+Currently, an attempted candidate can count as `processed` even when its submission was refused by the budget.
+
+This can prevent the zero-progress circuit breaker from detecting a campaign that is permanently stuck.
+
+## Regression tests
+
+Simulate:
+
+1. A campaign with 100 approved files.
+2. A per-cycle submission cap of 5.
+3. Several automatic daemon batches.
+4. Successful progression beyond 5, 10, 20, and 50 total submissions.
+5. Daemon restart halfway through.
+6. Repeated one-shot invocations.
+7. Rolling-budget exhaustion and later recovery.
+8. Pending asynchronous jobs.
+9. Zero successful submissions across several cycles.
+
+Verify that the per-cycle budget resets appropriately while rolling and outstanding-job limits remain enforced.
+
+**Acceptance:** A 7,000-file campaign can progress across arbitrarily many bounded cycles without becoming permanently blocked by an old cycle identifier.
+
+---
+
+# F10 — P1: Canary authorization is inferred from attempted submissions
+
+## Affected files
+
+* `src/shoko_linker/campaign.py`
+* `src/shoko_linker/state.py`
+* `src/shoko_linker/cli.py`
+* `src/shoko_linker/daemon.py`
+
+## Root cause
+
+`campaign.py`, approximately lines 1540–1562, selects campaigns for automatic processing when:
+
+```python
+campaign_send_progress(store, campaign.campaign_id) >= 1
+```
+
+However, `campaign_send_progress()` counts several states, including:
+
+* `request_may_have_been_sent`
+* `verifying`
+* `verified`
+* `partial`
+* `indeterminate_write`
+* `conflict`
+
+Therefore, the daemon can consider the canary complete after a single attempted submission.
+
+The canary might still be:
+
+* Unverified.
+* Partially linked.
+* Indeterminate.
+* Incorrectly linked.
+* Awaiting asynchronous Shoko jobs.
+
+More importantly, the software has no evidence that the operator inspected the resulting media files for unexpected renames, deletions, or other Shoko-side effects.
+
+The original safety requirement is that the operator reviews a completed canary before approving broader production writes.
+
+Counting an attempted request does not establish that approval.
+
+## Required correction
+
+Introduce a durable, explicit operator confirmation that the canary has passed.
+
+Suggested workflow:
+
+1. Approve the finite campaign.
+2. Manually execute a small canary batch.
+3. Wait for Shoko's asynchronous jobs to settle.
+4. Verify the exact resulting episode links.
+5. Confirm the physical-media safety checks.
+6. Explicitly authorize automatic draining.
+
+The final step should be represented by an operator-only CLI command or equivalent confirmed action.
+
+For example:
+
+`campaign authorize-drain --campaign-id <id> --confirm --note "canary inspected"`
+
+The command name is illustrative.
+
+Bind the authorization to the approved campaign identity/digest.
+
+Persist the authorization across restarts.
+
+Do not permit automatic draining when the canary is pending, partial, indeterminate, or conflicting.
+
+A verified Shoko association alone is insufficient to establish that the operator inspected physical-media side effects.
+
+Preserve the current manual batch commands.
+
+## Regression tests
+
+Test that:
+
+* A newly approved campaign cannot auto-drain.
+* One attempted but unverified send does not authorize draining.
+* An indeterminate canary does not authorize draining.
+* A verified canary without operator confirmation does not authorize draining.
+* Explicit confirmation after verification enables bounded automatic processing.
+* Revocation prevents further submissions.
+* A changed plan digest invalidates automatic-drain authorization.
+* Restart preserves valid confirmation.
+
+**Acceptance:** The daemon cannot begin mass backlog processing before the operator has explicitly confirmed that the canary passed.
+
+---
+
+# F11 — P1: Campaign batches reuse stale safety and timing decisions
+
+## Affected files
+
+* `src/shoko_linker/campaign.py`
+* `src/shoko_linker/daemon.py`
+* `src/shoko_linker/linking.py`
+
+## Root cause
+
+`apply_campaign()` checks the write gate and safety attestation once before entering its batch loop.
+
+It then processes multiple files.
+
+The initial timestamp is reused throughout the batch.
+
+More importantly, `_send_one()` calls `preflight()` with:
+
+```python
+attestation_valid=True
+apply_gate_open=True
+```
+
+These values are hardcoded because the batch previously passed its outer safety checks.
+
+However, each file may require substantial time for Shoko verification.
+
+A campaign processing several files can continue well beyond its original attestation inspection time.
+
+Consequently, an attestation or campaign deadline may expire while the batch is still active.
+
+The next file can be submitted using the earlier authorization.
+
+A related shutdown concern exists: a SIGTERM received during a long batch is not checked before every subsequent submission.
+
+The daemon checks shutdown after the entire reconciliation cycle, which now includes automatic campaign processing.
+
+This can result in additional POST requests after shutdown has been requested.
+
+## Required correction
+
+Immediately before each new Shoko POST, re-evaluate the safety inputs that can become stale.
+
+At minimum:
+
+* Current attestation validity.
+* Applicable safety scope.
+* Campaign deadline.
+* Campaign status.
+* Operator write gate.
+* Shutdown request.
+* Mapping generation consistency.
+* Existing-link protection.
+* Shoko file identity.
+
+Keep the existing fresh file/XRef and target-identity preflight.
+
+Use the actual current time for submission timestamps and rolling-budget calculations instead of reusing an old batch-start timestamp.
+
+Ensure the process stops starting new submissions when shutdown has been requested.
+
+An already submitted request must remain durably tracked and recoverable.
+
+Keep verification bounded and avoid busy polling.
+
+Do not bypass the original safety gate merely because the candidate belongs to an approved campaign.
+
+## Regression tests
+
+Using a fake clock:
+
+1. Begin a batch with a valid attestation.
+2. Submit and verify the first file.
+3. Advance beyond the attestation expiration.
+4. Confirm the next file is not submitted.
+
+Repeat with campaign deadline expiration.
+
+Also test:
+
+* Operator pause or revoke between files.
+* SIGTERM after the first request.
+* Mapping changes between candidates.
+* Long verification delays.
+* Correct pending-send recovery after interruption.
+
+**Acceptance:** No new Shoko POST begins after its applicable authorization expires or after shutdown has been requested.
+
+---
+
+# F12 — P2: GHCR provenance verification fetches manifests as blobs
+
+## Affected files
+
+* `scripts/ghcr_tags.py`
+* `.github/workflows/publish.yml`
+* `tests/test_ghcr_tags.py`
+
+## Root cause
+
+The new registry discovery implementation correctly queries GHCR instead of Git tags.
+
+However, the OCI index provenance code contains an endpoint error.
+
+In `scripts/ghcr_tags.py`, approximately lines 410–440, `_index_revision()` extracts the digest of a child manifest.
+
+It then fetches that manifest using:
+
+```python
+f"{REGISTRY}/v2/{owner}/{package}/blobs/{digest}"
+```
+
+The OCI Distribution API distinguishes manifests from blobs.
+
+A referenced image manifest must be fetched through:
+
+`GET /v2/<name>/manifests/<digest>`
+
+The `/blobs/<digest>` endpoint is for blobs such as image configurations and layers.
+
+This can cause provenance verification to fail for OCI image indexes produced by Docker Buildx.
+
+Because the workflow enables provenance attestations, OCI indexes are particularly relevant.
+
+The verifier may classify an already-published image as `unknown_provenance`.
+
+The backfill workflow can then repeatedly schedule that SHA for publication.
+
+## Required correction
+
+Fetch child manifest descriptors through the manifests endpoint.
+
+Fetch the referenced image configuration through the blobs endpoint.
+
+Handle OCI indexes containing multiple descriptors.
+
+Select an actual runnable image manifest rather than assuming the first descriptor is always the image.
+
+For example, an index may contain an image manifest and a separate attestation manifest.
+
+Preserve digest verification.
+
+Also correct the publication policy for existing tags with unknown provenance.
+
+An existing but unverifiable SHA tag should not automatically be overwritten merely because its name contains a commit SHA.
+
+A tag name derived from a commit is not automatically an immutable image reference.
+
+If an existing tag cannot be verified, report the problem and require safe reconciliation instead of silently overwriting an unknown image.
+
+## Regression tests
+
+Use a representative OCI index containing:
+
+* A runnable image manifest.
+* An attestation manifest.
+* Image configuration labels.
+* Valid SHA-256 digests.
+
+Assert the exact registry request paths.
+
+Also test:
+
+* Docker manifest schema 2.
+* OCI single-image manifests.
+* OCI indexes.
+* Manifest ordering variations.
+* Missing revision labels.
+* Mismatched revision labels.
+* Missing child manifests.
+* Registry authentication failure.
+* Repeated backfill after successful publication.
+
+**Acceptance:** Successfully published images are recognized reliably, and backfill does not overwrite an existing unverified SHA tag.
+
+OCI reference: https://github.com/opencontainers/distribution-spec/blob/main/spec.md
+
+---
+
+# F13 — P2: Empty hashes can pass the file-readiness check
+
+## Affected files
+
+* `src/shoko_linker/shoko.py`
+* `src/shoko_linker/linking.py`
+* Related tests
+
+## Root cause
+
+The new `has_available_hashes()` helper uses:
+
+```python
+return any(value is not None for value in _hash_tuple_values(item.hashes))
+```
+
+This considers an empty string a valid hash.
+
+For example:
+
+```python
+ShokoHashes(
+    ed2k="",
+    sha1=None,
+    crc32=None,
+    md5=None,
+)
+```
+
+passes the check.
+
+However, Shoko can use an empty ED2K string while preparing a new file record before hashing has completed.
+
+A non-null value is not necessarily a usable hash.
+
+## Required correction
+
+Validate that the required hash is nonempty and structurally valid.
+
+For Shoko 5.3.3, investigate requiring a complete ED2K identity before linking.
+
+Do not assume that a partially populated hash object means hashing has completed.
+
+Preserve the corrected behavior allowing fully hashed files with `Imported=null`.
+
+Tests must distinguish:
+
+* `Imported=null`, valid complete ED2K: eligible.
+* `Imported=null`, empty ED2K: ineligible.
+* Whitespace-only ED2K: ineligible.
+* Malformed ED2K: ineligible.
+* Missing hashes: ineligible.
+* Complete hashes, no XRefs: eligible.
+
+**Acceptance:** The `Imported=null` fix remains functional without admitting files whose hashing state is incomplete.
+
+---
+
+# F14 — P2: Deployment documentation contains inconsistent campaign instructions
+
+## Affected files
+
+* `docs/deployment.md`
+* `README.md`
+
+## Evidence
+
+The deployment guide currently prepares a campaign using:
+
+`campaign prepare --limit 1`
+
+It then explains that the daemon will process the remaining campaign automatically.
+
+However, the approved plan contains only one file.
+
+There are no additional approved files for the daemon to process.
+
+The same document also contains an older warning about stopping after the first campaign batch because of a known source-continuity defect.
+
+This contradicts the newly implemented multi-batch behavior.
+
+## Required correction
+
+Update the deployment instructions to prepare the complete intended campaign first.
+
+The operator should then apply only a small canary subset from that approved campaign.
+
+After verification and explicit operator confirmation, the daemon may process the remaining approved files automatically.
+
+Remove obsolete warnings about defects that have been fixed.
+
+Ensure the documentation accurately explains the separate daemon and campaign safety attestations after F8 is resolved.
+
+Cross-check example commands against actual CLI arguments.
+
+**Acceptance:** Following the deployment guide produces a finite, fully approved backlog campaign that can proceed safely after the canary.
+
+---
+
+# Implementation priority
+
+Address findings in this order:
+
+**Phase A — Core campaign correctness**
+
+1. F8: Independent safety attestations.
+2. F9: Unique budget-cycle identifiers.
+3. F10: Explicit canary confirmation.
+4. F11: Fresh per-submission authorization and shutdown checks.
+
+These four must be fixed before production automatic campaign processing.
+
+**Phase B — Registry reliability**
+
+5. F12: Correct OCI manifest traversal and tag-provenance handling.
+
+**Phase C — File readiness and documentation**
+
+6. F13: Validate actual hash contents.
+7. F14: Correct deployment documentation.
+
+Avoid adding new infrastructure or unnecessarily restructuring the existing application.
+
+---
+
+# Final validation requirements
+
+Run the project's configured checks:
+
+```bash
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+git diff --check
+docker build -t shoko-sonarr-linker:review .
+```
+
+Add a realistic simulated campaign containing at least 100 files.
+
+Use deliberately small budgets so the test crosses several per-cycle boundaries.
+
+Verify that automatic processing:
+
+* Continues beyond the per-cycle cap across later cycles.
+* Survives process restart.
+* Never widens the approved file or episode set.
+* Requires explicit canary confirmation.
+* Requires valid safety authorization for each submission.
+* Stops new submissions after revocation or shutdown.
+* Preserves uncertain sends without replaying POST requests.
+* Handles mapping updates and Shoko queue anomalies safely.
+
+Run independent regression tests for the GHCR OCI registry operations.
+
+Perform a separate adversarial review of all changes affecting Shoko POST submission, campaign authorization, and durable SQLite state.
+
+Record findings, actual test results, and local commit SHAs in `STATUS.md`.
+
+Keep `PLAN.md` unchanged.
+
+Do not perform live writes or push the resulting commits without authorization.
+
+## Completion criteria
+
+Remediation is complete when:
+
+1. Automatic campaigns operate with valid independent safety attestations.
+2. Campaigns progress through multiple real budget cycles without stalling.
+3. A canary cannot authorize automatic draining until explicitly confirmed by the operator.
+4. Expired safety authorization prevents further POST requests.
+5. Graceful shutdown prevents additional submissions after the current protected operation.
+6. GHCR provenance verification handles OCI manifests and indexes correctly.
+7. Hash-readiness checks reject empty or incomplete hashes.
+8. Deployment instructions accurately represent the implemented behavior.
+9. All targeted and full regression tests pass.
+10. Independent review finds no outstanding P0/P1 or acceptance-blocking P2 defects.
+11. `STATUS.md` contains accurate evidence.
+12. `PLAN.md` remains immutable.
+
+Continue through the remediation without routine approval requests.
+
+Preserve all existing file-protection, scope-isolation, and no-overwrite safeguards.
