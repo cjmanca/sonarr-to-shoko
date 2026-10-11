@@ -92,6 +92,7 @@ from .config import (
     load_settings,
 )
 from .daemon import (
+    AttestationScopeHooks,
     CycleMode,
     CycleReport,
     DaemonDeps,
@@ -114,6 +115,9 @@ from .policies import PolicyRequest, RunPolicy, parse_policy
 from .reporting import (
     META_CYCLE_ALIVE,
     META_CYCLE_APPLY_ELIGIBLE,
+    META_CYCLE_CAMPAIGN_ID,
+    META_CYCLE_CAMPAIGN_REMAINING,
+    META_CYCLE_CAMPAIGN_SUBMITTED,
     META_CYCLE_FAILED,
     META_CYCLE_KEY,
     META_CYCLE_MODE,
@@ -323,6 +327,21 @@ def read_overrides_text(settings: Settings) -> str | None:
         raise ConfigError(f"cannot read mappings.overrides_file {path}: {detail}") from exc
 
 
+def _campaign_attestation_hooks(settings: Settings) -> Callable[[str], AttestationScopeHooks]:
+    """Factory mapping a campaign id to its ``campaign:<id>`` attestation callables (F7)."""
+
+    def build(campaign_id: str) -> AttestationScopeHooks:
+        scope = f"campaign:{campaign_id}"
+        return AttestationScopeHooks(
+            valid=lambda: attestation_input(settings, scope=scope),
+            verdict=lambda: attestation_verdict_for(
+                settings, scope=scope, version_hint=settings.safety.attested_shoko_version
+            ),
+        )
+
+    return build
+
+
 def build_daemon_deps(
     settings: Settings,
     *,
@@ -358,6 +377,7 @@ def build_daemon_deps(
         max_cycle_seconds=settings.sync.max_cycle_seconds,
         churn_limit=settings.sync.mapping_churn_limit,
         max_recovery_rows_per_cycle=settings.sync.max_recovery_rows_per_cycle,
+        campaign_attestation=_campaign_attestation_hooks(settings),
     )
 
 
@@ -438,6 +458,24 @@ def _start_cycle_meta(store: StateStore, cycle_key: str, iso: str, interval_seco
         store.set_meta(META_NEXT_CYCLE_DUE_ISO, _iso_plus(iso, interval_seconds))
 
 
+def _set_cycle_campaign_meta(store: StateStore, report: CycleReport) -> None:
+    """Persist a bounded per-cycle campaign-batch summary (F7) on the cycle-meta path.
+
+    Fixed meta keys, overwritten every cycle (no per-cycle list grows): the counts and the
+    last-drained campaign id advance mid-run for ``report``/``health`` freshness while
+    the F4 bounded-history invariants stay intact.
+    """
+    campaign = getattr(report, "campaign", None)
+    if campaign is not None:
+        store.set_meta(META_CYCLE_CAMPAIGN_ID, campaign.campaign_id)
+        store.set_meta(META_CYCLE_CAMPAIGN_SUBMITTED, str(campaign.submitted))
+        store.set_meta(META_CYCLE_CAMPAIGN_REMAINING, str(campaign.remaining))
+    else:
+        store.set_meta(META_CYCLE_CAMPAIGN_ID, "")
+        store.set_meta(META_CYCLE_CAMPAIGN_SUBMITTED, "0")
+        store.set_meta(META_CYCLE_CAMPAIGN_REMAINING, "")
+
+
 def persist_cycle_meta(
     store: StateStore,
     report: CycleReport,
@@ -461,6 +499,7 @@ def persist_cycle_meta(
         store.set_meta(META_CYCLE_APPLY_ELIGIBLE, "1" if report.apply_eligible else "0")
         store.set_meta(META_CYCLE_FAILED, "1" if report.failed else "0")
         store.set_meta(META_CYCLE_SUBMITTED, str(report.counts.submitted))
+        _set_cycle_campaign_meta(store, report)
         store.set_meta(META_LAST_CYCLE_START_ISO, started_iso)
         store.set_meta(META_LAST_CYCLE_END_ISO, ended_iso)
         store.set_meta(META_NEXT_CYCLE_DUE_ISO, _iso_plus(ended_iso, interval_seconds))
@@ -615,6 +654,12 @@ def _daemon_preamble(
         "work budgets; the interval gate forces a full reconcile)"
     )
     bounded = "unbounded (Ctrl+C / SIGTERM)" if stop_after is None else f"bounded: {stop_after}"
+    campaign_drain = (
+        "approved backlog campaigns drain automatically (one bounded batch per apply cycle, "
+        "after the operator's canary)"
+        if settings.campaign.daemon_auto_apply
+        else "campaign drain off (campaign.daemon_auto_apply=false): manual CLI only"
+    )
     return [
         f"requested policy: {request.policy.label}",
         f"loop mode: {_mode_label(mode)} (apply requires the gate; validated once at start)",
@@ -624,6 +669,7 @@ def _daemon_preamble(
             f"rolling_new_limit={settings.sync.rolling_new_limit}, "
             f"max_pending_episode_jobs={settings.sync.max_pending_episode_jobs}"
         ),
+        f"campaign drain: {campaign_drain}",
         f"cycles: {bounded}",
         _ATTESTATION_NOTE,
     ]
@@ -694,6 +740,17 @@ def _run_daemon(args: argparse.Namespace) -> int:
                 report.full,
                 report.failed,
             )
+            campaign = getattr(report, "campaign", None)
+            if campaign is not None:
+                logging.getLogger(__name__).info(
+                    "cycle %s campaign batch: %s submitted=%d quarantined=%d remaining=%d%s",
+                    report.cycle_key,
+                    campaign.campaign_id,
+                    campaign.submitted,
+                    campaign.quarantined,
+                    campaign.remaining,
+                    f" stopped={campaign.stopped}" if campaign.stopped else "",
+                )
 
         daemon_report = run_daemon(
             deps,
@@ -2122,7 +2179,8 @@ def print_config_summary(settings: Settings) -> None:
     campaign = settings.campaign
     print(
         f"  campaign: max_campaign_files={campaign.max_campaign_files}, "
-        f"max_batch_size={campaign.max_batch_size}"
+        f"max_batch_size={campaign.max_batch_size}, "
+        f"daemon_auto_apply={campaign.daemon_auto_apply}"
     )
     print(
         f"  api keys: read from the environment at access time "

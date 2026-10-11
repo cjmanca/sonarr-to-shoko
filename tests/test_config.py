@@ -558,6 +558,24 @@ def test_campaign_fields_parse() -> None:
     settings = parse_settings(_campaign_document(max_campaign_files=50, max_batch_size=3))
     assert settings.campaign.max_campaign_files == CAMPAIGN_FILES_50
     assert settings.campaign.max_batch_size == CAMPAIGN_BATCH_3
+    # F7 default: the daemon drains approved campaigns automatically.
+    assert settings.campaign.daemon_auto_apply is True
+
+
+def test_campaign_daemon_auto_apply_parses_both_values() -> None:
+    assert (
+        parse_settings(_campaign_document(daemon_auto_apply=False)).campaign.daemon_auto_apply
+        is False
+    )
+    assert (
+        parse_settings(_campaign_document(daemon_auto_apply=True)).campaign.daemon_auto_apply
+        is True
+    )
+
+
+def test_campaign_daemon_auto_apply_rejects_non_bool() -> None:
+    with pytest.raises(ConfigError, match="daemon_auto_apply"):
+        parse_settings(_campaign_document(daemon_auto_apply="yes"))
 
 
 @pytest.mark.parametrize(

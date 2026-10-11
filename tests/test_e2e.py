@@ -136,11 +136,17 @@ def _no_root_logging_leak() -> Iterator[None]:
 
 
 def _lease_world(
-    tmp_path: Path, xml: str, **sync_extra: Any
+    tmp_path: Path,
+    xml: str,
+    *,
+    campaign: dict[str, Any] | None = None,
+    **sync_extra: Any,
 ) -> tuple[eh.World, eh.FakeClock, Path]:
     lease = tmp_path / "lease.yaml"
     eh.record_lease(lease)
-    world = eh.make_world(tmp_path, xml, lease=lease, sync_extra=dict(sync_extra) or None)
+    world = eh.make_world(
+        tmp_path, xml, lease=lease, campaign=campaign, sync_extra=dict(sync_extra) or None
+    )
     clock = eh.FakeClock()
     eh.seed_mapping(world, clock)
     return world, clock, lease
@@ -209,10 +215,15 @@ def _campaign_env(
     *,
     campaign_max: int = 200,
     batch: int = BATCH_TEN,
+    auto_drain: bool = True,
 ) -> eh.CampaignEnv:
     lease = tmp_path / "lease.yaml"
     sync_extra = {"max_new_per_cycle": 120, "max_pending_episode_jobs": 30}
-    campaign = {"max_campaign_files": campaign_max, "max_batch_size": batch}
+    campaign = {
+        "max_campaign_files": campaign_max,
+        "max_batch_size": batch,
+        "daemon_auto_apply": auto_drain,
+    }
     document = eh.settings_document(lease=lease, sync_extra=sync_extra, campaign=campaign)
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
     env = eh.CampaignEnv(
@@ -1319,6 +1330,50 @@ def test_campaign_canary_batches_quarantine_and_revoke(
     assert code == cli.EXIT_APPLY_GATE_REFUSAL
 
 
+def test_daemon_drains_approved_campaign_end_to_end_after_canary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7 (real machinery): after ONE manual canary the daemon drains the approved
+    campaign across bounded batches with ZERO further CLI invocations, all files verified."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    xml = eh.xml_document(eh.range_entry(4001, 300001, 1, PER_SERIES_HUNDRED))
+    # World campaign: drain on, small bounded batch (2) so many daemon batches are exercised.
+    world, clock, _lease = _lease_world(
+        tmp_path,
+        xml,
+        campaign={"max_campaign_files": 12, "max_batch_size": 2, "daemon_auto_apply": True},
+    )
+    eh.seed_backlog(world, 1, 12)  # a 12-file backlog (single mapped series)
+    env = _campaign_env(tmp_path, world, clock, monkeypatch, capsys, campaign_max=12, batch=2)
+    prepared = env.prepare(limit=12)
+    assert prepared["files"] == 12
+    assert world.shoko.posts_count() == 0  # prepare is dry-run
+    env.approve(str(prepared["approval_digest"]))
+    capsys.readouterr()
+    # The operator's manual canary (one file) opens the daemon drain.
+    code, payload = env.apply(batch=1)
+    assert code == cli.EXIT_OK
+    assert payload["submitted"] == 1
+    assert world.shoko.posts_count() == 1
+    # The daemon cycles drain the remaining 11 files automatically, ≤2 POSTs per cycle.
+    store = env.open_store()
+    try:
+        deps = eh.build_deps(world, store, clock, max_submissions=2)
+        for index in range(8):
+            report = _run_apply(deps, clock, f"drain-{index}")
+            if report.campaign is not None:
+                assert report.campaign.submitted <= 2  # bounded batch
+        campaign = store.get_campaign(str(prepared["campaign_id"]))
+    finally:
+        store.close()
+    assert campaign is not None
+    assert campaign.total_sent == 12  # fully drained with no further manual invocations
+    assert world.shoko.posts_count() == 12
+    report = env.report(str(prepared["campaign_id"]))
+    assert report["total_sent"] == 12
+    assert report["verified"] == 12
+
+
 # ------------------------------------------- 17b. Imported=null backlog progress
 
 
@@ -1501,10 +1556,16 @@ def test_measured_full_world_first_scan_campaign_and_daemon_cycles(
 ) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     xml = eh.xml_document(eh.range_entry(4001, 300001, 1, PER_SERIES_HUNDRED))
-    world, clock, _lease = _lease_world(tmp_path, xml)
+    world, clock, _lease = _lease_world(
+        tmp_path, xml, campaign={"max_campaign_files": LIMIT_HUNDRED, "daemon_auto_apply": False}
+    )
     specs = eh.seed_backlog(world, SERIES_SEVENTY, PER_SERIES_HUNDRED)
     assert len(specs) == BACKLOG_FILES
-    env = _campaign_env(tmp_path, world, clock, monkeypatch, capsys)
+    # F7: this perf scenario measures first-scan + ONE campaign batch + IDLE daemon cycles
+    # (new-arrival only). The daemon auto-drain is exercised deterministically in
+    # test_daemon_campaign_auto_drain; here it is off so the per-file GET ceiling
+    # measures the first-scan + single-batch cost, unchanged by repeated drain sweeps.
+    env = _campaign_env(tmp_path, world, clock, monkeypatch, capsys, auto_drain=False)
     submissions = 0
     with eh.measure(world) as stats:
         store = eh.open_store(world)

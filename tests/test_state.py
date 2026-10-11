@@ -21,6 +21,7 @@ from shoko_linker.state import (
     BaselineFile,
     BudgetLimits,
     BudgetRefusal,
+    CampaignBinding,
     Cohort,
     ContinuityVerdict,
     EligibilityVerdict,
@@ -1786,3 +1787,44 @@ def test_continuity_anchor_basis_persists_across_restart(tmp_path: Path) -> None
         )
         assert external.requires_rebaseline is True
         assert "discovery_total_drop" in external.reasons
+
+
+def test_create_campaign_persists_plan_path_and_round_trips(tmp_path: Path) -> None:
+    """F7: the approved campaign row persists the canonical plan file path (schema v1, no
+    migration), round-tripping through get_campaign/list_campaigns; None is allowed."""
+    path = tmp_path / "state.sqlite3"
+    with open_store(path) as store:
+        store.create_campaign(
+            "camp-1",
+            PLAN_FP,
+            max_submissions=2,
+            deadline_iso=None,
+            attestation_scope="campaign:camp-1",
+            approval_iso=T0,
+            iso=T0,
+            bindings=[
+                CampaignBinding(
+                    shoko_file_id=1, plan_fingerprint=PLAN_FP, request_fingerprint=REQ_FP
+                )
+            ],
+            plan_path="/data/plan.json",
+        )
+        store.create_campaign(
+            "camp-2",
+            REQ_FP,
+            max_submissions=1,
+            deadline_iso=None,
+            attestation_scope="campaign:camp-2",
+            approval_iso=T1,
+            iso=T1,
+            plan_path=None,
+        )
+    with open_store(path) as store:
+        camp1 = store.get_campaign("camp-1")
+        camp2 = store.get_campaign("camp-2")
+        assert camp1 is not None
+        assert camp1.plan_path == "/data/plan.json"
+        assert camp2 is not None
+        assert camp2.plan_path is None
+        by_id = {campaign.campaign_id: campaign.plan_path for campaign in store.list_campaigns()}
+        assert by_id == {"camp-1": "/data/plan.json", "camp-2": None}

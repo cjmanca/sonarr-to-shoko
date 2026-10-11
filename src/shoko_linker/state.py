@@ -78,6 +78,10 @@ ever been released): ``campaigns.campaign_id`` becomes **TEXT** (the plan file's
 gains ``attestation_scope``/``approval_iso``/``status_reason``/``last_batch_iso`` and a
 ``status IN ('approved','paused','revoked')`` check; ``files.campaign_id`` is TEXT for the
 same reason, and :meth:`StateStore.prepare_send` takes ``campaign_id: str | None``.
+F7 (also schema v1, unshipped — no image shipped with v1 columns has ever been released):
+``campaigns.plan_path`` records the canonical plan file path bound at approval, so the daemon
+drains an approved campaign against the same file the ``plan_drift`` digest gate re-verifies;
+it is appended to ``_SCHEMA_SQL`` with **no** migration entry.
 
 **Operator-only indirect chain (P3-B):** the transition graph contains the path
 ``indeterminate_write → waiting → planned → prepared_not_sent → request_may_have_been_sent``,
@@ -655,6 +659,7 @@ class CampaignBinding:
 
 CAMPAIGN_STATUS_APPROVED: Final[str] = "approved"
 CAMPAIGN_BINDING_FIELDS: Final[int] = 3
+CAMPAIGN_PLAN_PATH_COLUMN: Final[int] = 12
 CAMPAIGN_STATUS_PAUSED: Final[str] = "paused"
 CAMPAIGN_STATUS_REVOKED: Final[str] = "revoked"
 CAMPAIGN_STATUSES: Final[frozenset[str]] = frozenset(
@@ -681,6 +686,7 @@ class CampaignRecord:
     last_batch_iso: str | None
     created_iso: str
     bindings: tuple[CampaignBinding, ...]
+    plan_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -865,7 +871,8 @@ CREATE TABLE campaigns (
     status_reason TEXT NOT NULL DEFAULT '',
     total_sent INTEGER NOT NULL DEFAULT 0,
     last_batch_iso TEXT,
-    created_iso TEXT NOT NULL
+    created_iso TEXT NOT NULL,
+    plan_path TEXT
 );
 CREATE TABLE budgets (
     window_key TEXT PRIMARY KEY,
@@ -1121,6 +1128,9 @@ def _row_to_campaign(row: Any) -> CampaignRecord:
         last_batch_iso=_as_optional_str(values[9]),
         created_iso=_as_str(values[10], "created_iso"),
         bindings=tuple(bindings),
+        plan_path=_as_optional_str(values[CAMPAIGN_PLAN_PATH_COLUMN])
+        if len(values) > CAMPAIGN_PLAN_PATH_COLUMN
+        else None,
     )
 
 
@@ -2893,12 +2903,16 @@ class StateStore:
         approval_iso: str,
         iso: str,
         bindings: Sequence[CampaignBinding] = (),
+        plan_path: str | None = None,
     ) -> str:
         """Persist one **approved** campaign row (the ``campaign approve`` path).
 
         The approval is bound to the plan file's canonical digest; ``bindings`` are the
         per-file (id, plan fingerprint, request fingerprint) pairs the plan file carries.
-        A campaign id is unique — re-approving an existing campaign refuses.
+        ``plan_path`` (F7) records the canonical plan file path the daemon drains against
+        (the ``plan_drift`` digest check stays authoritative: the daemon re-reads this file
+        and re-digests it every batch). A campaign id is unique — re-approving an existing
+        campaign refuses.
         """
         _require_iso(iso, "iso")
         _require_iso(approval_iso, "approval_iso")
@@ -2926,8 +2940,8 @@ class StateStore:
             self._conn.execute(
                 "INSERT INTO campaigns (campaign_id, digest, plan_fingerprint_set, max_submissions,"
                 " deadline_iso, attestation_scope, approval_iso, status, status_reason, total_sent,"
-                " last_batch_iso, created_iso)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 0, NULL, ?)",
+                " last_batch_iso, created_iso, plan_path)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 0, NULL, ?, ?)",
                 (
                     campaign_id,
                     digest,
@@ -2938,6 +2952,7 @@ class StateStore:
                     approval_iso,
                     CAMPAIGN_STATUS_APPROVED,
                     iso,
+                    plan_path,
                 ),
             )
         return campaign_id
@@ -2946,7 +2961,7 @@ class StateStore:
         row = self._conn.execute(
             "SELECT campaign_id, digest, max_submissions, deadline_iso, attestation_scope,"
             " approval_iso, status, status_reason, total_sent, last_batch_iso,"
-            " created_iso, plan_fingerprint_set FROM campaigns WHERE campaign_id = ?",
+            " created_iso, plan_fingerprint_set, plan_path FROM campaigns WHERE campaign_id = ?",
             (campaign_id,),
         ).fetchone()
         if row is None:
@@ -2957,7 +2972,7 @@ class StateStore:
         rows = self._conn.execute(
             "SELECT campaign_id, digest, max_submissions, deadline_iso, attestation_scope,"
             " approval_iso, status, status_reason, total_sent, last_batch_iso, created_iso,"
-            " plan_fingerprint_set FROM campaigns ORDER BY campaign_id",
+            " plan_fingerprint_set, plan_path FROM campaigns ORDER BY campaign_id",
         ).fetchall()
         return tuple(_row_to_campaign(row) for row in rows)
 

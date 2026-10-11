@@ -53,6 +53,9 @@ META_CYCLE_MODE: Final[str] = "last_cycle_mode"
 META_CYCLE_KEY: Final[str] = "last_cycle_key"
 META_CYCLE_FAILED: Final[str] = "last_cycle_failed"
 META_CYCLE_SUBMITTED: Final[str] = "last_cycle_submitted"
+META_CYCLE_CAMPAIGN_ID: Final[str] = "last_cycle_campaign_id"
+META_CYCLE_CAMPAIGN_SUBMITTED: Final[str] = "last_cycle_campaign_submitted"
+META_CYCLE_CAMPAIGN_REMAINING: Final[str] = "last_cycle_campaign_remaining"
 META_OPERATOR_ACTIONS: Final[str] = "operator_actions"
 
 CYCLE_META_KEYS: Final[tuple[str, ...]] = (
@@ -63,6 +66,9 @@ CYCLE_META_KEYS: Final[tuple[str, ...]] = (
     META_CYCLE_APPLY_ELIGIBLE,
     META_CYCLE_FAILED,
     META_CYCLE_SUBMITTED,
+    META_CYCLE_CAMPAIGN_ID,
+    META_CYCLE_CAMPAIGN_SUBMITTED,
+    META_CYCLE_CAMPAIGN_REMAINING,
     META_LAST_CYCLE_START_ISO,
     META_LAST_CYCLE_END_ISO,
     META_NEXT_CYCLE_DUE_ISO,
@@ -133,6 +139,23 @@ def recovery_deferred(reasons: Sequence[str]) -> int:
 # ------------------------------------------------------------------ cycle payloads
 
 
+def _campaign_cycle_summary(report: Any | None) -> dict[str, Any] | None:
+    """Compact per-cycle campaign-batch summary (F7): counts only, no secret, bounded."""
+    if report is None:
+        return None
+    return {
+        "campaign_id": report.campaign_id,
+        "processed": report.processed,
+        "submitted": report.submitted,
+        "verified": report.verified,
+        "quarantined": report.quarantined,
+        "deferred": report.deferred,
+        "total_sent": report.total_sent,
+        "remaining": report.remaining,
+        "stopped": report.stopped,
+    }
+
+
 def cycle_report_payload(
     report: CycleReport,
     *,
@@ -157,6 +180,7 @@ def cycle_report_payload(
         "existing_link_drift": list(report.existing_link_drift),
         "deferred_planned": report.deferred_planned,
         "recovery_deferred": recovery_deferred(report.reasons),
+        "campaign": _campaign_cycle_summary(report.campaign),
         "failed": report.failed,
         "live_held_sends": report.live_held_sends,
         "live_held_slots": report.live_held_slots,
@@ -197,6 +221,17 @@ def daemon_report_payload(
     }
 
 
+def _campaign_cycle_segment(campaign: Any | None) -> str:
+    if campaign is None:
+        return ""
+    stopped = f" stopped={campaign.stopped}" if campaign.stopped else ""
+    return (
+        f" campaign={campaign.campaign_id[:8]}"
+        f"(submitted={campaign.submitted} quarantined={campaign.quarantined}"
+        f" remaining={campaign.remaining}{stopped})"
+    )
+
+
 def cycle_summary_line(report: CycleReport) -> str:
     """One human-readable cycle summary line (no secrets, no key values)."""
     counts = report.counts
@@ -212,6 +247,7 @@ def cycle_summary_line(report: CycleReport) -> str:
         f" live_held(sends={report.live_held_sends}, slots={report.live_held_slots})"
         f" apply_eligible={report.apply_eligible}"
         f" reconciliation_ready={report.reconciliation_ready}"
+        f"{_campaign_cycle_segment(report.campaign)}"
         f"{' FAILED' if report.failed else ''}"
     )
 

@@ -293,6 +293,29 @@ uv run shoko-sonarr-linker campaign verify config.yaml --campaign-id <campaign-i
 uv run shoko-sonarr-linker campaign report config.yaml --campaign-id <campaign-id> --plan plan.json --json
 ```
 
+The canary is the operator's **first** campaign batch: once it completes (≥1 file with persisted
+send progress) and physical-media inspection passes, the daemon drains the rest of the approved
+campaign automatically. Keep the daemon's campaign-scope lease valid for the drain window
+(`campaign.daemon_auto_apply: true`, default). The manual `campaign apply` command remains
+available for a batch at any time; a daemon batch and a concurrent CLI `campaign apply` contend for
+the single apply lock, so exactly one writer runs.
+
+Campaign drain rules the daemon enforces every batch (identical to `campaign apply`):
+
+- **Canary first.** The daemon drains an approved campaign; the operator's canary is the
+  first batch, run manually before the daemon is trusted to drain the rest.
+- The plan file digest must match the approval digest; a changed plan pauses the campaign
+  (`plan_drift`) with zero POSTs.
+- Candidate drift quarantines the file; it is never silently replaced.
+- Deadline passed / `max_submissions` reached → the batch refuses/auto-pauses and the daemon
+  skips the campaign thereafter (a new plan/approval is required to continue).
+- An expiring campaign lease, a blocked queue, mapping churn/drift, writes-disabled, or a
+  source discontinuity stop the batch with a persisted pause and zero POSTs; the daemon stays
+  alive reporting read-only.
+- Pause/resume/revoke are confirmed operator commands and take effect on the next cycle: a paused
+  or revoked campaign is skipped mid-drain; revoke returns queued planned/mapped rows to `waiting`
+  and refuses future applies.
+
 Stop after the first campaign batch in this build. The known multi-batch defect
 can pause subsequent campaign apply with `source_discontinuity` after
 the campaign's own accepted links reduce the discovery total.
@@ -315,6 +338,13 @@ docker compose -f compose.example.yaml up -d
 
 Set `SHOKO_LINKER_ALLOW_APPLY=1` only for a writable daemon. Set
 `sync.apply_changes: true` only after the canary passes.
+
+With `campaign.daemon_auto_apply: true` (default) the daemon drains the approved backlog campaign
+you canaried above — one bounded batch per apply cycle — with **no further manual invocations**;
+progress persists across restarts (durable send rows + fingerprints, never a double-send), oldest
+approved campaign first, and pause/resume/revoke stop it on the next cycle. Monitor `report`
+(campaign progress, `last_cycle_campaign_*`) and `health` while it drains. Set
+`campaign.daemon_auto_apply: false` to keep every batch a manual `campaign apply`.
 
 Monitor:
 

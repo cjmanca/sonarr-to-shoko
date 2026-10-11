@@ -14,7 +14,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,12 @@ import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker.campaign import (
+    apply_campaign,
+    approve_campaign,
+    prepare_campaign,
+    write_plan_file,
+)
 from shoko_linker.cli import StopState, persist_cycle_meta
 from shoko_linker.config import Settings, parse_settings
 from shoko_linker.daemon import (
@@ -40,6 +46,8 @@ from shoko_linker.linking import SendOutcome, VerificationVerdict
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome, refresh
 from shoko_linker.policies import RunPolicy
 from shoko_linker.reporting import (
+    META_CYCLE_CAMPAIGN_ID,
+    META_CYCLE_CAMPAIGN_SUBMITTED,
     META_CYCLE_KEY,
     META_CYCLE_SUBMITTED,
 )
@@ -3913,3 +3921,183 @@ def test_inter_cycle_wait_seam_is_separate_from_in_cycle_advance(
     assert len(waits) == cycles_three - 1  # between-cycle sleeps only, via the dedicated seam
     assert all(seconds > 0.0 for seconds in waits)
     assert sleeper.sleeps == []  # in-cycle advance untouched by inter-cycle sleep
+
+
+# ------------------------------------------------------------------ F7: daemon campaign drain
+
+
+def _drain_settings(tmp_path: Path, batch: int) -> Settings:
+    """Settings with a small campaign.max_batch_size so the daemon drains in many batches."""
+    document = yaml.safe_load(
+        yaml.safe_dump(
+            {
+                "sonarr": {
+                    "url": SONARR_BASE,
+                    "api_key_env": "SONARR_API_KEY",
+                    "allowed_roots": [SONARR_ROOT],
+                },
+                "shoko": {
+                    "url": SHOKO_BASE,
+                    "api_key_env": "SHOKO_API_KEY",
+                    "allowed_roots": [SHOKO_ROOT],
+                },
+                "paths": {"mappings": [{"sonarr": SONARR_ROOT, "shoko": SHOKO_ROOT}]},
+                "mappings": {
+                    "source": "anime-lists",
+                    "source_url": SOURCE_URL,
+                    "refresh_hours": HOURS,
+                },
+                "sync": {
+                    "apply_changes": True,
+                    "max_concurrent_links": 4,
+                    "new_file_grace_period_seconds": 0,
+                    "max_new_per_cycle": 50,
+                    "max_pending_episode_jobs": 100,
+                },
+                "database": {"path": "/daemon/state.sqlite3"},
+                "campaign": {
+                    "max_campaign_files": 7000,
+                    "max_batch_size": batch,
+                    "daemon_auto_apply": True,
+                },
+            }
+        )
+    )
+    return parse_settings(yaml.safe_dump(document))
+
+
+def _with_auto_drain(settings: Settings, *, auto: bool) -> Settings:
+    campaign = replace(settings.campaign, daemon_auto_apply=auto)
+    return replace(settings, campaign=campaign)
+
+
+def test_daemon_auto_drains_campaign_batches_with_bounded_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F7 + F4: run_daemon drains an approved campaign across MANY bounded batches; the cycle
+    history stays bounded, the campaign meta advances mid-run, and zero manual invocations follow
+    the canary."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    files = [
+        SpecFile(series_id=index + 1, file_id=10 + index, shoko_id=500 + index)
+        for index in range(6)
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    settings = _drain_settings(tmp_path, batch=2)
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    store.set_meta("budget_last_cycle_key", "cycle-1")
+    seed_baseline(store, files)  # the discovered files are backlog (they predate the baseline)
+    sleeper = Sleeper()
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO, MONO_ZERO, MONO_ZERO]),
+        advance=sleeper.advance,
+        settings=settings,
+        max_submissions=1,
+    )
+    # Prepare + approve the finite campaign (dry-run machinery, zero writes).
+    plan, digest = prepare_campaign(deps, settings, store, T0, limit=6, deadline_hours=168.0)
+    write_plan_file(tmp_path / "plan.json", plan)
+    approve_campaign(store, tmp_path / "plan.json", digest, T0)
+    approved_campaign = store.get_campaign(plan.campaign_id)
+    assert approved_campaign is not None
+    assert len(approved_campaign.bindings) == 6
+    # The operator's manual canary batch (one file) opens the daemon drain.
+    canary = apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
+    assert canary.submitted == 1
+    campaign_meta: list[str] = []
+
+    def on_complete(report: Any) -> None:
+        persist_cycle_meta(
+            store,
+            report,
+            started_iso=T1,
+            ended_iso=T1,
+            interval_seconds=10.0,
+            full_reconcile_hours=1000.0,
+        )
+        if report.campaign is not None:
+            campaign_meta.append(report.campaign.campaign_id)
+
+    times = iter(_iso_seq(T1, 10.0, 8))
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=10.0,
+            stop_after_cycles=8,
+            mode=CycleMode.APPLY,
+            on_cycle_complete=on_complete,
+        )
+        campaign = store.get_campaign(plan.campaign_id)
+        campaign_id_meta = store.get_meta(META_CYCLE_CAMPAIGN_ID)
+        submitted_meta = store.get_meta(META_CYCLE_CAMPAIGN_SUBMITTED)
+    finally:
+        store.close()
+    # The daemon drained the whole campaign with no further manual invocations after the canary.
+    assert campaign is not None
+    assert campaign.total_sent == 6
+    # F4: bounded history for an unbounded run flag; here a bounded 8-cycle run keeps all 8.
+    assert report.total_cycles == 8
+    assert len(report.cycles) <= max(DAEMON_HISTORY_MAXLEN, 8)
+    # The per-cycle campaign-batch summary persisted mid-run via the callback (the drained
+    # campaign id advanced the cycle meta), and the F4 history bound held.
+    assert plan.campaign_id in campaign_meta
+    assert len(campaign_meta) >= 3  # multiple bounded batches drained across cycles
+    assert campaign_id_meta is not None
+    assert submitted_meta is not None
+
+
+def test_daemon_campaign_drain_skipped_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F7: campaign.daemon_auto_apply=false keeps the daemon new-arrival-only (manual CLI)."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    files = [
+        SpecFile(series_id=index + 1, file_id=10 + index, shoko_id=500 + index)
+        for index in range(4)
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    settings = _drain_settings(tmp_path, batch=2)
+    settings = _with_auto_drain(settings, auto=False)
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    store.set_meta("budget_last_cycle_key", "cycle-1")
+    seed_baseline(store, files)
+    sleeper = Sleeper()
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO, MONO_ZERO, MONO_ZERO]),
+        advance=sleeper.advance,
+        settings=settings,
+        max_submissions=1,
+    )
+    plan, digest = prepare_campaign(deps, settings, store, T0, limit=4, deadline_hours=168.0)
+    write_plan_file(tmp_path / "plan.json", plan)
+    approve_campaign(store, tmp_path / "plan.json", digest, T0)
+    apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
+    times = iter(_iso_seq(T1, 10.0, 4))
+    try:
+        report = run_daemon(
+            deps,
+            cycle_key=lambda index: f"c{index}",
+            now_iso=lambda: next(times),
+            interval_seconds=10.0,
+            stop_after_cycles=4,
+            mode=CycleMode.APPLY,
+        )
+        campaign = store.get_campaign(plan.campaign_id)
+    finally:
+        store.close()
+    assert campaign is not None
+    # Drain disabled: the daemon never advances the campaign beyond the canary.
+    assert campaign.total_sent == 1
+    assert all(cycle.campaign is None for cycle in report.cycles)

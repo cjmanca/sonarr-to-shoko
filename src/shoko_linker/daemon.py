@@ -17,9 +17,14 @@ Hard safety properties this module enforces (PROJECT.md, docs/compatibility.md �
   :mod:`shoko_linker.state` documents. ``mark_sent`` (which commits
   ``request_may_have_been_sent``) is durably committed *before* any bytes are handed
   to HTTP; ``submit_link`` is called *after* it.
-* **Only the ``new_arrival`` cohort auto-applies in daemon cycles.** Backlog and
-  campaign files are never auto-submitted (backlog/campaign runs are M7 CLI
-  campaigns). ``classify_new`` decides cohort membership from the recorded baseline.
+* **Only the ``new_arrival`` cohort auto-applies in daemon cycles.** Backlog files are never
+  auto-submitted as new arrivals. An **approved** backlog campaign is drained by the daemon
+  (F7, when ``campaign.daemon_auto_apply`` is set) as ONE bounded batch per apply cycle, after
+  the operator's explicit approval + canary, through the full campaign guard chain under the
+  cycle's apply lock — the plan's approval digest, campaign status, deadline, budgets,
+  write gate, campaign-scope attestation, queue guard, and mapping revalidation all stay
+  authoritative. The one-batch CLI ``campaign apply`` remains for manual operation; a daemon
+  starting with ``apply_changes=true`` still never submits an unapproved backlog.
   New arrivals inside ``sync.new_file_grace_period_seconds`` (default 300s, measured from
   the persisted ``first_seen_iso``) defer with ``grace_period`` — they stay ``planned``
   and consume no budget slot — so Shoko's post-arrival import state settles first.
@@ -55,7 +60,7 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from types import MappingProxyType
@@ -107,6 +112,7 @@ from .shoko import ImportFolder, ShokoDiscovery, collect_shoko_discovery, match_
 from .sonarr import SonarrFile, SonarrInventory, collect_sonarr_inventory
 from .state import (
     ATTESTATION_PAUSE_REASON,
+    CAMPAIGN_STATUS_PAUSED,
     META_ATTESTATION_GATE,
     META_NEXT_FULL_RECONCILE_ISO,
     ApplyLockUnavailableError,
@@ -168,6 +174,21 @@ def _no_attestation_verdict() -> AttestationVerdict | None:
 
 
 @dataclass(frozen=True)
+class AttestationScopeHooks:
+    """Per-campaign attestation callables (F7 daemon drain, campaign-scope lease).
+
+    A campaign batch is authorized by a lease scoped ``campaign:<id>``, not the daemon
+    lease. The CLI wires :data:`DaemonDeps.campaign_attestation` to a factory that returns
+    this pair for a campaign id; the daemon drain builds a campaign-scoped copy of
+    ``deps`` from it. With no factory (plain-bool test wiring) the daemon's own attestation
+    stays authoritative and drain proceeds under it.
+    """
+
+    valid: Callable[[], bool]
+    verdict: Callable[[], AttestationVerdict | None]
+
+
+@dataclass(frozen=True)
 class DaemonDeps:
     """Every injected dependency a cycle needs: endpoints, stores, clocks, safety inputs.
 
@@ -201,6 +222,7 @@ class DaemonDeps:
     max_cycle_seconds: float = 300.0
     churn_limit: int = 500
     max_recovery_rows_per_cycle: int = 100
+    campaign_attestation: Callable[[str], AttestationScopeHooks] | None = None
 
 
 @dataclass(frozen=True)
@@ -226,7 +248,9 @@ class CycleReport:
 
     ``alive`` means the cycle ran; ``reconciliation_ready`` means both inventories
     were complete and an active mapping generation is present;
-    ``apply_eligible`` is the composed eligibility verdict.
+    ``apply_eligible`` is the composed eligibility verdict. ``campaign`` is the bounded
+    campaign-batch summary (:class:`~shoko_linker.campaign.CampaignApplyReport`) drained in
+    this cycle under the cycle's own apply lock (F7), or ``None`` when no batch ran.
     """
 
     mode: CycleMode
@@ -248,6 +272,7 @@ class CycleReport:
     full: bool = True
     plans: Mapping[int, LinkPlan] = MappingProxyType({})
     folders: Mapping[int, ImportFolder] = MappingProxyType({})
+    campaign: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -1262,8 +1287,9 @@ def _apply(
     with the ``grace_period`` reason: the row stays ``planned``, consumes **no** budget
     reservation (no ``prepare_send``), and is never quarantined — the next cycle that
     starts after the window closes submits it. Backlog/campaign files are outside this
-    gate (they are never daemon-submitted at all; campaign apply is the operator's act on
-    aged inventory).
+    new-arrival loop (the daemon never submits them as new arrivals); approved backlog
+    campaigns drain on the separate F7 path (see :func:`_drain_campaign`), and the CLI
+    ``campaign apply`` is the operator's manual act on aged, plan-approved inventory.
     """
     submitted = 0
     deferred = 0
@@ -1297,6 +1323,141 @@ def _apply(
 
 
 # ------------------------------------------------------------------ cycle runner
+
+
+def _campaign_scoped_deps(deps: DaemonDeps, campaign_id: str) -> DaemonDeps:
+    """A copy of ``deps`` whose attestation consults the ``campaign:<id>`` lease (F7)."""
+    if deps.campaign_attestation is None:
+        return deps
+    hooks = deps.campaign_attestation(campaign_id)
+    return replace(deps, attestation_valid=hooks.valid, attestation_verdict=hooks.verdict)
+
+
+#: Per-file reason prefixes aggregated before they enter the cycle report (F7 review P2-2:
+#: a full backlog plan must not flood the persisted per-cycle reason surface).
+_FILE_SCOPED_REASON_PREFIXES: Final[tuple[str, ...]] = (
+    "batch_limit:",
+    "max_submissions_reached:",
+    "file_missing:",
+    "unbound:",
+    "not_queueable:",
+    "pending_target:",
+    "campaign_quarantine:",
+    "preflight_deferred:",
+    "budget_refusal:",
+)
+
+#: Consecutive zero-progress drain cycles before the campaign auto-pauses
+#: (F7 review P2-3: an all-quarantined campaign must not burn full sweeps forever).
+ZERO_PROGRESS_PAUSE_CYCLES: Final[int] = 3
+
+
+def _aggregate_campaign_reasons(reasons: Sequence[str]) -> list[str]:
+    """Collapse per-file campaign reasons into ``<prefix>x<count>:first=<sample>`` entries."""
+    groups: dict[str, list[str]] = {}
+    others: list[str] = []
+    for reason in reasons:
+        prefix = next((p for p in _FILE_SCOPED_REASON_PREFIXES if reason.startswith(p)), None)
+        if prefix is None:
+            others.append(reason)
+        else:
+            groups.setdefault(prefix, []).append(reason)
+    aggregated = list(others)
+    for prefix, items in groups.items():
+        aggregated.append(f"{prefix}x{len(items)}:first={items[0]}")
+    return aggregated
+
+
+def _pause_deferred_campaign(deps: DaemonDeps, campaign_id: str, reason: str, now_iso: str) -> None:
+    """Persist a terminal drain deferral as a campaign pause (F7 review P1: a permanently
+    deferred campaign must drop out of selection so later campaigns drain)."""
+    with contextlib.suppress(WriteDisabledError, StateError):
+        deps.store.set_campaign_status(campaign_id, CAMPAIGN_STATUS_PAUSED, reason, iso=now_iso)
+
+
+def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str) -> bool:
+    """Count consecutive zero-progress drain cycles; pause at the bound.
+
+    Returns True when the campaign was auto-paused for ``no_queueable_candidates``."""
+    key = f"campaign_zero_progress:{campaign_id}"
+    raw = deps.store.get_meta(key)
+    try:
+        count = int(raw) if raw is not None else 0
+    except ValueError:
+        count = 0
+    count += 1
+    with contextlib.suppress(WriteDisabledError, StateError):
+        deps.store.set_meta(key, str(count))
+    if count >= ZERO_PROGRESS_PAUSE_CYCLES:
+        _pause_deferred_campaign(deps, campaign_id, "no_queueable_candidates", now_iso)
+        with contextlib.suppress(WriteDisabledError, StateError):
+            deps.store.set_meta(key, "0")
+        return True
+    return False
+
+
+def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any | None:
+    """Drain **one** bounded batch of the oldest approved campaign (F7), under this cycle's lock.
+
+    Runs entirely through :func:`shoko_linker.campaign.apply_campaign` with
+    ``lock_held=True`` (the daemon cycle already owns the OS apply lock), so the FULL
+    guard chain applies unchanged: plan digest, status/deadline/max-submissions, write gate,
+    campaign-scope attestation (an expiring lease pauses writes and stops the batch, zero
+    POSTs, the daemon stays alive read-only), queue snapshot fail-closed, mapping/drift
+    revalidation, eligibility, binding quarantine, preflight → prepare_send → mark_sent →
+    submit_link → record → inline verify, and restart recovery via the durable rows.
+
+    A missing plan path or an unreadable/malformed plan file defers (a named reason, no
+    crash, no POSTs); a campaign-state refusal defers the batch and is reported. Returns
+    the bounded :class:`~shoko_linker.campaign.CampaignApplyReport`, or ``None``.
+    """
+    from .campaign import (
+        CampaignError,
+        CampaignPlanInvalidError,
+        apply_campaign,
+        select_next_daemon_campaign,
+    )
+
+    log = logging.getLogger(__name__)
+    campaign = select_next_daemon_campaign(deps.store)
+    if campaign is None:
+        return None
+    if campaign.plan_path is None:
+        reasons.append(f"campaign_deferred:{campaign.campaign_id}:plan_path_missing")
+        _pause_deferred_campaign(deps, campaign.campaign_id, "plan_path_missing", now_iso)
+        return None
+    campaign_deps = _campaign_scoped_deps(deps, campaign.campaign_id)
+    try:
+        report = apply_campaign(
+            campaign_deps,
+            deps.settings,
+            deps.store,
+            campaign.plan_path,
+            now_iso,
+            lock_held=True,
+        )
+    except CampaignPlanInvalidError as exc:
+        reasons.append(f"campaign_deferred:{campaign.campaign_id}:plan_unreadable")
+        _pause_deferred_campaign(deps, campaign.campaign_id, "plan_unreadable", now_iso)
+        log.warning(
+            "campaign %s drain deferred: plan file unreadable (%s): paused, zero POSTs",
+            campaign.campaign_id,
+            exc,
+        )
+        return None
+    except CampaignError as exc:
+        reasons.append(f"campaign_deferred:{campaign.campaign_id}")
+        log.warning("campaign %s drain deferred: %s", campaign.campaign_id, exc)
+        return None
+    reasons.extend(_aggregate_campaign_reasons(report.reasons))
+    key = f"campaign_zero_progress:{campaign.campaign_id}"
+    if report.processed == 0:
+        if _record_zero_progress(deps, campaign.campaign_id, now_iso):
+            reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
+    else:
+        with contextlib.suppress(WriteDisabledError, StateError):
+            deps.store.set_meta(key, "0")
+    return report
 
 
 def _lock_preflight(
@@ -1393,7 +1554,9 @@ def run_cycle(
     inventory → Shoko discovery → baseline establishment → source continuity →
     persisted recovery consumption → reconcile matches → (APPLY only) the ordered
     send/verify loop. ``policy`` names the daemon's cohort policy (only ``NEW_ARRIVAL``
-    auto-applies; backlog/campaign campaigns are M7 CLI runs).
+    auto-applies in the new-arrival loop; an **approved** backlog campaign drains as one
+    bounded batch per apply cycle on the F7 path when ``campaign.daemon_auto_apply`` is set,
+    and the one-batch CLI ``campaign apply`` remains for manual runs).
 
     M7-b full/light cadence: ``full=True`` (the default — every explicit ``once`` and
     every due full-reconcile) runs the complete cycle. A **light** cycle (``full=False``)
@@ -1547,6 +1710,14 @@ def _run_cycle_body(
         full=full,
     )
 
+    # F7: drain ONE bounded batch of the oldest approved backlog campaign through the full
+    # campaign guard chain, under this same cycle's apply lock (lock_held). Only in APPLY
+    # mode on an eligible, reconciliation-ready cycle, and only when the operator opted in
+    # (campaign.daemon_auto_apply). Manual CLI campaign apply stays fully available.
+    campaign_report: Any | None = None
+    if mode is CycleMode.APPLY and apply_running and deps.settings.campaign.daemon_auto_apply:
+        campaign_report = _drain_campaign(deps, now_iso, reasons)
+
     counts = _final_counts(
         deps,
         reconcile.inserted,
@@ -1577,6 +1748,7 @@ def _run_cycle_body(
         full=full,
         plans=reconcile.plans,
         folders=discovery.folders,
+        campaign=campaign_report,
     )
 
 

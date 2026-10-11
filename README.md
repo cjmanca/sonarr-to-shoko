@@ -44,7 +44,7 @@ uv run python -m pytest -q
 | `validate` | Offline config validation (`--live-read-only` is not implemented in this build) | none |
 | `config [path] [--check]` | Resolved config path; `--check` loads and validates | none |
 | `once [--dry-run] [--apply] [--policy P] [--max-links N] [--json]` | One reconciliation cycle. Dry-run by default. `--max-links N` caps **POST submissions** (not enumerated files); default `sync.max_new_per_cycle`. `--apply` requires the write gate **and** a valid attestation lease | Sonarr/Shoko reads; writes only through the gated path |
-| `daemon [--cycles N] [--once-signal] [--policy P] [--json]` | The polling loop: interval/backoff/jitter from config, apply only when the gate **and** lease open, SIGINT/SIGTERM stop after the current cycle (an idle daemon wakes from the **interruptible** sleep immediately; a signal during a cycle is honoured once that cycle completes, never mid-write). Cycle metadata persists after every cycle, so health/cadence stay fresh. `--cycles N` (and `--once-signal`) bound the loop for tests/CI. Full/light cadence: light cycles poll the same inventories with halved recovery/apply work budgets; `full_reconcile_interval_hours` forces a full reconcile | same as `once` |
+| `daemon [--cycles N] [--once-signal] [--policy P] [--json]` | The polling loop: interval/backoff/jitter from config, apply only when the gate **and** lease open, SIGINT/SIGTERM stop after the current cycle (an idle daemon wakes from the **interruptible** sleep immediately; a signal during a cycle is honoured once that cycle completes, never mid-write). Cycle metadata persists after every cycle, so health/cadence stay fresh. `--cycles N` (and `--once-signal`) bound the loop for tests/CI. Full/light cadence: light cycles poll the same inventories with halved recovery/apply work budgets; `full_reconcile_interval_hours` forces a full reconcile. **F7:** with `campaign.daemon_auto_apply: true` (default) it drains an **approved** backlog campaign automatically — one bounded batch per apply cycle after the operator's canary — under the same guarded path and apply lock | apply gated |
 | `report [--json]` | Read-only rollup: state counts by state/cohort, detail roll-up, mapping generation + affected candidates, safety fields (attestation verdict, pause, writes-disabled), campaign summaries, outstanding jobs, coverage % with explicit denominators ("based on last cycle inventory"), liveness / reconciliation-ready / apply-eligible levels | none |
 | `health [--json]` | Cheap liveness: `alive`, `last_cycle_iso`, `cycle_ok`, `mapping_age_hours`, counts (state/meta + cache only) | none |
 | `mappings status [--json]` | Active generation: revision/content/effective/structure digests, age, last attempted/success + outcome, next due, source availability, mapping-affected candidate counts from the state DB. An absent generation is reported with exit 0 (informational) | none |
@@ -175,9 +175,24 @@ uv run shoko-sonarr-linker campaign apply --plan plan.json --batch-size 1 --json
 uv run shoko-sonarr-linker campaign verify --campaign-id <campaign-id> --json
 uv run shoko-sonarr-linker campaign report --campaign-id <campaign-id> --plan plan.json --json
 
-# 6. Remaining bounded batches (repeat; the one approval is consumed, never re-approved)
+# 6. Remaining bounded batches — automatic (daemon) or manual (CLI, both remain available)
+#    After the canary above is verified, start the daemon: with campaign.daemon_auto_apply:
+#    true (default) it drains the approved campaign ONE bounded batch per apply cycle, under the
+#    full guard chain, with zero further manual invocations. The one-batch CLI command stays for
+#    manual operation:
 uv run shoko-sonarr-linker campaign apply --plan plan.json --json   # ≤ campaign.max_batch_size files
 ```
+
+**Daemon auto-drain (F7).** The unattended objective: an approved 7,000-file backlog must not
+need hundreds of manual `campaign apply` invocations. Once the campaign is approved and the
+operator's canary batch has completed (≥1 file with send progress), the daemon drains subsequent
+batches automatically: one bounded batch (≤ `campaign.max_batch_size`) per apply cycle, oldest
+approved campaign first, through the exact same guarded path as `campaign apply` (the daemon's own
+apply lock is reused, so a daemon batch and a concurrent CLI `campaign apply` contend for the
+single lock — one apply writer). It never approves a campaign, never expands an approved set, and
+never opens the write gate; pause/resume/revoke, plan drift, mapping drift, deadline, budgets,
+queue, and an expiring campaign lease all stop the drain with persisted state and zero POSTs.
+Set `campaign.daemon_auto_apply: false` to keep campaigns manual-only.
 
 Rules that the apply path enforces, with persisted evidence:
 
@@ -245,9 +260,11 @@ Rules that the apply path enforces, with persisted evidence:
   disables the window). The row stays `planned`, consumes **no** budget slot, and is
   never quarantined; the first cycle that starts after the window closes submits it.
   Shoko's own post-arrival import/XRef state settles during the window, so submitting in
-  the arrival cycle is not attempted. Backlog and campaign files are **not** grace-gated:
-  the daemon never auto-submits them, and a campaign apply is the operator's act on aged,
-  plan-approved inventory.
+  the arrival cycle is not attempted. Backlog and campaign files are **not** grace-gated: the
+  daemon never submits them as new arrivals. An **approved** backlog campaign drains
+  automatically on the F7 path (one bounded batch per apply cycle, after the canary) when
+  `campaign.daemon_auto_apply: true`; the daemon never auto-approves a campaign, so an unapproved
+  backlog is never mass-submitted by a daemon started with `apply_changes=true`.
 
 ## Configuration budgets (M7-a/M7-b)
 

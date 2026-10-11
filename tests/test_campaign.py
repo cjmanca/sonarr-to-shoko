@@ -13,6 +13,7 @@ refuse; revoke releases queued rows.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -41,7 +42,13 @@ from shoko_linker.http import ApiEndpoint
 from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
-from shoko_linker.state import BaselineFile, FileState, StateStore, acquire_apply_lock
+from shoko_linker.state import (
+    BaselineFile,
+    FileState,
+    StateStore,
+    acquire_apply_lock,
+    release_apply_lock,
+)
 
 SONARR_BASE = "http://sonarr:8989"
 SHOKO_BASE = "http://shoko:8111"
@@ -1088,6 +1095,30 @@ def _campaign_deps(env: Env, store: StateStore, campaign_id: str) -> Any:
     )
 
 
+def _set_campaign(env: Env, **campaign: Any) -> None:
+    """Rewrite the fixture config's campaign section (e.g. a smaller max_batch_size)."""
+    document = _document(env.lease_path)
+    document["campaign"] = {**document["campaign"], **campaign}
+    env.config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+
+def _daemon_cycle(env: Env, store: StateStore, campaign_id: str, cycle_key: str) -> Any:
+    deps = _campaign_deps(env, store, campaign_id)
+    return run_cycle(
+        deps,
+        now_iso=env.now_iso,
+        mode=CycleMode.APPLY,
+        policy=RunPolicy.BACKLOG,
+        cycle_key=cycle_key,
+    )
+
+
+def _campaign_sent(store: StateStore, campaign_id: str) -> int:
+    campaign = store.get_campaign(campaign_id)
+    assert campaign is not None
+    return int(campaign.total_sent)
+
+
 def test_apply_campaign_defers_batch_when_apply_lock_held_by_foreign_pid(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1248,7 +1279,7 @@ def test_apply_campaign_steals_expired_lease_records_audit_and_releases(
 def test_campaign_apply_then_daemon_cycle_share_one_free_lock(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    env.seed(specs(COUNT_TWO))
+    env.seed(specs(COUNT_FIVE))
     prepared = prepare(env, capsys)
     approve(env, capsys, prepared["approval_digest"])
     settings = load_settings(env.config_path)
@@ -1273,12 +1304,19 @@ def test_campaign_apply_then_daemon_cycle_share_one_free_lock(
             policy=RunPolicy.BACKLOG,
             cycle_key="daemon-after-campaign",
         )
+        # F7: the daemon re-acquires the same free lock (no self-contention) and drains the
+        # remaining approved files automatically — the CLI batch (2) + daemon drain (3) = 5.
         assert not daemon_report.writes_suppressed
         assert not any("apply_lock_contended" in reason for reason in daemon_report.reasons)
         assert store.lock_holder() is None
+        assert daemon_report.campaign is not None
+        assert daemon_report.campaign.submitted == COUNT_THREE
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_FIVE
     finally:
         store.close()
-    assert len(env.stubs.posts) == BATCH_TWO
+    assert len(env.stubs.posts) == COUNT_FIVE
 
 
 def test_apply_campaign_releases_lock_when_a_send_crashes_mid_batch(
@@ -1371,5 +1409,609 @@ def test_apply_campaign_report_is_typed_batch_deferral(
         assert report.total_sent == 0
         assert report.remaining == COUNT_TWO
         assert report.stopped is None
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------------------ F7: daemon auto-drain
+
+# The daemon drains an APPROVED campaign automatically — one bounded batch per apply cycle —
+# ONLY after the operator's manual canary batch completes (canary gate: send progress ≥ 1).
+# Every scenario runs the full campaign guard chain via the daemon cycle; the daemon reuses its
+# own apply lock (apply_campaign lock_held=True), so a daemon batch never self-contends.
+
+COUNT_ONE = 1
+BATCH_ONE = 1
+COUNT_SIX = 6
+CAMPAIGN_DAEMON_KEY = "daemon-drain"
+LEASE_SHORT_HOURS = 1.0
+
+
+def _canary(env: Env, store: StateStore, campaign_id: str) -> CampaignApplyReport:
+    """The operator's manual first batch (the canary): one file through the CLI path."""
+    return apply_campaign(
+        _campaign_deps(env, store, campaign_id),
+        load_settings(env.config_path),
+        store,
+        env.tmp_path / "plan.json",
+        env.now_iso,
+        batch_size=BATCH_ONE,
+    )
+
+
+def test_daemon_drains_nothing_before_the_operator_canary(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7 canary gate: a freshly approved campaign (zero send progress) is never drained."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], CAMPAIGN_DAEMON_KEY)
+        assert cycle.campaign is None  # nothing drained (canary not run)
+        assert cycle.counts.submitted == 0
+        assert env.stubs.posts == []
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.total_sent == 0
+        assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_daemon_drains_all_batches_after_one_canary_zero_manual(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7 core: after ONE manual canary, daemon cycles drain the rest in bounded batches."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        canary = apply_campaign(
+            deps, settings, store, env.tmp_path / "plan.json", T0, batch_size=BATCH_ONE
+        )
+        assert canary.submitted == COUNT_ONE
+        assert len(env.stubs.posts) == COUNT_ONE
+        # Two daemon cycles drain the remaining 4 (2 per bounded batch), zero CLI calls.
+        first = _daemon_cycle(env, store, prepared["campaign_id"], "d1")
+        assert first.campaign is not None
+        assert first.campaign.submitted == BATCH_TWO
+        second = _daemon_cycle(env, store, prepared["campaign_id"], "d2")
+        assert second.campaign is not None
+        assert second.campaign.submitted == BATCH_TWO
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_FIVE
+        assert len(env.stubs.posts) == COUNT_FIVE
+        verified = sum(
+            1
+            for record in store.campaign_files(prepared["campaign_id"])
+            if record.state is FileState.VERIFIED
+        )
+        assert verified == COUNT_FIVE
+    finally:
+        store.close()
+
+
+def test_daemon_drain_resumes_after_restart_without_double_send(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7 restart: a store reopen mid-drain resumes progress with zero re-POSTs."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0, batch_size=BATCH_ONE)
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], "pre-restart")
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == BATCH_TWO
+        posts_before = len(env.stubs.posts)
+        assert posts_before == COUNT_THREE  # 1 canary + 2 drained
+    finally:
+        store.close()
+    reopened = env.open_store()
+    try:
+        cycle2 = _daemon_cycle(env, reopened, prepared["campaign_id"], "post-restart")
+        campaign = reopened.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        # Recovery re-walks the durable rows and drains the remaining 2; no file is ever re-sent.
+        assert cycle2.campaign is not None
+        assert cycle2.campaign.submitted == COUNT_TWO
+        assert campaign.total_sent == COUNT_FIVE
+        posted = env.stubs.posted_files
+        assert len(posted) == COUNT_FIVE  # exactly one POST per approved file, no duplicates
+        assert len(set(posted)) == COUNT_FIVE
+        assert set(posted) == {spec.shoko_id for spec in specs_list}
+    finally:
+        reopened.close()
+
+
+def test_daemon_drain_defers_on_missing_plan_with_zero_posts(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: a missing plan file defers the batch (named reason), no crash, zero POSTs."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        _canary(env, store, prepared["campaign_id"])
+        posts_before = len(env.stubs.posts)
+    finally:
+        store.close()
+    (env.tmp_path / "plan.json").unlink()
+    store = env.open_store()
+    try:
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], "missing-plan")
+        assert cycle.alive is True
+        assert cycle.campaign is None
+        deferred = [reason for reason in cycle.reasons if "campaign_deferred" in reason]
+        assert deferred
+        assert "plan_unreadable" in deferred[0]  # the bound plan path is now unreadable
+        assert len(env.stubs.posts) == posts_before  # zero new POSTs
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        # P1 fix: an unreadable bound plan is terminal for the daemon drain — the campaign
+        # pauses (the operator re-prepares/re-approves to resume), never a head-of-line stall.
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "plan_unreadable"
+    finally:
+        store.close()
+
+
+def test_daemon_drain_stops_on_expired_attestation_mid_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: an expiring campaign lease mid-drain stops the batch (persisted pause), zero POSTs."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        _canary(env, store, prepared["campaign_id"])
+        _daemon_cycle(env, store, prepared["campaign_id"], "d1")
+        posts_before = len(env.stubs.posts)
+        # Re-record a lease that expires in 1h, then advance the clock past it.
+        record = build_record(
+            endpoint=SHOKO_BASE,
+            version="5.3.3",
+            mounts=["/anime read-only (host-inspected)"],
+            settings_flags={
+                "FileQualityFilterEnabled": False,
+                "RenameOnImport": False,
+                "MoveOnImport": False,
+                "MyListAddFiles": False,
+            },
+            inspected_iso=env.now_iso,
+            expires_iso=_iso_plus(env.now_iso, 3600.0),
+            scope=f"campaign:{prepared['campaign_id']}",
+            operator_note="short campaign lease",
+        )
+        write_attestation(env.lease_path, record, overwrite=True)
+        env.now_iso = _iso_plus(env.now_iso, LEASE_SHORT_HOURS * 3600.0 + 60.0)
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], "expired")
+        assert cycle.alive is True
+        assert cycle.writes_suppressed is True
+        assert cycle.apply_eligible is False
+        assert any("attestation" in reason for reason in cycle.reasons)
+        assert len(env.stubs.posts) == posts_before  # zero new POSTs
+        assert store.budget_view().paused_reason == "attestation_expired"
+    finally:
+        store.close()
+
+
+def test_daemon_drain_quarantines_drifted_candidate_no_silent_replace(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: a candidate whose size changed mid-drain is quarantined, never silently replaced."""
+    _set_campaign(env, max_batch_size=COUNT_FIVE)
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        _canary(env, store, prepared["campaign_id"])
+        victim = specs_list[3]
+        env.stubs.sizes[victim.shoko_id] = FILE_SIZE + 1
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], "drift")
+        assert cycle.campaign is not None
+        assert cycle.campaign.quarantined == COUNT_ONE
+        record = store.get_file(victim.shoko_id)
+        assert record is not None
+        assert record.state in (FileState.BLOCKED_SAFETY, FileState.WAITING)
+        assert record.state_detail.startswith("campaign_quarantine:")
+        posted = set(env.stubs.posted_files)
+        assert victim.shoko_id not in posted
+    finally:
+        store.close()
+
+
+def test_daemon_drain_never_processes_unapproved_files(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: newly mapped files that are not in the approved plan are never POSTed by the drain."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    approved = {spec.shoko_id for spec in specs(COUNT_TWO)}
+    store = env.open_store()
+    try:
+        _canary(env, store, prepared["campaign_id"])
+        env.stubs.specs = specs(COUNT_FIVE)  # three more files appear (new mappings)
+        _daemon_cycle(env, store, prepared["campaign_id"], "extra")
+        posted = set(env.stubs.posted_files)
+        assert posted <= approved
+        assert len(posted) == COUNT_TWO
+    finally:
+        store.close()
+
+
+def test_operator_pause_resume_revoke_control_the_daemon_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: pause stops the drain, resume continues it, revoke stops it and refuses apply."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _daemon_cycle(env, store, campaign_id, "d1")
+        sent_running = _campaign_sent(store, campaign_id)
+    finally:
+        store.close()
+    assert (
+        main(
+            [
+                "campaign",
+                "pause",
+                str(env.config_path),
+                "--campaign-id",
+                campaign_id,
+                "--reason",
+                "ops review",
+                "--note",
+                "ops",
+                "--confirm",
+                "--json",
+            ]
+        )
+        == EXIT_OK
+    )
+    capsys.readouterr()
+    store = env.open_store()
+    try:
+        paused = _daemon_cycle(env, store, campaign_id, "paused")
+        assert paused.campaign is None
+        assert _campaign_sent(store, campaign_id) == sent_running  # drain stopped
+    finally:
+        store.close()
+    assert (
+        main(
+            [
+                "campaign",
+                "resume",
+                str(env.config_path),
+                "--campaign-id",
+                campaign_id,
+                "--note",
+                "resumed",
+                "--confirm",
+                "--json",
+            ]
+        )
+        == EXIT_OK
+    )
+    capsys.readouterr()
+    store = env.open_store()
+    try:
+        resumed = _daemon_cycle(env, store, campaign_id, "resumed")
+        assert resumed.campaign is not None  # drain continues
+        assert resumed.campaign.submitted == COUNT_FIVE - sent_running
+    finally:
+        store.close()
+    assert (
+        main(
+            [
+                "campaign",
+                "revoke",
+                str(env.config_path),
+                "--campaign-id",
+                campaign_id,
+                "--note",
+                "scope review",
+                "--confirm",
+                "--json",
+            ]
+        )
+        == EXIT_OK
+    )
+    capsys.readouterr()
+    store = env.open_store()
+    try:
+        after_revoke = _daemon_cycle(env, store, campaign_id, "revoked")
+        assert after_revoke.campaign is None  # revoked campaign is skipped
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "revoked"
+    finally:
+        store.close()
+
+
+def test_daemon_skips_campaign_after_deadline(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    """F7: past the campaign deadline the drain refuses (persisted refusal), zero POSTs."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys, deadline_hours="1")
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        _canary(env, store, prepared["campaign_id"])
+        posts_before = len(env.stubs.posts)
+        env.now_iso = _iso_plus(T0, 2 * 3600)  # deadline was 1h after prepare
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], "deadline")
+        assert cycle.campaign is None
+        assert any("campaign_deferred" in reason for reason in cycle.reasons)
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_approve_persists_canonical_plan_path_for_daemon_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: ``campaign approve`` records the canonical plan file path so the daemon drains the
+    campaign WITHOUT the operator re-supplying --plan every cycle."""
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    plan_path = env.tmp_path / "plan.json"
+    store = env.open_store()
+    try:
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.plan_path == str(plan_path.resolve())
+    finally:
+        store.close()
+
+
+def test_daemon_campaign_batch_runs_under_held_daemon_lock_no_self_contention(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7 lock parity: apply_campaign(lock_held=True) never self-contends a held lock."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    try:
+        # Simulate the daemon cycle owning the apply lock for this process (same pid).
+        acquire_apply_lock(store, pid=os.getpid(), iso=T0, lease_expires_iso=_iso_plus(T0, 7200.0))
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        report = apply_campaign(
+            deps, settings, store, env.tmp_path / "plan.json", T0, lock_held=True
+        )
+        assert report.submitted == COUNT_TWO
+        assert not any(reason.startswith("apply_lock_contended") for reason in report.reasons)
+        assert len(env.stubs.posts) == COUNT_TWO
+        # lock_held does not release the caller's lock.
+        holder = store.lock_holder()
+        assert holder is not None
+        assert holder.owner_pid == os.getpid()
+    finally:
+        release_apply_lock(store, os.getpid(), T0)
+        store.close()
+
+
+# ----------------------------------------------------- F7 review round: drops, pauses, aggregation
+
+DEADLINE_ONE_HOUR = "1"
+DEADLINE_WEEK = "168"
+HOUR_SECONDS = 3600.0
+ZERO_PROGRESS_CYCLE_KEYS = ("zp1", "zp2", "zp3")
+
+
+def test_daemon_drain_pauses_deadline_exceeded_campaign_with_zero_posts(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1 fix: a past-deadline campaign auto-pauses on the drain attempt, drops out
+    of selection, and submits zero new POSTs."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys, deadline_hours=DEADLINE_ONE_HOUR)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        posts_before = len(env.stubs.posts)
+        env.now_iso = _iso_plus(T0, 2.0 * HOUR_SECONDS)
+        cycle = _daemon_cycle(env, store, campaign_id, "past-deadline")
+        assert cycle.campaign is None
+        assert any(reason.startswith("campaign_deferred:") for reason in cycle.reasons)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "deadline_exceeded"
+        assert len(env.stubs.posts) == posts_before
+        later = _daemon_cycle(env, store, campaign_id, "after-dropout")
+        assert later.campaign is None
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_daemon_drain_head_of_line_campaign_drops_out_and_the_next_drains(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1 fix + multi-campaign: the oldest campaign past its deadline pauses on the drain
+    attempt; the next approved campaign then drains automatically (no head-of-line stall)."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_TWO))  # campaign A: shoko 500, 501
+    prepared_a = prepare(env, capsys, deadline_hours="2")
+    approve(env, capsys, prepared_a["approval_digest"])
+    store = env.open_store()
+    try:
+        _canary(env, store, prepared_a["campaign_id"])  # 500 linked under A
+        # Campaign B: two fresh files plus 501 (A's unlinked remainder stays eligible).
+        env.seed(
+            [
+                SpecFile(series_id=3, file_id=12, shoko_id=602),
+                SpecFile(series_id=4, file_id=13, shoko_id=603),
+            ]
+        )
+        env.now_iso = _iso_plus(T0, HOUR_SECONDS / 2.0)
+        plan_b_path = env.tmp_path / "planB.json"
+        assert (
+            main(
+                [
+                    "campaign",
+                    "prepare",
+                    str(env.config_path),
+                    "--out",
+                    str(plan_b_path),
+                    "--deadline-hours",
+                    DEADLINE_WEEK,
+                    "--limit",
+                    "3",
+                    "--json",
+                ]
+            )
+            == EXIT_OK
+        )
+        payload_b = json.loads(capsys.readouterr().out)
+        campaign_b = str(payload_b["campaign_id"])
+        env.write_campaign_lease(campaign_b)
+        assert (
+            main(
+                [
+                    "campaign",
+                    "approve",
+                    str(env.config_path),
+                    "--plan",
+                    str(plan_b_path),
+                    "--digest",
+                    str(payload_b["approval_digest"]),
+                    "--json",
+                ]
+            )
+            == EXIT_OK
+        )
+        settings = load_settings(env.config_path)
+        apply_campaign(
+            _campaign_deps(env, store, campaign_b),
+            settings,
+            store,
+            plan_b_path,
+            env.now_iso,
+            batch_size=1,
+        )  # B's canary (501 linked under B)
+        # Past A's deadline: A wins selection, the guard pauses it, B stays untouched.
+        env.now_iso = _iso_plus(T0, 2.2 * HOUR_SECONDS)
+        cycle_a = _daemon_cycle(env, store, campaign_b, "a-pauses")
+        assert cycle_a.campaign is None
+        campaign_a = store.get_campaign(prepared_a["campaign_id"])
+        assert campaign_a is not None
+        assert campaign_a.status == "paused"
+        assert campaign_a.status_reason == "deadline_exceeded"
+        assert _campaign_sent(store, campaign_b) == COUNT_ONE
+        # A drops out; the daemon drains campaign B automatically. 602/603 are also
+        # new-arrival-eligible, so either path linking them is correct — the point is the
+        # head-of-line campaign no longer blocks progress.
+        cycle_b = _daemon_cycle(env, store, campaign_b, "b-drains")
+        assert cycle_b.campaign is not None
+        assert cycle_b.campaign.campaign_id == campaign_b
+        campaign = store.get_campaign(campaign_b)
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_TWO
+        posted = set(env.stubs.posted_files)
+        assert posted == {500, 602, 603}
+        # A's unlinked remainder stays planned (A paused by deadline; operator resumes A
+        # to finish it) — the daemon drained B without head-of-line stalling.
+        remainder = store.get_file(501)
+        assert remainder is not None
+        assert remainder.state is FileState.PLANNED
+    finally:
+        store.close()
+
+
+def test_daemon_zero_progress_all_blocked_campaign_auto_pauses(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-3 fix: a campaign whose remaining files are all unqueueable pauses after the
+    bounded zero-progress cycles (no endless full-sweep churn); zero POSTs."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        posts_before = len(env.stubs.posts)
+        for spec in specs_list[1:]:
+            store.advance(spec.shoko_id, FileState.BLOCKED_SAFETY, "operator-blocked", iso=T0)
+        pause_cycle: CampaignApplyReport | None = None
+        for key in ZERO_PROGRESS_CYCLE_KEYS:
+            cycle = _daemon_cycle(env, store, campaign_id, key)
+            if key == ZERO_PROGRESS_CYCLE_KEYS[-1]:
+                assert any(
+                    reason.startswith("campaign_zero_progress_pause:") for reason in cycle.reasons
+                )
+                pause_cycle = cycle.campaign
+        assert pause_cycle is not None
+        assert pause_cycle.processed == 0
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "no_queueable_candidates"
+        assert len(env.stubs.posts) == posts_before
+        after = _daemon_cycle(env, store, campaign_id, "after-pause")
+        assert after.campaign is None
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_daemon_drain_aggregates_per_file_reasons(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-2 fix: per-file deferral reasons collapse into one aggregated entry per family
+    in the cycle report (no reason flood at backlog scale)."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        cycle = _daemon_cycle(env, store, campaign_id, "aggregate")
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == BATCH_TWO
+        batch_limit_entries = [
+            reason for reason in cycle.reasons if reason.startswith("batch_limit:")
+        ]
+        expected = f"batch_limit:x{COUNT_FIVE - BATCH_TWO - 1}:first=batch_limit:503"
+        assert batch_limit_entries == [expected]
     finally:
         store.close()

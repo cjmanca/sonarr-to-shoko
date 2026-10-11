@@ -128,6 +128,14 @@ campaign:
   max_campaign_files: 7000
   # Cap for `campaign apply --batch-size` (files processed per invocation; default 10).
   max_batch_size: 10
+  # F7 unattended backlog drain. When true (default) the daemon drains an APPROVED backlog
+  # campaign automatically — one bounded batch (≤ max_batch_size) per apply cycle, after the
+  # operator's explicit approval + canary — through the full guard chain under the cycle's apply
+  # lock (plan digest, status, deadline, budgets, write gate, campaign-scope attestation, queue
+  # guard, mapping revalidation, drift quarantine). It never approves a campaign, never expands
+  # an approved set, and never opens the write gate. Set false to keep campaigns manual-only
+  # (CLI `campaign apply`). The one-batch CLI command always remains available.
+  daemon_auto_apply: true
 
 # WRITE GATE (default-deny). Live Shoko writes require BOTH:
 #   1. sync.apply_changes: true above, AND

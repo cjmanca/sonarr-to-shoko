@@ -54,6 +54,7 @@ DEFAULT_ATTESTATION_VALIDITY_HOURS: Final[float] = 168.0
 DEFAULT_ATTESTATION_WARN_SECONDS: Final[float] = 3600.0
 DEFAULT_MAX_CAMPAIGN_FILES: Final[int] = 7000
 DEFAULT_MAX_BATCH_SIZE: Final[int] = 10
+DEFAULT_CAMPAIGN_DAEMON_AUTO_APPLY: Final[bool] = True
 DEFAULT_QUEUE_BLOCKED_TOLERANCE: Final[int] = 0
 MAX_JITTER_RATIO: Final[float] = 0.5
 
@@ -93,7 +94,9 @@ _SAFETY_KEYS: Final[frozenset[str]] = frozenset(
         "attested_shoko_version",
     }
 )
-_CAMPAIGN_KEYS: Final[frozenset[str]] = frozenset({"max_campaign_files", "max_batch_size"})
+_CAMPAIGN_KEYS: Final[frozenset[str]] = frozenset(
+    {"max_campaign_files", "max_batch_size", "daemon_auto_apply"}
+)
 _TIMEOUT_KEYS: Final[frozenset[str]] = frozenset({"connect_seconds", "read_seconds"})
 _DATABASE_KEYS: Final[frozenset[str]] = frozenset({"path"})
 _ENV_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -215,10 +218,17 @@ class CampaignSettings:
     --limit``); ``max_batch_size`` caps files processed per ``campaign apply``
     invocation. They do not bypass the write gate, the attestation lease, the budgets in
     :class:`shoko_linker.state` or the plan approval digest.
+
+    ``daemon_auto_apply`` (F7) makes the daemon drain **approved** backlog campaigns
+    automatically — one bounded batch per apply cycle, after the operator's canary. It
+    never approves a campaign, never expands an approved set, and never opens
+    the write gate: the gate, the campaign-scope attestation lease, and every campaign guard
+    stay authoritative. Set it false to keep campaigns manual (CLI ``campaign apply`` only).
     """
 
     max_campaign_files: int
     max_batch_size: int
+    daemon_auto_apply: bool = DEFAULT_CAMPAIGN_DAEMON_AUTO_APPLY
 
 
 @dataclass(frozen=True)
@@ -246,6 +256,7 @@ DEFAULT_SAFETY_SETTINGS: Final[SafetySettings] = SafetySettings(
 DEFAULT_CAMPAIGN_SETTINGS: Final[CampaignSettings] = CampaignSettings(
     max_campaign_files=DEFAULT_MAX_CAMPAIGN_FILES,
     max_batch_size=DEFAULT_MAX_BATCH_SIZE,
+    daemon_auto_apply=DEFAULT_CAMPAIGN_DAEMON_AUTO_APPLY,
 )
 
 
@@ -617,6 +628,7 @@ def _campaign(raw: Any) -> CampaignSettings:
         return CampaignSettings(
             max_campaign_files=DEFAULT_MAX_CAMPAIGN_FILES,
             max_batch_size=DEFAULT_MAX_BATCH_SIZE,
+            daemon_auto_apply=DEFAULT_CAMPAIGN_DAEMON_AUTO_APPLY,
         )
     if not isinstance(raw, dict):
         raise ConfigError("campaign: expected a mapping")
@@ -628,6 +640,9 @@ def _campaign(raw: Any) -> CampaignSettings:
         ),
         max_batch_size=_whole_number(
             section, "max_batch_size", "campaign", DEFAULT_MAX_BATCH_SIZE, minimum=1
+        ),
+        daemon_auto_apply=_bool(
+            section, "daemon_auto_apply", "campaign", DEFAULT_CAMPAIGN_DAEMON_AUTO_APPLY
         ),
     )
 

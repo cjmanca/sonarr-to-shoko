@@ -79,6 +79,7 @@ from .mapping_store import ActiveMappings, load_active
 from .policies import RunPolicy
 from .shoko import ImportFolder
 from .state import (
+    CAMPAIGN_STATUS_APPROVED,
     ApplyLockUnavailableError,
     BudgetRefusal,
     CampaignBinding,
@@ -660,6 +661,7 @@ def approve_campaign(
         approval_iso=now_iso,
         iso=now_iso,
         bindings=bindings,
+        plan_path=str(Path(plan_path).resolve()),
     )
     bound = store.bind_campaign_files(plan.campaign_id, now_iso)
     logger.info(
@@ -759,6 +761,7 @@ def apply_campaign(
     now_iso: str,
     *,
     batch_size: int | None = None,
+    lock_held: bool = False,
 ) -> CampaignApplyReport:
     """One bounded batch of the approved campaign through the full guarded path.
 
@@ -775,12 +778,24 @@ def apply_campaign(
     generation → ≤ ``batch_size`` candidates (capped by ``campaign.max_batch_size``):
     binding/drift quarantine checks, preflight, ``prepare_send`` → ``mark_sent`` →
     ``submit_link`` → record → inline verify.
+
+    ``lock_held=True`` (F7 daemon drain): the caller already owns this process's OS apply
+    lock, so the acquire/release pair is skipped (a same-process re-acquire self-contends).
+    Every other guard runs unchanged. The CLI ``campaign apply`` path keeps the default
+    ``lock_held=False`` and its own lock-first acquire/release.
     """
     plan, digest = read_plan_file(plan_path)
     campaign = _require_campaign(store, plan.campaign_id)
     size = _batch_size(settings, batch_size)
     reasons: list[str] = []
-    lock_reason, lock_acquired = _acquire_apply_lock(deps, now_iso)
+    if lock_held:
+        # F7 daemon drain: the caller (the daemon cycle) already holds the OS apply lock
+        # for this process, so acquire/release are skipped — a same-process re-acquire
+        # would self-contend. The campaign CLI path keeps ``lock_held=False`` and its own
+        # lock-first ordering unchanged.
+        lock_reason, lock_acquired = None, True
+    else:
+        lock_reason, lock_acquired = _acquire_apply_lock(deps, now_iso)
     if lock_reason is not None:
         remaining = max(0, len(plan.files) - campaign_send_progress(store, campaign.campaign_id))
         return CampaignApplyReport(
@@ -851,7 +866,7 @@ def apply_campaign(
             stopped=None if counters.processed < len(plan.files) else "plan_complete",
         )
     finally:
-        if lock_acquired:
+        if lock_acquired and not lock_held:
             _release_apply_lock(deps, now_iso)
 
 
@@ -930,12 +945,13 @@ def _apply_guards(
 
 
 def _require_campaign_window(store: StateStore, campaign: CampaignRecord, now_iso: str) -> None:
-    """Deadline and max-submissions refusals (the over-budget one auto-pauses)."""
+    """Deadline and max-submissions refusals (both auto-pause, F7 review P1)."""
     now = _parse_iso(now_iso)
     if campaign.deadline_iso is not None and now > _parse_iso(campaign.deadline_iso):
+        _pause_campaign(store, campaign.campaign_id, "deadline_exceeded", now_iso)
         raise CampaignError(
             f"campaign deadline {campaign.deadline_iso} passed at {now.isoformat()}: "
-            "apply is refused"
+            "the campaign is auto-paused, apply is refused"
         )
     if campaign.total_sent >= campaign.max_submissions:
         _pause_campaign(store, campaign.campaign_id, "max_submissions_reached", now_iso)
@@ -1519,6 +1535,31 @@ def _require_campaign(store: StateStore, campaign_id: str) -> CampaignRecord:
 def _short(campaign_id: str) -> str:
     """Short stable campaign label for cycle/window keys."""
     return campaign_id[:8]
+
+
+def select_next_daemon_campaign(store: StateStore) -> CampaignRecord | None:
+    """The F7 daemon's drain target: the oldest **approved, canaryed** campaign, deterministically.
+
+    Selection is by earliest ``approval_iso`` then ``campaign_id``; ``paused``/``revoked``
+    campaigns are skipped (operator controls authoritative). The **canary gate** is the
+    operator's first batch: a campaign drains only once it has send progress ≥ 1 (a completed
+    canary batch), so a freshly approved campaign is never mass-submitted by the daemon before
+    the operator's manual canary + safety checks. Campaigns drop out of selection through the
+    existing terminal transitions — normal completion (``max_submissions_reached``
+    auto-pause), deadline expiry (``deadline_exceeded`` auto-pause, P1 fix), drift,
+    attestation pause — plus the drain's ``no_queueable_candidates`` auto-pause (P2-3 fix),
+    so a deferred campaign never blocks the queue head. Returns ``None`` when nothing is
+    drainable.
+    """
+    drained = [
+        campaign
+        for campaign in store.list_campaigns()
+        if campaign.status == CAMPAIGN_STATUS_APPROVED
+        and campaign_send_progress(store, campaign.campaign_id) >= 1
+    ]
+    if not drained:
+        return None
+    return min(drained, key=lambda campaign: (campaign.approval_iso, campaign.campaign_id))
 
 
 def _parse_iso(raw: str) -> datetime:

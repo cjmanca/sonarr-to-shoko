@@ -834,6 +834,27 @@ def test_daemon_once_signal_runs_a_single_cycle(
     assert env.sleeps == []
 
 
+def test_daemon_preamble_reports_campaign_auto_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: the daemon preamble states that approved campaigns drain automatically (default)."""
+    env.seed_mapping()
+    code = main(["daemon", "--cycles", str(CYCLES_ONE), str(env.config_path)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "campaign drain: approved backlog campaigns drain automatically" in out
+
+
+def test_config_check_shows_campaign_daemon_auto_apply(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F7: the resolved config summary surfaces the campaign.daemon_auto_apply knob."""
+    code = main(["config", str(env.config_path), "--check"])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "daemon_auto_apply=True" in out
+
+
 def test_daemon_json_stdout_is_a_single_json_document(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
