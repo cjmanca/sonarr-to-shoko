@@ -20,8 +20,10 @@ import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import cli
 from shoko_linker.attestation import (
+    SCOPE_DAEMON,
     AttestationVerdict,
     build_record,
+    campaign_lease_path,
     lease_expiry_cap,
     load_attestation,
     parse_attestation_document,
@@ -399,7 +401,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> StubEnv:
         ),
     )
     monkeypatch.setattr(cli, "state_path", lambda settings: environment.tmp_path / "state.sqlite3")
-    monkeypatch.setattr(cli, "attestation_target_path", lambda settings: environment.lease_path)
+    monkeypatch.setattr(
+        cli,
+        "attestation_target_path",
+        lambda settings, scope=SCOPE_DAEMON, *, for_write=False: environment.lease_path,
+    )
     monkeypatch.setattr(cli, "current_iso", lambda: environment.now_iso)
     monkeypatch.setattr(cli, "sleep", lambda seconds: None)
     monkeypatch.setattr(cli, "interruptible_sleep", lambda seconds: None)
@@ -694,3 +700,296 @@ def test_once_apply_without_gate_refuses(
     code = main(["once", "--apply", str(env.config_path)])
     assert code == EXIT_APPLY_GATE_REFUSAL
     assert "REFUSED" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ F8: scope-specific leases
+
+
+def _tmp_posix(tmp_path: Path, name: str) -> str:
+    """A POSIX absolute string for ``tmp_path/<name>`` that ``Path`` resolves identically.
+
+    ``safety.attestation_file`` must be a POSIX-style path (the config layer rejects Windows
+    backslashes); stripping the drive letter yields a rooted POSIX string that ``Path`` resolves
+    to the same on-disk location on the current drive (where pytest's tmp_path lives).
+    """
+    posix = tmp_path.as_posix()
+    if len(posix) >= 2 and posix[1] == ":":
+        posix = posix[2:]
+    return f"{posix}/{name}"
+
+
+def _scope_document(lease: Path) -> dict[str, Any]:
+    document = _document(lease)
+    document["safety"]["attestation_file"] = lease.as_posix()
+    return document
+
+
+def _write_lease_file(path: Path, *, scope: str) -> Path:
+    write_attestation(path, _record(scope=scope, expires_iso=LATER), overwrite=True)
+    return path
+
+
+@pytest.fixture
+def scope_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """Real scope-aware resolver: daemon lease at the configured path, campaign leases as siblings.
+
+    The real :func:`cli.attestation_target_path` is used (NO flattening monkeypatch) so the
+    record/status/invalidate commands must select the right file for each scope.
+    """
+    lease = Path(_tmp_posix(tmp_path, "lease.yaml"))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(_scope_document(lease)), encoding="utf-8")
+    monkeypatch.setattr(cli, "current_iso", lambda: T0)
+    monkeypatch.setattr(cli, "state_path", lambda settings: tmp_path / "state.sqlite3")
+    monkeypatch.setattr(
+        cli, "open_state_store", lambda settings: StateStore(tmp_path / "state.sqlite3")
+    )
+    return lease, config_path
+
+
+def _record_cli(config_path: Path, scope: str) -> int:
+    return main(
+        [
+            "attestation",
+            "record",
+            str(config_path),
+            "--endpoint",
+            SHOKO_BASE,
+            "--version",
+            "5.3.3",
+            "--mounts",
+            "/anime read-only",
+            "--settings",
+            "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false",
+            "--hours",
+            "24",
+            "--scope",
+            scope,
+            "--note",
+            f"lease {scope}",
+            "--confirm",
+            "--json",
+        ]
+    )
+
+
+def test_campaign_lease_path_is_a_sibling_of_the_daemon_lease() -> None:
+    base = Path("/data/lease.yaml")
+    sibling = campaign_lease_path(base, "camp-1")
+    assert sibling.name == "lease.campaign-camp-1.yaml"
+    assert sibling.parent == base.parent
+    assert sibling != base
+
+
+def test_record_and_status_target_the_right_file_per_scope(
+    scope_env: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    lease, config_path = scope_env
+    campaign_lease = campaign_lease_path(lease, "camp-1")
+
+    assert _record_cli(config_path, "daemon") == EXIT_OK
+    capsys.readouterr()
+    assert lease.exists()
+    assert not campaign_lease.exists()
+
+    assert _record_cli(config_path, "campaign:camp-1") == EXIT_OK
+    capsys.readouterr()
+    assert campaign_lease.exists()
+    # recording a campaign lease must never clobber the daemon lease
+    daemon = cli.attestation_verdict_for(load_settings(config_path), scope=SCOPE_DAEMON)
+    assert daemon.valid_for_apply is True
+    assert daemon.record is not None
+    assert daemon.record.scope == "daemon"
+    campaign = cli.attestation_verdict_for(load_settings(config_path), scope="campaign:camp-1")
+    assert campaign.valid_for_apply is True
+    assert campaign.record is not None
+    assert campaign.record.scope == "campaign:camp-1"
+
+    daemon_status = main(["attestation", "status", str(config_path), "--scope", "daemon", "--json"])
+    assert daemon_status == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["status"] == "valid"
+    campaign_status = main(
+        ["attestation", "status", str(config_path), "--scope", "campaign:camp-1", "--json"]
+    )
+    assert campaign_status == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_invalidate_campaign_scope_leaves_the_daemon_lease_valid(
+    scope_env: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    lease, config_path = scope_env
+    campaign_lease = campaign_lease_path(lease, "camp-1")
+    assert _record_cli(config_path, "daemon") == EXIT_OK
+    assert _record_cli(config_path, "campaign:camp-1") == EXIT_OK
+    capsys.readouterr()
+
+    code = main(
+        [
+            "attestation",
+            "invalidate",
+            str(config_path),
+            "--scope",
+            "campaign:camp-1",
+            "--note",
+            "campaign lease retired",
+            "--confirm",
+            "--json",
+        ]
+    )
+    assert code == EXIT_OK
+    assert not campaign_lease.exists()
+    assert campaign_lease.with_name(campaign_lease.name + ".revoked").exists()
+    assert lease.exists()  # the daemon lease is untouched by a campaign-scope invalidate
+    capsys.readouterr()
+
+    daemon_status = main(["attestation", "status", str(config_path), "--scope", "daemon", "--json"])
+    assert daemon_status == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["status"] == "valid"
+    # No campaign sibling remains; the read resolver falls back to the configured path, whose
+    # daemon-scoped record fails the campaign scope match — fail closed (never "valid").
+    campaign_status = main(
+        ["attestation", "status", str(config_path), "--scope", "campaign:camp-1", "--json"]
+    )
+    assert campaign_status == EXIT_OK
+    campaign_after = json.loads(capsys.readouterr().out)
+    assert campaign_after["status"] in {"absent", "invalid"}
+
+
+def test_backward_compatible_campaign_record_at_the_configured_path(
+    scope_env: tuple[Path, Path],
+) -> None:
+    """A ``campaign:<id>`` record written directly at safety.attestation_file keeps working.
+
+    The read resolver falls back to the configured path when no sibling exists, so a legacy
+    campaign record at that path still authorizes its campaign scope.
+    """
+    lease, config_path = scope_env
+    _write_lease_file(lease, scope="campaign:camp-1")
+    verdict = cli.attestation_verdict_for(load_settings(config_path), scope="campaign:camp-1")
+    assert verdict.valid_for_apply is True
+    # the same file must NOT authorize the daemon scope (fail closed on the scope match)
+    daemon = cli.attestation_verdict_for(load_settings(config_path), scope=SCOPE_DAEMON)
+    assert daemon.valid_for_apply is False
+    assert "scope mismatch" in daemon.reason
+
+
+def test_per_scope_evaluation_rules_are_identical_fail_closed(scope_env: tuple[Path, Path]) -> None:
+    lease, _config_path = scope_env
+    campaign_lease = campaign_lease_path(lease, "camp-1")
+    _write_lease_file(campaign_lease, scope="campaign:camp-1")
+
+    endpoint = load_attestation(
+        campaign_lease, shoko_url="http://other-shoko:8111", now_iso=T0, scope="campaign:camp-1"
+    )
+    assert endpoint.status == "invalid"
+    assert "endpoint mismatch" in endpoint.reason
+
+    stale = load_attestation(
+        campaign_lease,
+        shoko_url=SHOKO_BASE,
+        now_iso=T0,
+        scope="campaign:camp-1",
+        version_hint="5.9.9",
+    )
+    assert stale.status == "stale_version"
+    assert stale.valid_for_apply is False
+
+    cross_scope = load_attestation(campaign_lease, shoko_url=SHOKO_BASE, now_iso=T0, scope="daemon")
+    assert cross_scope.status == "invalid"
+    assert "scope mismatch" in cross_scope.reason
+
+    expired = load_attestation(
+        campaign_lease,
+        shoko_url=SHOKO_BASE,
+        now_iso="2027-01-01T00:00:00+00:00",
+        scope="campaign:camp-1",
+    )
+    assert expired.status == "expired"
+
+
+def test_invalidate_campaign_scope_never_revokes_the_daemon_lease(
+    scope_env: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-1: campaign-scope invalidate with the sibling ABSENT must NOT fall back to the
+    base daemon lease (destructive read-fallback would destroy daemon authorization)."""
+    lease, config_path = scope_env
+    assert _record_cli(config_path, "daemon") == EXIT_OK
+    capsys.readouterr()
+    before = lease.read_bytes()
+
+    code = main(
+        [
+            "attestation",
+            "invalidate",
+            str(config_path),
+            "--scope",
+            "campaign:ghost",
+            "--note",
+            "attempt campaign revoke",
+            "--confirm",
+            "--json",
+        ]
+    )
+    assert code == EXIT_CONFIG_INVALID  # refused, nonzero
+    out = capsys.readouterr().out
+    assert "refused" in out
+    assert lease.read_bytes() == before  # the daemon lease is byte-for-byte untouched
+    assert not lease.with_name(lease.name + ".revoked").exists()
+    # daemon authorization remains valid
+    daemon_status = main(["attestation", "status", str(config_path), "--scope", "daemon", "--json"])
+    assert daemon_status == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_hostile_campaign_scope_is_refused_without_traceback(
+    scope_env: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3: path separators, colon/`< > | ? * "`, and over-long campaign ids are refused by
+    validate_scope (clean nonzero exit), never a raw OSError/ValueError traceback."""
+    _lease, config_path = scope_env
+    overlong = "campaign:" + "x" * 300
+    for hostile in (
+        "campaign:a/b",
+        "campaign:a\\b",
+        "campaign:../escape",
+        "campaign:a:b",
+        'campaign:a"b',
+        "campaign:a|b",
+        "campaign:a*b",
+        "campaign:a?b",
+        "campaign:a<b>c",
+        overlong,
+    ):
+        code = main(["attestation", "status", str(config_path), "--scope", hostile, "--json"])
+        assert code == EXIT_CONFIG_INVALID
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.out + captured.err
+        assert "scope" in captured.err.lower()
+
+    # The record path (the reported crash) must refuse a colon id cleanly, writing no lease file.
+    code = main(
+        [
+            "attestation",
+            "record",
+            str(config_path),
+            "--endpoint",
+            SHOKO_BASE,
+            "--version",
+            "5.3.3",
+            "--mounts",
+            "/anime read-only",
+            "--settings",
+            "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false",
+            "--hours",
+            "24",
+            "--scope",
+            "campaign:a:b",
+            "--note",
+            "n",
+            "--confirm",
+        ]
+    )
+    assert code == EXIT_CONFIG_INVALID
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err

@@ -16,8 +16,11 @@ Apply semantics (PROJECT.md M7, PLAN tradeoff): a completely unattended
 *indefinite* writable daemon is incompatible with an expiring physical-safety
 attestation. When the lease is absent/invalid/expired (or the version hint is stale),
 every apply is suppressed and the daemon stays alive reporting read-only — never a
-restart loop. The daemon/campaign persist one write pause per valid→invalid transition
-(``attestation_expired``) and clear it on a re-attested lease.
+restart loop. Daemon-scope and campaign-scope authorizations are independent leases in
+independent files (:func:`campaign_lease_path`): an invalid daemon lease suppresses only
+daemon new-arrival apply (persisted one global write pause per transition), an
+invalid campaign lease stops only that campaign's submissions (persisted campaign
+pause); neither blocks the other, and both re-attest independently.
 """
 
 from __future__ import annotations
@@ -63,6 +66,11 @@ MIN_NOTE_CHARS: Final[int] = 1
 MAX_NOTE_CHARS: Final[int] = 400
 MAX_MOUNT_ITEMS: Final[int] = 50
 MAX_MOUNT_ITEM_CHARS: Final[int] = 200
+MIN_PRINTABLE_CODEPOINT: Final[int] = 32
+MAX_CAMPAIGN_ID_CHARS: Final[int] = 128
+# Characters illegal in a Windows filename (colon is the drive/stream separator); `/` and `\`
+# are path separators. A campaign id becomes a filename component.
+ILLEGAL_ID_CHARS: Final[frozenset[str]] = frozenset({":", '"', "<", ">", "|", "?", "*", "/", "\\"})
 
 
 class AttestationError(LinkerError):
@@ -144,17 +152,37 @@ def parse_iso(raw: str) -> datetime:
 
 
 def validate_scope(scope: str) -> str:
-    """Accept ``daemon`` or ``campaign:<id>`` (non-empty id); anything else refuses."""
+    """Accept ``daemon`` or ``campaign:<id>`` (safe id); anything else refuses.
+
+    A campaign id becomes a filename component (:func:`campaign_lease_path`), so it is capped in
+    length and must not contain path separators, ``..`` traversal, characters illegal in a Windows
+    filename (``: " < > | ? *``), or control characters — hostile ids are refused here (fail
+    closed) rather than reaching the filesystem.
+    """
     if not isinstance(scope, str):
         raise AttestationError("scope: must be 'daemon' or 'campaign:<id>'")
     candidate = scope.strip()
     if candidate == SCOPE_DAEMON:
         return candidate
     if candidate.startswith("campaign:"):
-        identifier = candidate.removeprefix("campaign:")
-        if not identifier.strip():
+        identifier = candidate.removeprefix("campaign:").strip()
+        if not identifier:
             raise AttestationError("scope: 'campaign:' requires a non-empty campaign id")
-        return f"campaign:{identifier.strip()}"
+        if len(identifier) > MAX_CAMPAIGN_ID_CHARS:
+            raise AttestationError(
+                f"scope: campaign id must be at most {MAX_CAMPAIGN_ID_CHARS} characters"
+            )
+        present = sorted({char for char in identifier if char in ILLEGAL_ID_CHARS})
+        if present:
+            raise AttestationError(
+                "scope: campaign id must not contain path separators or characters illegal "
+                f"in a file name ({', '.join(repr(char) for char in present)})"
+            )
+        if ".." in identifier:
+            raise AttestationError("scope: campaign id must not contain '..' path traversal")
+        if any(ord(char) < MIN_PRINTABLE_CODEPOINT or char == "\x7f" for char in identifier):
+            raise AttestationError("scope: campaign id must not contain control characters")
+        return f"campaign:{identifier}"
     raise AttestationError(f"scope: must be 'daemon' or 'campaign:<id>' (got {scope!r})")
 
 
@@ -494,6 +522,21 @@ def load_attestation(
     )
 
 
+def campaign_lease_path(daemon_path: str | Path, campaign_id: str) -> Path:
+    """The sibling lease file for one campaign scope, derived from the daemon path.
+
+    The daemon lease stays at ``safety.attestation_file``; each ``campaign:<id>`` lease lives
+    in a deterministic sibling in the same directory (``<stem>.campaign-<id>.yaml``) so daemon
+    and campaign authorizations are independent, simultaneously valid files on the
+    persisted safety volume (they survive container restart). Callers read a campaign lease from
+    its sibling when present, and fall back to the configured path only for backward
+    compatibility (an operator who recorded a ``campaign:<id>`` record directly at that path).
+    """
+    base = Path(daemon_path)
+    identifier = validate_scope(f"campaign:{campaign_id}").removeprefix("campaign:")
+    return base.with_name(f"{base.stem}.campaign-{identifier}.yaml")
+
+
 def lease_expiry_cap(hours: float, validity_cap_hours: float) -> tuple[bool, str]:
     """``attestation record --hours`` cap: leases never outlive the config cap."""
     if hours <= 0:
@@ -516,6 +559,7 @@ __all__ = [
     "AttestationStatus",
     "AttestationVerdict",
     "build_record",
+    "campaign_lease_path",
     "canonical_record",
     "lease_expiry_cap",
     "load_attestation",

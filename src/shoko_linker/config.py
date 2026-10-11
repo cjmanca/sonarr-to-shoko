@@ -189,8 +189,13 @@ class DatabaseSettings:
 class SafetySettings:
     """Safety attestation lease configuration (M7-b).
 
-    ``attestation_file`` is the operator-created lease record path (``None`` = no lease
-    exists, so every apply stays refused with ``attestation_invalid``). The lease expires
+    ``attestation_file`` is the operator-created daemon-scope lease record path (``None`` =
+    no lease exists, so every apply stays refused with ``attestation_invalid``). Each
+    ``campaign:<id>`` authorization lives in a deterministic sibling in the same directory
+    (``<stem>.campaign-<id>.yaml`` — see :func:`shoko_linker.attestation.campaign_lease_path`),
+    so daemon and campaign authorizations are independent, simultaneously valid files on the
+    persisted safety volume; a campaign record written directly at ``attestation_file`` keeps
+    working for that campaign (backward compatibility). The lease expires
     after a finite validity window; ``attestation_validity_hours`` is the hard cap on any
     lease's lifetime (``attestation record --hours`` may not exceed it) and
     ``attestation_warn_seconds`` is the pre-expiry warning lead. The trust anchor is the

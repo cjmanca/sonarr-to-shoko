@@ -645,7 +645,9 @@ def test_once_max_links_counts_submissions_not_files(
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     write_daemon_lease(env.tmp_path / "lease.yaml")
     monkeypatch.setattr(
-        cli, "attestation_target_path", lambda settings: env.tmp_path / "lease.yaml"
+        cli,
+        "attestation_target_path",
+        lambda settings, scope=SCOPE_DAEMON, *, for_write=False: env.tmp_path / "lease.yaml",
     )
     config = write_config(env.tmp_path, cli_document(apply_changes=True))
     files = [
@@ -711,7 +713,9 @@ def _wire_daemon_lease(env: Env, monkeypatch: pytest.MonkeyPatch, document: dict
     """Gate-open config + daemon-scope lease at the seam path; returns the config path."""
     write_daemon_lease(env.tmp_path / "lease.yaml")
     monkeypatch.setattr(
-        cli, "attestation_target_path", lambda settings: env.tmp_path / "lease.yaml"
+        cli,
+        "attestation_target_path",
+        lambda settings, scope=SCOPE_DAEMON, *, for_write=False: env.tmp_path / "lease.yaml",
     )
     return write_config(env.tmp_path, document)
 
@@ -1092,6 +1096,53 @@ def test_operator_commands_require_confirm(env: Env, capsys: pytest.CaptureFixtu
     out = capsys.readouterr().out
     assert code == EXIT_CONFIG_INVALID
     assert "--confirm" in out
+
+
+def test_pause_writes_refuses_the_reserved_attestation_reason(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-2: 'attestation_expired' is the gate's reserved internal reason — the operator pause
+    command must refuse it so it never masquerades as the origin-gated attestation pause."""
+    code = main(
+        [
+            "pause-writes",
+            str(env.config_path),
+            "--reason",
+            "attestation_expired",
+            "--note",
+            "n",
+            "--confirm",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == EXIT_CONFIG_INVALID
+    assert "reserved" in out
+    store = env.open_store()
+    try:
+        assert store.budget_view().paused_reason is None  # nothing was paused
+    finally:
+        store.close()
+
+
+def test_pause_writes_allows_an_operator_reason(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-2: a distinct operator reason (not the reserved one) pauses writes normally."""
+    code = main(
+        [
+            "pause-writes",
+            str(env.config_path),
+            "--reason",
+            "disk_review",
+            "--note",
+            "ops",
+            "--confirm",
+            "--json",
+        ]
+    )
+    payload = captured_json(capsys)
+    assert code == EXIT_OK
+    assert payload["result"]["paused_reason"] == "disk_review"
 
 
 def test_pause_resume_and_clear_rebaseline_persist(

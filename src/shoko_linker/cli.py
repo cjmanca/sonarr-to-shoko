@@ -61,8 +61,10 @@ from .attestation import (
     AttestationRecord,
     AttestationVerdict,
     build_record,
+    campaign_lease_path,
     lease_expiry_cap,
     load_attestation,
+    parse_attestation_document,
     validate_scope,
     write_attestation,
 )
@@ -140,6 +142,7 @@ from .reporting import (
     report_payload,
 )
 from .state import (
+    ATTESTATION_PAUSE_REASON,
     META_LAST_CYCLE_END_ISO,
     META_LAST_CYCLE_START_ISO,
     META_LAST_FULL_RECONCILE_ISO,
@@ -182,9 +185,10 @@ _RESOLVE_REPLAN_NOTE: Final[str] = (
     "fingerprint; the resolved fingerprint is never resubmitted"
 )
 _ATTESTATION_NOTE: Final[str] = (
-    "safety attestation: the lease at safety.attestation_file is evaluated offline "
-    "before every apply; absent/invalid/expired suppresses writes and persists one pause "
-    "per transition (the daemon stays alive reporting read-only)"
+    "safety attestation: the daemon lease at safety.attestation_file and each campaign "
+    "lease in its campaign-<id> sibling are evaluated offline before every apply; an invalid "
+    "lease suppresses only its own scope's writes and persists one pause per transition (the "
+    "daemon stays alive reporting read-only)"
 )
 
 
@@ -196,11 +200,28 @@ def current_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def attestation_target_path(settings: Settings) -> Path | None:
-    """Resolve the lease file path from ``safety.attestation_file`` (test seam)."""
+def attestation_target_path(
+    settings: Settings, scope: str = SCOPE_DAEMON, *, for_write: bool = False
+) -> Path | None:
+    """Resolve the lease file path for one scope from ``safety.attestation_file`` (test seam).
+
+    The daemon lease stays at the configured path. A ``campaign:<id>`` lease lives in its
+    deterministic sibling: writing (``for_write=True``) always targets the sibling so recording
+    a campaign lease never clobbers the daemon lease; reading resolves the sibling when present
+    and falls back to the configured path only for backward compatibility (a campaign record the
+    operator wrote directly at ``attestation_file``).
+    """
     if settings.safety.attestation_file is None:
         return None
-    return Path(settings.safety.attestation_file)
+    base = Path(settings.safety.attestation_file)
+    validated = validate_scope(scope)
+    if validated == SCOPE_DAEMON:
+        return base
+    campaign_id = validated.removeprefix("campaign:")
+    sibling = campaign_lease_path(base, campaign_id)
+    if for_write:
+        return sibling
+    return sibling if sibling.exists() else base
 
 
 def attestation_verdict_for(
@@ -209,15 +230,16 @@ def attestation_verdict_for(
     """Evaluate the configured safety attestation lease offline (test seam, no network).
 
     The Shoko URL identity, the requested ``scope`` (``daemon`` for the daemon/
-    ``once --apply``; ``campaign:<id>`` for a campaign apply), the configured warn lead,
-    the configured version pin (``safety.attested_shoko_version`` — M7 review P3-4: a
-    lease recorded for a different Shoko version is ``stale_version``, fail closed; an
-    explicit ``version_hint`` overrides it), and :func:`current_iso` are the only inputs —
-    nothing is fetched, nothing is guessed. An unconfigured lease is ``absent``.
+    ``once --apply``; ``campaign:<id>`` for a campaign apply — each evaluated from its own
+    lease file), the configured warn lead, the configured version pin
+    (``safety.attested_shoko_version`` — M7 review P3-4: a lease recorded for a different
+    Shoko version is ``stale_version``, fail closed; an explicit ``version_hint``
+    overrides it), and :func:`current_iso` are the only inputs — nothing is fetched, nothing
+    is guessed. An unconfigured lease is ``absent``.
     """
     hint = settings.safety.attested_shoko_version if version_hint is None else version_hint
     return load_attestation(
-        attestation_target_path(settings),
+        attestation_target_path(settings, scope),
         shoko_url=settings.shoko.url,
         now_iso=current_iso(),
         scope=validate_scope(scope),
@@ -1130,6 +1152,14 @@ def _run_resume_writes(args: argparse.Namespace) -> int:
 
 
 def _run_pause_writes(args: argparse.Namespace) -> int:
+    if cast(str, args.reason).strip() == ATTESTATION_PAUSE_REASON:
+        print(
+            f"refused: --reason {ATTESTATION_PAUSE_REASON!r} is reserved for the safety-"
+            "attestation gate's own write pause; operators must pick a distinct reason "
+            f"(e.g. 'disk_review', 'maintenance', 'operator_paused')"
+        )
+        return EXIT_CONFIG_INVALID
+
     def action(_settings: Settings, store: StateStore, iso: str) -> Mapping[str, Any]:
         reason = cast(str, args.reason)
         store.pause(reason, iso)
@@ -1166,7 +1196,8 @@ def _run_attestation_status(args: argparse.Namespace) -> int:
         return EXIT_OK
     print(f"attestation: {verdict.status} ({verdict.reason})")
     print(f"  scope checked: {scope}")
-    lease = settings.safety.attestation_file or "<safety.attestation_file not configured>"
+    resolved = attestation_target_path(settings, scope)
+    lease = str(resolved) if resolved is not None else "<safety.attestation_file not configured>"
     print(f"  lease file: {lease}")
     if verdict.digest is not None:
         print(f"  record digest: {verdict.digest}")
@@ -1211,7 +1242,8 @@ def _run_attestation_record(args: argparse.Namespace) -> int:
         print(f"attestation record: {_CONFIRM_REQUIRED}")
         return EXIT_CONFIG_INVALID
     settings = load_settings(cast(str, args.config))
-    target = attestation_target_path(settings)
+    scope = validate_scope(cast("str | None", args.scope) or SCOPE_DAEMON)
+    target = attestation_target_path(settings, scope, for_write=True)
     if target is None:
         print(
             "refused: safety.attestation_file is not configured — point the config at the "
@@ -1225,7 +1257,6 @@ def _run_attestation_record(args: argparse.Namespace) -> int:
     if not ok:
         print(f"refused: {cap_reason}")
         return EXIT_CONFIG_INVALID
-    scope = validate_scope(cast("str | None", args.scope) or SCOPE_DAEMON)
     try:
         path, digest, warning, record = _record_lease(args, target, hours, scope)
     except (AttestationError, ConfigError) as exc:
@@ -1275,16 +1306,52 @@ def _record_lease(
     return path, digest, warning, record
 
 
+def _invalidate_target(settings: Settings, scope: str) -> tuple[Path | None, str | None]:
+    """Resolve the file a destructive invalidate may move, without the read fallback.
+
+    A campaign-scope invalidate must NEVER reach the daemon lease: it targets the
+    campaign sibling. Only when the sibling is absent does it consider the configured
+    path, and then only if that file parses AND records exactly this scope (the legacy
+    backward-compat lease the operator wrote directly there). Otherwise it refuses (exit
+    nonzero) leaving the daemon lease untouched.
+    """
+    if settings.safety.attestation_file is None:
+        return None, "safety.attestation_file is not configured"
+    base = attestation_target_path(settings, SCOPE_DAEMON, for_write=True)
+    assert base is not None
+    validated = validate_scope(scope)
+    if validated == SCOPE_DAEMON:
+        return base, None
+    campaign_id = validated.removeprefix("campaign:")
+    sibling = campaign_lease_path(base, campaign_id)
+    if sibling.exists():
+        return sibling, None
+    if base.exists():
+        record: AttestationRecord | None
+        try:
+            record = parse_attestation_document(base.read_text(encoding="utf-8"))
+        except (AttestationError, UnicodeDecodeError, OSError):
+            record = None
+        if record is not None and record.scope == validated:
+            return base, None
+    return None, (
+        f"no lease to invalidate for scope {validated!r}: the campaign lease {sibling} does not "
+        f"exist and {base} does not attest this scope (the daemon lease is never touched)"
+    )
+
+
 def _run_attestation_invalidate(args: argparse.Namespace) -> int:
     """Move the lease aside (``.revoked`` suffix) and audit the action. Apply stays closed."""
     if not cast(bool, args.confirm):
         print(f"attestation invalidate: {_CONFIRM_REQUIRED}")
         return EXIT_CONFIG_INVALID
     settings = load_settings(cast(str, args.config))
-    source = attestation_target_path(settings)
-    if source is None:
-        print("refused: safety.attestation_file is not configured")
+    scope = validate_scope(cast("str | None", args.scope) or SCOPE_DAEMON)
+    source, refuse = _invalidate_target(settings, scope)
+    if refuse is not None:
+        print(f"refused: {refuse}")
         return EXIT_CONFIG_INVALID
+    assert source is not None
     if not source.exists():
         print(f"refused: attestation file {source} does not exist")
         return EXIT_CONFIG_INVALID
@@ -1301,7 +1368,7 @@ def _run_attestation_invalidate(args: argparse.Namespace) -> int:
     note = cast(str, args.note)
     db_path = state_path(settings)
     store = open_state_store(settings) if db_path.exists() else None
-    result: dict[str, Any] = {"revoked_path": str(target), "note": note}
+    result: dict[str, Any] = {"revoked_path": str(target), "scope": scope, "note": note}
     if store is not None:
         try:
             _record_operator_action(store, "attestation-invalidate", note, iso, result)
@@ -1848,7 +1915,13 @@ def _add_resume_writes(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 def _add_pause_writes(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("pause-writes", help="Persist a write pause with a reason.")
     _add_config_argument(parser)
-    parser.add_argument("--reason", required=True, metavar="TEXT")
+    parser.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help="why writes pause (a distinct operator reason, e.g. disk_review/maintenance/"
+        "operator_paused; the reserved reason 'attestation_expired' belongs to the gate)",
+    )
     parser.add_argument(
         "--hours",
         type=_positive_number,
@@ -1922,6 +1995,12 @@ def _add_attestation(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
         "invalidate", help="Move the lease aside (.revoked suffix) with an audit note."
     )
     _add_config_argument(invalidate)
+    invalidate.add_argument(
+        "--scope",
+        default=SCOPE_DAEMON,
+        metavar="SCOPE",
+        help="daemon | campaign:<id> (default daemon)",
+    )
     _add_confirm_note_arguments(invalidate)
     _add_json_argument(invalidate)
 

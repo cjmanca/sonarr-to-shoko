@@ -17,12 +17,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker.attestation import AttestationVerdict
 from shoko_linker.campaign import (
     apply_campaign,
     approve_campaign,
@@ -35,6 +37,7 @@ from shoko_linker.daemon import (
     DAEMON_HISTORY_MAXLEN,
     CycleMode,
     DaemonDeps,
+    attestation_gate,
     compute_eligibility,
     full_cycle_due,
     run_cycle,
@@ -560,6 +563,7 @@ def build_deps(
     advance: Callable[[float], None],
     jitter: Callable[[], float] = lambda: 0.5,
     attestation: bool = True,
+    attestation_valid: Callable[[], bool] | None = None,
     max_submissions: int = 1,
     verification_timeout: float = VERIFICATION_TIMEOUT,
     poll_interval: float = POLL_INTERVAL,
@@ -587,7 +591,9 @@ def build_deps(
         advance=advance,
         jitter=jitter,
         pid=4242,
-        attestation_valid=lambda: attestation,
+        attestation_valid=(
+            attestation_valid if attestation_valid is not None else lambda: attestation
+        ),
         blocked_over=blocked_over,
         verification_timeout_seconds=verification_timeout,
         poll_interval_seconds=poll_interval,
@@ -4101,3 +4107,61 @@ def test_daemon_campaign_drain_skipped_when_disabled(
     # Drain disabled: the daemon never advances the campaign beyond the canary.
     assert campaign.total_sent == 1
     assert all(cycle.campaign is None for cycle in report.cycles)
+
+
+def test_attestation_gate_campaign_scope_requires_campaign_id() -> None:
+    """P3-7: a campaign scope with campaign_id=None must raise, never silently share the daemon
+    gate key (which would make a campaign lease mutate the daemon write pause)."""
+    deps = SimpleNamespace(attestation_verdict=lambda: AttestationVerdict("expired", "x"))
+    with pytest.raises(ValueError, match="campaign_id"):
+        attestation_gate(
+            deps,  # type: ignore[arg-type]
+            "2026-01-01T00:00:00+00:00",
+            mutate=True,
+            scope="campaign:camp-1",
+            campaign_id=None,
+        )
+
+
+def test_daemon_lease_expiry_mid_cycle_stops_later_new_arrivals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2: the daemon re-evaluates the lease per candidate — a lease that expires after the
+    first send stops the remaining new arrivals (zero POSTs), and the blocked candidate defers
+    (stays planned), never quarantines."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    a = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    b = SpecFile(series_id=2, file_id=20, shoko_id=501)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([a, b])
+    state = {"valid": True}
+    shoko.on_post = lambda: state.__setitem__("valid", False)
+    sleeper = Sleeper()
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[a, b],
+            shoko_files=[a, b],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=sleeper.advance,
+            shoko=shoko,
+            attestation_valid=lambda: state["valid"],
+            max_submissions=2,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        state_a = store.get_file(500)
+        state_b = store.get_file(501)
+    finally:
+        store.close()
+    assert len(shoko.posts) == 1  # only the first new arrival POSTed
+    assert state_a is not None
+    assert state_a.state is FileState.VERIFIED
+    assert state_b is not None
+    assert state_b.state is FileState.PLANNED  # deferred, NOT quarantined
+    assert any("attestation_invalid" in reason for reason in report.reasons)

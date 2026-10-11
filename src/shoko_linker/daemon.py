@@ -69,7 +69,7 @@ from typing import Any, Final
 import httpx
 
 from . import mappings as _mappings
-from .attestation import AttestationVerdict
+from .attestation import SCOPE_DAEMON, AttestationVerdict
 from .config import Settings, apply_gate
 from .errors import HttpPolicyError
 from .http import ApiEndpoint, resolve_and_send
@@ -114,6 +114,7 @@ from .state import (
     ATTESTATION_PAUSE_REASON,
     CAMPAIGN_STATUS_PAUSED,
     META_ATTESTATION_GATE,
+    META_CAMPAIGN_ATTESTATION_GATE,
     META_NEXT_FULL_RECONCILE_ISO,
     ApplyLockUnavailableError,
     BaselineFile,
@@ -492,7 +493,30 @@ def effective_blocked_over(deps: DaemonDeps) -> int:
     return deps.settings.sync.queue_blocked_tolerance
 
 
-def _budget_headroom(deps: DaemonDeps) -> bool:
+def _global_pause_reason(deps: DaemonDeps, *, campaign: bool) -> str | None:
+    """The global write pause that must gate this scope, or ``None``.
+
+    F8: the daemon-scope lease transition records a global write pause
+    (``attestation_expired`` under ``META_ATTESTATION_GATE=paused``). That pause gates daemon
+    writes ONLY — it must never block an authorized campaign drain. The bypass is **origin-gated**:
+    it applies only to the pause the attestation gate itself recorded (gate meta
+    ``paused`` AND reason ``attestation_expired``); an operator ``pause-writes --reason
+    attestation_expired`` is refused at the CLI, and any other global pause reason — mapping
+    churn, source break, queue anomaly, a plain operator pause — gates every scope.
+    """
+    reason = deps.store.budget_view().paused_reason
+    if reason is None:
+        return None
+    if (
+        campaign
+        and reason == ATTESTATION_PAUSE_REASON
+        and deps.store.get_meta(META_ATTESTATION_GATE) == "paused"
+    ):
+        return None
+    return reason
+
+
+def _budget_headroom(deps: DaemonDeps, *, campaign: bool = False) -> bool:
     """Non-mutating peek: is there room for at least one more submission?
 
     The authoritative reservation happens in ``prepare_send``; this only feeds the
@@ -500,7 +524,7 @@ def _budget_headroom(deps: DaemonDeps) -> bool:
     """
     view = deps.store.budget_view()
     limits = deps.store.budget_limits
-    if view.paused_reason is not None:
+    if _global_pause_reason(deps, campaign=campaign) is not None:
         return False
     if limits is None:
         return True
@@ -511,27 +535,35 @@ def _budget_headroom(deps: DaemonDeps) -> bool:
     return view.rolling_new_submissions < limits.rolling_new
 
 
-def _eligibility_flags(deps: DaemonDeps, mapping_present: bool) -> _EligibilityFlags:
+def _eligibility_flags(
+    deps: DaemonDeps, mapping_present: bool, *, campaign: bool = False
+) -> _EligibilityFlags:
     source_stable = deps.store.get_meta("requires_rebaseline") != "1"
-    paused = deps.store.budget_view().paused_reason is not None
+    paused = _global_pause_reason(deps, campaign=campaign) is not None
     return _EligibilityFlags(
         attestation=deps.attestation_valid(),
         gate=apply_gate(deps.settings),
-        budgets_ok=_budget_headroom(deps),
+        budgets_ok=_budget_headroom(deps, campaign=campaign),
         mapping_stable=mapping_present and not paused,
         source_stable=source_stable,
     )
 
 
-def compute_eligibility(deps: DaemonDeps, now_iso: str) -> EligibilityVerdict:  # noqa: ARG001
+def compute_eligibility(
+    deps: DaemonDeps,
+    now_iso: str,  # noqa: ARG001
+    *,
+    campaign: bool = False,
+) -> EligibilityVerdict:
     """Compose the cycle-level auto-apply verdict from every safety input.
 
     Refuses when any of: the apply gate is closed, the attestation is missing, budgets
     are exhausted, no active mapping generation is present, the source is discontinuous,
-    or writes are paused. Daemon cycles consult this in APPLY mode.
+    or writes are paused. Daemon cycles consult this in APPLY mode; campaign apply consults
+    it with ``campaign=True`` so a daemon-lease write pause never blocks an authorized campaign.
     """
     active = load_active(deps.mapping_store, _load_overrides(deps))
-    flags = _eligibility_flags(deps, active is not None)
+    flags = _eligibility_flags(deps, active is not None, campaign=campaign)
     reasons: list[str] = []
     if deps.store.writes_disabled:
         reasons.append("writes_disabled")
@@ -553,22 +585,96 @@ def compute_eligibility(deps: DaemonDeps, now_iso: str) -> EligibilityVerdict:  
 # ------------------------------------------------------------------ attestation gate
 
 
+def _clear_gate_pause(
+    deps: DaemonDeps, gate_key: str, now_iso: str, is_campaign: bool
+) -> tuple[str, ...]:
+    """Clear a persisted pause on the first invalid→valid transition for one scope."""
+    reasons: list[str] = []
+    gate = deps.store.get_meta(gate_key)
+    if (
+        not is_campaign
+        and gate == "paused"
+        and deps.store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON
+    ):
+        with contextlib.suppress(WriteDisabledError, StateError):
+            deps.store.resume(now_iso)
+            deps.store.set_meta(gate_key, "valid")
+        reasons.append("attestation_resumed")
+    elif gate != "valid":
+        with contextlib.suppress(WriteDisabledError, StateError):
+            deps.store.set_meta(gate_key, "valid")
+        if is_campaign and gate == "paused":
+            # F4: the campaign gate meta is cleared, but the campaign itself stays PAUSED (the
+            # operator resumes it via 'campaign resume') — report the gate clear, not a resume.
+            reasons.append("campaign_attestation_gate_cleared")
+    return tuple(reasons)
+
+
+def _persist_gate_pause(
+    deps: DaemonDeps,
+    gate_key: str,
+    now_iso: str,
+    *,
+    is_campaign: bool,
+    campaign_id: str | None,
+    status: str,
+    reason: str,
+) -> tuple[str, ...]:
+    """Persist the once-per-transition pause for one scope (idempotent campaign status)."""
+    log = logging.getLogger(__name__)
+    reasons: list[str] = []
+    gate = deps.store.get_meta(gate_key)
+    if is_campaign and campaign_id is not None:
+        # P2-3: idempotently persist the campaign status pause on EVERY invalid cycle so a
+        # resumed campaign whose lease dies is re-paused (drops out of drain selection), even
+        # when the gate meta is already "paused". No-op safe if already paused.
+        with contextlib.suppress(WriteDisabledError, StateError):
+            deps.store.set_campaign_status(
+                campaign_id, CAMPAIGN_STATUS_PAUSED, ATTESTATION_PAUSE_REASON, iso=now_iso
+            )
+    if gate != "paused":
+        with contextlib.suppress(WriteDisabledError, StateError):
+            if not is_campaign:
+                deps.store.pause(ATTESTATION_PAUSE_REASON, now_iso)
+            deps.store.set_meta(gate_key, "paused")
+        log.warning(
+            "safety attestation is %s (%s) for scope %s: writes for this scope are paused "
+            "(persisted, once per transition); the daemon stays alive reporting read-only",
+            status,
+            reason,
+            gate_key,
+        )
+        reasons.append("attestation_pause_persisted")
+    else:
+        reasons.append("attestation_pause_active")
+    return tuple(reasons)
+
+
 def attestation_gate(
     deps: DaemonDeps,
     now_iso: str,
     *,
     mutate: bool = True,
+    scope: str = SCOPE_DAEMON,
+    campaign_id: str | None = None,
 ) -> tuple[str, ...]:
-    """Compute the attestation gate and the persisted pause *transition* (once).
+    """Compute the attestation gate and the persisted pause *transition* (once) for one scope.
 
-    A lease that is absent/invalid/expired/stale suppresses apply (the eligibility
-    conjunction already refuses with ``attestation_invalid``). The first valid→invalid
-    transition persists one write pause (``attestation_expired``) and logs a warning;
-    repeated invalid cycles do **not** re-pause (no restart loop, daemon stays alive
-    reporting read-only). The first invalid→valid transition clears the pause **only when
-    the pause reason is exactly ``attestation_expired``** (a mapping-churn pause is never
-    cleared here). ``mutate=False`` (daemon DRY_RUN) computes the verdict and warns
-    without touching the persisted gate state.
+    A lease that is absent/invalid/expired/stale suppresses apply for **its own scope** (the
+    eligibility conjunction already refuses with ``attestation_invalid``). The first
+    valid→invalid transition persists one pause for that scope and logs a warning; repeated
+    invalid cycles do **not** re-pause (no restart loop, daemon stays alive reporting
+    read-only). The first invalid→valid transition clears the pause.
+
+    F8 scope separation: the **daemon** scope persists a global write pause
+    (``attestation_expired`` via :meth:`shoko_linker.state.StateStore.pause`) under
+    ``META_ATTESTATION_GATE``; the invalid→valid transition clears it only when the pause reason
+    is exactly ``attestation_expired`` (a mapping-churn pause is never cleared here). The
+    **campaign** scope never touches the global write pause — it records a per-campaign gate
+    (``META_CAMPAIGN_ATTESTATION_GATE:<id>``) and idempotently pauses the campaign via
+    ``set_campaign_status`` so a campaign-lease failure stops only that campaign's submissions,
+    never daemon writes. ``mutate=False`` (daemon DRY_RUN) computes the verdict and warns
+    without touching persisted gate state.
 
     Without a verdict seam (pure-bool M6-a wiring) this is a no-op: the bool input stays
     authoritative and no pause bookkeeping happens.
@@ -577,46 +683,43 @@ def attestation_gate(
     if verdict is None:
         return ()
     reasons: list[str] = []
-    logging.getLogger(__name__).debug(
-        "attestation gate: status=%s reason=%s", verdict.status, verdict.reason
+    log = logging.getLogger(__name__)
+    is_campaign = scope != SCOPE_DAEMON
+    if is_campaign and campaign_id is None:
+        # P3-7: a campaign scope with no campaign_id would silently share the daemon gate key.
+        raise ValueError("attestation_gate: a campaign scope requires an explicit campaign_id")
+    gate_key = (
+        f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}" if is_campaign else META_ATTESTATION_GATE
+    )
+    log.debug(
+        "attestation gate: scope=%s status=%s reason=%s", scope, verdict.status, verdict.reason
     )
     if verdict.valid_for_apply:
         if verdict.warn:
             reasons.append("attestation_expires_soon")
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "safety attestation expires soon (%s): re-record the lease before "
                 "apply resumes being refused",
                 verdict.reason,
             )
         if not mutate:
             return tuple(reasons)
-        gate = deps.store.get_meta(META_ATTESTATION_GATE)
-        if gate == "paused" and deps.store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON:
-            with contextlib.suppress(WriteDisabledError, StateError):
-                deps.store.resume(now_iso)
-                deps.store.set_meta(META_ATTESTATION_GATE, "valid")
-            reasons.append("attestation_resumed")
-        elif gate != "valid":
-            with contextlib.suppress(WriteDisabledError, StateError):
-                deps.store.set_meta(META_ATTESTATION_GATE, "valid")
+        reasons.extend(_clear_gate_pause(deps, gate_key, now_iso, is_campaign))
         return tuple(reasons)
     reasons.append(f"attestation_{verdict.status}")
     if not mutate:
         return tuple(reasons)
-    gate = deps.store.get_meta(META_ATTESTATION_GATE)
-    if gate != "paused":
-        with contextlib.suppress(WriteDisabledError, StateError):
-            deps.store.pause(ATTESTATION_PAUSE_REASON, now_iso)
-            deps.store.set_meta(META_ATTESTATION_GATE, "paused")
-        logging.getLogger(__name__).warning(
-            "safety attestation is %s (%s): writes are paused (persisted, once per "
-            "transition); the daemon stays alive reporting read-only",
-            verdict.status,
-            verdict.reason,
+    reasons.extend(
+        _persist_gate_pause(
+            deps,
+            gate_key,
+            now_iso,
+            is_campaign=is_campaign,
+            campaign_id=campaign_id,
+            status=verdict.status,
+            reason=verdict.reason,
         )
-        reasons.append("attestation_pause_persisted")
-    else:
-        reasons.append("attestation_pause_active")
+    )
     return tuple(reasons)
 
 
@@ -1181,11 +1284,16 @@ def _process_candidate(
     now_iso: str,
 ) -> _ApplyOutcome:
     """One file's guarded send: eligibility → preflight → prepare → mark_sent → submit → verify."""
+    # F2: the attestation lease and the apply gate are re-evaluated per candidate, not from the
+    # cycle-start snapshot, so a lease that expires (or a gate that closes) mid-cycle stops the
+    # remaining submissions. A blocked candidate defers (stays planned) — never quarantined.
+    attestation_ok = deps.attestation_valid()
+    gate_open = apply_gate(deps.settings)
     verdict = deps.store.can_auto_apply(
         file_id,
         now=now_iso,
-        attestation_valid=flags.attestation,
-        gate_open=flags.gate,
+        attestation_valid=attestation_ok,
+        gate_open=gate_open,
         budgets_ok=flags.budgets_ok,
         mapping_stable=flags.mapping_stable,
         source_stable=flags.source_stable,
@@ -1197,8 +1305,8 @@ def _process_candidate(
         plan,
         deps.settings,
         folders,
-        attestation_valid=flags.attestation,
-        apply_gate_open=flags.gate,
+        attestation_valid=attestation_ok,
+        apply_gate_open=gate_open,
         queue=queue,
         active_targets_digest=active.targets_digest,
         active_structure_digest=active.structure_digest,
@@ -1711,11 +1819,19 @@ def _run_cycle_body(
     )
 
     # F7: drain ONE bounded batch of the oldest approved backlog campaign through the full
-    # campaign guard chain, under this same cycle's apply lock (lock_held). Only in APPLY
-    # mode on an eligible, reconciliation-ready cycle, and only when the operator opted in
-    # (campaign.daemon_auto_apply). Manual CLI campaign apply stays fully available.
+    # campaign guard chain, under this same cycle's apply lock (lock_held). Only in APPLY mode
+    # on a reconciliation-ready, churn-stable cycle, and only when the operator opted in
+    # (campaign.daemon_auto_apply). F8: this gate does NOT require the daemon's own apply
+    # eligibility — an authorized campaign drains even when the daemon lease is invalid (the
+    # campaign applies its own campaign-scope lease and eligibility inside apply_campaign).
+    # Manual CLI campaign apply stays fully available.
     campaign_report: Any | None = None
-    if mode is CycleMode.APPLY and apply_running and deps.settings.campaign.daemon_auto_apply:
+    if (
+        mode is CycleMode.APPLY
+        and reconciliation_ready
+        and not phase.churn_paused
+        and deps.settings.campaign.daemon_auto_apply
+    ):
         campaign_report = _drain_campaign(deps, now_iso, reasons)
 
     counts = _final_counts(

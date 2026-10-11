@@ -1053,7 +1053,11 @@ def wire_campaign_env(env: CampaignEnv, monkeypatch: Any) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     monkeypatch.setattr(cli, "open_state_store", open_state)
     monkeypatch.setattr(cli, "state_path", lambda settings: world.tmp_path / "state.sqlite3")
-    monkeypatch.setattr(cli, "attestation_target_path", lambda settings: env.lease)
+    monkeypatch.setattr(
+        cli,
+        "attestation_target_path",
+        lambda settings, scope=SCOPE_DAEMON, *, for_write=False: env.lease,
+    )
     monkeypatch.setattr(cli, "current_iso", lambda: env.now)
     monkeypatch.setattr(cli, "sleep", lambda seconds: None)
     monkeypatch.setattr(cli, "interruptible_sleep", lambda seconds: None)

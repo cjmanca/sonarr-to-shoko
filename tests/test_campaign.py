@@ -26,7 +26,13 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import cli
-from shoko_linker.attestation import build_record, write_attestation
+from shoko_linker.attestation import (
+    SCOPE_DAEMON,
+    build_record,
+    campaign_lease_path,
+    load_attestation,
+    write_attestation,
+)
 from shoko_linker.campaign import (
     CampaignApplyReport,
     CampaignDigestMismatchError,
@@ -43,6 +49,8 @@ from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
 from shoko_linker.state import (
+    ATTESTATION_PAUSE_REASON,
+    CAMPAIGN_STATUS_APPROVED,
     BaselineFile,
     FileState,
     StateStore,
@@ -106,6 +114,7 @@ class Stubs:
     linked: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     shoko_requests: list[httpx.Request] = field(default_factory=list)
+    post_hook: Callable[[int], None] | None = None
 
     def size(self, spec: SpecFile) -> int:
         return self.sizes.get(spec.shoko_id, FILE_SIZE)
@@ -223,6 +232,8 @@ class Stubs:
             spec = next(item for item in self.specs if item.shoko_id == file_id)
             if file_id not in self.verify_empty:
                 self.linked[file_id] = [self.xref(spec)]
+            if self.post_hook is not None:
+                self.post_hook(file_id)
             return httpx.Response(200, json={}, request=request)
         if path == "/api/v3/ImportFolder":
             return httpx.Response(
@@ -404,7 +415,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
         ),
     )
     monkeypatch.setattr(cli, "state_path", lambda settings: environment.tmp_path / "state.sqlite3")
-    monkeypatch.setattr(cli, "attestation_target_path", lambda settings: environment.lease_path)
+    monkeypatch.setattr(
+        cli,
+        "attestation_target_path",
+        lambda settings, scope=SCOPE_DAEMON, *, for_write=False: environment.lease_path,
+    )
     monkeypatch.setattr(cli, "current_iso", lambda: environment.now_iso)
     monkeypatch.setattr(cli, "sleep", lambda seconds: None)
 
@@ -2013,5 +2028,666 @@ def test_daemon_drain_aggregates_per_file_reasons(
         ]
         expected = f"batch_limit:x{COUNT_FIVE - BATCH_TWO - 1}:first=batch_limit:503"
         assert batch_limit_entries == [expected]
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------------------ F8: independent lease scopes
+
+
+def _tmp_posix(tmp_path: Path, name: str) -> str:
+    """POSIX absolute string for ``tmp_path/<name>`` that ``Path`` resolves identically.
+
+    ``safety.attestation_file`` must be POSIX-style; stripping the drive letter yields a rooted
+    string that ``Path`` maps to the same on-disk location on the current drive (where pytest's
+    tmp_path lives), so the real scope-aware resolver is exercised against real files.
+    """
+    posix = tmp_path.as_posix()
+    if len(posix) >= 2 and posix[1] == ":":
+        posix = posix[2:]
+    return f"{posix}/{name}"
+
+
+def _dual_document(lease_posix: str) -> dict[str, Any]:
+    document = _document(Path(lease_posix))
+    document["safety"]["attestation_file"] = lease_posix
+    document["sync"]["max_new_per_cycle"] = 20
+    document["sync"]["max_pending_episode_jobs"] = 20
+    document["sync"]["new_file_grace_period_seconds"] = 0
+    document["campaign"] = {
+        "max_campaign_files": 7000,
+        "max_batch_size": BATCH_TWO,
+        "daemon_auto_apply": True,
+    }
+    return document
+
+
+@dataclass
+class DualEnv:
+    """Production co-existence fixture: real scope-aware resolver, daemon + campaign sibling leases.
+
+    The daemon lease lives at ``safety.attestation_file``; each campaign lease lives in its
+    deterministic sibling. ``attestation_target_path`` is NOT monkeypatched — the real resolver
+    selects the right file per scope, exactly as the daemon/CLI wiring does in production.
+    """
+
+    tmp_path: Path
+    stubs: Stubs
+    config_path: Path
+    lease: Path
+    now_iso: str = T0
+
+    def open_store(self) -> StateStore:
+        return StateStore(
+            self.tmp_path / "state.sqlite3",
+            budget_limits=cli.budget_limits_from_settings(load_settings(self.config_path)),
+        )
+
+    def write_daemon_lease(self, *, hours: float = 24.0) -> None:
+        record = build_record(
+            endpoint=SHOKO_BASE,
+            version="5.3.3",
+            mounts=["/anime read-only (host-inspected)"],
+            settings_flags={
+                "FileQualityFilterEnabled": False,
+                "RenameOnImport": False,
+                "MoveOnImport": False,
+                "MyListAddFiles": False,
+            },
+            inspected_iso=self.now_iso,
+            expires_iso=_iso_plus(self.now_iso, hours * 3600.0),
+            scope=SCOPE_DAEMON,
+            operator_note="daemon lease",
+        )
+        write_attestation(self.lease, record, overwrite=True)
+
+    def write_campaign_lease(self, campaign_id: str, *, hours: float = 24.0) -> None:
+        target = campaign_lease_path(self.lease, campaign_id)
+        record = build_record(
+            endpoint=SHOKO_BASE,
+            version="5.3.3",
+            mounts=["/anime read-only (host-inspected)"],
+            settings_flags={
+                "FileQualityFilterEnabled": False,
+                "RenameOnImport": False,
+                "MoveOnImport": False,
+                "MyListAddFiles": False,
+            },
+            inspected_iso=self.now_iso,
+            expires_iso=_iso_plus(self.now_iso, hours * 3600.0),
+            scope=f"campaign:{campaign_id}",
+            operator_note="campaign lease",
+        )
+        write_attestation(target, record, overwrite=True)
+
+    def write_expired_campaign_lease(self, campaign_id: str) -> None:
+        """Overwrite the campaign sibling with a lease already expired at ``now_iso``."""
+        target = campaign_lease_path(self.lease, campaign_id)
+        record = build_record(
+            endpoint=SHOKO_BASE,
+            version="5.3.3",
+            mounts=["/anime read-only (host-inspected)"],
+            settings_flags={
+                "FileQualityFilterEnabled": False,
+                "RenameOnImport": False,
+                "MoveOnImport": False,
+                "MyListAddFiles": False,
+            },
+            inspected_iso=_iso_plus(self.now_iso, -7200.0),
+            expires_iso=_iso_plus(self.now_iso, -3600.0),
+            scope=f"campaign:{campaign_id}",
+            operator_note="expired campaign lease",
+        )
+        write_attestation(target, record, overwrite=True)
+
+    def campaign_deps(self, store: StateStore, campaign_id: str) -> Any:
+        """Daemon deps wired to the campaign-scope lease (the CLI campaign-apply wiring)."""
+        settings = load_settings(self.config_path)
+        return cli.build_daemon_deps(
+            settings,
+            store=store,
+            mapping_store=cli.open_mapping_store(settings),
+            max_submissions=settings.sync.max_new_per_cycle,
+            overrides_text=None,
+            attestation_scope=f"campaign:{campaign_id}",
+        )
+
+    def daemon_deps(self, store: StateStore) -> Any:
+        """Production daemon deps: daemon-scope lease + campaign-scope hooks (the CLI wiring)."""
+        settings = load_settings(self.config_path)
+        return cli.build_daemon_deps(
+            settings,
+            store=store,
+            mapping_store=cli.open_mapping_store(settings),
+            max_submissions=settings.sync.max_new_per_cycle,
+            overrides_text=cli.read_overrides_text(settings),
+        )
+
+    def daemon_cycle(self, store: StateStore, cycle_key: str) -> Any:
+        return run_cycle(
+            self.daemon_deps(store),
+            now_iso=self.now_iso,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key=cycle_key,
+        )
+
+
+@pytest.fixture
+def dual_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DualEnv:
+    lease = Path(_tmp_posix(tmp_path, "lease.yaml"))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(_dual_document(lease.as_posix())), encoding="utf-8")
+    environment = DualEnv(tmp_path=tmp_path, stubs=Stubs(), config_path=config_path, lease=lease)
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    monkeypatch.setattr(
+        cli,
+        "open_state_store",
+        lambda settings: StateStore(
+            environment.tmp_path / "state.sqlite3",
+            budget_limits=cli.budget_limits_from_settings(settings),
+        ),
+    )
+    monkeypatch.setattr(cli, "state_path", lambda settings: environment.tmp_path / "state.sqlite3")
+    # attestation_target_path is deliberately NOT patched: the real scope-aware resolver runs.
+    monkeypatch.setattr(cli, "current_iso", lambda: environment.now_iso)
+    monkeypatch.setattr(cli, "sleep", lambda seconds: None)
+    monkeypatch.setattr(cli, "interruptible_sleep", lambda seconds: None)
+
+    def _endpoint(handler: Any, base: str) -> ApiEndpoint:
+        client = httpx.Client(
+            base_url=base,
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            timeout=httpx.Timeout(5.0),
+        )
+        return ApiEndpoint(client, lambda: {})
+
+    monkeypatch.setattr(
+        cli, "sonarr_endpoint", lambda settings: _endpoint(environment.stubs.sonarr, SONARR_BASE)
+    )
+    monkeypatch.setattr(
+        cli, "shoko_endpoint", lambda settings: _endpoint(environment.stubs.shoko, SHOKO_BASE)
+    )
+
+    def _source(store: Any, settings: Any) -> ApiEndpoint:
+        client = httpx.Client(
+            base_url="https://raw.githubusercontent.com/",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, headers={"ETag": '"s"'}, content=_source_xml(), request=request
+                )
+            ),
+            follow_redirects=False,
+            timeout=httpx.Timeout(5.0),
+        )
+        return ApiEndpoint(client, lambda: {"Accept-Encoding": "identity"})
+
+    monkeypatch.setattr(cli, "source_endpoint", _source)
+    monkeypatch.setattr(
+        cli, "open_mapping_store", lambda settings: MappingStore(environment.tmp_path / "mappings")
+    )
+    monkeypatch.setattr(cli, "read_overrides_text", lambda settings: None)
+    return environment
+
+
+def _dual_seed_mapping(env: DualEnv) -> None:
+    store = MappingStore(env.tmp_path / "mappings")
+    settings = load_settings(env.config_path)
+    endpoint = cli.source_endpoint(store, settings)
+    try:
+        mapping_refresh(
+            store, endpoint, now=datetime.fromisoformat(T0), refresh_hours=168.0, force=True
+        )
+    finally:
+        endpoint.client.close()
+
+
+def _dual_prepare(env: DualEnv, capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    _dual_seed_mapping(env)
+    assert (
+        main(
+            [
+                "campaign",
+                "prepare",
+                str(env.config_path),
+                "--out",
+                str(env.tmp_path / "plan.json"),
+                "--deadline-hours",
+                "168",
+                "--json",
+            ]
+        )
+        == EXIT_OK
+    )
+    return cast("dict[str, Any]", json.loads(capsys.readouterr().out))
+
+
+def _dual_approve(env: DualEnv, capsys: pytest.CaptureFixture[str], digest: str) -> None:
+    assert (
+        main(
+            [
+                "campaign",
+                "approve",
+                str(env.config_path),
+                "--plan",
+                str(env.tmp_path / "plan.json"),
+                "--digest",
+                digest,
+                "--json",
+            ]
+        )
+        == EXIT_OK
+    )
+    capsys.readouterr()
+
+
+def _dual_canary(env: DualEnv, store: StateStore, capsys: pytest.CaptureFixture[str]) -> None:
+    """The operator's manual first batch: one file through the CLI campaign-apply path.
+
+    The CLI apply path resolves the ``campaign:<id>`` scope to the sibling lease.
+    """
+    assert (
+        main(
+            [
+                "campaign",
+                "apply",
+                str(env.config_path),
+                "--plan",
+                str(env.tmp_path / "plan.json"),
+                "--batch-size",
+                "1",
+                "--json",
+            ]
+        )
+        == EXIT_OK
+    )
+    capsys.readouterr()
+
+
+def _seed_backlog_and_new(env: DualEnv) -> None:
+    """specs 0,1 are baseline backlog (campaign files); specs 2..4 are new arrivals."""
+    all_specs = specs(COUNT_FIVE)
+    env.stubs.specs = all_specs
+    store = env.open_store()
+    try:
+        store.record_baseline(
+            [
+                BaselineFile(
+                    sonarr_series_id=s.series_id,
+                    sonarr_file_id=s.file_id,
+                    path=_sonarr_path(s),
+                    size=FILE_SIZE,
+                )
+                for s in all_specs[:2]
+            ],
+            complete=True,
+            auto_apply_eligible=True,
+            iso=T0,
+        )
+    finally:
+        store.close()
+
+
+def _dual_campaign(env: DualEnv, capsys: pytest.CaptureFixture[str]) -> str:
+    """Seed a 2-file backlog campaign, approve it, and write its campaign-scope sibling lease."""
+    _seed_backlog_and_new(env)
+    prepared = _dual_prepare(env, capsys)
+    _dual_approve(env, capsys, prepared["approval_digest"])
+    campaign_id = cast(str, prepared["campaign_id"])
+    env.write_campaign_lease(campaign_id)
+    return campaign_id
+
+
+def test_both_leases_valid_campaign_drains_and_daemon_submits(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8 acceptance: a daemon lease and a campaign lease are simultaneously valid; the
+    campaign drains backlog AND the daemon submits new arrivals in the same cycle."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        posts_after_canary = len(env.stubs.posts)
+        assert posts_after_canary == 1
+        cycle = env.daemon_cycle(store, "both-valid")
+        assert cycle.alive is True
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == 1  # backlog 501 drained
+        assert cycle.counts.submitted == COUNT_FIVE - 2  # new arrivals 502,503,504
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == 2
+        assert store.get_meta("attestation_gate") == "valid"
+    finally:
+        store.close()
+    assert set(env.stubs.posted_files) == {500, 501, 502, 503, 504}
+
+
+def test_daemon_lease_expired_campaign_still_drains(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8 core: an expired daemon lease pauses only daemon writes.
+
+    An authorized campaign must still drain in the same cycle.
+    """
+    env = dual_env
+    _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        # Expire the daemon lease only (campaign lease stays valid), advance the clock.
+        env.write_daemon_lease(hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        posts_before = len(env.stubs.posts)
+        cycle = env.daemon_cycle(store, "daemon-expired")
+        assert cycle.alive is True
+        assert cycle.apply_eligible is False
+        assert cycle.counts.submitted == 0
+        assert store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON
+        assert store.get_meta("attestation_gate") == "paused"
+        # ...and the authorized campaign still drains (backlog 501):
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == 1
+        assert len(env.stubs.posts) == posts_before + 1
+        assert 501 in env.stubs.posted_files
+    finally:
+        store.close()
+
+
+def test_campaign_lease_absent_daemon_still_submits(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8 core: a campaign with no valid lease defers only that campaign.
+
+    The daemon keeps submitting new arrivals in the same cycle.
+    """
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        # Remove the campaign lease (sibling); the daemon lease stays valid.
+        campaign_lease_path(env.lease, campaign_id).unlink()
+        posts_before = len(env.stubs.posts)
+        cycle = env.daemon_cycle(store, "campaign-absent")
+        assert cycle.alive is True
+        assert cycle.apply_eligible is True
+        assert cycle.counts.submitted == COUNT_FIVE - 2
+        assert any(reason.startswith("campaign_deferred:") for reason in cycle.reasons)
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert store.get_meta("attestation_gate") == "valid"
+        # only the 3 new arrivals were posted — backlog 501 was NOT sent by the paused campaign.
+        assert len(env.stubs.posts) == posts_before + (COUNT_FIVE - 2)
+        assert 501 not in env.stubs.posted_files
+    finally:
+        store.close()
+
+
+def test_campaign_lease_expired_does_not_globally_pause_daemon(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8 core: a campaign-lease transition never records the global write pause."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        # Expire the campaign lease only (daemon lease stays valid).
+        env.write_campaign_lease(campaign_id, hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        cycle = env.daemon_cycle(store, "campaign-expired")
+        assert cycle.alive is True
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == ATTESTATION_PAUSE_REASON
+        # daemon writes are NOT globally paused: new arrivals submit in the same cycle.
+        assert store.budget_view().paused_reason is None
+        assert cycle.apply_eligible is True
+        assert cycle.counts.submitted == COUNT_FIVE - 2
+    finally:
+        store.close()
+
+
+def test_both_leases_expired_no_writes_daemon_alive(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8: with both leases expired nothing is submitted; the daemon stays alive read-only."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease(hours=0.5)
+    env.write_campaign_lease(campaign_id, hours=0.5)
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)  # canary at T0 (leases valid at record time)
+        env.now_iso = _iso_plus(T0, 3600.0 + 60.0)
+        posts_before = len(env.stubs.posts)
+        cycle = env.daemon_cycle(store, "both-expired")
+        assert cycle.alive is True
+        assert cycle.counts.submitted == 0
+        assert cycle.campaign is None  # campaign deferred (its lease is expired)
+        assert len(env.stubs.posts) == posts_before
+        assert store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON
+        assert store.get_meta("attestation_gate") == "paused"
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+    finally:
+        store.close()
+
+
+def test_daemon_and_campaign_leases_survive_restart(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8: persisted sibling leases give identical verdicts on a fresh loader read after restart."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    campaign_lease = campaign_lease_path(env.lease, campaign_id)
+
+    settings = load_settings(env.config_path)
+    first_daemon = cli.attestation_verdict_for(settings, scope=SCOPE_DAEMON)
+    first_campaign = cli.attestation_verdict_for(settings, scope=f"campaign:{campaign_id}")
+    assert first_daemon.valid_for_apply is True
+    assert first_campaign.valid_for_apply is True
+
+    # Fresh loader read of the persisted files yields the same verdicts (container restart).
+    reloaded_daemon = load_attestation(
+        env.lease, shoko_url=SHOKO_BASE, now_iso=T0, scope=SCOPE_DAEMON, warn_lead_seconds=3600.0
+    )
+    reloaded_campaign = load_attestation(
+        campaign_lease,
+        shoko_url=SHOKO_BASE,
+        now_iso=T0,
+        scope=f"campaign:{campaign_id}",
+        warn_lead_seconds=3600.0,
+    )
+    assert reloaded_daemon.valid_for_apply is True
+    assert reloaded_campaign.valid_for_apply is True
+    assert reloaded_daemon.digest == first_daemon.digest
+    assert reloaded_campaign.digest == first_campaign.digest
+
+
+def test_operator_pause_blocks_campaign_drain(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-2: the campaign bypass is origin-gated. A plain operator global pause (reason
+    'disk_review', gate meta NOT 'paused') gates every scope, including campaigns."""
+    env = dual_env
+    _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        store.pause("disk_review", env.now_iso)
+        posts_before = len(env.stubs.posts)
+        cycle = env.daemon_cycle(store, "op-pause")
+        assert store.budget_view().paused_reason == "disk_review"
+        assert store.get_meta("attestation_gate") != "paused"
+        assert cycle.counts.submitted == 0  # daemon gated by the pause
+        assert cycle.campaign is None  # campaign drain gated by the pause (no bypass)
+        assert len(env.stubs.posts) == posts_before  # zero campaign POSTs
+    finally:
+        store.close()
+
+
+def test_attestation_pause_lets_campaign_drain(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-2 (preserved): an attestation-gate daemon pause (gate meta 'paused' + reason
+    'attestation_expired') lets an authorized campaign drain."""
+    env = dual_env
+    _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        env.write_daemon_lease(hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        cycle = env.daemon_cycle(store, "attest-pause")
+        assert store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON
+        assert store.get_meta("attestation_gate") == "paused"
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == 1  # backlog 501 drains under the origin-gated bypass
+    finally:
+        store.close()
+
+
+def test_resume_then_lease_expiry_repauses_campaign(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P2-3: after a lease expiry pauses the campaign, a valid-lease resume re-arms the gate
+    meta, so the next expiry re-pauses the campaign (no head-of-line APPROVED campaign with a
+    dead lease)."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        # First expiry: campaign pauses, gate meta "paused".
+        env.write_campaign_lease(campaign_id, hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        env.daemon_cycle(store, "first-expiry")
+        first = store.get_campaign(campaign_id)
+        assert first is not None
+        assert first.status == "paused"
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+        # Re-record a valid lease, then resume: status approved + gate meta cleared to "valid".
+        env.now_iso = T0
+        env.write_campaign_lease(campaign_id, hours=24.0)
+        assert (
+            main(
+                [
+                    "campaign",
+                    "resume",
+                    str(env.config_path),
+                    "--campaign-id",
+                    campaign_id,
+                    "--note",
+                    "re-attested",
+                    "--confirm",
+                    "--json",
+                ]
+            )
+            == EXIT_OK
+        )
+        capsys.readouterr()
+        resumed = store.get_campaign(campaign_id)
+        assert resumed is not None
+        assert resumed.status == CAMPAIGN_STATUS_APPROVED
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "valid"
+        # Second expiry: the gate sees "valid" → fresh transition → campaign re-paused, not
+        # left APPROVED with a dead lease.
+        env.write_campaign_lease(campaign_id, hours=0.5)
+        env.now_iso = _iso_plus(T0, 3600.0 + 60.0)
+        env.daemon_cycle(store, "second-expiry")
+        second = store.get_campaign(campaign_id)
+        assert second is not None
+        assert second.status == "paused"
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+    finally:
+        store.close()
+
+
+def test_campaign_lease_expiry_mid_batch_defers_second_send(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F1: the campaign lease is re-checked per submission. After the first POST the lease
+    expires, the second file is DEFERRED (transient BLOCKED_SAFETY) — zero POSTs, NO quarantine,
+    the row stays queueable, and a re-attestation re-apply finishes it with no operator
+    review."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)  # backlog 500,501; valid campaign lease
+    store = env.open_store()
+    try:
+        env.stubs.post_hook = lambda file_id: env.write_expired_campaign_lease(campaign_id)
+        report = apply_campaign(
+            env.campaign_deps(store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            env.now_iso,
+            batch_size=2,
+        )
+        assert env.stubs.posted_files == [500]  # first file posted; second never POSTs
+        assert report.submitted == 1
+        assert report.quarantined == 0  # F1: transient safety is a deferral, not quarantine
+        assert report.deferred >= 1
+        assert any(reason.startswith("preflight_deferred:501:") for reason in report.reasons)
+        # 501 stays queueable (planned), NOT quarantined to blocked_safety.
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state in (FileState.PLANNED, FileState.MAPPED)
+        # Re-attestation (fresh valid lease) + re-apply finishes 501, no operator review.
+        env.stubs.post_hook = None
+        env.write_campaign_lease(campaign_id, hours=24.0)
+        second = apply_campaign(
+            env.campaign_deps(store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            env.now_iso,
+            batch_size=2,
+        )
+        assert 501 in env.stubs.posted_files
+        assert second.submitted == 1
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == 2
+    finally:
+        store.close()
+
+
+def test_campaign_gate_clear_reports_accurate_reason(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F4: a valid-lease campaign apply that clears a persisted 'paused' gate meta reports
+    'campaign_attestation_gate_cleared', never 'attestation_resumed' (the campaign is not resumed
+    by the gate)."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)  # approved + valid campaign lease (backlog 500,501)
+    store = env.open_store()
+    try:
+        store.set_meta(f"campaign_attestation_gate:{campaign_id}", "paused")
+        report = apply_campaign(
+            env.campaign_deps(store, campaign_id),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            env.now_iso,
+            batch_size=2,
+        )
+        assert "campaign_attestation_gate_cleared" in report.reasons
+        assert "attestation_resumed" not in report.reasons
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "valid"
     finally:
         store.close()

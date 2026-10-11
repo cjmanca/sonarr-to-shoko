@@ -172,6 +172,9 @@ META_NEXT_CYCLE_DUE_ISO: Final[str] = "next_cycle_due_iso"
 META_LAST_FULL_RECONCILE_ISO: Final[str] = "last_full_reconcile_iso"
 META_NEXT_FULL_RECONCILE_ISO: Final[str] = "next_full_reconcile_iso"
 META_ATTESTATION_GATE: Final[str] = "attestation_gate"
+#: Per-campaign attestation gate bookkeeping key prefix (F8: campaign-scope lease
+#: transitions are tracked per campaign, never as the global daemon write pause).
+META_CAMPAIGN_ATTESTATION_GATE: Final[str] = "campaign_attestation_gate"
 ATTESTATION_PAUSE_REASON: Final[str] = "attestation_expired"
 
 #: OS advisory lock file (the F5 ownership fence) living in the SAME
@@ -1672,7 +1675,7 @@ class StateStore:
             )
 
     def _reserve_tx(
-        self, cycle_key: str, iso: str, *, expected_episode_jobs: int
+        self, cycle_key: str, iso: str, *, expected_episode_jobs: int, campaign: bool = False
     ) -> SlotReservation | BudgetRefusal:
         limits = self._require_limits()
         self._ensure_global_budget_tx()
@@ -1684,7 +1687,15 @@ class StateStore:
         ).fetchone()
         assert global_row is not None
         paused = _as_optional_str(global_row[4])
-        if paused:
+        # F8: the daemon attestation gate's global pause never blocks a campaign
+        # submission — origin-gated on the gate's own marker (gate meta "paused" AND reason
+        # "attestation_expired"). Any other pause reason (churn/source/queue/operator pause)
+        # gates every scope, including campaigns.
+        daemon_attestation_pause = (
+            paused == ATTESTATION_PAUSE_REASON
+            and _as_optional_str(self.get_meta(META_ATTESTATION_GATE)) == "paused"
+        )
+        if paused and not (campaign and daemon_attestation_pause):
             return BudgetRefusal(False, "paused", f"writes paused: {paused}")
         rolling = _as_int(global_row[0], "rolling_new_submissions")
         rolling_start = _as_optional_str(global_row[1])
@@ -1960,7 +1971,12 @@ class StateStore:
                 raise TransitionError(f"file {shoko_file_id} has no tracked row to prepare")
             current = FileState(_as_str(row[0], "state"))
             validate_transition(current, FileState.PREPARED_NOT_SENT)
-            decision = self._reserve_tx(cycle_key, iso, expected_episode_jobs=expected_episode_jobs)
+            decision = self._reserve_tx(
+                cycle_key,
+                iso,
+                expected_episode_jobs=expected_episode_jobs,
+                campaign=campaign_id is not None,
+            )
             if isinstance(decision, BudgetRefusal):
                 return decision
             cursor = self._conn.execute(

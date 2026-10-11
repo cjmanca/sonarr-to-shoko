@@ -80,6 +80,7 @@ from .policies import RunPolicy
 from .shoko import ImportFolder
 from .state import (
     CAMPAIGN_STATUS_APPROVED,
+    META_CAMPAIGN_ATTESTATION_GATE,
     ApplyLockUnavailableError,
     BudgetRefusal,
     CampaignBinding,
@@ -140,6 +141,12 @@ _DEFERRING_PREFLIGHT_REASONS: Final[frozenset[PreflightReason]] = frozenset(
         PreflightReason.QUEUE_UNKNOWN,
         PreflightReason.QUEUE_BLOCKED,
         PreflightReason.TRANSPORT_FAILURE,
+        # F1: BLOCKED_SAFETY is raised only by the transient attestation/gate inputs (never by
+        # plan/mapping/candidacy checks). A lease expiry / gate close mid-batch is a TRANSIENT
+        # safety state: defer (the row stays queueable, no quarantine, no operator review) so it
+        # re-applies after re-attestation. Quarantine stays reserved for the durable
+        # plan/mapping/digest/candidacy reasons.
+        PreflightReason.BLOCKED_SAFETY,
     }
 )
 _SEND_PROGRESS_STATES: Final[frozenset[FileState]] = frozenset(
@@ -935,7 +942,15 @@ def _apply_guards(
             "apply gate closed: campaign apply requires the write gate (sync.apply_changes "
             "and the operator opt-in); nothing was sent"
         )
-    reasons.extend(attestation_gate(deps, now_iso, mutate=True))
+    reasons.extend(
+        attestation_gate(
+            deps,
+            now_iso,
+            mutate=True,
+            scope=f"campaign:{campaign.campaign_id}",
+            campaign_id=campaign.campaign_id,
+        )
+    )
     if not deps.attestation_valid():
         verdict = deps.attestation_verdict()
         raise CampaignError(
@@ -977,7 +992,7 @@ def _apply_sweep(
         raise CampaignError(
             "campaign apply: the reconciliation sweep failed (transport); zero POSTs"
         )
-    eligibility = compute_eligibility(deps, now_iso)
+    eligibility = compute_eligibility(deps, now_iso, campaign=True)
     if not eligibility.eligible:
         _pause_for_eligibility(deps.store, campaign_id, eligibility.reasons, now_iso, reasons)
         raise CampaignError(
@@ -1353,8 +1368,10 @@ def _send_one(
         plan,
         settings,
         folders,
-        attestation_valid=True,
-        apply_gate_open=True,
+        # P2-4: the campaign lease/gate is re-checked per submission, so a lease that expires
+        # mid-batch stops later files (no POST) instead of riding the guard-time verdict.
+        attestation_valid=deps.attestation_valid(),
+        apply_gate_open=apply_gate(settings),
         queue=queue,
         active_targets_digest=active.targets_digest,
         active_structure_digest=active.structure_digest,
@@ -1448,6 +1465,10 @@ def campaign_resume(
     if not gate_open:
         raise CampaignError(f"campaign {campaign_id} resume refused: the apply gate is closed")
     store.set_campaign_status(campaign_id, "approved", "resumed", iso=now_iso)
+    # F8 (P2-3): resume with a valid lease re-arms the campaign gate, so the *next* lease
+    # expiry is recorded as a fresh valid→invalid transition (not skipped as "already
+    # paused") and re-pauses the campaign — no head-of-line approved campaign with a dead lease.
+    store.set_meta(f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}", "valid")
     updated = store.get_campaign(campaign_id)
     assert updated is not None
     return updated
