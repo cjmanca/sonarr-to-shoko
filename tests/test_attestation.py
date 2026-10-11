@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import hash_fixtures as hf
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -298,7 +299,7 @@ def _file_row(env: StubEnv, file_id: int) -> dict[str, Any]:
         "IsIgnored": False,
         "IsVariation": False,
         "Imported": "2024-01-01T00:00:00",
-        "Hashes": {"ED2K": f"e{file_id}", "SHA1": None, "CRC32": file_id, "MD5": None},
+        "Hashes": hf.ed2k_hashes(file_id, 1000, f"{file_id}.mkv"),
         "Locations": [
             {
                 "ID": file_id * 10,

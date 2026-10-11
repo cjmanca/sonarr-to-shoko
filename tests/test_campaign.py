@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+import hash_fixtures as hf
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -164,12 +165,7 @@ class Stubs:
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
-            "Hashes": {
-                "ED2K": f"e{spec.shoko_id}",
-                "SHA1": None,
-                "CRC32": spec.shoko_id,
-                "MD5": None,
-            },
+            "Hashes": hf.ed2k_hashes(spec.shoko_id, self.size(spec), f"{spec.shoko_id}.mkv"),
             "Locations": [
                 {
                     "ID": spec.shoko_id * 10,

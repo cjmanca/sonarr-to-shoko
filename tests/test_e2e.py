@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import e2e_harness as eh
+import hash_fixtures as hf
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -253,7 +254,7 @@ def _shoko_file(file_id: int, size: int, absolute: str) -> ShokoFile:
         is_ignored=False,
         is_variation=False,
         imported="2024-01-01T00:00:00",
-        hashes=ShokoHashes(f"ed2k-{file_id}", None, file_id, None),
+        hashes=ShokoHashes(hf.ed2k_uri("file.mkv", size, file_id), None, file_id, None),
         xref_count=0,
         locations=(location,),
     )
@@ -705,7 +706,12 @@ def _preflight_existing_link(world: eh.World, clock: eh.FakeClock) -> tuple[bool
         shoko_file_id=MANUAL_FILE,
         sonarr_file=sonarr_file,
         shoko_paths=(eh.shoko_path(80, MANUAL_FILE),),
-        hashes=ShokoHashes(f"ed2k-{MANUAL_FILE}", None, MANUAL_FILE, None),
+        hashes=ShokoHashes(
+            hf.ed2k_uri(f"file{MANUAL_FILE}.mkv", sonarr_file.size, MANUAL_FILE),
+            None,
+            MANUAL_FILE,
+            None,
+        ),
     )
     frozen = freeze_plan(
         match,

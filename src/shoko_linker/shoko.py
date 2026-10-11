@@ -15,7 +15,8 @@ malformed ``ListResult`` envelope, a page-cap hit, or a server that ignored
 ``include=AbsolutePaths`` / ``include=XRefs`` mark the snapshot **incomplete**, and
 :func:`match_shoko_files` refuses an incomplete snapshot. Files that are simply not
 candidates (carrying XRefs, variations, ignored files, files with no locations, files
-with no available hashes) are recorded as categorized exclusions and keep the snapshot
+whose hash identity has not settled — no complete, structurally valid ED2K, per
+:func:`has_available_hashes`) are recorded as categorized exclusions and keep the snapshot
 complete. Shoko's ``Imported``
 (``DateTimeImported``) field is **diagnostic only**: it is set once a file is identified
 via AniDB, so a fully hashed file with ``Imported=null`` stays a valid candidate
@@ -41,6 +42,7 @@ hash values are media file hashes, not credentials.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -66,6 +68,16 @@ VALID_DROP_TYPES: Final[frozenset[str]] = frozenset({"None", "Source", "Destinat
 LIST_RESULT_KEYS: Final[frozenset[str]] = frozenset({"Total", "List"})
 _INCLUDE_FLAGS: Final[str] = "XRefs,AbsolutePaths"
 _UNRECOGNIZED_FILTER: Final[str] = "Unrecognized"
+_ED2K_SCHEME: Final[str] = "ed2k://"
+_DECIMAL_RE: Final[re.Pattern[str]] = re.compile(r"[0-9]+")
+_MAX_DECIMAL_DIGITS: Final[int] = 20
+_SHA1_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{40}")
+_MD5_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{32}")
+_CRC32_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{8}")
+_ED2K_HASHLIST_RE: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*=[0-9a-fA-F]+(?:&[A-Za-z][A-Za-z0-9]*=[0-9a-fA-F]+)*"
+)
+_ED2K_CORE_SEGMENTS: Final[int] = 4
 
 
 class SnapshotReason(Enum):
@@ -879,7 +891,7 @@ def _candidate_gate(item: ShokoFile) -> tuple[ExclusionReason, str] | None:
     elif _has_no_hash(item):
         gate = (
             ExclusionReason.NO_HASHES,
-            f"file {item.id} reports no available hashes: identity incomplete "
+            f"file {item.id} reports no settled hash identity: identity incomplete "
             "(hashing not settled), never a link candidate",
         )
     return gate
@@ -1200,8 +1212,75 @@ def _parse_location(item: Any, file_id: int | None) -> tuple[ShokoLocation, bool
 
 
 def has_available_hashes(item: ShokoFile) -> bool:
-    """True when Shoko reported at least one file hash (identity evidence settled)."""
-    return any(value is not None for value in _hash_tuple_values(item.hashes))
+    """True when Shoko reported a **settled, usable** hash identity (the link-eligibility gate).
+
+    Shoko 5.3.3 creates the file record and exposes an **empty** ``ED2K`` string
+    while the file is still being hashed, so "at least one non-null hash value" is
+    not identity evidence and must never admit a link candidate. Settled means the
+    ED2K identity Shoko and AniDB recognize is present and structurally complete —
+    ``ed2k://|file|<name>|<size>|<md5hex>|[<key>=<hex>&…]|/`` with a non-empty
+    name, a decimal size greater than zero, a 32-hex MD5 segment, and an optional
+    hashlist segment of ``key=hex`` pairs — **and** every other populated field is
+    non-empty and structurally plausible: ``sha1`` a 40-hex string, ``md5`` a
+    32-hex string, ``crc32`` an 8-hex string or a non-negative integer. Empty and
+    whitespace-only strings, truncated or malformed URIs, partially populated
+    objects, and values that are neither strings nor integers all mean *not
+    settled*. ``Imported=null`` is irrelevant here: a fully hashed file stays
+    eligible. Values are trimmed for validation only, never rewritten.
+    """
+    return _hashes_settled(item.hashes)
+
+
+def _hashes_settled(hashes: ShokoHashes) -> bool:
+    """Single source of truth for "hashing settled" (snapshot and preflight gates)."""
+    if not _valid_ed2k(hashes.ed2k):
+        return False
+    return (
+        _settled_field(hashes.sha1, _SHA1_HEX_RE, allow_int=False)
+        and _settled_field(hashes.md5, _MD5_HEX_RE, allow_int=False)
+        and _settled_field(hashes.crc32, _CRC32_HEX_RE, allow_int=True)
+    )
+
+
+def _valid_ed2k(value: str | int | None) -> bool:
+    """Canonical ED2K identity URI ``ed2k://|file|<name>|<size>|<md5hex>|[<hashlist>]|/``."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text.startswith(_ED2K_SCHEME):
+        return False
+    body = text[len(_ED2K_SCHEME) :]
+    if not body.startswith("|") or not body.endswith("/"):
+        return False
+    segments = body[1:-1]
+    if segments.endswith("|"):
+        segments = segments[:-1]
+    parts = segments.split("|")
+    if len(parts) not in (_ED2K_CORE_SEGMENTS, _ED2K_CORE_SEGMENTS + 1):
+        return False
+    if parts[0].lower() != "file":
+        return False
+    name, size, md5_segment = parts[1], parts[2], parts[3]
+    hashlist = parts[4] if len(parts) == _ED2K_CORE_SEGMENTS + 1 else ""
+    return (
+        bool(name.strip())
+        and bool(_DECIMAL_RE.fullmatch(size))
+        and len(size) <= _MAX_DECIMAL_DIGITS
+        and int(size) > 0
+        and bool(_MD5_HEX_RE.fullmatch(md5_segment))
+        and (hashlist == "" or bool(_ED2K_HASHLIST_RE.fullmatch(hashlist)))
+    )
+
+
+def _settled_field(value: str | int | None, pattern: re.Pattern[str], *, allow_int: bool) -> bool:
+    """Unreported (``None``) is fine; a populated value must be non-empty and plausible."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return allow_int and value >= 0
+    return bool(pattern.fullmatch(value.strip()))
 
 
 def _has_no_hash(item: ShokoFile) -> bool:
@@ -1231,10 +1310,6 @@ def _file_problems(
 
 def _hash_tuple(identity: ShokoFileIdentity) -> tuple[str | int | None, ...]:
     return (identity.ed2k, identity.sha1, identity.crc32, identity.md5)
-
-
-def _hash_tuple_values(hashes: ShokoHashes) -> tuple[str | int | None, ...]:
-    return (hashes.ed2k, hashes.sha1, hashes.crc32, hashes.md5)
 
 
 def _safe_path(path: str) -> str:

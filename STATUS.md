@@ -19,7 +19,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | F10 — canary authorization inferred from attempted submissions | P1 | PASS (pending final gate) |
 | F11 — campaign batches reuse stale safety/timing decisions | P1 | PASS (pending final gate) |
 | F12 — GHCR provenance fetches manifests as blobs | P2 | PASS (pending final gate) |
-| F13 — empty hashes pass file-readiness check | P2 | TODO |
+| F13 — empty hashes pass file-readiness check | P2 | PASS (pending final gate) |
 | F14 — deployment docs inconsistent campaign instructions | P2 | TODO |
 | Final validation (full checks + simulated campaign + adversarial review) | Gate | TODO |
 
@@ -72,6 +72,16 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 **Deferred P3s:** `_require_digest` message says "blob digest" for child-manifest mismatches (cosmetic); backfill reconciliation list is cap-bounded (reporting completeness only — unverified tags beyond window are excluded from pushes anyway); enumerator reason label `tag-provenance-unverified` reused for proven-absent tags (out-of-scope script).
 
 **Evidence:** `uv run pytest -q` 901 passed (test_ghcr_tags 60, incl. exact /manifests//blobs path assertions, attestation-first ordering, multi-platform determinism, nested index, digest tamper/format, docker schema2 + manifest list, missing/mismatched revision labels, auth classification, repeated-backfill stability); ruff check pass; format clean; mypy clean (44 files + scripts/ghcr_tags.py strict); git diff --check clean. Offline fake transports only — GHCR live behavior EXTERNAL/UNVERIFIED.
+
+## F13 — PASS (local commit this round)
+
+**Design:** `has_available_hashes` (shoko.py) now means "settled hash identity": requires a complete canonical ED2K — `ed2k://|file|<name>|<size>|<md5hex>|<hashlist>|/` (non-empty name, ASCII-decimal size >0 ≤20 digits, 32-hex MD5 segment, optional `key=hex` hashlist pairs) — and every other populated field structurally plausible (sha1 40-hex string, md5 32-hex string, crc32 8-hex string or non-negative int). Empty/whitespace-only strings are empty (not hashes); numeric sha1/md5, booleans, non-string/non-int types rejected; `None` fields = unreported (fine). Partial population (e.g. valid ED2K + `sha1=""`) → unsettled. Validation trims copies only; Shoko-reported values persist unchanged. Single source of truth gates BOTH the snapshot candidate gate (`_candidate_gate` → NO_HASHES exclusion; snapshot stays complete) and the linking preflight (NOT_CANDIDATE, zero POST). `Imported=null` untouched → F1 fully-hashed-eligible fix preserved end-to-end (snapshot match, preflight ok, apply path links with exactly one POST, e2e backlog). Dead `_hash_tuple_values` removed; state.py/daemon.py persistence untouched.
+
+**Review:** single adversarial read-only round: **ACCEPTABLE**, no P0/P1/P2. Probes: ReDoS-safe (all scans linear, 10MB adversarial strings ≤260ms), unicode-digit/`+`/oversized/malformed sizes rejected, no fail-open with decision authority (name segment leniencies are cosmetic — matching is size+path+XRef), numeric sha1/md5 not legitimately Shoko-emittable (parse layer defensive types; gate fail-closed), F1 preserved through full paths, fixture canonicalization strictly stronger (identity-stability placeholders kept off the gate path), no test asserts a previously-ineligible shape eligible.
+
+**Deferred P3s:** ED2K name segment accepts newlines/embedded-scheme/case variants (zero decision authority); leading-zero sizes accepted; unbounded name/hashlist length (linear, bounded cost); no cross-check of ED2K size segment vs `Size` (linking gates `item.size == plan.sonarr_size` separately).
+
+**Evidence:** `uv run pytest -q` 944 passed; ruff check pass; format --check clean (48 files); mypy clean (45 files); git diff --check clean. 43 new gate tests across snapshot/preflight/apply covering all 8 plan scenarios (empty/whitespace/malformed/missing/complete/Imported=null/numeric crc32/partial). Offline only.
 
 ## Constraints
 

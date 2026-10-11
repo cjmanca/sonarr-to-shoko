@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+import hash_fixtures as hf
 import httpx
 import yaml  # type: ignore[import-untyped]
 
@@ -365,19 +366,13 @@ class ShokoStub:
         return httpx.Response(200, json=self._row_payload(row), request=request)
 
     def _row_payload(self, row: ShokoRow) -> dict[str, Any]:
-        ed2k = f"ed2k-{row.file_id}"
         return {
             "ID": row.file_id,
             "Size": row.size,
             "IsIgnored": row.ignored,
             "IsVariation": row.variation,
             "Imported": row.imported,
-            "Hashes": {
-                "ED2K": ed2k,
-                "SHA1": None,
-                "CRC32": row.file_id,
-                "MD5": None,
-            },
+            "Hashes": hf.ed2k_hashes(row.file_id, row.size, f"file{row.file_id}.mkv"),
             "Locations": [self._location_payload(item) for item in row.locations],
             "SeriesIDs": list(row.xrefs),
         }

@@ -15,6 +15,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, TypeVar
 
+import hash_fixtures as hf
 import httpx
 import pytest
 
@@ -192,6 +193,7 @@ def file_json(
     locations: list[dict[str, Any]] | None = None,
     xrefs: list[dict[str, Any]] | None = None,
     imported: str | None = "2024-01-01T00:00:00",
+    hashes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     places = (
         locations
@@ -204,7 +206,7 @@ def file_json(
         "IsIgnored": False,
         "IsVariation": False,
         "Imported": imported,
-        "Hashes": {"ED2K": f"ed2k-{id_}", "SHA1": None, "CRC32": id_, "MD5": None},
+        "Hashes": hf.ed2k_hashes(id_, size) if hashes is None else hashes,
         "Locations": places,
         "SeriesIDs": [] if xrefs is None else xrefs,
     }
@@ -1263,8 +1265,93 @@ def test_apply_path_links_fully_hashed_imported_null_candidate(
     assert stub.post_bodies == [{"EpisodeIDs": [777, 778]}]
 
 
-def test_preflight_blocks_on_echoed_file_id_mismatch(
+PREFLIGHT_ED2K = hf.ed2k_uri("S01E01+02.mkv", SONARR_SIZE, SHOKO_FILE_ID)
+
+UNSETTLED_PREFLIGHT_IDENTITIES: list[tuple[str, dict[str, Any]]] = [
+    (
+        "empty ED2K while Shoko is still hashing the file",
+        {"ED2K": "", "SHA1": None, "CRC32": None, "MD5": None},
+    ),
+    (
+        "empty ED2K with a populated SHA1",
+        {"ED2K": "", "SHA1": hf.hex40(SHOKO_FILE_ID), "CRC32": SHOKO_FILE_ID, "MD5": None},
+    ),
+    ("whitespace-only ED2K", {"ED2K": "  ", "SHA1": None, "CRC32": None, "MD5": None}),
+    ("placeholder-shaped ED2K", {"ED2K": "ed2k-500", "SHA1": None, "CRC32": 500, "MD5": None}),
+    ("garbage ED2K", {"ED2K": "not-a-hash", "SHA1": None, "CRC32": None, "MD5": None}),
+    ("truncated ED2K URI", {"ED2K": PREFLIGHT_ED2K[:-1], "SHA1": None, "CRC32": None, "MD5": None}),
+    (
+        "ED2K with a non-numeric size segment",
+        {"ED2K": PREFLIGHT_ED2K.replace(f"|{SONARR_SIZE}|", "|abc|"), "SHA1": None},
+    ),
+    (
+        "ED2K with an empty MD5 segment",
+        {"ED2K": PREFLIGHT_ED2K.replace(f"|{hf.hex32(SHOKO_FILE_ID)}|", "||"), "SHA1": None},
+    ),
+    ("all-null Hashes object", {"ED2K": None, "SHA1": None, "CRC32": None, "MD5": None}),
+    ("empty SHA1 string", {"ED2K": PREFLIGHT_ED2K, "SHA1": "", "CRC32": None, "MD5": None}),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "hashes"),
+    UNSETTLED_PREFLIGHT_IDENTITIES,
+    ids=[label for label, _ in UNSETTLED_PREFLIGHT_IDENTITIES],
+)
+def test_preflight_blocks_unsettled_hash_identity_on_fresh_read(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    label: str,
+    hashes: dict[str, Any],
+) -> None:
+    # Fresh-read gate (F13): an empty/whitespace/malformed/partially populated Hashes
+    # object is not a settled identity, so the POST is never built on it.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(imported=None, hashes=hashes)
+    verdict = run_preflight(stub, plan, settings)
+    assert verdict.ok is False
+    assert PreflightReason.NOT_CANDIDATE in verdict.reasons
+    assert any("hashing not settled" in detail for detail in verdict.details)
+    assert stub.posts() == []
+
+
+def test_apply_path_refuses_unsettled_hash_identity_without_post(
     base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # Apply path: the preflight gate stops the cycle before any POST is sent.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    empty = {"ED2K": "", "SHA1": None, "CRC32": None, "MD5": None}
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(imported=None, hashes=empty)
+    result = reconcile(stub, plan, settings, dry_run=False)
+    assert result.stage is not ReconcileStage.SUBMITTED
+    assert stub.posts() == []
+
+
+def test_preflight_accepts_complete_ed2k_identity_with_full_hash_set(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # Settled identity at preflight: valid ED2K + 40-hex SHA1 + 8-hex CRC32 + 32-hex MD5,
+    # Imported=null.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    full = hf.full_hashes(SHOKO_FILE_ID, SONARR_SIZE, "S01E01+02.mkv")
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(imported=None, hashes=full)
+    verdict = run_preflight(stub, plan, settings)
+    assert verdict.ok is True
+    assert PreflightReason.NOT_CANDIDATE not in verdict.reasons
+
+
+def test_preflight_blocks_on_echoed_file_id_mismatch(
+    base_document: dict[str, Any],
+    write_document: Writer,
 ) -> None:
     settings = base_settings(base_document, write_document)
     plan = linkable_plan()

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+import hash_fixtures as hf
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -250,7 +251,7 @@ class Stubs:
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
-            "Hashes": {"ED2K": f"ed2k-{file_id}", "SHA1": None, "CRC32": file_id, "MD5": None},
+            "Hashes": hf.ed2k_hashes(file_id, FILE_SIZE, f"{file_id}.mkv"),
             "Locations": [
                 {
                     "ID": file_id * 10,

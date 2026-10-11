@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import hash_fixtures as hf
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -283,7 +284,7 @@ class ShokoStub:
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
-            "Hashes": {"ED2K": f"ed2k-{shoko_id}", "SHA1": None, "CRC32": shoko_id, "MD5": None},
+            "Hashes": hf.ed2k_hashes(shoko_id, FILE_SIZE, f"{shoko_id}.mkv"),
             "Locations": [self._location(file)],
             "SeriesIDs": xrefs,
         }
@@ -2745,7 +2746,7 @@ class _EmptyXRefStub(ShokoStub):
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
-            "Hashes": {"ED2K": f"ed2k-{shoko_id}", "SHA1": None, "CRC32": shoko_id, "MD5": None},
+            "Hashes": hf.ed2k_hashes(shoko_id, FILE_SIZE, f"{shoko_id}.mkv"),
             "Locations": [],
             "SeriesIDs": [],
         }

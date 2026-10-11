@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import hash_fixtures as hf
 import httpx
 import pytest
 
@@ -58,6 +59,7 @@ SMALL_PAGE_SIZE = 2
 SMALL_PAGES = 3
 PAGE_CAP = 4
 CAPPED_FILES = 8
+VALID_ED2K = hf.ed2k_uri("a.mkv", 1000, 112)
 LARGE_TOTAL = 7000
 LARGE_PAGE_SIZE = 1000
 LARGE_PAGES = 7
@@ -169,11 +171,7 @@ def shoko_file(
     ignored: bool = False,
     hashes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    hash_values = (
-        {"ED2K": f"ed2k-{id_}", "SHA1": f"sha1-{id_}", "CRC32": id_, "MD5": f"md5-{id_}"}
-        if hashes is None
-        else hashes
-    )
+    hash_values = hf.full_hashes(id_, size) if hashes is None else hashes
     return {
         "ID": id_,
         "Size": size,
@@ -820,8 +818,164 @@ def test_file_without_available_hashes_is_excluded(
     assert result.matches == ()
 
 
-def test_file_without_locations_is_excluded(
+def hash_shape(
+    ed2k: Any,
+    *,
+    sha1: Any = None,
+    crc32: Any = None,
+    md5: Any = None,
+) -> dict[str, Any]:
+    """A wire ``Hashes`` object with the given (deliberately unsettled) shapes."""
+    return {"ED2K": ed2k, "SHA1": sha1, "CRC32": crc32, "MD5": md5}
+
+
+UNSETTLED_HASH_IDENTITIES: list[tuple[str, dict[str, Any]]] = [
+    ("empty ED2K while Shoko is still hashing the new file", hash_shape("")),
+    ("empty ED2K with a populated SHA1", hash_shape("", sha1=hf.hex40(112), crc32=112)),
+    ("whitespace-only ED2K", hash_shape("   ")),
+    ("placeholder-shaped ED2K", hash_shape("ed2k-112", crc32=112)),
+    ("garbage ED2K", hash_shape("not-a-hash")),
+    ("numeric ED2K", hash_shape(112, crc32=112)),
+    ("ED2K without the ed2k:// scheme", hash_shape(VALID_ED2K.removeprefix(hf.ED2K_SCHEME))),
+    ("truncated ED2K (no closing slash)", hash_shape(VALID_ED2K[:-1])),
+    ("ED2K with a zero size segment", hash_shape(VALID_ED2K.replace("|1000|", "|0|"))),
+    ("ED2K with a negative size segment", hash_shape(VALID_ED2K.replace("|1000|", "|-1000|"))),
+    ("ED2K with a non-numeric size segment", hash_shape(VALID_ED2K.replace("|1000|", "|abc|"))),
+    (
+        "ED2K with an oversized numeric size segment",
+        hash_shape(VALID_ED2K.replace("|1000|", f"|{'9' * 40}|")),
+    ),
+    ("ED2K with an empty MD5 segment", hash_shape(VALID_ED2K.replace(f"|{hf.hex32(112)}|", "||"))),
+    (
+        "ED2K with a short MD5 segment",
+        hash_shape(VALID_ED2K.replace(hf.hex32(112), hf.hex32(112)[:-1])),
+    ),
+    ("ED2K with an empty file name", hash_shape(VALID_ED2K.replace("|a.mkv|", "||"))),
+    ("ED2K with a whitespace-only file name", hash_shape(VALID_ED2K.replace("|a.mkv|", "|   |"))),
+    ("ED2K with a non-file type segment", hash_shape(VALID_ED2K.replace("|file|", "|video|"))),
+    (
+        "ED2K with a non-hex hashlist segment",
+        hash_shape(VALID_ED2K.replace(f"h={hf.hex8(112)}", "h=zz")),
+    ),
+    ("ED2K with an extra segment", hash_shape(VALID_ED2K.replace("|/", "|extra|/"))),
+    ("all-null Hashes object", hash_shape(None)),
+    ("empty SHA1 string", hash_shape(VALID_ED2K, sha1="")),
+    ("whitespace-only MD5 string", hash_shape(VALID_ED2K, md5=" ")),
+    ("short SHA1 string", hash_shape(VALID_ED2K, sha1="a" * 39)),
+    ("non-hex MD5 string", hash_shape(VALID_ED2K, md5="z" * 32)),
+    ("numeric SHA1", hash_shape(VALID_ED2K, sha1=112)),
+    ("empty CRC32 string", hash_shape(VALID_ED2K, crc32="")),
+    ("short CRC32 string", hash_shape(VALID_ED2K, crc32="abc123")),
+    ("negative CRC32 integer", hash_shape(VALID_ED2K, crc32=-1)),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "hashes"),
+    UNSETTLED_HASH_IDENTITIES,
+    ids=[label for label, _ in UNSETTLED_HASH_IDENTITIES],
+)
+def test_unsettled_hash_identity_is_excluded_as_no_hashes(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    label: str,
+    hashes: dict[str, Any],
+) -> None:
+    # Shoko 5.3.3 exposes an empty ED2K string while a new file record is still being
+    # hashed: only a complete, structurally valid ED2K identity (with every populated
+    # field plausible) settles candidacy. Empty/whitespace/malformed/partial shapes are
+    # NO_HASHES exclusions, and the snapshot stays complete for them.
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    entry = shoko_file(
+        112,
+        1000,
+        [location(1120, 112, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
+        imported=None,
+        hashes=hashes,
+    )
+    stub.pages = {1: envelope([entry], 1)}
+    discovery = discover(stub)
+    assert discovery.verdict.complete is True
+    files = sonarr_files((7, 40, f"{SONARR_ROOT}/a.mkv", 1000))
+    result = reconcile(discovery, files, shoko_settings(base_document, write_document))
+    assert [(item.shoko_file_id, item.reason) for item in result.exclusions] == [
+        (112, ExclusionReason.NO_HASHES)
+    ]
+    assert result.matches == ()
+
+
+def test_complete_ed2k_identity_with_numeric_crc32_is_a_candidate(
     base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # ED2K settles the identity; CRC32 in Shoko's numeric form and unreported SHA1/MD5
+    # stay eligible, Imported=null included.
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    entry = shoko_file(
+        113,
+        1000,
+        [location(1130, 113, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
+        imported=None,
+        hashes=hf.ed2k_hashes(113, 1000, "a.mkv"),
+    )
+    stub.pages = {1: envelope([entry], 1)}
+    discovery = discover(stub)
+    assert discovery.verdict.complete is True
+    files = sonarr_files((7, 40, f"{SONARR_ROOT}/a.mkv", 1000))
+    result = reconcile(discovery, files, shoko_settings(base_document, write_document))
+    assert [item.reason for item in result.exclusions] == []
+    assert [match.shoko_file_id for match in result.matches] == [113]
+
+
+def test_full_valid_hash_set_without_xrefs_is_a_candidate(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # ED2K + 40-hex SHA1 + 32-hex MD5 + 8-hex CRC32, zero cross-references: eligible.
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    entry = shoko_file(
+        114,
+        1000,
+        [location(1140, 114, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
+        hashes=hf.full_hashes(114, 1000, "a.mkv"),
+    )
+    stub.pages = {1: envelope([entry], 1)}
+    discovery = discover(stub)
+    assert discovery.verdict.complete is True
+    files = sonarr_files((7, 40, f"{SONARR_ROOT}/a.mkv", 1000))
+    result = reconcile(discovery, files, shoko_settings(base_document, write_document))
+    assert [item.reason for item in result.exclusions] == []
+    assert [match.shoko_file_id for match in result.matches] == [114]
+
+
+def test_ed2k_identity_without_a_hashlist_segment_is_a_candidate(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # The hashlist segment is optional: a complete ED2K identity settles candidacy even
+    # when Shoko reports no per-hash entries at all.
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    no_hashlist = f"{hf.ED2K_SCHEME}|file|a.mkv|1000|{hf.hex32(115)}|/"
+    entry = shoko_file(
+        115,
+        1000,
+        [location(1150, 115, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
+        imported=None,
+        hashes=hash_shape(no_hashlist),
+    )
+    stub.pages = {1: envelope([entry], 1)}
+    discovery = discover(stub)
+    assert discovery.verdict.complete is True
+    files = sonarr_files((7, 40, f"{SONARR_ROOT}/a.mkv", 1000))
+    result = reconcile(discovery, files, shoko_settings(base_document, write_document))
+    assert [item.reason for item in result.exclusions] == []
+    assert [match.shoko_file_id for match in result.matches] == [115]
+
+
+def test_file_without_locations_is_excluded(
+    base_document: dict[str, Any],
+    write_document: Writer,
 ) -> None:
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
@@ -1307,7 +1461,9 @@ def test_file_match_exposes_hash_values_as_received(
     result = reconcile(discovery, files, shoko_settings(base_document, write_document))
     match = result.matches[0]
     assert isinstance(match, FileMatch)
-    assert match.hashes == ShokoHashes("ed2k-500", "sha1-500", 500, "md5-500")
+    assert match.hashes == ShokoHashes(
+        hf.ed2k_uri("file-500.mkv", 1000, 500), hf.hex40(500), 500, hf.hex32(500)
+    )
     assert match.shoko_paths == (f"{SONARR_ROOT}/Show A/S01E01.mkv",)
 
 

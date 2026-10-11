@@ -881,7 +881,7 @@ def _preflight_file(
         )
     elif not has_available_hashes(item):
         disqualifier = (
-            "with no available hashes: identity incomplete (hashing not settled), "
+            "with no settled hash identity: identity incomplete (hashing not settled), "
             "never a link target"
         )
     if disqualifier is not None:
