@@ -9,7 +9,7 @@ Sonarr; Shoko writes are gated. See [PROJECT.md](PROJECT.md) for requirements,
 **Current state: M7-b commands + M9-e2e mocked suite.** The command surface,
 durable SQLite state, the daemon cycle engine, the Anime-Lists cache, the safety
 attestation lease (`attestation status|record|invalidate`), the backlog campaign
-(`campaign prepare|approve|apply|verify|report|pause|resume|revoke`), and the
+(`campaign prepare|approve|apply|verify|report|pause|resume|revoke|authorize-drain|revoke-drain`), and the
 read-only existing-link audit (`audit`) are wired with offline tests. GHCR
 publishing (M8) and delta-fetch light cycles (M9) remain open.
 
@@ -44,7 +44,7 @@ uv run python -m pytest -q
 | `validate` | Offline config validation (`--live-read-only` is not implemented in this build) | none |
 | `config [path] [--check]` | Resolved config path; `--check` loads and validates | none |
 | `once [--dry-run] [--apply] [--policy P] [--max-links N] [--json]` | One reconciliation cycle. Dry-run by default. `--max-links N` caps **POST submissions** (not enumerated files); default `sync.max_new_per_cycle`. `--apply` requires the write gate **and** a valid attestation lease | Sonarr/Shoko reads; writes only through the gated path |
-| `daemon [--cycles N] [--once-signal] [--policy P] [--json]` | The polling loop: interval/backoff/jitter from config, apply only when the gate **and** lease open, SIGINT/SIGTERM stop after the current cycle (an idle daemon wakes from the **interruptible** sleep immediately; a signal during a cycle is honoured once that cycle completes, never mid-write). Cycle metadata persists after every cycle, so health/cadence stay fresh. `--cycles N` (and `--once-signal`) bound the loop for tests/CI. Full/light cadence: light cycles poll the same inventories with halved recovery/apply work budgets; `full_reconcile_interval_hours` forces a full reconcile. **F7:** with `campaign.daemon_auto_apply: true` (default) it drains an **approved** backlog campaign automatically — one bounded batch per apply cycle after the operator's canary — under the same guarded path and apply lock | apply gated |
+| `daemon [--cycles N] [--once-signal] [--policy P] [--json]` | The polling loop: interval/backoff/jitter from config, apply only when the gate **and** lease open, SIGINT/SIGTERM stop after the current cycle (an idle daemon wakes from the **interruptible** sleep immediately; a signal during a cycle is honoured once that cycle completes, never mid-write). Cycle metadata persists after every cycle, so health/cadence stay fresh. `--cycles N` (and `--once-signal`) bound the loop for tests/CI. Full/light cadence: light cycles poll the same inventories with halved recovery/apply work budgets; `full_reconcile_interval_hours` forces a full reconcile. **F7 + F10:** with `campaign.daemon_auto_apply: true` (default) it drains an **approved** backlog campaign automatically — one bounded batch per apply cycle — only after the operator's manual canary **and** the explicit `campaign authorize-drain` confirmation bound to the plan digest; a changed plan fingerprint set invalidates the authorization, and `campaign revoke-drain` stops the drain | apply gated |
 | `report [--json]` | Read-only rollup: state counts by state/cohort, detail roll-up, mapping generation + affected candidates, safety fields (attestation verdict, pause, writes-disabled), campaign summaries, outstanding jobs, coverage % with explicit denominators ("based on last cycle inventory"), liveness / reconciliation-ready / apply-eligible levels | none |
 | `health [--json]` | Cheap liveness: `alive`, `last_cycle_iso`, `cycle_ok`, `mapping_age_hours`, counts (state/meta + cache only) | none |
 | `mappings status [--json]` | Active generation: revision/content/effective/structure digests, age, last attempted/success + outcome, next due, source availability, mapping-affected candidate counts from the state DB. An absent generation is reported with exit 0 (informational) | none |
@@ -56,10 +56,12 @@ uv run python -m pytest -q
 | `campaign approve --plan FILE --digest HEX [--json]` | Approve the campaign by supplying the digest **separately from the file**; a mismatch refuses (exit 2) and prints both digests. Persists the approved campaign row + per-file bindings | none |
 | `campaign apply --plan FILE [--batch-size N] [--json]` | One bounded batch (default/cap `campaign.max_batch_size`) of **approved** candidates through the guarded path. Repeated invocations consume the one approval. Campaign-state refusals (not-approved/revoked/paused/deadline/max-submissions/plan drift/attestation/gate/eligibility) exit 3 with zero POSTs; a malformed plan file exits 2. A queue blocked beyond `sync.queue_blocked_tolerance` **defers** every candidate (zero POSTs, no quarantine) | guarded path for approved files only |
 | `campaign verify --campaign-id ID [--json]` | Re-poll verification of campaign sends (read-only cycle; zero POSTs) | XRef GETs only |
-| `campaign report --campaign-id ID [--plan FILE] [--json]` | Progress (sent/verified/quarantined/remaining), digests, deadline, pause reason; `--plan` also re-checks the plan file digest. `remaining` = plan files with **no** persisted send progress: any file with send progress counts as consumed, including sends that ended in `conflict` (operator-review rows are never counted as "still to send") | none |
+| `campaign report --campaign-id ID [--plan FILE] [--json]` | Progress (sent/verified/quarantined/remaining), digests, deadline, pause reason, and the **drain-authorization state** (`drain_selection`: `authorized` / `drain_not_authorized` / `drain_revoked` / `drain_digest_stale` / `status_*`, plus `drain_authorized_iso`/`drain_authorized_digest`/`drain_invalidated_reason`) so the operator sees why the daemon is skipping a campaign; `--plan` also re-checks the plan file digest. `remaining` = plan files with **no** persisted send progress: any file with send progress counts as consumed, including sends that ended in `conflict` (operator-review rows are never counted as "still to send") | none |
 | `campaign pause --campaign-id ID [--reason TEXT] --note TEXT --confirm [--json]` | Persist a campaign pause with a reason | none |
 | `campaign resume --campaign-id ID --note TEXT --confirm [--json]` | Resume after re-checking the attestation lease (campaign scope) **and** the write gate | none |
 | `campaign revoke --campaign-id ID --note TEXT --confirm [--json]` | Revoke: queued planned/mapped rows return to `waiting` with a reason; rows past `planned` are never rewound; future applies refuse | none |
+| `campaign authorize-drain --campaign-id ID --note TEXT --confirm [--json]` | **F10 drain authorization.** The operator's explicit confirmation that the canary passed: requires an APPROVED campaign whose canary is SETTLED (≥1 submitted file and EVERY submitted campaign file `verified` — a `request_may_have_been_sent`/`verifying`/`partial`/`indeterminate_write`/`conflict` row refuses). The grant binds the campaign's current approval digest and persists across restarts; only the automatic daemon drain consumes it — manual `campaign apply` never requires it. Without this authorization the daemon drains NOTHING | none |
+| `campaign revoke-drain --campaign-id ID --note TEXT --confirm [--json]` | Withdraw the drain authorization: the daemon skips the campaign (`drain_revoked`) with zero further automatic submissions; the campaign status is untouched, so manual `campaign apply` stays available. A re-grant after a fresh review is the operator's decision | none |
 | `audit [--series-anidb N] [--limit N] [--max-requests N] [--json]` | Bounded **read-only** existing-link audit (GETs only, zero writes): classifies already-linked Shoko files against the verified mapping as `linked_consistent` (exact identity-set equality only), `partial_link`, `existing_link_mismatch`, `wrong_first_episode`, `ambiguous_match`, plus `no_sonarr_counterpart`/`audit_incomplete` buckets | Shoko/Sonarr GETs within the request budget |
 | `resolve-send --file-id N --fingerprint FP (--release\|--block) --note TEXT --confirm [--json]` | Operator close of a live terminal-review send (releases the budget slot). Refuses verified/closed rows. A closed send authorizes only a **fresh** re-plan fingerprint | none |
 | `clear-requires-rebaseline --note TEXT --confirm [--json]` | Operator clear of the persisted source-discontinuity flag | none |
@@ -81,7 +83,7 @@ field is documented there).
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success — completed cycle, mapping `activated`/`unchanged` (304)/`not_due`, informational `mappings status`/`report`/`health`/`audit` (an absent generation/state is reported, not an error), a confirmed operator action, a clean `daemon` exit, a campaign `prepare`/`approve`/`apply`/`verify`/`report`/`pause`/`resume`/`revoke` that completed |
+| `0` | Success — completed cycle, mapping `activated`/`unchanged` (304)/`not_due`, informational `mappings status`/`report`/`health`/`audit` (an absent generation/state is reported, not an error), a confirmed operator action, a clean `daemon` exit, a campaign `prepare`/`approve`/`apply`/`verify`/`report`/`pause`/`resume`/`revoke`/`authorize-drain`/`revoke-drain` that completed |
 | `2` | Configuration/request invalid (unknown policy, unconfirmed operator command, bad flags, a malformed plan file — on **any** campaign command including `apply`, plan-file parse/digest-format errors are invalid input —, an `approve` digest mismatch — the refusal prints **both** digests; the message names the failed field, never a secret) |
 | `3` | Apply-gate refusal (`--apply`/campaign `apply` with the default-deny gate shut) **and** campaign-state apply refusals: campaign not approved, revocation, campaign pause, deadline, max-submissions, plan drift, attestation, eligibility |
 | `4` | Runtime/network failure (mapping-source fetch failure, transport-failed cycle, an audit whose Shoko listing failed, `validate --live-read-only` not implemented in this build) |
@@ -176,23 +178,32 @@ uv run shoko-sonarr-linker campaign verify --campaign-id <campaign-id> --json
 uv run shoko-sonarr-linker campaign report --campaign-id <campaign-id> --plan plan.json --json
 
 # 6. Remaining bounded batches — automatic (daemon) or manual (CLI, both remain available)
-#    After the canary above is verified, start the daemon: with campaign.daemon_auto_apply:
-#    true (default) it drains the approved campaign ONE bounded batch per apply cycle, under the
-#    full guard chain, with zero further manual invocations. The one-batch CLI command stays for
-#    manual operation:
+#    After the canary above is verified, the operator inspects the physical-media side effects
+#    (renames, deletions, MyList writes Shoko jobs can cause) and authorizes the automatic drain:
+uv run shoko-sonarr-linker campaign authorize-drain --campaign-id <campaign-id> `
+  --note "canary inspected: side effects reviewed" --confirm
+#    Then start the daemon: with campaign.daemon_auto_apply: true (default) it drains the approved
+#    campaign ONE bounded batch per apply cycle, under the full guard chain, with zero further
+#    manual invocations. Without the authorization it drains NOTHING. The one-batch CLI command
+#    stays for manual operation (it never requires the authorization):
 uv run shoko-sonarr-linker campaign apply --plan plan.json --json   # ≤ campaign.max_batch_size files
 ```
 
-**Daemon auto-drain (F7).** The unattended objective: an approved 7,000-file backlog must not
-need hundreds of manual `campaign apply` invocations. Once the campaign is approved and the
-operator's canary batch has completed (≥1 file with send progress), the daemon drains subsequent
-batches automatically: one bounded batch (≤ `campaign.max_batch_size`) per apply cycle, oldest
-approved campaign first, through the exact same guarded path as `campaign apply` (the daemon's own
+**Daemon auto-drain (F7 + F10).** The unattended objective: an approved 7,000-file backlog must not
+need hundreds of manual `campaign apply` invocations. Once the campaign is approved, the operator's
+canary batch has completed **settled** (≥1 submitted file, every submitted file `verified`
+— `verifying`/`partial`/`indeterminate_write`/`conflict` rows refuse the grant), **and** the operator
+has run `campaign authorize-drain --confirm`, the daemon drains subsequent batches automatically:
+one bounded batch (≤ `campaign.max_batch_size`) per apply cycle, oldest approved campaign first,
+through the exact same guarded path as `campaign apply` (the daemon's own
 apply lock is reused, so a daemon batch and a concurrent CLI `campaign apply` contend for the
 single lock — one apply writer). It never approves a campaign, never expands an approved set, and
 never opens the write gate; pause/resume/revoke, plan drift, mapping drift, deadline, budgets,
 queue, and an expiring campaign lease all stop the drain with persisted state and zero POSTs.
-Set `campaign.daemon_auto_apply: false` to keep campaigns manual-only.
+The authorization binds the plan approval digest: a plan-fingerprint change invalidates it
+(`drain_digest_stale` in `campaign report`), and `campaign revoke-drain` withdraws it
+(`drain_revoked`) — in both cases the operator re-reviews and re-grants. Set
+`campaign.daemon_auto_apply: false` to keep campaigns manual-only.
 
 Rules that the apply path enforces, with persisted evidence:
 
@@ -212,6 +223,11 @@ Rules that the apply path enforces, with persisted evidence:
   campaign pause persisted + report.
 - Pause/resume/revoke are operator commands: revoke returns queued planned/mapped
   rows to `waiting` with a reason and refuses future applies.
+- **Drain authorization (F10):** the daemon's automatic drain runs only with the operator's
+  explicit `campaign authorize-drain` confirmation of a SETTLED canary (every submitted
+  campaign file `verified`); it binds the approval digest, survives restarts, is invalidated by
+  a plan-fingerprint change, and is withdrawn by `campaign revoke-drain`. Manual `campaign apply`
+  never requires it. `campaign report` shows `drain_selection` so the skip reason is visible.
 - `campaign report`'s `remaining` counts plan files with **no** persisted send progress,
   so every file with any send progress is excluded — including `conflict`-state sends
   (operator-review rows are never re-counted as still-to-send).

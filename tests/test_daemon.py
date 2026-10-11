@@ -28,6 +28,7 @@ from shoko_linker.attestation import AttestationVerdict
 from shoko_linker.campaign import (
     apply_campaign,
     approve_campaign,
+    authorize_campaign_drain,
     campaign_send_progress,
     prepare_campaign,
     write_plan_file,
@@ -4021,6 +4022,8 @@ def test_daemon_auto_drains_campaign_batches_with_bounded_history(
     # The operator's manual canary batch (one file) opens the daemon drain.
     canary = apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
     assert canary.submitted == 1
+    # F10: the drain starts only on the operator's explicit, digest-bound confirmation.
+    authorize_campaign_drain(store, plan.campaign_id, T0, note="canary inspected")
     campaign_meta: list[str] = []
 
     def on_complete(report: Any) -> None:
@@ -4167,6 +4170,7 @@ def test_campaign_pending_target_deferrals_trip_zero_progress_then_resume(
         canary = apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
         assert canary.submitted == 1  # the materialized head opens the drain
         assert campaign_send_progress(store, campaign_id) == 1
+        authorize_campaign_drain(store, campaign_id, T0, note="canary inspected")  # F10
         posts_before = len(shoko.posts)
         for index, key in enumerate(("p1", "p2", "p3")):
             report = run_cycle(

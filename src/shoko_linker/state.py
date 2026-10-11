@@ -684,6 +684,11 @@ class CampaignBinding:
 CAMPAIGN_STATUS_APPROVED: Final[str] = "approved"
 CAMPAIGN_BINDING_FIELDS: Final[int] = 3
 CAMPAIGN_PLAN_PATH_COLUMN: Final[int] = 12
+CAMPAIGN_DRAIN_AUTHORIZED_ISO_COLUMN: Final[int] = 13
+CAMPAIGN_DRAIN_AUTHORIZED_DIGEST_COLUMN: Final[int] = 14
+CAMPAIGN_DRAIN_INVALIDATED_REASON_COLUMN: Final[int] = 15
+CAMPAIGN_DRAIN_REVOKED_REASON: Final[str] = "operator_revoked"
+CAMPAIGN_DRAIN_FINGERPRINT_REASON: Final[str] = "plan_fingerprint_set_changed"
 CAMPAIGN_STATUS_PAUSED: Final[str] = "paused"
 CAMPAIGN_STATUS_REVOKED: Final[str] = "revoked"
 CAMPAIGN_STATUSES: Final[frozenset[str]] = frozenset(
@@ -711,6 +716,9 @@ class CampaignRecord:
     created_iso: str
     bindings: tuple[CampaignBinding, ...]
     plan_path: str | None = None
+    drain_authorized_iso: str | None = None
+    drain_authorized_digest: str | None = None
+    drain_invalidated_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -882,6 +890,13 @@ CREATE TABLE sends (
     target_ids_json TEXT NOT NULL DEFAULT '[]',
     slot_released INTEGER NOT NULL DEFAULT 0 CHECK (slot_released IN (0, 1))
 );
+-- F10 drain authorization (schema v1, unshipped — columns, no migration): the daemon
+-- drains an APPROVED campaign only with the operator's explicit confirmation of a settled
+-- (all-VERIFIED) canary. drain_authorized_iso + drain_authorized_digest record the grant
+-- (bound to the campaign's approval digest: a changed digest invalidates selection);
+-- drain_invalidated_reason records why an authorization stopped being valid
+-- ('operator_revoked' / 'plan_fingerprint_set_changed'). Manual campaign apply never
+-- requires it; only the automatic daemon drain does.
 CREATE TABLE campaigns (
     campaign_id TEXT PRIMARY KEY,
     digest TEXT NOT NULL,
@@ -896,7 +911,10 @@ CREATE TABLE campaigns (
     total_sent INTEGER NOT NULL DEFAULT 0,
     last_batch_iso TEXT,
     created_iso TEXT NOT NULL,
-    plan_path TEXT
+    plan_path TEXT,
+    drain_authorized_iso TEXT,
+    drain_authorized_digest TEXT,
+    drain_invalidated_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE budgets (
     window_key TEXT PRIMARY KEY,
@@ -1155,6 +1173,17 @@ def _row_to_campaign(row: Any) -> CampaignRecord:
         plan_path=_as_optional_str(values[CAMPAIGN_PLAN_PATH_COLUMN])
         if len(values) > CAMPAIGN_PLAN_PATH_COLUMN
         else None,
+        drain_authorized_iso=_as_optional_str(values[CAMPAIGN_DRAIN_AUTHORIZED_ISO_COLUMN])
+        if len(values) > CAMPAIGN_DRAIN_AUTHORIZED_ISO_COLUMN
+        else None,
+        drain_authorized_digest=_as_optional_str(values[CAMPAIGN_DRAIN_AUTHORIZED_DIGEST_COLUMN])
+        if len(values) > CAMPAIGN_DRAIN_AUTHORIZED_DIGEST_COLUMN
+        else None,
+        drain_invalidated_reason=(
+            _as_str(values[CAMPAIGN_DRAIN_INVALIDATED_REASON_COLUMN], "drain_invalidated_reason")
+            if len(values) > CAMPAIGN_DRAIN_INVALIDATED_REASON_COLUMN
+            else ""
+        ),
     )
 
 
@@ -3074,7 +3103,9 @@ class StateStore:
         row = self._conn.execute(
             "SELECT campaign_id, digest, max_submissions, deadline_iso, attestation_scope,"
             " approval_iso, status, status_reason, total_sent, last_batch_iso,"
-            " created_iso, plan_fingerprint_set, plan_path FROM campaigns WHERE campaign_id = ?",
+            " created_iso, plan_fingerprint_set, plan_path, drain_authorized_iso,"
+            " drain_authorized_digest, drain_invalidated_reason"
+            " FROM campaigns WHERE campaign_id = ?",
             (campaign_id,),
         ).fetchone()
         if row is None:
@@ -3085,7 +3116,8 @@ class StateStore:
         rows = self._conn.execute(
             "SELECT campaign_id, digest, max_submissions, deadline_iso, attestation_scope,"
             " approval_iso, status, status_reason, total_sent, last_batch_iso, created_iso,"
-            " plan_fingerprint_set, plan_path FROM campaigns ORDER BY campaign_id",
+            " plan_fingerprint_set, plan_path, drain_authorized_iso, drain_authorized_digest,"
+            " drain_invalidated_reason FROM campaigns ORDER BY campaign_id",
         ).fetchall()
         return tuple(_row_to_campaign(row) for row in rows)
 
@@ -3117,18 +3149,33 @@ class StateStore:
                     ),
                 )
                 bound += result.rowcount
-            self._conn.execute(
-                "UPDATE campaigns SET plan_fingerprint_set = ? WHERE campaign_id = ?",
-                (
-                    json.dumps(
-                        [
-                            [b.shoko_file_id, b.plan_fingerprint, b.request_fingerprint]
-                            for b in campaign.bindings
-                        ]
-                    ),
-                    campaign_id,
-                ),
+            stored = self._conn.execute(
+                "SELECT plan_fingerprint_set FROM campaigns WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+            new_set = json.dumps(
+                [
+                    [b.shoko_file_id, b.plan_fingerprint, b.request_fingerprint]
+                    for b in campaign.bindings
+                ]
             )
+            # F10: a refresh that moves the approved fingerprint set outlives any drain
+            # authorization — the operator re-reviews the canary and re-grants.
+            fingerprint_drift = (
+                stored is not None and _as_str(stored[0], "plan_fingerprint_set") != new_set
+            )
+            if fingerprint_drift:
+                self._conn.execute(
+                    "UPDATE campaigns SET plan_fingerprint_set = ?, drain_authorized_iso = NULL,"
+                    " drain_authorized_digest = NULL, drain_invalidated_reason = ?"
+                    " WHERE campaign_id = ?",
+                    (new_set, CAMPAIGN_DRAIN_FINGERPRINT_REASON, campaign_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE campaigns SET plan_fingerprint_set = ? WHERE campaign_id = ?",
+                    (new_set, campaign_id),
+                )
         return bound
 
     @_mutation
@@ -3146,6 +3193,44 @@ class StateStore:
             )
             if result.rowcount == 0:
                 raise StateError(f"campaign {campaign_id!r} does not exist")
+
+    @_mutation
+    def authorize_campaign_drain(self, campaign_id: str, digest: str, *, iso: str) -> None:
+        """F10: persist the operator's explicit drain authorization, bound to the approval digest.
+
+        The grant is durable (it survives a restart) and only the automatic daemon drain reads
+        it — manual ``campaign apply`` never consults it. A campaign whose digest later moves
+        outlives the grant: selection re-checks the binding on every cycle.
+        """
+        _require_iso(iso, "iso")
+        _require_hex64(digest, "drain authorization digest")
+        with self._transaction():
+            result = self._conn.execute(
+                "UPDATE campaigns SET drain_authorized_iso = ?, drain_authorized_digest = ?,"
+                " drain_invalidated_reason = '' WHERE campaign_id = ?",
+                (iso, digest, campaign_id),
+            )
+            if result.rowcount == 0:
+                raise StateError(f"campaign {campaign_id!r} does not exist: nothing to authorize")
+
+    @_mutation
+    def revoke_campaign_drain(self, campaign_id: str, reason: str, *, iso: str) -> None:
+        """F10: withdraw the drain authorization; the reason stays visible in the report.
+
+        The campaign's own status is untouched (manual apply stays available): revocation stops
+        the automatic drain only, and a later re-grant is the operator's decision.
+        """
+        _require_iso(iso, "iso")
+        if not isinstance(reason, str) or not reason.strip():
+            raise StateError("revoke reason must be a non-empty string")
+        with self._transaction():
+            result = self._conn.execute(
+                "UPDATE campaigns SET drain_authorized_iso = NULL, drain_authorized_digest = NULL,"
+                " drain_invalidated_reason = ? WHERE campaign_id = ?",
+                (_clip(reason), campaign_id),
+            )
+            if result.rowcount == 0:
+                raise StateError(f"campaign {campaign_id!r} does not exist: nothing to revoke")
 
     @_mutation
     def record_campaign_send(self, campaign_id: str, iso: str) -> int:

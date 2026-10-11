@@ -291,19 +291,28 @@ uv run shoko-sonarr-linker attestation record config.yaml `
 uv run shoko-sonarr-linker campaign apply config.yaml --plan plan.json --batch-size 1 --json
 uv run shoko-sonarr-linker campaign verify config.yaml --campaign-id <campaign-id> --json
 uv run shoko-sonarr-linker campaign report config.yaml --campaign-id <campaign-id> --plan plan.json --json
+uv run shoko-sonarr-linker campaign authorize-drain config.yaml --campaign-id <campaign-id> `
+  --note "canary inspected: renames/deletions/MyList side effects reviewed" --confirm
 ```
 
-The canary is the operator's **first** campaign batch: once it completes (≥1 file with persisted
-send progress) and physical-media inspection passes, the daemon drains the rest of the approved
-campaign automatically. Keep the daemon's campaign-scope lease valid for the drain window
-(`campaign.daemon_auto_apply: true`, default). The manual `campaign apply` command remains
-available for a batch at any time; a daemon batch and a concurrent CLI `campaign apply` contend for
-the single apply lock, so exactly one writer runs.
+The canary is the operator's **first** campaign batch: once it completes and settles — every
+submitted campaign file is `verified` (an attempted/unverified, `partial`, `indeterminate_write`,
+or `conflict` row refuses the authorization) — and physical-media inspection passes, the operator
+records the explicit, digest-bound **drain authorization** above. Only then does the daemon drain
+the rest of the approved campaign automatically. Keep the daemon's campaign-scope lease valid for
+the drain window (`campaign.daemon_auto_apply: true`, default). The manual `campaign apply` command
+remains available for a batch at any time (it never requires the authorization); a daemon batch and
+a concurrent CLI `campaign apply` contend for the single apply lock, so exactly one
+writer runs. `campaign revoke-drain --confirm` withdraws the authorization later: the daemon
+skips the campaign (`drain_revoked` in `campaign report`) with zero further automatic submissions,
+while manual applies stay available.
 
 Campaign drain rules the daemon enforces every batch (identical to `campaign apply`):
 
-- **Canary first.** The daemon drains an approved campaign; the operator's canary is the
-  first batch, run manually before the daemon is trusted to drain the rest.
+- **Canary first, then authorization.** The daemon drains an approved campaign only after the
+  operator's canary settled AND the digest-bound `campaign authorize-drain` confirmation; a
+  newly approved (unauthorized) campaign is never drained. A plan fingerprint/digest change
+  invalidates the grant (`drain_digest_stale`) and the campaign is skipped until re-authorized.
 - The plan file digest must match the approval digest; a changed plan pauses the campaign
   (`plan_drift`) with zero POSTs.
 - Candidate drift quarantines the file; it is never silently replaced.

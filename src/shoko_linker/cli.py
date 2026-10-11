@@ -70,11 +70,14 @@ from .attestation import (
 )
 from .audit import collect_audit_inputs, run_audit
 from .campaign import (
+    DRAIN_AUTHORIZATION_RULE,
     CampaignDigestMismatchError,
     CampaignError,
     CampaignPlanInvalidError,
     apply_campaign,
     approve_campaign,
+    authorize_campaign_drain,
+    campaign_drain_selection,
     campaign_pause,
     campaign_report,
     campaign_resume,
@@ -83,6 +86,7 @@ from .campaign import (
     plan_digest,
     prepare_campaign,
     read_plan_file,
+    revoke_campaign_drain,
     write_plan_file,
 )
 from .config import (
@@ -692,7 +696,8 @@ def _daemon_preamble(
     bounded = "unbounded (Ctrl+C / SIGTERM)" if stop_after is None else f"bounded: {stop_after}"
     campaign_drain = (
         "approved backlog campaigns drain automatically (one bounded batch per apply cycle, "
-        "after the operator's canary)"
+        "only after the operator's canary AND 'campaign authorize-drain' on the settled, "
+        "verified canary)"
         if settings.campaign.daemon_auto_apply
         else "campaign drain off (campaign.daemon_auto_apply=false): manual CLI only"
     )
@@ -908,7 +913,8 @@ def _print_report(payload: Mapping[str, Any]) -> None:
                     f"{f' ({item['status_reason']})' if item['status_reason'] else ''} "
                     f"sent={item['total_sent']}/{item['max_submissions']} "
                     f"verified={progress.get('verified', 0)} "
-                    f"quarantined={progress.get('quarantined', 0)}"
+                    f"quarantined={progress.get('quarantined', 0)} "
+                    f"drain={item['drain_selection']}"
                 )
         jobs = payload["outstanding_jobs"]
         print(
@@ -1584,6 +1590,13 @@ def _run_campaign_report(args: argparse.Namespace) -> int:
     )
     print(f"  quarantined: {payload['quarantined']}  remaining: {payload['remaining_planned']}")
     print(f"  deadline: {payload['deadline_iso']}  last batch: {payload['last_batch_iso']}")
+    print(
+        f"  drain authorization: {payload['drain_selection']} "
+        f"(authorized_iso={payload['drain_authorized_iso']} "
+        f"digest_bound={payload['drain_authorized_digest']} "
+        f"invalidated={payload['drain_invalidated_reason'] or 'none'})"
+    )
+    print(f"  drain rule: {DRAIN_AUTHORIZATION_RULE}")
     if payload["plan_file_digest"] is not None:
         print(
             f"  plan file digest: {payload['plan_file_digest']} "
@@ -1670,6 +1683,82 @@ def _run_campaign_revoke(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_campaign_authorize_drain(args: argparse.Namespace) -> int:
+    if not cast(bool, args.confirm):
+        print(f"campaign authorize-drain: {_CONFIRM_REQUIRED}")
+        return EXIT_CONFIG_INVALID
+    note = cast(str, args.note)
+    if not note.strip():
+        print(
+            "campaign authorize-drain refused: --note must record the canary inspection "
+            "(physical-media side effects reviewed); nothing was written"
+        )
+        return EXIT_CONFIG_INVALID
+    settings = load_settings(cast(str, args.config))
+    campaign_id = cast(str, args.campaign_id)
+    store = open_state_store(settings)
+    try:
+        campaign = authorize_campaign_drain(store, campaign_id, current_iso(), note=note)
+        result = {
+            "campaign_id": campaign.campaign_id,
+            "drain_authorized": True,
+            "drain_authorized_digest": campaign.drain_authorized_digest,
+            "drain_selection": campaign_drain_selection(campaign),
+        }
+        _record_operator_action(store, "campaign-authorize-drain", note, current_iso(), result)
+    finally:
+        store.close()
+    payload = operator_action_payload(
+        "campaign-authorize-drain", note, iso=current_iso(), result=result
+    )
+    if cast(bool, args.json):
+        print(json_payload(payload))
+    else:
+        print(
+            f"campaign {campaign.campaign_id} drain authorized: every submitted canary file is "
+            f"VERIFIED, bound to approval digest {campaign.drain_authorized_digest}"
+        )
+        print(f"  rule: {DRAIN_AUTHORIZATION_RULE}")
+    return EXIT_OK
+
+
+def _run_campaign_revoke_drain(args: argparse.Namespace) -> int:
+    if not cast(bool, args.confirm):
+        print(f"campaign revoke-drain: {_CONFIRM_REQUIRED}")
+        return EXIT_CONFIG_INVALID
+    note = cast(str, args.note)
+    if not note.strip():
+        print(
+            "campaign revoke-drain refused: --note must record the revocation reason; "
+            "nothing was written"
+        )
+        return EXIT_CONFIG_INVALID
+    settings = load_settings(cast(str, args.config))
+    campaign_id = cast(str, args.campaign_id)
+    store = open_state_store(settings)
+    try:
+        campaign = revoke_campaign_drain(store, campaign_id, current_iso(), note=note)
+        result = {
+            "campaign_id": campaign.campaign_id,
+            "drain_authorized": False,
+            "drain_selection": campaign_drain_selection(campaign),
+        }
+        _record_operator_action(store, "campaign-revoke-drain", note, current_iso(), result)
+    finally:
+        store.close()
+    payload = operator_action_payload(
+        "campaign-revoke-drain", note, iso=current_iso(), result=result
+    )
+    if cast(bool, args.json):
+        print(json_payload(payload))
+    else:
+        print(
+            f"campaign {campaign.campaign_id} drain authorization revoked: the daemon skips it "
+            "(manual campaign apply stays available)"
+        )
+    return EXIT_OK
+
+
 _CAMPAIGN_HANDLERS: Final[dict[str, CommandHandler]] = {
     "prepare": _run_campaign_prepare,
     "approve": _run_campaign_approve,
@@ -1679,6 +1768,8 @@ _CAMPAIGN_HANDLERS: Final[dict[str, CommandHandler]] = {
     "pause": _run_campaign_pause,
     "resume": _run_campaign_resume,
     "revoke": _run_campaign_revoke,
+    "authorize-drain": _run_campaign_authorize_drain,
+    "revoke-drain": _run_campaign_revoke_drain,
 }
 
 
@@ -2024,7 +2115,7 @@ def _add_campaign(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
         "campaign",
         help=(
             "Backlog campaign: prepare / approve / apply / verify / report / "
-            "pause / resume / revoke."
+            "pause / resume / revoke / authorize-drain / revoke-drain."
         ),
     )
     campaign_sub = parser.add_subparsers(
@@ -2105,6 +2196,35 @@ def _add_campaign(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
     revoke.add_argument("--campaign-id", required=True, metavar="ID")
     _add_confirm_note_arguments(revoke)
     _add_json_argument(revoke)
+    _add_campaign_drain_subcommands(campaign_sub)
+
+
+def _add_campaign_drain_subcommands(
+    campaign_sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """F10: the operator drain-authorization pair (grant + withdrawal)."""
+    authorize_drain = campaign_sub.add_parser(
+        "authorize-drain",
+        help=(
+            "Confirm the settled canary and authorize the automatic daemon drain "
+            "(digest-bound; manual apply needs no authorization)."
+        ),
+    )
+    _add_config_argument(authorize_drain)
+    authorize_drain.add_argument("--campaign-id", required=True, metavar="ID")
+    _add_confirm_note_arguments(authorize_drain)
+    _add_json_argument(authorize_drain)
+    revoke_drain = campaign_sub.add_parser(
+        "revoke-drain",
+        help=(
+            "Withdraw the drain authorization: the daemon skips the campaign "
+            "(manual apply stays available)."
+        ),
+    )
+    _add_config_argument(revoke_drain)
+    revoke_drain.add_argument("--campaign-id", required=True, metavar="ID")
+    _add_confirm_note_arguments(revoke_drain)
+    _add_json_argument(revoke_drain)
 
 
 def _add_audit(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:

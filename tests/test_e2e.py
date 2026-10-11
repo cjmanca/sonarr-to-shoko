@@ -1350,11 +1350,13 @@ def test_daemon_drains_approved_campaign_end_to_end_after_canary(
     assert world.shoko.posts_count() == 0  # prepare is dry-run
     env.approve(str(prepared["approval_digest"]))
     capsys.readouterr()
-    # The operator's manual canary (one file) opens the daemon drain.
+    # The operator's manual canary (one file) + the F10 drain authorization open the daemon drain.
     code, payload = env.apply(batch=1)
     assert code == cli.EXIT_OK
     assert payload["submitted"] == 1
     assert world.shoko.posts_count() == 1
+    assert env.authorize_drain(str(prepared["campaign_id"])) == cli.EXIT_OK
+    capsys.readouterr()
     # The daemon cycles drain the remaining 11 files automatically, ≤2 POSTs per cycle.
     store = env.open_store()
     try:

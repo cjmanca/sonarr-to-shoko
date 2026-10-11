@@ -841,12 +841,13 @@ def test_daemon_once_signal_runs_a_single_cycle(
 def test_daemon_preamble_reports_campaign_auto_drain(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """F7: the daemon preamble states that approved campaigns drain automatically (default)."""
+    """F7 + F10: the daemon preamble states auto-drain AND the explicit drain-authorization gate."""
     env.seed_mapping()
     code = main(["daemon", "--cycles", str(CYCLES_ONE), str(env.config_path)])
     out = capsys.readouterr().out
     assert code == EXIT_OK
     assert "campaign drain: approved backlog campaigns drain automatically" in out
+    assert "campaign authorize-drain" in out
 
 
 def test_config_check_shows_campaign_daemon_auto_apply(

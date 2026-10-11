@@ -79,7 +79,9 @@ from .mapping_store import ActiveMappings, load_active
 from .policies import RunPolicy
 from .shoko import ImportFolder
 from .state import (
+    CAMPAIGN_DRAIN_REVOKED_REASON,
     CAMPAIGN_STATUS_APPROVED,
+    CAMPAIGN_STATUS_REVOKED,
     META_CAMPAIGN_ATTESTATION_GATE,
     ApplyLockUnavailableError,
     BudgetRefusal,
@@ -1559,6 +1561,112 @@ def campaign_revoke(store: StateStore, campaign_id: str, now_iso: str) -> int:
     return unbound
 
 
+# ----------------------------------------------------------- drain authorization (F10)
+
+#: The strict rule :func:`authorize_campaign_drain` enforces — documented once, reused by the
+#: CLI output and the selection/report surfaces.
+DRAIN_AUTHORIZATION_RULE: Final[str] = (
+    "drain authorization requires the campaign APPROVED and its canary SETTLED: at least one "
+    "submitted campaign file, and EVERY submitted campaign file VERIFIED (a file in "
+    "request_may_have_been_sent/verifying/partial/indeterminate_write/conflict is unreviewed "
+    "media-side-effect risk and refuses the grant). The grant binds the campaign's CURRENT "
+    "approval digest, persists across restarts, and is invalidated by a digest/plan-fingerprint "
+    "change or an operator revoke. Manual 'campaign apply' never requires it — only the "
+    "automatic daemon drain does."
+)
+
+
+def campaign_drain_selection(campaign: CampaignRecord) -> str:
+    """Why :func:`select_next_daemon_campaign` does (not) drain this campaign (F10).
+
+    ``authorized`` drains; ``drain_not_authorized`` / ``drain_revoked`` / ``drain_digest_stale``
+    / ``status_<status>`` skip — the reason is surfaced in ``campaign report``.
+    """
+    if campaign.status != CAMPAIGN_STATUS_APPROVED:
+        return f"status_{campaign.status}"
+    if campaign.drain_authorized_iso is None:
+        if campaign.drain_invalidated_reason == CAMPAIGN_DRAIN_REVOKED_REASON:
+            return "drain_revoked"
+        return "drain_not_authorized"
+    if campaign.drain_authorized_digest != campaign.digest:
+        return "drain_digest_stale"
+    return "authorized"
+
+
+def authorize_campaign_drain(
+    store: StateStore, campaign_id: str, now_iso: str, *, note: str
+) -> CampaignRecord:
+    """F10: the operator's explicit, digest-bound confirmation that the canary passed.
+
+    Enforces :data:`DRAIN_AUTHORIZATION_RULE` verbatim. Refuses a campaign that is unknown,
+    paused, or revoked, and refuses while ANY submitted campaign file is unsettled
+    (``request_may_have_been_sent`` / ``verifying`` / ``partial`` / ``indeterminate_write`` /
+    ``conflict``) — the canary gate is an *inspected, verified* canary, never a mere
+    submission attempt.
+    """
+    if not note.strip():
+        raise CampaignError(
+            "drain authorization refused: the note must record the canary inspection "
+            "(physical-media side effects — renames/deletions/MyList writes — reviewed)"
+        )
+    campaign = _require_campaign(store, campaign_id)
+    if campaign.status == CAMPAIGN_STATUS_REVOKED:
+        raise CampaignError(f"campaign {campaign_id} is revoked: drain authorization is refused")
+    if campaign.status != CAMPAIGN_STATUS_APPROVED:
+        raise CampaignError(
+            f"campaign {campaign_id} is {campaign.status} ({campaign.status_reason}): drain "
+            "authorization requires an approved campaign — resume it first"
+        )
+    sent_states = [
+        record.state
+        for record in store.campaign_files(campaign_id)
+        if record.state in _SEND_PROGRESS_STATES
+    ]
+    if not sent_states:
+        raise CampaignError(
+            f"campaign {campaign_id} has no completed canary (zero submitted files): run the "
+            "manual canary batch, verify it, inspect the physical-media side effects, then "
+            "authorize the drain"
+        )
+    unsettled = sorted({state.value for state in sent_states if state is not FileState.VERIFIED})
+    if unsettled:
+        open_count = sum(1 for state in sent_states if state is not FileState.VERIFIED)
+        raise CampaignError(
+            f"campaign {campaign_id} canary is not settled: {open_count} submitted file(s) await "
+            f"operator review ({', '.join(unsettled)}); drain authorization requires every "
+            "submitted campaign file VERIFIED"
+        )
+    store.authorize_campaign_drain(campaign_id, campaign.digest, iso=now_iso)
+    logger.info(
+        "campaign %s drain authorized against digest %s at %s",
+        campaign_id,
+        campaign.digest,
+        now_iso,
+    )
+    updated = store.get_campaign(campaign_id)
+    assert updated is not None
+    return updated
+
+
+def revoke_campaign_drain(
+    store: StateStore, campaign_id: str, now_iso: str, *, note: str
+) -> CampaignRecord:
+    """F10: withdraw the drain authorization — automatic submissions stop, manual apply stays.
+
+    The campaign's status is untouched (``campaign apply`` remains available for a manual
+    batch); the campaign drops out of daemon drain selection with reason ``drain_revoked``
+    until the operator re-authorizes after a fresh review.
+    """
+    if not note.strip():
+        raise CampaignError("drain revocation refused: the note must record the reason")
+    _require_campaign(store, campaign_id)
+    store.revoke_campaign_drain(campaign_id, CAMPAIGN_DRAIN_REVOKED_REASON, iso=now_iso)
+    logger.warning("campaign %s drain authorization revoked by the operator", campaign_id)
+    updated = store.get_campaign(campaign_id)
+    assert updated is not None
+    return updated
+
+
 def campaign_report(
     store: StateStore, campaign_id: str, plan_path: str | Path | None
 ) -> dict[str, Any]:
@@ -1586,6 +1694,10 @@ def campaign_report(
         "remaining_planned": progress[FileState.PLANNED.value],
         "verified": progress[FileState.VERIFIED.value],
         "quarantined": progress["quarantined"],
+        "drain_authorized_iso": campaign.drain_authorized_iso,
+        "drain_authorized_digest": campaign.drain_authorized_digest,
+        "drain_invalidated_reason": campaign.drain_invalidated_reason,
+        "drain_selection": campaign_drain_selection(campaign),
     }
 
 
@@ -1633,24 +1745,28 @@ def _short(campaign_id: str) -> str:
 
 
 def select_next_daemon_campaign(store: StateStore) -> CampaignRecord | None:
-    """The F7 daemon's drain target: the oldest **approved, canaryed** campaign, deterministically.
+    """The F7 daemon's drain target: the oldest **approved, drain-authorized** campaign.
 
     Selection is by earliest ``approval_iso`` then ``campaign_id``; ``paused``/``revoked``
-    campaigns are skipped (operator controls authoritative). The **canary gate** is the
-    operator's first batch: a campaign drains only once it has send progress ≥ 1 (a completed
-    canary batch), so a freshly approved campaign is never mass-submitted by the daemon before
-    the operator's manual canary + safety checks. Campaigns drop out of selection through the
-    existing terminal transitions — normal completion (``max_submissions_reached``
-    auto-pause), deadline expiry (``deadline_exceeded`` auto-pause, P1 fix), drift,
-    attestation pause — plus the drain's ``no_queueable_candidates`` auto-pause (P2-3 fix),
-    so a deferred campaign never blocks the queue head. Returns ``None`` when nothing is
-    drainable.
+    campaigns are skipped (operator controls authoritative). The **drain authorization** (F10)
+    is the operator's explicit confirmation of a settled canary (see
+    :func:`authorize_campaign_drain`): a campaign drains only when the authorization exists, its
+    digest binding still matches the campaign's CURRENT approval digest (a plan fingerprint
+    change invalidates it — the campaign is skipped with ``drain_digest_stale``), and the
+    operator has not revoked it. Send progress ≥ 1 stays a hard floor (the canary exists), and a
+    newly approved campaign WITHOUT the authorization is never drained: the manual canary and
+    bounded ``campaign apply`` remain the un-authorized path. Campaigns drop out of selection
+    through the existing terminal transitions — normal completion (``max_submissions_reached``
+    auto-pause), deadline expiry (``deadline_exceeded`` auto-pause, P1 fix), drift, attestation
+    pause — plus the drain's ``no_queueable_candidates`` auto-pause (P2-3 fix), so a deferred
+    campaign never blocks the queue head. Returns ``None`` when nothing is drainable.
     """
     drained = [
         campaign
         for campaign in store.list_campaigns()
         if campaign.status == CAMPAIGN_STATUS_APPROVED
         and campaign_send_progress(store, campaign.campaign_id) >= 1
+        and campaign_drain_selection(campaign) == "authorized"
     ]
     if not drained:
         return None

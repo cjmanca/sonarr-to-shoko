@@ -16,7 +16,7 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 | --- | --- | --- |
 | F8 — daemon/campaign attestation scope mutual exclusion | P1 | PASS (pending final gate) |
 | F9 — campaign submission budgets never reset between batches | P1 | PASS (pending final gate) |
-| F10 — canary authorization inferred from attempted submissions | P1 | TODO |
+| F10 — canary authorization inferred from attempted submissions | P1 | PASS (pending final gate) |
 | F11 — campaign batches reuse stale safety/timing decisions | P1 | TODO |
 | F12 — GHCR provenance fetches manifests as blobs | P2 | TODO |
 | F13 — empty hashes pass file-readiness check | P2 | TODO |
@@ -43,6 +43,16 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 **Evidence:** `uv run pytest -q` 847 passed; `uv run ruff check .` pass; `uv run ruff format --check .` clean; `uv run mypy` clean (44 files); `git diff --check` clean. 17+ `test_f9_*` regression tests incl: 100-file campaign / per-cycle cap 5 progressing past 5/10/20/50 across daemon batches; restart key-collision freedom; repeated manual applies fresh keys; rolling exhaustion stop/resume; outstanding-job cap across batches; budget-blocked zero-progress auto-pause; crash-mid-batch single-completion (no replay); bounded preflight/resolve calls (spy counts ≤ batch size); wall-time bound; all-refused ≠ plan_complete. Offline only; no live writes.
 
+## F10 — PASS (local commit this round)
+
+**Design:** Automatic draining now requires a durable, operator-only, digest-bound drain authorization. `campaigns` gains `drain_authorized_iso` / `drain_authorized_digest` / `drain_invalidated_reason` (schema v1 unshipped, no migration). Operator CLI `campaign authorize-drain --campaign-id ID --note TEXT --confirm` refuses without confirm/note, refuses unknown/paused/revoked campaigns, and refuses while ANY submitted campaign file is unsettled (`request_may_have_been_sent`/`verifying`/`partial`/`indeterminate_write`/`conflict`) — the canary gate is an inspected, fully VERIFIED canary, never an attempted submission. Grant binds the campaign's current digest (the only writer of `campaigns.digest` is the one-shot create; plan-file drift triggers `plan_drift` auto-pause with zero POSTs; fingerprint-set refresh clears authorization with reason `plan_fingerprint_set_changed`). `select_next_daemon_campaign` (sole production drain selector, daemon.py:1534) requires APPROVED ∧ progress≥1 ∧ selection==`authorized`; skip reasons (`drain_not_authorized`/`drain_revoked`/`drain_digest_stale`) surfaced in `campaign report`/rollups. `campaign revoke-drain --confirm --note` withdraws the grant (status untouched → manual apply stays). Manual `campaign apply` never requires authorization. Restart durability: single transaction UPDATE in SQLite; write-disabled store refuses.
+
+**Review:** single independent read-only adversarial round: **ACCEPTABLE**, no P0/P1/P2. Verified: no auto-drain bypass path; campaign_files SQL isolation (cross-campaign verified files cannot settle a canary; binds planned/mapped only); digest binding; revoke/pause interactions; crash durability; test integrity (29 added grant steps use the real authorize call with settled canaries; no faked columns).
+
+**Deferred P3s:** stale test comment at test_campaign.py:2218 (`# 1 job held`); shipped-v1-DB hypothetical column gap (accepted per unshipped claim); revoke-drain idempotent on any existing campaign (documented).
+
+**Evidence:** `uv run pytest -q` 884 passed; ruff check pass; format --check clean; mypy clean (44 files); git diff --check clean. 16 new F10 tests: newly-approved not drained (zero POSTs) while manual apply works; attempted-unverified canary refused; indeterminate/partial/conflict canaries refused; verified-without-confirmation not drained; confirmation opens bounded drain; revocation stops submissions; digest change invalidates (zero POSTs); fingerprint refresh clears; restart preserves. Docs updated (README, docs/deployment.md §8, config.example.yaml). Offline only.
+
 ## Constraints
 
 - Sequential model agents only (single-slot local inference endpoint).
@@ -52,4 +62,4 @@ Mutable ledger maintained by the main orchestrator. PLAN.md is immutable.
 
 ## Next action
 
-Implement F10 (explicit operator canary confirmation for automatic drain authorization) via a self-contained delegated brief.
+Implement F11 (fresh per-submission safety/timing/shutdown evaluation) via a self-contained delegated brief.

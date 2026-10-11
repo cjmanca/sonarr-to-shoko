@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
@@ -37,11 +38,17 @@ from shoko_linker.attestation import (
 from shoko_linker.campaign import (
     CampaignApplyReport,
     CampaignDigestMismatchError,
+    CampaignError,
     CampaignPlanInvalidError,
     apply_campaign,
     approve_campaign,
+    authorize_campaign_drain,
+    campaign_drain_selection,
+    campaign_report,
     campaign_send_progress,
     read_plan_file,
+    revoke_campaign_drain,
+    select_next_daemon_campaign,
 )
 from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
 from shoko_linker.config import load_settings
@@ -52,9 +59,12 @@ from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
 from shoko_linker.state import (
     ATTESTATION_PAUSE_REASON,
+    CAMPAIGN_DRAIN_FINGERPRINT_REASON,
     CAMPAIGN_STATUS_APPROVED,
+    CAMPAIGN_STATUS_REVOKED,
     BaselineFile,
     BudgetRefusal,
+    CampaignRecord,
     FileState,
     StateStore,
     acquire_apply_lock,
@@ -1332,6 +1342,7 @@ def test_campaign_apply_then_daemon_cycle_share_one_free_lock(
         assert report.submitted == BATCH_TWO
         assert store.lock_holder() is None
         assert len(env.stubs.posts) == BATCH_TWO
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: operator confirms the canary
         daemon_report = run_cycle(
             deps,
             now_iso=T0,
@@ -1451,7 +1462,8 @@ def test_apply_campaign_report_is_typed_batch_deferral(
 # ------------------------------------------------------------------ F7: daemon auto-drain
 
 # The daemon drains an APPROVED campaign automatically — one bounded batch per apply cycle —
-# ONLY after the operator's manual canary batch completes (canary gate: send progress ≥ 1).
+# ONLY after the operator's manual canary batch completes AND the operator explicitly authorizes
+# the drain (F10: `campaign authorize-drain` on a settled, all-VERIFIED canary, digest-bound).
 # Every scenario runs the full campaign guard chain via the daemon cycle; the daemon reuses its
 # own apply lock (apply_campaign lock_held=True), so a daemon batch never self-contends.
 
@@ -1460,6 +1472,7 @@ BATCH_ONE = 1
 COUNT_SIX = 6
 CAMPAIGN_DAEMON_KEY = "daemon-drain"
 LEASE_SHORT_HOURS = 1.0
+AUTH_NOTE = "canary inspected: renames/deletions/MyList side effects reviewed"
 
 
 def _canary(env: Env, store: StateStore, campaign_id: str) -> CampaignApplyReport:
@@ -1472,6 +1485,15 @@ def _canary(env: Env, store: StateStore, campaign_id: str) -> CampaignApplyRepor
         env.now_iso,
         batch_size=BATCH_ONE,
     )
+
+
+def _authorize_drain(env: Env, store: StateStore, campaign_id: str) -> CampaignRecord:
+    """F10: the operator's explicit, digest-bound drain authorization after a settled canary.
+
+    The daemon drains only on this confirmation — a bare canary (verified or not) never
+    opens the automatic drain.
+    """
+    return authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)
 
 
 def test_daemon_drains_nothing_before_the_operator_canary(
@@ -1499,7 +1521,8 @@ def test_daemon_drains_nothing_before_the_operator_canary(
 def test_daemon_drains_all_batches_after_one_canary_zero_manual(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """F7 core: after ONE manual canary, daemon cycles drain the rest in bounded batches."""
+    """F7 core: after ONE manual canary + drain authorization, daemon cycles drain the rest
+    in bounded batches."""
     _set_campaign(env, max_batch_size=BATCH_TWO)
     env.seed(specs(COUNT_FIVE))
     prepared = prepare(env, capsys)
@@ -1513,6 +1536,7 @@ def test_daemon_drains_all_batches_after_one_canary_zero_manual(
         )
         assert canary.submitted == COUNT_ONE
         assert len(env.stubs.posts) == COUNT_ONE
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: operator confirms the canary
         # Two daemon cycles drain the remaining 4 (2 per bounded batch), zero CLI calls.
         first = _daemon_cycle(env, store, prepared["campaign_id"], "d1")
         assert first.campaign is not None
@@ -1548,6 +1572,7 @@ def test_daemon_drain_resumes_after_restart_without_double_send(
     try:
         deps = _campaign_deps(env, store, prepared["campaign_id"])
         apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0, batch_size=BATCH_ONE)
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: confirmed canary
         cycle = _daemon_cycle(env, store, prepared["campaign_id"], "pre-restart")
         assert cycle.campaign is not None
         assert cycle.campaign.submitted == BATCH_TWO
@@ -1583,6 +1608,7 @@ def test_daemon_drain_defers_on_missing_plan_with_zero_posts(
     store = env.open_store()
     try:
         _canary(env, store, prepared["campaign_id"])
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: drain is authorized
         posts_before = len(env.stubs.posts)
     finally:
         store.close()
@@ -1617,6 +1643,7 @@ def test_daemon_drain_stops_on_expired_attestation_mid_drain(
     store = env.open_store()
     try:
         _canary(env, store, prepared["campaign_id"])
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: drain is authorized
         _daemon_cycle(env, store, prepared["campaign_id"], "d1")
         posts_before = len(env.stubs.posts)
         # Re-record a lease that expires in 1h, then advance the clock past it.
@@ -1660,6 +1687,7 @@ def test_daemon_drain_quarantines_drifted_candidate_no_silent_replace(
     store = env.open_store()
     try:
         _canary(env, store, prepared["campaign_id"])
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: drain is authorized
         victim = specs_list[3]
         env.stubs.sizes[victim.shoko_id] = FILE_SIZE + 1
         cycle = _daemon_cycle(env, store, prepared["campaign_id"], "drift")
@@ -1687,6 +1715,7 @@ def test_daemon_drain_never_processes_unapproved_files(
     store = env.open_store()
     try:
         _canary(env, store, prepared["campaign_id"])
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: drain is authorized
         env.stubs.specs = specs(COUNT_FIVE)  # three more files appear (new mappings)
         _daemon_cycle(env, store, prepared["campaign_id"], "extra")
         posted = set(env.stubs.posted_files)
@@ -1708,6 +1737,7 @@ def test_operator_pause_resume_revoke_control_the_daemon_drain(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         _daemon_cycle(env, store, campaign_id, "d1")
         sent_running = _campaign_sent(store, campaign_id)
     finally:
@@ -1799,6 +1829,7 @@ def test_daemon_skips_campaign_after_deadline(env: Env, capsys: pytest.CaptureFi
     store = env.open_store()
     try:
         _canary(env, store, prepared["campaign_id"])
+        _authorize_drain(env, store, prepared["campaign_id"])  # F10: drain is authorized
         posts_before = len(env.stubs.posts)
         env.now_iso = _iso_plus(T0, 2 * 3600)  # deadline was 1h after prepare
         cycle = _daemon_cycle(env, store, prepared["campaign_id"], "deadline")
@@ -1877,6 +1908,7 @@ def test_daemon_drain_pauses_deadline_exceeded_campaign_with_zero_posts(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         posts_before = len(env.stubs.posts)
         env.now_iso = _iso_plus(T0, 2.0 * HOUR_SECONDS)
         cycle = _daemon_cycle(env, store, campaign_id, "past-deadline")
@@ -1906,6 +1938,7 @@ def test_daemon_drain_head_of_line_campaign_drops_out_and_the_next_drains(
     store = env.open_store()
     try:
         _canary(env, store, prepared_a["campaign_id"])  # 500 linked under A
+        _authorize_drain(env, store, prepared_a["campaign_id"])  # F10: A's drain is authorized
         # Campaign B: two fresh files plus 501 (A's unlinked remainder stays eligible).
         env.seed(
             [
@@ -1959,6 +1992,7 @@ def test_daemon_drain_head_of_line_campaign_drops_out_and_the_next_drains(
             env.now_iso,
             batch_size=1,
         )  # B's canary (501 linked under B)
+        _authorize_drain(env, store, campaign_b)  # F10: B's drain is authorized
         # Past A's deadline: A wins selection, the guard pauses it, B stays untouched.
         env.now_iso = _iso_plus(T0, 2.2 * HOUR_SECONDS)
         cycle_a = _daemon_cycle(env, store, campaign_b, "a-pauses")
@@ -2002,6 +2036,7 @@ def test_daemon_zero_progress_all_blocked_campaign_auto_pauses(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         posts_before = len(env.stubs.posts)
         for spec in specs_list[1:]:
             store.advance(spec.shoko_id, FileState.BLOCKED_SAFETY, "operator-blocked", iso=T0)
@@ -2040,6 +2075,7 @@ def test_daemon_drain_aggregates_per_file_reasons(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         cycle = _daemon_cycle(env, store, campaign_id, "aggregate")
         assert cycle.campaign is not None
         assert cycle.campaign.submitted == BATCH_TWO
@@ -2077,6 +2113,7 @@ def test_f9_campaign_per_cycle_budget_resets_each_batch(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         assert _campaign_sent(store, campaign_id) == 1
         milestones: list[int] = []
         for index in range(40):
@@ -2111,6 +2148,7 @@ def test_f9_daemon_restart_new_cycle_keys_never_collide(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         _daemon_cycle(env, store, campaign_id, "pre-restart")
         keys_before = _budget_window_keys(store)
     finally:
@@ -2161,18 +2199,23 @@ def test_f9_outstanding_job_cap_enforced_across_batches(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Scenario 5: the outstanding async-job ceiling keeps applying across batches — sends
-    that stay in ``verifying`` hold their jobs, so a later batch defers at the cap."""
+    that stay in ``verifying`` hold their jobs, so a later batch defers at the cap.
+
+    F10: the canary file verifies (a settled canary is the drain-authorization precondition);
+    the remaining files never verify, so their jobs accumulate against the ceiling."""
     _set_campaign(env, max_batch_size=5)
-    _set_sync(env, max_new_per_cycle=5, max_pending_episode_jobs=2, rolling_new_limit=1000)
+    _set_sync(env, max_new_per_cycle=5, max_pending_episode_jobs=1, rolling_new_limit=1000)
     specs_list = specs(COUNT_FIVE)
     env.seed(specs_list)
-    env.stubs.verify_empty = {spec.shoko_id for spec in specs_list}  # never verify → jobs held
+    # Never verify (jobs held) — the canary file (500) excepted, so the drain can be authorized.
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs_list[1:]}
     prepared = prepare(env, capsys)
     approve(env, capsys, prepared["approval_digest"])
     campaign_id = prepared["campaign_id"]
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)  # 1 job held
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         first = _daemon_cycle(env, store, campaign_id, "j1")
         assert first.campaign is not None
         assert first.campaign.submitted == 1  # 2nd job fills the ceiling
@@ -2200,6 +2243,7 @@ def test_f9_budget_blocked_campaign_trips_zero_progress(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)  # the one submission that opens the drain
+        _authorize_drain(env, store, campaign_id)  # F10: operator confirms the settled canary
         posts_before = len(env.stubs.posts)
         assert posts_before == 1
         for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
@@ -2246,6 +2290,7 @@ def test_f9_batch_loop_preflights_are_bounded_by_attempts(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)  # F10: drain is authorized
         preflight_calls = 0  # measure only the drain batch
         cycle = _daemon_cycle(env, store, campaign_id, "cap3-batch12")
         assert cycle.campaign is not None
@@ -2472,6 +2517,7 @@ def test_f9_per_file_refusals_trip_zero_progress_breaker(
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)  # opens the drain with one real submission
+        _authorize_drain(env, store, campaign_id)  # F10: operator confirms the settled canary
         canary_files = set(env.stubs.posted_files)
         _force_job_exhaustion(store, monkeypatch, exclude=canary_files)
         posts_before = len(env.stubs.posts)
@@ -2841,6 +2887,7 @@ def test_both_leases_valid_campaign_drains_and_daemon_submits(
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         posts_after_canary = len(env.stubs.posts)
         assert posts_after_canary == 1
         cycle = env.daemon_cycle(store, "both-valid")
@@ -2865,11 +2912,12 @@ def test_daemon_lease_expired_campaign_still_drains(
     An authorized campaign must still drain in the same cycle.
     """
     env = dual_env
-    _dual_campaign(env, capsys)
+    campaign_id = _dual_campaign(env, capsys)
     env.write_daemon_lease()
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         # Expire the daemon lease only (campaign lease stays valid), advance the clock.
         env.write_daemon_lease(hours=0.5)
         env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
@@ -2902,6 +2950,7 @@ def test_campaign_lease_absent_daemon_still_submits(
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         # Remove the campaign lease (sibling); the daemon lease stays valid.
         campaign_lease_path(env.lease, campaign_id).unlink()
         posts_before = len(env.stubs.posts)
@@ -2932,6 +2981,7 @@ def test_campaign_lease_expired_does_not_globally_pause_daemon(
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         # Expire the campaign lease only (daemon lease stays valid).
         env.write_campaign_lease(campaign_id, hours=0.5)
         env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
@@ -2961,6 +3011,7 @@ def test_both_leases_expired_no_writes_daemon_alive(
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)  # canary at T0 (leases valid at record time)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         env.now_iso = _iso_plus(T0, 3600.0 + 60.0)
         posts_before = len(env.stubs.posts)
         cycle = env.daemon_cycle(store, "both-expired")
@@ -3013,11 +3064,12 @@ def test_operator_pause_blocks_campaign_drain(
     """P1-2: the campaign bypass is origin-gated. A plain operator global pause (reason
     'disk_review', gate meta NOT 'paused') gates every scope, including campaigns."""
     env = dual_env
-    _dual_campaign(env, capsys)
+    campaign_id = _dual_campaign(env, capsys)
     env.write_daemon_lease()
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         store.pause("disk_review", env.now_iso)
         posts_before = len(env.stubs.posts)
         cycle = env.daemon_cycle(store, "op-pause")
@@ -3036,11 +3088,12 @@ def test_attestation_pause_lets_campaign_drain(
     """P1-2 (preserved): an attestation-gate daemon pause (gate meta 'paused' + reason
     'attestation_expired') lets an authorized campaign drain."""
     env = dual_env
-    _dual_campaign(env, capsys)
+    campaign_id = _dual_campaign(env, capsys)
     env.write_daemon_lease()
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         env.write_daemon_lease(hours=0.5)
         env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
         cycle = env.daemon_cycle(store, "attest-pause")
@@ -3064,6 +3117,7 @@ def test_resume_then_lease_expiry_repauses_campaign(
     store = env.open_store()
     try:
         _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
         # First expiry: campaign pauses, gate meta "paused".
         env.write_campaign_lease(campaign_id, hours=0.5)
         env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
@@ -3182,3 +3236,421 @@ def test_campaign_gate_clear_reports_accurate_reason(
         assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "valid"
     finally:
         store.close()
+
+
+# ------------------------------------------------------------------ F10: drain authorization
+#
+# The daemon drains an approved campaign ONLY on the operator's EXPLICIT, digest-bound drain
+# authorization (`campaign authorize-drain`), recorded after the operator inspected a
+# COMPLETED canary. An ATTEMPTED send (request_may_have_been_sent / verifying / partial /
+# indeterminate_write / conflict) never settles the canary: the authorization
+# rule requires every SENT campaign file to be VERIFIED, with at least one. Manual
+# ``campaign apply`` never requires the authorization.
+
+STALE_DIGEST = "1" * DIGEST_HEX
+F10_CYCLE_KEY = "f10-cycle"
+
+
+def _authorize(env: Env, store: StateStore, campaign_id: str) -> CampaignRecord:
+    return _authorize_drain(env, store, campaign_id)
+
+
+def _f10_campaign(env: Env, capsys: pytest.CaptureFixture[str]) -> str:
+    """Seed/approve a 5-file campaign (batch 2) and return its id."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    return cast(str, prepared["campaign_id"])
+
+
+def test_daemon_does_not_drain_verified_canary_without_authorization(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10 core: a completed (verified) canary alone never opens the automatic drain."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, campaign_id)
+        assert canary.verified == COUNT_ONE
+        cycle = _daemon_cycle(env, store, campaign_id, "unauthorized")
+        assert cycle.campaign is None  # no operator authorization → no drain
+        assert cycle.counts.submitted == 0
+        assert len(env.stubs.posts) == COUNT_ONE  # only the canary POSTed
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "drain_not_authorized"
+        assert report["drain_authorized_iso"] is None
+    finally:
+        store.close()
+
+
+def test_authorize_drain_refuses_before_any_canary(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: zero send progress means there is no completed canary to confirm."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        with pytest.raises(CampaignError, match="canary"):
+            _authorize(env, store, campaign_id)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None
+    finally:
+        store.close()
+
+
+def test_authorize_drain_refuses_attempted_unverified_canary(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: an attempted send that never verified (verifying) does not settle the canary."""
+    campaign_id = _f10_campaign(env, capsys)
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs(COUNT_FIVE)}
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, campaign_id)
+        assert canary.submitted == COUNT_ONE
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.VERIFYING
+        with pytest.raises(CampaignError, match="not settled"):
+            _authorize(env, store, campaign_id)
+        cycle = _daemon_cycle(env, store, campaign_id, "attempted")
+        assert cycle.campaign is None
+        assert len(env.stubs.posts) == COUNT_ONE
+    finally:
+        store.close()
+
+
+def test_authorize_drain_refuses_indeterminate_canary(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: an indeterminate_write canary is an uninspected side-effect risk — refused."""
+    campaign_id = _f10_campaign(env, capsys)
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs(COUNT_FIVE)}
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        store.advance(500, FileState.INDETERMINATE_WRITE, "ambiguous send", iso=env.now_iso)
+        with pytest.raises(CampaignError, match="indeterminate_write"):
+            _authorize(env, store, campaign_id)
+        cycle = _daemon_cycle(env, store, campaign_id, "indeterminate")
+        assert cycle.campaign is None
+    finally:
+        store.close()
+
+
+def test_authorize_drain_refuses_partial_and_conflict_canary(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10 strict rule: partial (incomplete link) and conflict rows are NOT settled."""
+    campaign_id = _f10_campaign(env, capsys)
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs(COUNT_FIVE)}
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        store.advance(500, FileState.PARTIAL, "partial link", iso=env.now_iso)
+        with pytest.raises(CampaignError, match="partial"):
+            _authorize(env, store, campaign_id)
+        store.advance(500, FileState.CONFLICT, "contradiction", iso=env.now_iso)
+        with pytest.raises(CampaignError, match="conflict"):
+            _authorize(env, store, campaign_id)
+    finally:
+        store.close()
+
+
+def test_authorize_drain_refuses_paused_revoked_or_unknown_campaign(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: authorization is only for an approved campaign that exists."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        with pytest.raises(CampaignError, match="does not exist"):
+            authorize_campaign_drain(
+                store, "00000000-0000-0000-0000-000000000000", T0, note=AUTH_NOTE
+            )
+        store.set_campaign_status(campaign_id, "paused", "ops review", iso=env.now_iso)
+        with pytest.raises(CampaignError, match="paused"):
+            _authorize(env, store, campaign_id)
+        store.set_campaign_status(
+            campaign_id, CAMPAIGN_STATUS_REVOKED, "scope review", iso=env.now_iso
+        )
+        with pytest.raises(CampaignError, match="revoked"):
+            _authorize(env, store, campaign_id)
+    finally:
+        store.close()
+
+
+def test_authorized_verified_canary_opens_bounded_daemon_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10 core fix: the explicit confirmation after a verified canary drains the rest."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        authorized = _authorize(env, store, campaign_id)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert authorized.drain_authorized_iso == env.now_iso
+        assert authorized.drain_authorized_digest == campaign.digest
+        assert campaign_drain_selection(campaign) == "authorized"
+        first = _daemon_cycle(env, store, campaign_id, "auth-1")
+        assert first.campaign is not None
+        assert first.campaign.submitted == BATCH_TWO
+        second = _daemon_cycle(env, store, campaign_id, "auth-2")
+        assert second.campaign is not None
+        assert second.campaign.submitted == BATCH_TWO
+        after = store.get_campaign(campaign_id)
+        assert after is not None
+        assert after.total_sent == COUNT_FIVE
+        assert len(env.stubs.posts) == COUNT_FIVE
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "authorized"
+    finally:
+        store.close()
+
+
+def test_drain_authorization_survives_store_restart(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: authorization is durable SQLite state — a reopen keeps the campaign drainable."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+    finally:
+        store.close()
+    reopened = env.open_store()
+    try:
+        selected = select_next_daemon_campaign(reopened)
+        assert selected is not None
+        assert selected.campaign_id == campaign_id
+        assert selected.drain_authorized_iso == T0
+        cycle = _daemon_cycle(env, reopened, campaign_id, "post-restart")
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == BATCH_TWO
+    finally:
+        reopened.close()
+
+
+def test_revoke_drain_stops_further_daemon_submissions(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: the inverse command withdraws the authorization; the campaign leaves selection."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        drained = _daemon_cycle(env, store, campaign_id, "auth-1")
+        assert drained.campaign is not None
+        posts_before = len(env.stubs.posts)
+        revoke_campaign_drain(store, campaign_id, env.now_iso, note="side effects under review")
+        cycle = _daemon_cycle(env, store, campaign_id, "revoked")
+        assert cycle.campaign is None
+        assert len(env.stubs.posts) == posts_before  # zero further submissions
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None
+        assert campaign_drain_selection(campaign) == "drain_revoked"
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "drain_revoked"
+    finally:
+        store.close()
+
+
+def test_plan_digest_change_invalidates_drain_authorization(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: the authorization is bound to the plan digest — a changed fingerprint set skips it."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        conn = sqlite3.connect(str(store.path))
+        conn.execute(
+            "UPDATE campaigns SET digest = ? WHERE campaign_id = ?", (STALE_DIGEST, campaign_id)
+        )
+        conn.commit()
+        conn.close()
+        cycle = _daemon_cycle(env, store, campaign_id, "digest-changed")
+        assert cycle.campaign is None  # stale authorization → skipped, not drained
+        assert len(env.stubs.posts) == COUNT_ONE
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "drain_digest_stale"
+    finally:
+        store.close()
+
+
+def test_campaign_apply_refuses_authorized_plan_drift_with_zero_posts(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: a bound plan file rewritten after authorization is plan_drift —
+    the campaign pauses with zero POSTs (the authorization never authorizes a plan change)."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        plan_path = env.tmp_path / "plan.json"
+        plan_text = plan_path.read_text(encoding="utf-8")
+        plan_path.write_text(
+            plan_text.replace('"max_submissions": 5', '"max_submissions": 4'), encoding="utf-8"
+        )
+        posts_before = len(env.stubs.posts)
+        cycle = _daemon_cycle(env, store, campaign_id, "plan-changed")
+        assert cycle.campaign is None
+        assert len(env.stubs.posts) == posts_before
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "plan_drift"
+    finally:
+        store.close()
+
+
+def test_manual_apply_never_requires_drain_authorization(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10 boundary: manual batch commands stay unchanged (no authorization needed)."""
+    campaign_id = _f10_campaign(env, capsys)
+    result = apply(env, capsys, batch="2")
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == BATCH_TWO
+    store = env.open_store()
+    try:
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "drain_not_authorized"
+        cycle = _daemon_cycle(env, store, campaign_id, "manual-only")
+        assert cycle.campaign is None  # manual batches do not authorize the drain
+    finally:
+        store.close()
+
+
+def test_cli_authorize_drain_requires_confirm_and_nonempty_note(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10 CLI: the authorization is an operator command — confirm + a real note required."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+    finally:
+        store.close()
+    base = ["campaign", "authorize-drain", str(env.config_path), "--campaign-id", campaign_id]
+    capsys.readouterr()
+    assert main([*base, "--note", "reviewed", "--json"]) == EXIT_CONFIG_INVALID
+    assert "--confirm" in capsys.readouterr().out
+    assert main([*base, "--note", "", "--confirm", "--json"]) == EXIT_CONFIG_INVALID
+    assert "note" in capsys.readouterr().out
+    assert main([*base, "--note", AUTH_NOTE, "--confirm", "--json"]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["result"]["drain_authorized"] is True
+    store = env.open_store()
+    try:
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "authorized"
+        actions = json.loads(str(store.get_meta("operator_actions")))
+        assert any(entry["command"] == "campaign-authorize-drain" for entry in actions)
+        cycle = _daemon_cycle(env, store, campaign_id, "cli-authorized")
+        assert cycle.campaign is not None
+        assert cycle.campaign.submitted == BATCH_TWO
+    finally:
+        store.close()
+
+
+def test_cli_revoke_drain_requires_confirm_and_clears_authorization(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10 CLI: revoke-drain is the confirm-gated inverse and is audited like other operators."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+    finally:
+        store.close()
+    base = ["campaign", "revoke-drain", str(env.config_path), "--campaign-id", campaign_id]
+    capsys.readouterr()
+    assert main([*base, "--note", "review", "--json"]) == EXIT_CONFIG_INVALID
+    capsys.readouterr()
+    assert main([*base, "--note", "side effects under review", "--confirm", "--json"]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["result"]["drain_authorized"] is False
+    store = env.open_store()
+    try:
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "drain_revoked"
+        actions = json.loads(str(store.get_meta("operator_actions")))
+        assert any(entry["command"] == "campaign-revoke-drain" for entry in actions)
+    finally:
+        store.close()
+
+
+def test_fingerprint_set_refresh_clears_drain_authorization(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: a plan-fingerprint-set refresh (the state bind path) invalidates the grant."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        _authorize(env, store, campaign_id)
+        # A refresh writes a fingerprint set that no longer matches the campaign's bindings
+        # (non-canonical stored rows are the observable drift at the bind path).
+        fingerprint = "a" * DIGEST_HEX
+        conn = sqlite3.connect(str(store.path))
+        conn.execute(
+            "UPDATE campaigns SET plan_fingerprint_set = ? WHERE campaign_id = ?",
+            (f'[[500,"{fingerprint}","{fingerprint}"]]', campaign_id),
+        )
+        conn.commit()
+        conn.close()
+        store.bind_campaign_files(campaign_id, env.now_iso)  # the refresh rewrites the set
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None
+        assert campaign.drain_invalidated_reason == CAMPAIGN_DRAIN_FINGERPRINT_REASON
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "drain_not_authorized"
+        assert report["drain_invalidated_reason"] == CAMPAIGN_DRAIN_FINGERPRINT_REASON
+        cycle = _daemon_cycle(env, store, campaign_id, "after-refresh")
+        assert cycle.campaign is None  # re-grant is the operator's decision after review
+    finally:
+        store.close()
+
+
+def test_campaign_report_surfaces_authorization_identity(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F10: report/status shows who authorized what digest, and why selection skips."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        _authorize(env, store, campaign_id)
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "authorized"
+        assert report["drain_authorized_iso"] == env.now_iso
+        assert report["drain_authorized_digest"] == campaign.digest
+    finally:
+        store.close()
+    code = main(
+        [
+            "campaign",
+            "report",
+            str(env.config_path),
+            "--campaign-id",
+            campaign_id,
+        ]
+    )
+    assert code == EXIT_OK
+    out = capsys.readouterr().out
+    assert "drain authorization: authorized" in out

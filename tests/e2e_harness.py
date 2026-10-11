@@ -1019,6 +1019,21 @@ class CampaignEnv:
         ]
         return self._main(args)
 
+    def authorize_drain(self, campaign_id: str) -> int:
+        """F10: the operator's explicit, digest-bound drain authorization (settled canary)."""
+        args = [
+            "campaign",
+            "authorize-drain",
+            str(self.world.tmp_path / "config.yaml"),
+            "--campaign-id",
+            campaign_id,
+            "--note",
+            "e2e canary inspected",
+            "--confirm",
+            "--json",
+        ]
+        return self._main(args)
+
     def audit(self, extra: list[str] | None = None) -> dict[str, Any]:
         args = [
             "audit",

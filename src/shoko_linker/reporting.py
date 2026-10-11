@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from .audit import AuditReport
-from .campaign import CampaignApplyReport
+from .campaign import CampaignApplyReport, campaign_drain_selection
 from .config import Settings, apply_gate_status
 from .daemon import CycleReport, DaemonReport
 from .mapping_store import MappingStatus, RefreshOutcome
@@ -493,6 +493,10 @@ def campaign_rollup(store: StateStore) -> list[dict[str, Any]]:
                 "last_batch_iso": campaign.last_batch_iso,
                 "approved_files": len(campaign.bindings),
                 "progress": store.campaign_progress(campaign.campaign_id),
+                "drain_authorized_iso": campaign.drain_authorized_iso,
+                "drain_authorized_digest": campaign.drain_authorized_digest,
+                "drain_invalidated_reason": campaign.drain_invalidated_reason,
+                "drain_selection": campaign_drain_selection(campaign),
             }
         )
     return rows
