@@ -12,6 +12,7 @@ refuse; revoke releases queued rows.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -3725,22 +3726,76 @@ def test_plan_digest_change_invalidates_drain_authorization(
         store.close()
 
 
+def _tamper_plan_file_canonical(plan_path: Path) -> tuple[bytes, str]:
+    """Structurally rewrite a canonical plan file and return ``(original_bytes, new_digest)``.
+
+    The edit changes ``totals.max_submissions`` (lowered below the approved file count)
+    together with the bound file set (the plan schema requires
+    ``totals.files == totals.max_submissions == len(files)``, so an inconsistent document
+    would hit the invalid-plan path instead of the digest gate). The file is written back
+    as byte-exact canonical bytes via ``write_bytes`` — no ``write_text`` newline
+    translation — so the byte/digest change is identical on Windows and Linux, and the
+    assertions here fail loudly if the tamper is ever a no-op.
+    """
+    original_bytes = plan_path.read_bytes()
+    document = json.loads(plan_path.read_text(encoding="utf-8"))
+    totals = document["totals"]
+    assert "max_submissions" in totals
+    original_max = totals["max_submissions"]
+    tampered_max = original_max - 1
+    assert tampered_max != original_max  # a real structural change, not a no-op edit
+    document["files"] = document["files"][:tampered_max]
+    totals["max_submissions"] = tampered_max
+    totals["files"] = tampered_max
+    tampered_bytes = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    plan_path.write_bytes(tampered_bytes)
+    # (a) the file bytes changed and (b) the canonical file digest changed.
+    file_bytes = plan_path.read_bytes()
+    assert file_bytes != original_bytes
+    tampered_digest = hashlib.sha256(file_bytes).hexdigest()
+    assert tampered_digest != hashlib.sha256(original_bytes).hexdigest()
+    # guard: the tampered file is byte-exact canonical JSON (no newline translation),
+    # so its digest is stable under re-serialization — a future write_text() newline
+    # regression on Windows would make this comparison fail.
+    reparsed = json.loads(file_bytes.decode("utf-8"))
+    canonical_again = (json.dumps(reparsed, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    assert canonical_again == file_bytes
+    assert hashlib.sha256(canonical_again).hexdigest() == tampered_digest
+    return original_bytes, tampered_digest
+
+
 def test_campaign_apply_refuses_authorized_plan_drift_with_zero_posts(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """F10: a bound plan file rewritten after authorization is plan_drift —
-    the campaign pauses with zero POSTs (the authorization never authorizes a plan change)."""
+    the campaign pauses with zero POSTs (the authorization never authorizes a plan change).
+
+    The tamper is STRUCTURAL (``totals.max_submissions`` 5→4 with the bound file set)
+    written back as byte-exact canonical bytes — platform-independent (no newline
+    translation), with explicit byte/digest-change assertions before the cycle, so the
+    drift is real on every OS, not a platform artifact."""
     campaign_id = _f10_campaign(env, capsys)
     store = env.open_store()
     try:
         _canary(env, store, campaign_id)
         _authorize(env, store, campaign_id)
         plan_path = env.tmp_path / "plan.json"
-        plan_text = plan_path.read_text(encoding="utf-8")
-        plan_path.write_text(
-            plan_text.replace('"max_submissions": 5', '"max_submissions": 4'), encoding="utf-8"
-        )
+        approved = store.get_campaign(campaign_id)
+        assert approved is not None
+        plan_document = json.loads(plan_path.read_text(encoding="utf-8"))
+        assert plan_document["totals"]["max_submissions"] == COUNT_FIVE
+        original_bytes, tampered_digest = _tamper_plan_file_canonical(plan_path)
+        original_digest = hashlib.sha256(original_bytes).hexdigest()
+        # the approval bind is the file digest; (c) the new digest differs from it.
+        assert original_digest == approved.digest
+        assert tampered_digest != approved.digest
         posts_before = len(env.stubs.posts)
+        assert posts_before == COUNT_ONE  # only the canary POSTed
+        sends_before = len(store.campaign_send_history(campaign_id))
         cycle = _daemon_cycle(env, store, campaign_id, "plan-changed")
         assert cycle.campaign is None
         assert len(env.stubs.posts) == posts_before
@@ -3748,6 +3803,20 @@ def test_campaign_apply_refuses_authorized_plan_drift_with_zero_posts(
         assert campaign is not None
         assert campaign.status == "paused"
         assert campaign.status_reason == "plan_drift"
+        # the verified canary is untouched: VERIFIED file, unchanged sends.
+        canary_record = store.get_file(500)
+        assert canary_record is not None
+        assert canary_record.state is FileState.VERIFIED
+        assert len(store.campaign_send_history(campaign_id)) == sends_before
+        assert campaign.total_sent == COUNT_ONE
+        # the changed plan file cannot be bypassed by the drain authorization.
+        assert campaign_drain_selection(campaign) == "status_paused"
+        assert select_next_daemon_campaign(store) is None
+        report = campaign_report(store, campaign_id, None)
+        assert report["drain_selection"] == "status_paused"
+        after = _daemon_cycle(env, store, campaign_id, "plan-changed-2")
+        assert after.campaign is None
+        assert len(env.stubs.posts) == posts_before
     finally:
         store.close()
 
