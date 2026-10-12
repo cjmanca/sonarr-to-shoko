@@ -83,6 +83,19 @@ F7 (also schema v1, unshipped — no image shipped with v1 columns has ever been
 drains an approved campaign against the same file the ``plan_drift`` digest gate re-verifies;
 it is appended to ``_SCHEMA_SQL`` with **no** migration entry.
 
+**F17 (schema v2): the F10 drain-authorization columns ARE a schema change.** A database created
+by the previous implementation carries ``user_version = 1`` **without** those columns, so
+``_init_schema`` routes any existing lower version through :meth:`StateStore.migrate`: the
+registered ``1 → 2`` step adds each missing drain column via ``ALTER TABLE campaigns ADD COLUMN``
+(defaults NULL / NULL / '' — a migrated campaign is **never** auto-authorized; the operator
+re-inspects the canary and re-grants), using ``PRAGMA table_info`` so an interim v1 database that
+already has the columns upgrades cleanly. The step, the ``PRAGMA user_version=2`` bump and the
+``schema_version`` audit row commit in **one transaction**: a failing step rolls back whole, the
+store refuses to open with a recoverable :class:`StateError`, and the file stays usable at its
+original version with every history row intact. Fresh (empty) databases initialize directly at v2;
+``user_version > SCHEMA_VERSION`` is refused (fail closed). Migrations never rewrite send, budget
+or campaign rows.
+
 F9 (also schema v1, unshipped — no released image exists): the per-cycle budget window_key is
 made durable-unique. :meth:`StateStore.begin_cycle` allocates ``<label>-<run_id>-<seq>`` window
 keys from two meta rows (``budget_run_id`` nonce + ``budget_cycle_seq`` monotonic counter), so
@@ -151,7 +164,7 @@ else:
 
 _O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
 GLOBAL_BUDGET_KEY: Final[str] = "_global"
 MAX_DETAIL_CHARS: Final[int] = 1000
@@ -893,7 +906,8 @@ CREATE TABLE sends (
     target_ids_json TEXT NOT NULL DEFAULT '[]',
     slot_released INTEGER NOT NULL DEFAULT 0 CHECK (slot_released IN (0, 1))
 );
--- F10 drain authorization (schema v1, unshipped — columns, no migration): the daemon
+-- F10 drain authorization (schema v2 — F17: existing v1 databases gain these columns via the
+-- registered 1→2 migration; fresh installs create them): the daemon
 -- drains an APPROVED campaign only with the operator's explicit confirmation of a settled
 -- (all-VERIFIED) canary. drain_authorized_iso + drain_authorized_digest record the grant
 -- (bound to the campaign's approval digest: a changed digest invalidates selection);
@@ -939,10 +953,34 @@ CREATE INDEX idx_sends_file ON sends (shoko_file_id);
 CREATE INDEX idx_baseline_files_identity ON baseline_files (sonarr_series_id, sonarr_file_id);
 """
 
+#: The three campaigns columns that distinguish v2 from v1 (column name → ADD COLUMN DDL;
+#: kept in sync with the tail of ``campaigns`` in ``_SCHEMA_SQL``).
+_CAMPAIGN_V2_DRAIN_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
+    ("drain_authorized_iso", "TEXT"),
+    ("drain_authorized_digest", "TEXT"),
+    ("drain_invalidated_reason", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """F17: add the F10 drain-authorization columns to a schema-v1 ``campaigns`` table.
+
+    ``PRAGMA table_info`` is consulted per column so an interim v1 database created with the
+    columns already present upgrades without a duplicate-column error. The defaults are
+    NULL / NULL / '' — migrated campaigns are **not** drain-authorized, and no existing row is
+    rewritten: durable submission history, budgets and approvals survive untouched.
+    """
+    existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(campaigns)")}
+    for name, column_ddl in _CAMPAIGN_V2_DRAIN_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {column_ddl}")
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
-# v1 is the current schema; future slices append entries here and bump
-# SCHEMA_VERSION. Migrations never destroy tables and never run backwards.
-_MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {}
+# v2 is the current schema; the 1→2 entry (F17) upgrades existing v1 databases in place.
+# Future slices append entries here and bump SCHEMA_VERSION. Migrations never destroy
+# tables, never rewrite stored rows, and never run backwards.
+_MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {1: _migrate_v1_to_v2}
 
 
 def _parse_iso(raw: str) -> datetime:
@@ -1287,7 +1325,18 @@ class StateStore:
             if step is None:
                 raise StateError(f"no forward migration registered from version {version}")
             with self._transaction():
-                step(self._conn)
+                # F17: the step, the version bump and the audit row commit as ONE transaction.
+                # A failing step rolls the whole migration back — the file stays at its original
+                # version with every row intact, and the operator gets a recoverable StateError
+                # (fix the volume/cause, reopen: the migration runs again from the same start).
+                try:
+                    step(self._conn)
+                except sqlite3.Error as exc:
+                    raise StateError(
+                        f"migration from schema version {version} failed: {exc}; "
+                        f"state left at version {version} (no changes committed, data intact) "
+                        "— recoverable: fix the cause and reopen"
+                    ) from exc
                 version += 1
                 self._conn.execute(f"PRAGMA user_version={version}")
                 self._conn.execute(
@@ -1308,13 +1357,22 @@ class StateStore:
             )
         if version == SCHEMA_VERSION:
             return
+        if version > 0:
+            # F17: an existing database from an older schema is upgraded IN PLACE through the
+            # forward-only registry — never deleted, recreated, or treated as current.
+            self.migrate()
+            return
         with self._transaction():
             self._conn.executescript(_SCHEMA_SQL)
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.execute(
                 "INSERT INTO schema_version (version, applied_iso, description)"
                 " VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, datetime.now(UTC).isoformat(), "initial v1 schema"),
+                (
+                    SCHEMA_VERSION,
+                    datetime.now(UTC).isoformat(),
+                    f"initial v{SCHEMA_VERSION} schema",
+                ),
             )
 
     @contextlib.contextmanager
