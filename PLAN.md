@@ -1,256 +1,491 @@
-# Sonarr-to-Shoko — Second Independent Review Handoff
+# Sonarr-to-Shoko — Third Independent Review Handoff
 
-Repository: https://github.com/cjmanca/sonarr-to-shoko
+**Repository:** https://github.com/cjmanca/sonarr-to-shoko
 
-Reviewed commit: `6d4183b408ee9835c65d035b0e9fb7ec6df9d962`
+**Reviewed HEAD:** `721689f22c34879302386fa0d67017aef333517f`
 
-Review date: 2026-10-10
+**Review date:** 2026-10-11
 
 ## Objective
 
-Address the remaining defects discovered after implementation of remediation F1–F7.
+Correct the remaining defects discovered during an independent review of the F8–F14 remediation.
 
-The previous remediation is substantially successful. Do not rewrite working subsystems or repeat completed implementation unnecessarily.
+The previous fixes are largely implemented and should be preserved. Focus on the confirmed issues below rather than redesigning working components.
 
-Focus on the findings below, particularly automatic backlog campaigns and production write safety.
+The application must remain default-deny, preserve existing Shoko associations, avoid media modifications, and never submit a potentially duplicated link request.
 
 ## Operating instructions
 
-The main orchestrator must follow `ORCHESTRATION.md`.
+Follow the repository's existing orchestration framework.
 
-Document responsibilities remain unchanged:
+* `PROJECT.md` defines product requirements.
+* `AGENTS.md` defines engineering procedures.
+* `ORCHESTRATION.md` defines main-orchestrator responsibilities.
+* `PLAN.md` is immutable during execution.
+* `STATUS.md` is the mutable execution ledger.
 
-* `PROJECT.md`: authoritative product requirements.
-* `PLAN.md`: immutable implementation plan. Never modify.
-* `STATUS.md`: mutable progress and verification evidence.
-* `AGENTS.md`: general engineering procedures.
-* `ORCHESTRATION.md`: main orchestrator workflow.
+Only the main orchestrator reads or updates `PLAN.md` and `STATUS.md`. Subagents receive self-contained task briefs and must not inspect those orchestration files.
 
-Subagents receive self-contained assignments. They must not read or modify `PLAN.md`, `STATUS.md`, or `ORCHESTRATION.md`.
+For every issue:
 
-For each finding:
+1. Verify the finding against current HEAD.
+2. Identify affected implementation and test paths.
+3. Implement the smallest complete correction.
+4. Add focused regression tests.
+5. Run relevant checks.
+6. Conduct a separate read-only review.
+7. Fix blocking findings and retest.
+8. Update `STATUS.md`.
+9. Commit locally after validation.
+10. Continue without requesting routine approval.
 
-1. Verify the root cause against current HEAD.
-2. Implement the smallest complete correction.
-3. Add focused regression tests.
-4. Run relevant tests.
-5. Perform an independent read-only review.
-6. Fix blocking findings and retest.
-7. Update `STATUS.md`.
-8. Commit locally.
-9. Continue to the next finding.
-
-Run model agents sequentially.
-
-Do not push, publish, deploy, or perform live Shoko/Sonarr writes without explicit authorization.
+Do not push, publish packages, deploy, modify production configuration, or perform live Sonarr/Shoko writes without authorization.
 
 ---
 
-# F8 — P1: Daemon and campaign safety attestations are mutually exclusive
+# F15 — P0: Unsafe Shoko file-quality-filter settings can pass attestation
 
 ## Affected files
 
 * `src/shoko_linker/attestation.py`
 * `src/shoko_linker/cli.py`
-* `src/shoko_linker/daemon.py`
-* `src/shoko_linker/campaign.py`
-* Related configuration and tests
+* `tests/test_attestation.py`
+* Related apply-safety tests
 
-## Root cause
+## Evidence
 
-The application currently stores one safety attestation in the path configured by:
+In `attestation.py`, `build_record()` validates that all four settings flags are present and Boolean.
 
-`safety.attestation_file`
+It does not enforce that `FileQualityFilterEnabled` is false.
 
-That record contains a scope:
+The loader also accepts a correctly structured record containing:
 
-* `daemon`
-* `campaign:<campaign-id>`
+```yaml
+settings_summary:
+  FileQualityFilterEnabled: true
+  RenameOnImport: false
+  MoveOnImport: false
+  MyListAddFiles: false
+```
 
-The attestation loader requires an exact scope match.
+`load_attestation()` checks the endpoint, scope, version, and expiration, but does not reject this unsafe settings value.
 
-However, the automatic campaign daemon uses two independent authorization paths.
+`AttestationVerdict.valid_for_apply` returns true whenever the status is `valid`.
 
-First, the daemon computes its ordinary apply eligibility:
+Consequently, the application can accept an operator attestation that explicitly states the file-quality filter is enabled.
 
-`daemon.py`, approximately lines 1683–1719.
+This contradicts the production safety requirements.
 
-This requires a valid daemon-scoped attestation before `apply_running` becomes true.
+### Why this matters
 
-Second, automatic campaign processing uses:
+In Shoko Server 5.3.3:
 
-`_campaign_scoped_deps()`
+`Shoko.Server/Scheduling/Jobs/Shoko/ManualLinkJob.cs`
 
-This requires a campaign-scoped attestation.
+`ManualLinkJob.Process()` calls `ProcessFileQualityFilter()`.
 
-Both lookups use the same configured attestation file.
+That function checks:
 
-Consequently:
+```csharp
+if (!_settings.FileQualityFilterEnabled) return;
+```
 
-* A daemon-scoped attestation cannot authorize the campaign.
-* A campaign-scoped attestation cannot authorize the daemon's outer apply cycle.
-* Recording a new attestation in the same file does not allow both scopes to remain valid simultaneously.
+When the filter is enabled, it can ultimately call:
 
-The resulting configuration can prevent automatic campaign processing entirely.
+```csharp
+RemoveRecordAndDeletePhysicalFile(...)
+```
 
-The problem is compounded by the global attestation pause mechanism: an invalid daemon attestation can pause writes before the valid campaign attestation is considered.
+The affected files can include media in Shoko's independently writable manual collection.
+
+Making Sonarr's mounts read-only does not necessarily protect those files.
 
 ## Required correction
 
-Support independent, simultaneously valid safety authorizations for daemon and campaign operations.
+Treat `FileQualityFilterEnabled=true` as a hard apply-safety failure.
 
-Choose a simple design that preserves the existing operator-controlled safety model.
+Enforce this at both boundaries:
 
-For example, use separately persisted, scope-specific attestation records under the configured safety directory.
+1. When creating an attestation.
+2. When loading an existing attestation.
 
-Alternatively, separate deployment-wide media-safety certification from campaign-specific authorization.
+A manually edited or previously generated unsafe attestation must not become valid merely because it parses successfully.
 
-Do not weaken the requirement for a valid operator-recorded safety lease.
+Return a clear refusal explaining which setting is unsafe.
 
-The daemon must distinguish:
+Do not require all renamer/MyList flags to be false without examining their separate risk and deployment requirements. The file-quality filter is the independently established hard prohibition.
 
-1. Permission to submit newly arriving episodes.
-2. Permission to process an explicitly approved backlog campaign.
+Preserve the operator-controlled mount/plugin checklist.
 
-A missing daemon-scope lease must not invalidate an otherwise authorized campaign solely because the service runs inside the daemon process.
+## Required tests
 
-Similarly, an invalid campaign lease must not disable unrelated, independently authorized new-arrival processing.
+Verify:
 
-Avoid using one global pause marker for unrelated scope failures unless it represents a genuinely deployment-wide safety issue.
+* `FileQualityFilterEnabled=false` permits an otherwise valid attestation.
+* `FileQualityFilterEnabled=true` is rejected when recording.
+* An existing YAML lease containing `true` is rejected when loaded.
+* Daemon apply performs zero POSTs with an unsafe lease.
+* Manual campaign apply performs zero POSTs.
+* Automatic campaign draining performs zero POSTs.
+* Other unrelated safety flags retain their documented behavior.
+* Missing or malformed flags remain invalid.
 
-Maintain backward compatibility with existing attestation files where practical.
-
-## Regression tests
-
-Test with real temporary attestation files, not only injected Boolean callbacks.
-
-Required scenarios:
-
-* Valid daemon lease only.
-* Valid campaign lease only.
-* Both leases valid simultaneously.
-* Daemon lease expired, campaign lease valid.
-* Campaign lease expired, daemon lease valid.
-* Both leases expired.
-* Different Shoko endpoint.
-* Different Shoko version.
-* Explicit operator invalidation.
-* Container restart with persisted attestations.
-
-**Acceptance:** An approved, canary-authorized campaign can drain automatically under its own valid safety authorization without disabling unrelated daemon processing.
+**Acceptance:** No Shoko link request is authorized by an attestation explicitly reporting an enabled file-quality filter.
 
 ---
 
-# F9 — P1: Campaign submission budgets never reset between batches
+# F16 — P1: ED2K validation rejects Shoko's actual hash format
+
+## Affected files
+
+* `src/shoko_linker/shoko.py`
+* `src/shoko_linker/linking.py`
+* `tests/hash_fixtures.py`
+* `tests/test_shoko.py`
+* `tests/test_linking.py`
+* `tests/e2e_harness.py`
+* Other fixtures using ED2K hashes
+
+## Evidence
+
+The F13 implementation introduced `_valid_ed2k()`.
+
+It requires the ED2K value to begin with:
+
+```text
+ed2k://
+```
+
+It then validates a URI containing a filename, file size, and hash segments.
+
+However, **Shoko's v3 File API does not return ED2K as a URI**.
+
+In Shoko Server 5.3.3:
+
+`Shoko.Server/API/v3/Models/Shoko/File.cs`
+
+The response is populated with:
+
+```csharp
+Hashes = new()
+{
+    ED2K = file.Hash,
+    MD5 = file.MD5,
+    CRC32 = file.CRC32,
+    SHA1 = file.SHA1
+};
+```
+
+And in:
+
+`Shoko.Server/Scheduling/Jobs/Shoko/HashFileJob.cs`
+
+Shoko stores:
+
+```csharp
+vlocal.Hash = hashes.ED2K.ToUpperInvariant();
+```
+
+The ED2K value is the raw hexadecimal hash, normally 32 hexadecimal characters.
+
+An actual response resembles:
+
+```json
+{
+  "Hashes": {
+    "ED2K": "0123456789ABCDEF0123456789ABCDEF",
+    "SHA1": null,
+    "MD5": null,
+    "CRC32": null
+  }
+}
+```
+
+It does not contain a filename or URI prefix.
+
+The current `_valid_ed2k()` rejects this value.
+
+Because discovery and fresh preflight both use `has_available_hashes()`, valid files can be rejected as `NO_HASHES`.
+
+This potentially blocks the entire real backlog.
+
+### Why the tests did not detect it
+
+`tests/hash_fixtures.py` constructs synthetic `ed2k://` URIs.
+
+Those fixtures are then reused across discovery, linking, and end-to-end tests.
+
+The tests consistently exercise an incorrect API representation.
+
+## Required correction
+
+Replace URI validation with validation of Shoko's actual ED2K field.
+
+For Shoko 5.3.3:
+
+* Require a string.
+* Require exactly 32 hexadecimal characters.
+* Accept uppercase and lowercase.
+* Reject empty, whitespace-only, and malformed values.
+* Preserve the original value for identity comparisons.
+* Validate other populated hash fields according to their actual wire formats.
+* Permit absent optional hashes.
+* Do not use `Imported=null` as an exclusion.
+
+Verify the field contract against upstream Shoko source before implementation.
+
+Correct the shared test fixtures so they model actual Shoko API responses.
+
+Do not keep URI-based synthetic fixtures simply to preserve passing tests.
+
+### Required tests
+
+Test:
+
+1. Valid uppercase 32-character ED2K.
+2. Valid lowercase 32-character ED2K.
+3. `Imported=null` with valid ED2K.
+4. Empty ED2K.
+5. Whitespace-only ED2K.
+6. Truncated ED2K.
+7. Nonhexadecimal ED2K.
+8. Missing ED2K.
+9. Malformed optional hashes.
+10. Existing XRefs.
+11. Correct file identity across discovery and fresh preflight.
+
+Add an end-to-end backlog fixture containing actual Shoko-style hash values.
+
+**Acceptance:** A fully hashed, unrecognized Shoko file with a normal hexadecimal ED2K value can progress through discovery, mapping, planning, and protected preflight.
+
+---
+
+# F17 — P1: Existing SQLite v1 databases cannot be upgraded safely
+
+## Affected files
+
+* `src/shoko_linker/state.py`
+* `tests/test_state.py`
+* Relevant campaign migration tests
+
+## Evidence
+
+The current state module still declares:
+
+```python
+SCHEMA_VERSION = 1
+```
+
+The initial SQL schema has been modified to add campaign fields:
+
+```sql
+drain_authorized_iso TEXT,
+drain_authorized_digest TEXT,
+drain_invalidated_reason TEXT NOT NULL DEFAULT ''
+```
+
+However, the previous implementation already created schema-v1 databases without these columns.
+
+The migration registry is still empty.
+
+In `_init_schema()`, an existing database with `user_version=1` is treated as current, and initialization returns without applying any changes.
+
+Meanwhile, `get_campaign()` and `list_campaigns()` now select the new columns.
+
+Opening an existing v1 database can therefore produce:
+
+```text
+sqlite3.OperationalError:
+no such column: drain_authorized_iso
+```
+
+This is an upgrade compatibility defect.
+
+The affected state may contain important historical submissions, approvals, budgets, and indeterminate write outcomes.
+
+It must not be discarded or silently recreated.
+
+## Required correction
+
+Implement a genuine forward-only schema migration.
+
+Suggested approach:
+
+* Bump `SCHEMA_VERSION` to 2.
+* Keep the new fields in the fresh-install schema.
+* Add a migration from v1 to v2.
+* Add missing campaign columns with appropriate defaults.
+* Preserve all existing data.
+* Treat existing campaigns as **not drain-authorized** after migration.
+* Ensure migration failure leaves a recoverable database state.
+* Refuse newer unsupported schema versions.
+
+Do not solve this by deleting the state database.
+
+Do not rewrite existing submission histories.
+
+Avoid migrations that automatically authorize old campaigns.
+
+## Required tests
+
+Create a database using the actual schema from commit:
+
+`6d4183b408ee9835c65d035b0e9fb7ec6df9d962`
+
+Populate it with:
+
+* A baseline.
+* File records.
+* An existing campaign.
+* A verified send.
+* An indeterminate send.
+* Rolling-budget state.
+* A stored apply-pause reason.
+
+Then open it with the corrected implementation.
+
+Verify:
+
+1. Migration succeeds.
+2. Schema version advances.
+3. All existing records survive.
+4. Campaign queries work.
+5. Old campaigns have no automatic-drain authorization.
+6. Pending sends are not replayed.
+7. Budget accounting remains correct.
+8. Reopening the database does not repeat the migration.
+9. A future unsupported schema version is refused.
+10. Migration failure does not destroy the database.
+
+**Acceptance:** An existing installation can upgrade without losing state or requiring manual database reconstruction.
+
+---
+
+# F18 — P1/P2: Normal budget cooldown permanently pauses unattended campaigns
+
+## Affected files
+
+* `src/shoko_linker/daemon.py`
+* `src/shoko_linker/campaign.py`
+* `src/shoko_linker/state.py`
+* `tests/test_daemon.py`
+* `tests/test_campaign.py`
+* End-to-end campaign tests
+
+## Evidence
+
+The daemon implements a three-cycle zero-progress breaker.
+
+When campaign apply is refused because of:
+
+```text
+budgets_exhausted
+```
+
+the daemon increments its zero-progress counter.
+
+After three such cycles, it pauses the campaign with:
+
+```text
+no_budget_progress
+```
+
+Paused campaigns are excluded from automatic-drain selection.
+
+This creates a problem with normal rolling budgets.
+
+For example, the existing default limits include:
+
+```text
+rolling_new_limit = 200
+rolling_window_hours = 168
+```
+
+After 200 submissions, the weekly rolling budget is exhausted.
+
+The application should stop submitting until the rolling window permits more work.
+
+Instead, subsequent daemon cycles can permanently pause the campaign.
+
+When the rolling budget eventually resets, the campaign remains paused and requires operator intervention.
+
+For a 7,000-file backlog, this defeats unattended processing across multiple budget windows.
+
+### Related issue
+
+The same zero-progress logic can pause campaigns waiting for:
+
+* Shoko metadata.
+* Pending asynchronous jobs.
+* Temporary queue congestion.
+* Other expected, recoverable conditions.
+
+A few consecutive zero-progress cycles are not proof of permanent failure.
+
+## Required correction
+
+Distinguish **recoverable waiting** from **permanent failure**.
+
+Normal rolling-budget exhaustion should produce a deferred state with an expected retry time.
+
+When the rolling window permits more submissions, processing should resume automatically.
+
+The application should similarly wait through legitimate metadata and async-job delays without immediately requiring operator intervention.
+
+Preserve hard stops for:
+
+* Invalid safety authorization.
+* Revoked approval.
+* Mapping conflicts requiring review.
+* Source identity discontinuity.
+* Unsafe Shoko settings.
+* Unexpected existing links.
+* Other genuinely unsafe states.
+
+Do not remove rate limits or submission ceilings to make the campaign progress.
+
+The goal is correct scheduling, not faster unsafe writes.
+
+### Required tests
+
+Use a fake clock and a campaign larger than the rolling limit.
+
+Example:
+
+* 100 approved files.
+* Per-cycle cap: 5.
+* Rolling cap: 10.
+* Rolling window: 1 hour.
+
+Verify:
+
+1. The campaign submits at most 5 per cycle.
+2. It stops after 10 during the rolling window.
+3. It remains approved while waiting.
+4. No submissions occur before the window permits them.
+5. Processing resumes automatically after the window.
+6. The campaign completes across multiple windows.
+7. Restart during cooldown preserves the schedule.
+8. Pending Shoko jobs do not cause premature permanent pauses.
+9. Genuine safety failures still stop writes.
+
+**Acceptance:** An approved campaign can progress across multiple rolling-budget windows without repeated manual intervention.
+
+---
+
+# F19 — P2: Canary verification ignores attempted sends that return to WAITING
 
 ## Affected files
 
 * `src/shoko_linker/campaign.py`
 * `src/shoko_linker/state.py`
-* `src/shoko_linker/daemon.py`
-* `src/shoko_linker/cli.py`
+* `tests/test_campaign.py`
 
-## Root cause
+## Evidence
 
-`campaign.py`, approximately line 1383, submits requests using:
+`authorize_campaign_drain()` checks submitted campaign files by filtering their current states against `_SEND_PROGRESS_STATES`.
 
-```python
-cycle_key=f"campaign-{_short(campaign_id)}"
-```
-
-This key is identical across every batch of the same campaign.
-
-However, `StateStore._reserve_tx()` retrieves the existing `cycle_new_submissions` count using that key.
-
-It increments the stored count after every submission.
-
-The per-cycle limit is checked against the accumulated count.
-
-The default configuration permits:
-
-`sync.max_new_per_cycle = 20`
-
-Consequently, once a campaign has submitted 20 files, every subsequent batch can encounter:
-
-`cycle_new_exhausted`
-
-Because the cycle key never changes, waiting for another daemon cycle does not reset the count.
-
-This can permanently stall a campaign intended to process thousands of files.
-
-A related issue exists in the daemon's cycle identifiers.
-
-The daemon uses identifiers such as:
-
-`cycle-1`, `cycle-2`, etc.
-
-These identifiers restart at `cycle-1` whenever the process restarts.
-
-Old persisted budget rows can therefore be reused accidentally by a new process.
-
-## Required correction
-
-Give every actual reconciliation cycle and campaign batch a distinct durable budget-cycle identity.
-
-Requirements:
-
-* Unique across process restarts.
-* Stable for one executing cycle/batch.
-* Consistent for every submission belonging to that cycle.
-* No collision with previous campaign batches.
-* Does not reset global rolling budgets.
-* Does not permit crash recovery to submit the same request twice.
-
-A persisted run identifier combined with a sequence number, or a UUID-based cycle identifier, would be suitable.
-
-Keep the existing durable send fingerprints and idempotence protections.
-
-Consider bounded cleanup of old completed cycle-budget rows so thousands of campaigns do not cause unlimited SQLite metadata growth.
-
-Also examine zero-progress handling.
-
-Currently, an attempted candidate can count as `processed` even when its submission was refused by the budget.
-
-This can prevent the zero-progress circuit breaker from detecting a campaign that is permanently stuck.
-
-## Regression tests
-
-Simulate:
-
-1. A campaign with 100 approved files.
-2. A per-cycle submission cap of 5.
-3. Several automatic daemon batches.
-4. Successful progression beyond 5, 10, 20, and 50 total submissions.
-5. Daemon restart halfway through.
-6. Repeated one-shot invocations.
-7. Rolling-budget exhaustion and later recovery.
-8. Pending asynchronous jobs.
-9. Zero successful submissions across several cycles.
-
-Verify that the per-cycle budget resets appropriately while rolling and outstanding-job limits remain enforced.
-
-**Acceptance:** A 7,000-file campaign can progress across arbitrarily many bounded cycles without becoming permanently blocked by an old cycle identifier.
-
----
-
-# F10 — P1: Canary authorization is inferred from attempted submissions
-
-## Affected files
-
-* `src/shoko_linker/campaign.py`
-* `src/shoko_linker/state.py`
-* `src/shoko_linker/cli.py`
-* `src/shoko_linker/daemon.py`
-
-## Root cause
-
-`campaign.py`, approximately lines 1540–1562, selects campaigns for automatic processing when:
-
-```python
-campaign_send_progress(store, campaign.campaign_id) >= 1
-```
-
-However, `campaign_send_progress()` counts several states, including:
+That set includes:
 
 * `request_may_have_been_sent`
 * `verifying`
@@ -259,377 +494,205 @@ However, `campaign_send_progress()` counts several states, including:
 * `indeterminate_write`
 * `conflict`
 
-Therefore, the daemon can consider the canary complete after a single attempted submission.
+It excludes `waiting`.
 
-The canary might still be:
+However, `StateStore.record_send_outcome()` maps `REJECTED` and `REFUSED` outcomes to `FileState.WAITING`.
 
-* Unverified.
-* Partially linked.
-* Indeterminate.
-* Incorrectly linked.
-* Awaiting asynchronous Shoko jobs.
+The send is still recorded in the submission ledger.
 
-More importantly, the software has no evidence that the operator inspected the resulting media files for unexpected renames, deletions, or other Shoko-side effects.
+Consider a manually executed canary batch:
 
-The original safety requirement is that the operator reviews a completed canary before approving broader production writes.
+1. File A is submitted and verified.
+2. File B is submitted but Shoko returns a rejection.
+3. File B transitions to `waiting`.
+4. The operator invokes `campaign authorize-drain`.
 
-Counting an attempted request does not establish that approval.
+The authorization check can see only File A among its filtered submitted files.
 
-## Required correction
-
-Introduce a durable, explicit operator confirmation that the canary has passed.
-
-Suggested workflow:
-
-1. Approve the finite campaign.
-2. Manually execute a small canary batch.
-3. Wait for Shoko's asynchronous jobs to settle.
-4. Verify the exact resulting episode links.
-5. Confirm the physical-media safety checks.
-6. Explicitly authorize automatic draining.
-
-The final step should be represented by an operator-only CLI command or equivalent confirmed action.
-
-For example:
-
-`campaign authorize-drain --campaign-id <id> --confirm --note "canary inspected"`
-
-The command name is illustrative.
-
-Bind the authorization to the approved campaign identity/digest.
-
-Persist the authorization across restarts.
-
-Do not permit automatic draining when the canary is pending, partial, indeterminate, or conflicting.
-
-A verified Shoko association alone is insufficient to establish that the operator inspected physical-media side effects.
-
-Preserve the current manual batch commands.
-
-## Regression tests
-
-Test that:
-
-* A newly approved campaign cannot auto-drain.
-* One attempted but unverified send does not authorize draining.
-* An indeterminate canary does not authorize draining.
-* A verified canary without operator confirmation does not authorize draining.
-* Explicit confirmation after verification enables bounded automatic processing.
-* Revocation prevents further submissions.
-* A changed plan digest invalidates automatic-drain authorization.
-* Restart preserves valid confirmation.
-
-**Acceptance:** The daemon cannot begin mass backlog processing before the operator has explicitly confirmed that the canary passed.
-
----
-
-# F11 — P1: Campaign batches reuse stale safety and timing decisions
-
-## Affected files
-
-* `src/shoko_linker/campaign.py`
-* `src/shoko_linker/daemon.py`
-* `src/shoko_linker/linking.py`
-
-## Root cause
-
-`apply_campaign()` checks the write gate and safety attestation once before entering its batch loop.
-
-It then processes multiple files.
-
-The initial timestamp is reused throughout the batch.
-
-More importantly, `_send_one()` calls `preflight()` with:
-
-```python
-attestation_valid=True
-apply_gate_open=True
-```
-
-These values are hardcoded because the batch previously passed its outer safety checks.
-
-However, each file may require substantial time for Shoko verification.
-
-A campaign processing several files can continue well beyond its original attestation inspection time.
-
-Consequently, an attestation or campaign deadline may expire while the batch is still active.
-
-The next file can be submitted using the earlier authorization.
-
-A related shutdown concern exists: a SIGTERM received during a long batch is not checked before every subsequent submission.
-
-The daemon checks shutdown after the entire reconciliation cycle, which now includes automatic campaign processing.
-
-This can result in additional POST requests after shutdown has been requested.
+It may conclude that every submitted canary file was verified, even though File B was not.
 
 ## Required correction
 
-Immediately before each new Shoko POST, re-evaluate the safety inputs that can become stale.
+Base canary completion checks on the durable send history, not solely the current file state.
 
-At minimum:
+The operator authorization should account for every send attempted as part of the canary.
 
-* Current attestation validity.
-* Applicable safety scope.
-* Campaign deadline.
-* Campaign status.
-* Operator write gate.
-* Shutdown request.
-* Mapping generation consistency.
-* Existing-link protection.
-* Shoko file identity.
+Do not confuse a request rejected with documented zero-write semantics with a verified episode association.
 
-Keep the existing fresh file/XRef and target-identity preflight.
+If rejected canary requests are permitted as an exceptional outcome, require explicit, visible handling rather than silently excluding them from the completeness check.
 
-Use the actual current time for submission timestamps and rolling-budget calculations instead of reusing an old batch-start timestamp.
+Preserve the requirement for operator confirmation of physical-media safety.
 
-Ensure the process stops starting new submissions when shutdown has been requested.
+## Required tests
 
-An already submitted request must remain durably tracked and recoverable.
+* One verified canary: eligible for explicit operator confirmation.
+* One verifying canary: refused.
+* One indeterminate canary: refused.
+* One rejected canary: refused or explicitly handled according to the documented policy.
+* One verified plus one rejected: cannot silently pass.
+* Previously attempted file now in `waiting`: remains visible in the canary audit.
+* Successful explicit confirmation after safe resolution persists across restart.
 
-Keep verification bounded and avoid busy polling.
-
-Do not bypass the original safety gate merely because the candidate belongs to an approved campaign.
-
-## Regression tests
-
-Using a fake clock:
-
-1. Begin a batch with a valid attestation.
-2. Submit and verify the first file.
-3. Advance beyond the attestation expiration.
-4. Confirm the next file is not submitted.
-
-Repeat with campaign deadline expiration.
-
-Also test:
-
-* Operator pause or revoke between files.
-* SIGTERM after the first request.
-* Mapping changes between candidates.
-* Long verification delays.
-* Correct pending-send recovery after interruption.
-
-**Acceptance:** No new Shoko POST begins after its applicable authorization expires or after shutdown has been requested.
+**Acceptance:** Drain authorization cannot silently omit attempted canary sends from its verification decision.
 
 ---
 
-# F12 — P2: GHCR provenance verification fetches manifests as blobs
+# F20 — P2: Current GitHub CI and publishing are failing
 
 ## Affected files
 
-* `scripts/ghcr_tags.py`
-* `.github/workflows/publish.yml`
-* `tests/test_ghcr_tags.py`
-
-## Root cause
-
-The new registry discovery implementation correctly queries GHCR instead of Git tags.
-
-However, the OCI index provenance code contains an endpoint error.
-
-In `scripts/ghcr_tags.py`, approximately lines 410–440, `_index_revision()` extracts the digest of a child manifest.
-
-It then fetches that manifest using:
-
-```python
-f"{REGISTRY}/v2/{owner}/{package}/blobs/{digest}"
-```
-
-The OCI Distribution API distinguishes manifests from blobs.
-
-A referenced image manifest must be fetched through:
-
-`GET /v2/<name>/manifests/<digest>`
-
-The `/blobs/<digest>` endpoint is for blobs such as image configurations and layers.
-
-This can cause provenance verification to fail for OCI image indexes produced by Docker Buildx.
-
-Because the workflow enables provenance attestations, OCI indexes are particularly relevant.
-
-The verifier may classify an already-published image as `unknown_provenance`.
-
-The backfill workflow can then repeatedly schedule that SHA for publication.
-
-## Required correction
-
-Fetch child manifest descriptors through the manifests endpoint.
-
-Fetch the referenced image configuration through the blobs endpoint.
-
-Handle OCI indexes containing multiple descriptors.
-
-Select an actual runnable image manifest rather than assuming the first descriptor is always the image.
-
-For example, an index may contain an image manifest and a separate attestation manifest.
-
-Preserve digest verification.
-
-Also correct the publication policy for existing tags with unknown provenance.
-
-An existing but unverifiable SHA tag should not automatically be overwritten merely because its name contains a commit SHA.
-
-A tag name derived from a commit is not automatically an immutable image reference.
-
-If an existing tag cannot be verified, report the problem and require safe reconciliation instead of silently overwriting an unknown image.
-
-## Regression tests
-
-Use a representative OCI index containing:
-
-* A runnable image manifest.
-* An attestation manifest.
-* Image configuration labels.
-* Valid SHA-256 digests.
-
-Assert the exact registry request paths.
-
-Also test:
-
-* Docker manifest schema 2.
-* OCI single-image manifests.
-* OCI indexes.
-* Manifest ordering variations.
-* Missing revision labels.
-* Mismatched revision labels.
-* Missing child manifests.
-* Registry authentication failure.
-* Repeated backfill after successful publication.
-
-**Acceptance:** Successfully published images are recognized reliably, and backfill does not overwrite an existing unverified SHA tag.
-
-OCI reference: https://github.com/opencontainers/distribution-spec/blob/main/spec.md
-
----
-
-# F13 — P2: Empty hashes can pass the file-readiness check
-
-## Affected files
-
-* `src/shoko_linker/shoko.py`
-* `src/shoko_linker/linking.py`
-* Related tests
-
-## Root cause
-
-The new `has_available_hashes()` helper uses:
-
-```python
-return any(value is not None for value in _hash_tuple_values(item.hashes))
-```
-
-This considers an empty string a valid hash.
-
-For example:
-
-```python
-ShokoHashes(
-    ed2k="",
-    sha1=None,
-    crc32=None,
-    md5=None,
-)
-```
-
-passes the check.
-
-However, Shoko can use an empty ED2K string while preparing a new file record before hashing has completed.
-
-A non-null value is not necessarily a usable hash.
-
-## Required correction
-
-Validate that the required hash is nonempty and structurally valid.
-
-For Shoko 5.3.3, investigate requiring a complete ED2K identity before linking.
-
-Do not assume that a partially populated hash object means hashing has completed.
-
-Preserve the corrected behavior allowing fully hashed files with `Imported=null`.
-
-Tests must distinguish:
-
-* `Imported=null`, valid complete ED2K: eligible.
-* `Imported=null`, empty ED2K: ineligible.
-* Whitespace-only ED2K: ineligible.
-* Malformed ED2K: ineligible.
-* Missing hashes: ineligible.
-* Complete hashes, no XRefs: eligible.
-
-**Acceptance:** The `Imported=null` fix remains functional without admitting files whose hashing state is incomplete.
-
----
-
-# F14 — P2: Deployment documentation contains inconsistent campaign instructions
-
-## Affected files
-
-* `docs/deployment.md`
-* `README.md`
+* `tests/test_campaign.py`
+* Related campaign-plan tests
+* `STATUS.md` (orchestrator only)
 
 ## Evidence
 
-The deployment guide currently prepares a campaign using:
+The latest GitHub Actions runs failed:
 
-`campaign prepare --limit 1`
+CI:
+https://github.com/cjmanca/sonarr-to-shoko/actions/runs/38199820749
 
-It then explains that the daemon will process the remaining campaign automatically.
+GHCR:
+https://github.com/cjmanca/sonarr-to-shoko/actions/runs/38199820737
 
-However, the approved plan contains only one file.
+Both workflows fail during the test phase.
 
-There are no additional approved files for the daemon to process.
+The failing test is:
 
-The same document also contains an older warning about stopping after the first campaign batch because of a known source-continuity defect.
+```text
+test_campaign_apply_refuses_authorized_plan_drift_with_zero_posts
+```
 
-This contradicts the newly implemented multi-batch behavior.
+The test attempts to modify an approved plan using:
+
+```python
+plan_text.replace(
+    '"max_submissions": 5',
+    '"max_submissions": 4',
+)
+```
+
+However, campaign plan files are written using compact canonical JSON:
+
+```python
+json.dumps(
+    document,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+```
+
+The actual JSON therefore contains:
+
+```json
+"max_submissions":5
+```
+
+rather than a space after the colon.
+
+The replacement does nothing.
+
+The plan file remains unchanged, so the application's digest validation correctly permits the next batch.
+
+The test then incorrectly expects plan drift and fails.
+
+GitHub's runner confirmed that additional mocked submissions occurred before the assertion failed.
+
+This is primarily a **test-fixture defect**, not evidence that the production digest guard can be bypassed.
+
+Nevertheless, the intended plan-drift regression is currently not being tested correctly.
 
 ## Required correction
 
-Update the deployment instructions to prepare the complete intended campaign first.
+Modify the plan structurally rather than using whitespace-sensitive text replacement.
 
-The operator should then apply only a small canary subset from that approved campaign.
+For example:
 
-After verification and explicit operator confirmation, the daemon may process the remaining approved files automatically.
+```python
+document = json.loads(plan_path.read_text())
+document["totals"]["max_submissions"] = 4
 
-Remove obsolete warnings about defects that have been fixed.
+plan_path.write_text(
+    json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+)
+```
 
-Ensure the documentation accurately explains the separate daemon and campaign safety attestations after F8 is resolved.
+Verify that the chosen field exists and that its original value differs.
 
-Cross-check example commands against actual CLI arguments.
+Before running the daemon, explicitly assert:
 
-**Acceptance:** Following the deployment guide produces a finite, fully approved backlog campaign that can proceed safely after the canary.
+* The file contents changed.
+* The canonical digest changed.
+* The new digest differs from the stored approval digest.
+
+Then verify:
+
+* The campaign pauses with `plan_drift`.
+* No additional POST is issued.
+* Existing verified canary associations remain untouched.
+* Automatic drain authorization does not bypass the changed plan.
+
+Do not remove the test or weaken its assertions merely to restore CI.
+
+## Required validation
+
+Run the focused test first, then the complete test suite.
+
+Check that the locally passing results in `STATUS.md` reconcile with the actual GitHub runner failure.
+
+Actual publishing success for the latest commit remains unverified until GitHub Actions completes successfully on a corrected commit.
+
+**Acceptance:** The plan-drift test genuinely modifies the approved plan and proves that the application refuses further submissions.
 
 ---
 
-# Implementation priority
+# Implementation sequence
 
-Address findings in this order:
+## Phase 1 — Critical safety and API compatibility
 
-**Phase A — Core campaign correctness**
+Fix F15 and F16 first.
 
-1. F8: Independent safety attestations.
-2. F9: Unique budget-cycle identifiers.
-3. F10: Explicit canary confirmation.
-4. F11: Fresh per-submission authorization and shutdown checks.
+Verify the relevant Shoko Server 5.3.3 source directly.
 
-These four must be fixed before production automatic campaign processing.
+The work is incomplete if the tests pass only because they use synthetic API formats that Shoko does not return.
 
-**Phase B — Registry reliability**
+Conduct a separate adversarial review of the safety-attestation and Shoko file-readiness paths.
 
-5. F12: Correct OCI manifest traversal and tag-provenance handling.
+## Phase 2 — Database upgrade safety
 
-**Phase C — File readiness and documentation**
+Implement F17.
 
-6. F13: Validate actual hash contents.
-7. F14: Correct deployment documentation.
+Test against a database created by the previous implementation, not merely against a schema reconstructed from the latest source.
 
-Avoid adding new infrastructure or unnecessarily restructuring the existing application.
+Preserve durable submission history.
 
----
+## Phase 3 — Campaign correctness
 
-# Final validation requirements
+Fix F18 and F19.
 
-Run the project's configured checks:
+Use the existing campaign, daemon, and SQLite mechanisms.
+
+Do not introduce a separate scheduler, task queue, or database.
+
+Verify unattended progress across multiple real budget windows and comprehensive canary authorization.
+
+## Phase 4 — Repair CI validation
+
+Fix F20.
+
+Make the failing test actually exercise plan drift.
+
+Run the relevant checks and distinguish local evidence from GitHub runner results.
+
+Do not push unless authorized.
+
+## Phase 5 — Final integration and adversarial review
+
+Run:
 
 ```bash
 uv run pytest -q
@@ -640,48 +703,56 @@ git diff --check
 docker build -t shoko-sonarr-linker:review .
 ```
 
-Add a realistic simulated campaign containing at least 100 files.
+Also run targeted integration tests for:
 
-Use deliberately small budgets so the test crosses several per-cycle boundaries.
+* Actual Shoko-style ED2K payloads.
+* `Imported=null` with completed hashing.
+* Explicitly unsafe file-quality-filter settings.
+* Existing SQLite schema migration.
+* Campaign progression across multiple rolling-budget windows.
+* Rejected and indeterminate canary submissions.
+* Campaign approval digest changes.
+* Container restart and send recovery.
+* Existing-link protection.
+* Multi-episode file verification.
+* Normal daemon shutdown.
 
-Verify that automatic processing:
+Perform a separate read-only review of every mutation path.
 
-* Continues beyond the per-cycle cap across later cycles.
-* Survives process restart.
-* Never widens the approved file or episode set.
-* Requires explicit canary confirmation.
-* Requires valid safety authorization for each submission.
-* Stops new submissions after revocation or shutdown.
-* Preserves uncertain sends without replaying POST requests.
-* Handles mapping updates and Shoko queue anomalies safely.
+The final review must establish that:
 
-Run independent regression tests for the GHCR OCI registry operations.
+1. Every real Shoko POST is protected by fresh safety checks.
+2. The state machine persists intent before transmitting.
+3. An uncertain request is never blindly replayed.
+4. A previously linked Shoko file cannot be intentionally overwritten.
+5. No out-of-scope Sonarr file is linked.
+6. Attestations explicitly reporting unsafe settings are rejected.
+7. Existing installations can upgrade without losing SQLite state.
+8. An approved backlog can progress unattended across normal budget resets.
+9. The plan-drift regression exercises a genuine change.
+10. Tests use realistic, upstream-verified API payloads.
 
-Perform a separate adversarial review of all changes affecting Shoko POST submission, campaign authorization, and durable SQLite state.
+Record actual evidence in `STATUS.md`.
 
-Record findings, actual test results, and local commit SHAs in `STATUS.md`.
+Keep `PLAN.md` immutable.
 
-Keep `PLAN.md` unchanged.
+Commit the corrections locally after successful validation.
 
-Do not perform live writes or push the resulting commits without authorization.
+Do not perform production writes, deployments, or GitHub publishing without authorization.
 
-## Completion criteria
+# Completion criteria
 
-Remediation is complete when:
+This remediation is complete when:
 
-1. Automatic campaigns operate with valid independent safety attestations.
-2. Campaigns progress through multiple real budget cycles without stalling.
-3. A canary cannot authorize automatic draining until explicitly confirmed by the operator.
-4. Expired safety authorization prevents further POST requests.
-5. Graceful shutdown prevents additional submissions after the current protected operation.
-6. GHCR provenance verification handles OCI manifests and indexes correctly.
-7. Hash-readiness checks reject empty or incomplete hashes.
-8. Deployment instructions accurately represent the implemented behavior.
-9. All targeted and full regression tests pass.
-10. Independent review finds no outstanding P0/P1 or acceptance-blocking P2 defects.
-11. `STATUS.md` contains accurate evidence.
-12. `PLAN.md` remains immutable.
+* F15–F20 are corrected or conclusively disproved with source/test evidence.
+* All required targeted regression tests pass.
+* The full configured test suite passes.
+* Docker builds and the default-deny CLI smoke tests pass.
+* Independent review finds no unresolved P0/P1 or acceptance-blocking P2 defects.
+* Existing SQLite data survives upgrades.
+* Campaigns can complete across budget windows without repeated operator intervention.
+* `STATUS.md` contains accurate results and commits.
+* `PLAN.md` remains unchanged.
+* External validations are not represented as completed until actually performed.
 
-Continue through the remediation without routine approval requests.
-
-Preserve all existing file-protection, scope-isolation, and no-overwrite safeguards.
+Continue through the phases without routine approval requests. Preserve the existing architecture and all previously implemented safety controls.

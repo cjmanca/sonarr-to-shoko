@@ -1681,7 +1681,7 @@ def test_identity_snapshot_roundtrip(tmp_path: Path) -> None:
             cohort=Cohort.BACKLOG,
             iso=T0,
             identity=FileIdentitySnapshot(
-                ed2k="ed2k://|x|",
+                ed2k="0123456789ABCDEF0123456789ABCDEF",
                 sha1="abc",
                 md5="def",
                 crc32="1234abcd",
@@ -1692,7 +1692,7 @@ def test_identity_snapshot_roundtrip(tmp_path: Path) -> None:
         assert record is not None
         snapshot = record.identity
         assert snapshot is not None
-        assert snapshot.ed2k == "ed2k://|x|"
+        assert snapshot.ed2k == "0123456789ABCDEF0123456789ABCDEF"
         assert snapshot.shoko_paths == ("/anime/s01e01.mkv",)
 
 

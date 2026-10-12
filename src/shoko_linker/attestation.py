@@ -62,6 +62,7 @@ SAFE_SETTINGS_FLAGS: Final[frozenset[str]] = frozenset(
     }
 )
 SCOPE_DAEMON: Final[str] = "daemon"
+FILE_QUALITY_FILTER_FLAG: Final[str] = "FileQualityFilterEnabled"
 MIN_NOTE_CHARS: Final[int] = 1
 MAX_NOTE_CHARS: Final[int] = 400
 MAX_MOUNT_ITEMS: Final[int] = 50
@@ -186,6 +187,26 @@ def validate_scope(scope: str) -> str:
     raise AttestationError(f"scope: must be 'daemon' or 'campaign:<id>' (got {scope!r})")
 
 
+def _refuse_enabled_file_quality_filter(flags: Mapping[str, bool]) -> None:
+    """F15 P0: an attested file-quality filter ENABLED is a hard apply-safety refusal.
+
+    Shoko Server 5.3.3 (pinned upstream commit ``892461188e5f1cc3ccf1b9b6eb1d4dfd31bea6f8``)
+    enqueues ``ManualLinkJob`` from ``POST /api/v3/File/{id}/Link``; that job calls
+    ``ProcessFileQualityFilter`` and, when ``FileQualityFilterEnabled`` is true, can call
+    ``RemoveRecordAndDeletePhysicalFile`` — physically deleting media files, including files in
+    Shoko's independently writable manual collection that Sonarr's read-only mounts do not
+    protect. A lease that records the filter as enabled must never authorize writes: the record
+    path refuses it, and the load path marks it invalid (fail closed on both boundaries). The
+    other three flags keep their documented presence + bool-type behavior and are NOT
+    hard-prohibited.
+    """
+    if flags.get(FILE_QUALITY_FILTER_FLAG) is True:
+        raise AttestationError(
+            "FileQualityFilterEnabled=true is refused: Shoko's ManualLinkJob can physically "
+            "delete files under the file-quality filter; attest the setting as false"
+        )
+
+
 def build_record(
     *,
     endpoint: str,
@@ -228,6 +249,7 @@ def build_record(
         )
     if any(not isinstance(value, bool) for value in flags.values()):
         raise AttestationError("settings: every flag value must be true or false")
+    _refuse_enabled_file_quality_filter(flags)
     note = operator_note.strip()
     if len(note) < MIN_NOTE_CHARS:
         raise AttestationError("note: a non-empty operator note is required")
@@ -356,6 +378,7 @@ def _parse_settings_summary(raw: Any) -> Mapping[str, bool]:
         )
     if any(not isinstance(value, bool) for value in document.values()):
         raise AttestationError("settings_summary: every flag value must be true or false")
+    _refuse_enabled_file_quality_filter(document)
     return MappingProxyType(dict(sorted(document.items())))
 
 

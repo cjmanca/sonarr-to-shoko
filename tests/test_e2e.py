@@ -254,7 +254,7 @@ def _shoko_file(file_id: int, size: int, absolute: str) -> ShokoFile:
         is_ignored=False,
         is_variation=False,
         imported="2024-01-01T00:00:00",
-        hashes=ShokoHashes(hf.ed2k_uri("file.mkv", size, file_id), None, file_id, None),
+        hashes=ShokoHashes(hf.hex32(file_id), None, hf.hex8(file_id), None),
         xref_count=0,
         locations=(location,),
     )
@@ -707,9 +707,9 @@ def _preflight_existing_link(world: eh.World, clock: eh.FakeClock) -> tuple[bool
         sonarr_file=sonarr_file,
         shoko_paths=(eh.shoko_path(80, MANUAL_FILE),),
         hashes=ShokoHashes(
-            hf.ed2k_uri(f"file{MANUAL_FILE}.mkv", sonarr_file.size, MANUAL_FILE),
+            hf.hex32(MANUAL_FILE),
             None,
-            MANUAL_FILE,
+            hf.hex8(MANUAL_FILE),
             None,
         ),
     )
@@ -1399,6 +1399,11 @@ def _set_representative_imported_null(world: eh.World) -> set[int]:
 def test_imported_null_backlog_files_progress_through_full_pipeline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # F16: fully hashed, unrecognized Shoko backlog files — valid 32-hex
+    # ED2K with SHA1/CRC32/MD5 null and Imported=null — progress through discovery →
+    # mapping → planning → protected preflight → (mocked) link → VERIFIED. The harness
+    # ShokoStub emits Shoko's real raw-hex Hashes shape, so the settled-hash gate that
+    # previously rejected genuine files as NO_HASHES now admits them.
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     xml = eh.xml_document(eh.range_entry(4001, 300001, 1, N_TEN))
     world, clock, _lease = _lease_world(tmp_path, xml)
@@ -1431,6 +1436,13 @@ def test_imported_null_backlog_files_progress_through_full_pipeline(
     for record in verified_null:
         assert record is not None
         assert record.state is FileState.VERIFIED
+        # Shoko's raw-hex identity is preserved verbatim through the pipeline: the 32-hex
+        # ED2K as reported, with the unreported optional hashes kept as null (not invented).
+        assert record.identity is not None
+        assert record.identity.ed2k == hf.hex32(record.shoko_file_id)
+        assert record.identity.sha1 is None
+        assert record.identity.crc32 is None
+        assert record.identity.md5 is None
 
 
 # ------------------------------------------------- 18. lease-expiry degradation

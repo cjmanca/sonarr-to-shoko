@@ -22,9 +22,11 @@ import yaml  # type: ignore[import-untyped]
 from shoko_linker import cli
 from shoko_linker.attestation import (
     SCOPE_DAEMON,
+    AttestationError,
     AttestationVerdict,
     build_record,
     campaign_lease_path,
+    canonical_record,
     lease_expiry_cap,
     load_attestation,
     parse_attestation_document,
@@ -185,6 +187,78 @@ def test_settings_flags_are_the_only_allowed_summary(tmp_path: Path) -> None:
     verdict = _load(None, path)
     assert verdict.status == "invalid"
     assert "settings_summary" in verdict.reason
+
+
+def _flags(quality: bool) -> dict[str, bool]:
+    return {
+        "FileQualityFilterEnabled": quality,
+        "RenameOnImport": False,
+        "MoveOnImport": False,
+        "MyListAddFiles": False,
+    }
+
+
+def _write_unsafe_lease_text(lease: Path, *, scope: str = "daemon") -> None:
+    """A structurally valid lease whose recorded file-quality filter is ENABLED.
+
+    ``build_record`` refuses this record, so the unsafe lease is written by hand —
+    the exact shape of a manually edited or previously generated (pre-F15) file.
+    """
+    canonical = canonical_record(_record(scope=scope))
+    canonical["settings_summary"] = {
+        "FileQualityFilterEnabled": True,
+        "RenameOnImport": False,
+        "MoveOnImport": False,
+        "MyListAddFiles": False,
+    }
+    lease.write_text(
+        yaml.safe_dump(canonical, sort_keys=True, allow_unicode=True), encoding="utf-8"
+    )
+
+
+def test_file_quality_filter_false_permits_an_otherwise_valid_lease(tmp_path: Path) -> None:
+    record = _record(settings_flags=_flags(False))
+    path, _digest, _warning = write_attestation(tmp_path / "lease.yaml", record)
+    parsed = parse_attestation_document(path.read_text(encoding="utf-8"))
+    assert parsed == record
+    verdict = _load(None, path)
+    assert verdict.status == "valid"
+    assert verdict.valid_for_apply is True
+
+
+def test_file_quality_filter_true_is_refused_at_record() -> None:
+    with pytest.raises(AttestationError) as excinfo:
+        _record(settings_flags=_flags(True))
+    assert "FileQualityFilterEnabled" in str(excinfo.value)
+    assert "physically delete" in str(excinfo.value)
+
+
+def test_lease_with_file_quality_filter_true_is_rejected_at_load(tmp_path: Path) -> None:
+    path = tmp_path / "lease.yaml"
+    _write_unsafe_lease_text(path)
+    with pytest.raises(AttestationError, match="FileQualityFilterEnabled"):
+        parse_attestation_document(path.read_text(encoding="utf-8"))
+    verdict = _load(None, path)
+    assert verdict.status == "invalid"
+    assert "FileQualityFilterEnabled" in verdict.reason
+    assert verdict.valid_for_apply is False
+
+
+def test_renamer_and_mylist_flags_true_remain_valid(tmp_path: Path) -> None:
+    """Only the file-quality filter is a hard prohibition; the other flags keep their
+    documented presence + bool-type behavior (no requirement that they are false)."""
+    record = _record(
+        settings_flags={
+            "FileQualityFilterEnabled": False,
+            "RenameOnImport": True,
+            "MoveOnImport": True,
+            "MyListAddFiles": True,
+        }
+    )
+    path, _digest, _warning = write_attestation(tmp_path / "lease.yaml", record)
+    verdict = _load(None, path)
+    assert verdict.status == "valid"
+    assert verdict.valid_for_apply is True
 
 
 def test_record_payload_is_secret_free(tmp_path: Path) -> None:
@@ -569,6 +643,38 @@ def test_record_refuses_hours_beyond_cap(env: StubEnv, capsys: pytest.CaptureFix
     assert not env.lease_path.exists()
 
 
+def test_record_cli_refuses_file_quality_filter_true(
+    env: StubEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F15: the record path refuses an ENABLED file-quality filter as a clean config
+    error (no traceback), naming the setting, and writes no lease."""
+    code = main(
+        [
+            "attestation",
+            "record",
+            str(env.config_path),
+            "--endpoint",
+            SHOKO_BASE,
+            "--version",
+            "5.3.3",
+            "--mounts",
+            "/anime read-only",
+            "--settings",
+            "FileQualityFilterEnabled=true,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false",
+            "--hours",
+            "24",
+            "--note",
+            "quality filter on",
+            "--confirm",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == EXIT_CONFIG_INVALID
+    assert "FileQualityFilterEnabled" in captured.out
+    assert "Traceback" not in captured.out + captured.err
+    assert not env.lease_path.exists()
+
+
 def test_invalidate_moves_lease_aside(env: StubEnv, capsys: pytest.CaptureFixture[str]) -> None:
     env.lease_path.write_text("x: 1\n", encoding="utf-8")
     env.open_store().close()
@@ -630,6 +736,27 @@ def test_expired_lease_pauses_writes_once_and_daemon_stays_alive(
     _seed_baseline(env)
     _write_valid_lease(env, hours=0.5)
     env.now_iso = "2026-01-01T06:00:00+00:00"  # lease expired at 00:30
+    code = main(["daemon", "--cycles", "3", str(env.config_path)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "daemon exit: stop_after_cycles after 3 cycle(s)" in out
+    assert env.posts == []
+    store = env.open_store()
+    try:
+        assert store.budget_view().paused_reason == "attestation_expired"
+        assert store.get_meta("attestation_gate") == "paused"
+    finally:
+        store.close()
+
+
+def test_daemon_apply_with_unsafe_lease_performs_zero_posts(
+    env: StubEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F15: a structurally valid lease that attests the file-quality filter ENABLED is
+    invalid at load, so daemon apply writes nothing (no restart loop)."""
+    _seed_mapping(env)
+    _seed_baseline(env)
+    _write_unsafe_lease_text(env.lease_path)
     code = main(["daemon", "--cycles", "3", str(env.config_path)])
     out = capsys.readouterr().out
     assert code == EXIT_OK

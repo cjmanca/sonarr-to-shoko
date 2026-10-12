@@ -1265,7 +1265,7 @@ def test_apply_path_links_fully_hashed_imported_null_candidate(
     assert stub.post_bodies == [{"EpisodeIDs": [777, 778]}]
 
 
-PREFLIGHT_ED2K = hf.ed2k_uri("S01E01+02.mkv", SONARR_SIZE, SHOKO_FILE_ID)
+PREFLIGHT_ED2K = hf.hex32(SHOKO_FILE_ID)
 
 UNSETTLED_PREFLIGHT_IDENTITIES: list[tuple[str, dict[str, Any]]] = [
     (
@@ -1274,22 +1274,25 @@ UNSETTLED_PREFLIGHT_IDENTITIES: list[tuple[str, dict[str, Any]]] = [
     ),
     (
         "empty ED2K with a populated SHA1",
-        {"ED2K": "", "SHA1": hf.hex40(SHOKO_FILE_ID), "CRC32": SHOKO_FILE_ID, "MD5": None},
+        {"ED2K": "", "SHA1": hf.hex40(SHOKO_FILE_ID), "CRC32": hf.hex8(SHOKO_FILE_ID), "MD5": None},
     ),
     ("whitespace-only ED2K", {"ED2K": "  ", "SHA1": None, "CRC32": None, "MD5": None}),
-    ("placeholder-shaped ED2K", {"ED2K": "ed2k-500", "SHA1": None, "CRC32": 500, "MD5": None}),
+    ("placeholder-shaped ED2K", {"ED2K": "ed2k-500", "SHA1": None, "CRC32": None, "MD5": None}),
     ("garbage ED2K", {"ED2K": "not-a-hash", "SHA1": None, "CRC32": None, "MD5": None}),
-    ("truncated ED2K URI", {"ED2K": PREFLIGHT_ED2K[:-1], "SHA1": None, "CRC32": None, "MD5": None}),
-    (
-        "ED2K with a non-numeric size segment",
-        {"ED2K": PREFLIGHT_ED2K.replace(f"|{SONARR_SIZE}|", "|abc|"), "SHA1": None},
-    ),
-    (
-        "ED2K with an empty MD5 segment",
-        {"ED2K": PREFLIGHT_ED2K.replace(f"|{hf.hex32(SHOKO_FILE_ID)}|", "||"), "SHA1": None},
-    ),
+    ("numeric ED2K", {"ED2K": SHOKO_FILE_ID, "SHA1": None, "CRC32": None, "MD5": None}),
+    ("truncated ED2K (31 hex chars)", {"ED2K": PREFLIGHT_ED2K[:-1], "SHA1": None}),
+    ("oversized ED2K (33 hex chars)", {"ED2K": PREFLIGHT_ED2K + "a", "SHA1": None}),
+    ("non-hexadecimal ED2K (32 chars)", {"ED2K": "z" * 32, "SHA1": None}),
+    ("missing ED2K key", {"SHA1": None, "CRC32": None, "MD5": None}),
     ("all-null Hashes object", {"ED2K": None, "SHA1": None, "CRC32": None, "MD5": None}),
     ("empty SHA1 string", {"ED2K": PREFLIGHT_ED2K, "SHA1": "", "CRC32": None, "MD5": None}),
+    ("short SHA1 string (39 hex)", {"ED2K": PREFLIGHT_ED2K, "SHA1": "a" * 39, "MD5": None}),
+    ("non-hex MD5 string", {"ED2K": PREFLIGHT_ED2K, "SHA1": None, "MD5": "z" * 32}),
+    ("numeric CRC32", {"ED2K": PREFLIGHT_ED2K, "SHA1": None, "CRC32": SHOKO_FILE_ID, "MD5": None}),
+    (
+        "short CRC32 string (6 hex)",
+        {"ED2K": PREFLIGHT_ED2K, "SHA1": None, "CRC32": "ABC123", "MD5": None},
+    ),
 ]
 
 
@@ -1347,6 +1350,64 @@ def test_preflight_accepts_complete_ed2k_identity_with_full_hash_set(
     verdict = run_preflight(stub, plan, settings)
     assert verdict.ok is True
     assert PreflightReason.NOT_CANDIDATE not in verdict.reasons
+
+
+def test_preflight_accepts_ed2k_only_with_null_optional_hashes(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # Shoko reports a complete 32-hex ED2K with SHA1/CRC32/MD5 as null: an uncomputed
+    # optional hash must never fail a settled file at fresh preflight (Imported=null).
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(
+        imported=None, hashes=hf.ed2k_hashes(SHOKO_FILE_ID, SONARR_SIZE, "S01E01+02.mkv")
+    )
+    verdict = run_preflight(stub, plan, settings)
+    assert verdict.ok is True
+    assert PreflightReason.NOT_CANDIDATE not in verdict.reasons
+
+
+def test_preflight_accepts_lowercase_ed2k_identity(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # Case-insensitive validation with the exact bytes preserved for comparison.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    hashes = {
+        "ED2K": PREFLIGHT_ED2K.lower(),
+        "SHA1": hf.hex40(SHOKO_FILE_ID).lower(),
+        "CRC32": hf.hex8(SHOKO_FILE_ID).lower(),
+        "MD5": hf.hex32(SHOKO_FILE_ID).lower(),
+    }
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(imported=None, hashes=hashes)
+    verdict = run_preflight(stub, plan, settings)
+    assert verdict.ok is True
+    assert PreflightReason.NOT_CANDIDATE not in verdict.reasons
+
+
+def test_preflight_protects_a_file_that_already_carries_xrefs(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    # A fully hashed file (valid 32-hex ED2K) that already carries a User XRef
+    # is protected: the settled-hash gate passes, then the existing-link gate blocks
+    # the POST. This proves F16's hash fix does not weaken existing-link protection.
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(
+        imported=None,
+        hashes=hf.full_hashes(SHOKO_FILE_ID, SONARR_SIZE, "S01E01+02.mkv"),
+        xrefs=[xref(ANIME_ID, [xref_episode(777, 5501, "User")])],
+    )
+    verdict = run_preflight(stub, plan, settings)
+    assert verdict.ok is False
+    assert verdict.reasons == (PreflightReason.EXISTING_LINK,)
+    assert stub.posts() == []
 
 
 def test_preflight_blocks_on_echoed_file_id_mismatch(

@@ -15,7 +15,7 @@ malformed ``ListResult`` envelope, a page-cap hit, or a server that ignored
 ``include=AbsolutePaths`` / ``include=XRefs`` mark the snapshot **incomplete**, and
 :func:`match_shoko_files` refuses an incomplete snapshot. Files that are simply not
 candidates (carrying XRefs, variations, ignored files, files with no locations, files
-whose hash identity has not settled — no complete, structurally valid ED2K, per
+whose hash identity has not settled — no complete 32-hex ED2K, per
 :func:`has_available_hashes`) are recorded as categorized exclusions and keep the snapshot
 complete. Shoko's ``Imported``
 (``DateTimeImported``) field is **diagnostic only**: it is set once a file is identified
@@ -68,16 +68,14 @@ VALID_DROP_TYPES: Final[frozenset[str]] = frozenset({"None", "Source", "Destinat
 LIST_RESULT_KEYS: Final[frozenset[str]] = frozenset({"Total", "List"})
 _INCLUDE_FLAGS: Final[str] = "XRefs,AbsolutePaths"
 _UNRECOGNIZED_FILTER: Final[str] = "Unrecognized"
-_ED2K_SCHEME: Final[str] = "ed2k://"
-_DECIMAL_RE: Final[re.Pattern[str]] = re.compile(r"[0-9]+")
-_MAX_DECIMAL_DIGITS: Final[int] = 20
+# Shoko's ``Hashes`` object carries raw hexadecimal hash strings, not ``ed2k://``
+# URIs: ``HashesDict.ED2K`` is the AniDB base hash (MD5 of the file content) as a
+# 32-hex string, and SHA1/CRC32/MD5 are nullable hex strings (40/8/32 hex). See
+# ``File.cs`` ``HashesDict`` and ``HashFileJob`` at the pinned upstream commit.
+_ED2K_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{32}")
 _SHA1_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{40}")
 _MD5_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{32}")
 _CRC32_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{8}")
-_ED2K_HASHLIST_RE: Final[re.Pattern[str]] = re.compile(
-    r"[A-Za-z][A-Za-z0-9]*=[0-9a-fA-F]+(?:&[A-Za-z][A-Za-z0-9]*=[0-9a-fA-F]+)*"
-)
-_ED2K_CORE_SEGMENTS: Final[int] = 4
 
 
 class SnapshotReason(Enum):
@@ -1216,17 +1214,19 @@ def has_available_hashes(item: ShokoFile) -> bool:
 
     Shoko 5.3.3 creates the file record and exposes an **empty** ``ED2K`` string
     while the file is still being hashed, so "at least one non-null hash value" is
-    not identity evidence and must never admit a link candidate. Settled means the
-    ED2K identity Shoko and AniDB recognize is present and structurally complete —
-    ``ed2k://|file|<name>|<size>|<md5hex>|[<key>=<hex>&…]|/`` with a non-empty
-    name, a decimal size greater than zero, a 32-hex MD5 segment, and an optional
-    hashlist segment of ``key=hex`` pairs — **and** every other populated field is
-    non-empty and structurally plausible: ``sha1`` a 40-hex string, ``md5`` a
-    32-hex string, ``crc32`` an 8-hex string or a non-negative integer. Empty and
-    whitespace-only strings, truncated or malformed URIs, partially populated
-    objects, and values that are neither strings nor integers all mean *not
-    settled*. ``Imported=null`` is irrelevant here: a fully hashed file stays
-    eligible. Values are trimmed for validation only, never rewritten.
+    not identity evidence and must never admit a link candidate. Shoko's ``Hashes``
+    object carries the raw hexadecimal digests AniDB and Shoko match on, **not** an
+    ``ed2k://`` URI. Settled means the ED2K identity is present and complete — a
+    non-empty string of **exactly 32 hexadecimal characters** (the AniDB ED2K base
+    hash, i.e. the MD5 of the file content, stored uppercase by Shoko) — **and**
+    every other *populated* field matches its wire shape: ``sha1`` a 40-hex string,
+    ``md5`` a 32-hex string, ``crc32`` an 8-hex string. Unreported (null/absent)
+    ``SHA1``/``MD5``/``CRC32`` are permitted and never fail a file. Empty and
+    whitespace-only strings, non-hex characters, truncated or oversized values, and
+    values that are not strings all mean *not settled*. ``Imported=null`` is
+    irrelevant here: a fully hashed file stays eligible. Values are trimmed for
+    validation only, never rewritten, so identity comparisons use the exact bytes
+    Shoko reported (case-sensitive).
     """
     return _hashes_settled(item.hashes)
 
@@ -1238,38 +1238,15 @@ def _hashes_settled(hashes: ShokoHashes) -> bool:
     return (
         _settled_field(hashes.sha1, _SHA1_HEX_RE, allow_int=False)
         and _settled_field(hashes.md5, _MD5_HEX_RE, allow_int=False)
-        and _settled_field(hashes.crc32, _CRC32_HEX_RE, allow_int=True)
+        and _settled_field(hashes.crc32, _CRC32_HEX_RE, allow_int=False)
     )
 
 
 def _valid_ed2k(value: str | int | None) -> bool:
-    """Canonical ED2K identity URI ``ed2k://|file|<name>|<size>|<md5hex>|[<hashlist>]|/``."""
+    """Shoko's ED2K field is the raw AniDB base hash: a 32-hex string (upper or lower)."""
     if not isinstance(value, str):
         return False
-    text = value.strip()
-    if not text.startswith(_ED2K_SCHEME):
-        return False
-    body = text[len(_ED2K_SCHEME) :]
-    if not body.startswith("|") or not body.endswith("/"):
-        return False
-    segments = body[1:-1]
-    if segments.endswith("|"):
-        segments = segments[:-1]
-    parts = segments.split("|")
-    if len(parts) not in (_ED2K_CORE_SEGMENTS, _ED2K_CORE_SEGMENTS + 1):
-        return False
-    if parts[0].lower() != "file":
-        return False
-    name, size, md5_segment = parts[1], parts[2], parts[3]
-    hashlist = parts[4] if len(parts) == _ED2K_CORE_SEGMENTS + 1 else ""
-    return (
-        bool(name.strip())
-        and bool(_DECIMAL_RE.fullmatch(size))
-        and len(size) <= _MAX_DECIMAL_DIGITS
-        and int(size) > 0
-        and bool(_MD5_HEX_RE.fullmatch(md5_segment))
-        and (hashlist == "" or bool(_ED2K_HASHLIST_RE.fullmatch(hashlist)))
-    )
+    return bool(_ED2K_HEX_RE.fullmatch(value.strip()))
 
 
 def _settled_field(value: str | int | None, pattern: re.Pattern[str], *, allow_int: bool) -> bool:

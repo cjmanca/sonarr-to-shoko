@@ -33,6 +33,7 @@ from shoko_linker.attestation import (
     SCOPE_DAEMON,
     build_record,
     campaign_lease_path,
+    canonical_record,
     load_attestation,
     write_attestation,
 )
@@ -2686,6 +2687,37 @@ class DualEnv:
         )
         write_attestation(target, record, overwrite=True)
 
+    def write_unsafe_campaign_lease(self, campaign_id: str, *, hours: float = 24.0) -> None:
+        """F15: overwrite the campaign sibling with a structurally valid lease whose
+        recorded file-quality filter is ENABLED (``build_record`` refuses it, so it is
+        written by hand — a manually edited / previously generated unsafe lease)."""
+        target = campaign_lease_path(self.lease, campaign_id)
+        record = build_record(
+            endpoint=SHOKO_BASE,
+            version="5.3.3",
+            mounts=["/anime read-only (host-inspected)"],
+            settings_flags={
+                "FileQualityFilterEnabled": False,
+                "RenameOnImport": False,
+                "MoveOnImport": False,
+                "MyListAddFiles": False,
+            },
+            inspected_iso=self.now_iso,
+            expires_iso=_iso_plus(self.now_iso, hours * 3600.0),
+            scope=f"campaign:{campaign_id}",
+            operator_note="campaign lease",
+        )
+        canonical = canonical_record(record)
+        canonical["settings_summary"] = {
+            "FileQualityFilterEnabled": True,
+            "RenameOnImport": False,
+            "MoveOnImport": False,
+            "MyListAddFiles": False,
+        }
+        target.write_text(
+            yaml.safe_dump(canonical, sort_keys=True, allow_unicode=True), encoding="utf-8"
+        )
+
     def campaign_deps(self, store: StateStore, campaign_id: str) -> Any:
         """Daemon deps wired to the campaign-scope lease (the CLI campaign-apply wiring)."""
         settings = load_settings(self.config_path)
@@ -3005,6 +3037,74 @@ def test_campaign_lease_expired_does_not_globally_pause_daemon(
         assert store.budget_view().paused_reason is None
         assert cycle.apply_eligible is True
         assert cycle.counts.submitted == COUNT_FIVE - 2
+    finally:
+        store.close()
+
+
+def test_manual_campaign_apply_with_unsafe_lease_performs_zero_posts(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F15: a manual ``campaign apply`` against a structurally valid campaign lease that
+    attests the file-quality filter ENABLED is refused (zero POSTs, campaign paused)."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)  # a valid lease, then overwritten
+    env.write_daemon_lease()
+    env.write_unsafe_campaign_lease(campaign_id)
+    store = env.open_store()
+    try:
+        posts_before = len(env.stubs.posts)
+        code = main(
+            [
+                "campaign",
+                "apply",
+                str(env.config_path),
+                "--plan",
+                str(env.tmp_path / "plan.json"),
+                "--batch-size",
+                "1",
+                "--json",
+            ]
+        )
+        capsys.readouterr()
+        assert code == EXIT_APPLY_GATE_REFUSAL  # attestation refusal is a clean nonzero exit
+        assert len(env.stubs.posts) == posts_before  # zero POSTs
+        assert env.stubs.posts == []
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == ATTESTATION_PAUSE_REASON
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+        # the daemon lease stays valid (scope isolation): no global write pause is armed, and
+        # the campaign-apply path never touches the daemon-scope gate meta.
+        assert store.budget_view().paused_reason is None
+    finally:
+        store.close()
+
+
+def test_campaign_drain_with_unsafe_lease_performs_zero_posts(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F15: automatic campaign draining (daemon drain selection + cycle) with an unsafe
+    campaign lease defers the campaign and writes nothing; daemon writes stay gated
+    only by their own (valid) lease."""
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)  # canary under the valid lease (posts backlog 500)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)  # F10
+        env.write_unsafe_campaign_lease(campaign_id)  # the campaign lease turns unsafe
+        cycle = env.daemon_cycle(store, "campaign-unsafe")
+        assert cycle.alive is True
+        assert cycle.campaign is None  # campaign deferred (its lease is invalid)
+        # Zero campaign POSTs: the pending campaign target (backlog 501) is never sent, while
+        # the daemon's OWN new arrivals (502,503,504) still post under the valid daemon lease.
+        assert 501 not in env.stubs.posted_files
+        assert cycle.counts.submitted == COUNT_FIVE - 2
+        assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
+        assert store.get_meta("attestation_gate") == "valid"  # daemon lease untouched
+        assert store.budget_view().paused_reason is None  # no global write pause
     finally:
         store.close()
 

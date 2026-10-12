@@ -59,7 +59,7 @@ SMALL_PAGE_SIZE = 2
 SMALL_PAGES = 3
 PAGE_CAP = 4
 CAPPED_FILES = 8
-VALID_ED2K = hf.ed2k_uri("a.mkv", 1000, 112)
+VALID_ED2K = hf.hex32(112)
 LARGE_TOTAL = 7000
 LARGE_PAGE_SIZE = 1000
 LARGE_PAGES = 7
@@ -831,42 +831,28 @@ def hash_shape(
 
 UNSETTLED_HASH_IDENTITIES: list[tuple[str, dict[str, Any]]] = [
     ("empty ED2K while Shoko is still hashing the new file", hash_shape("")),
-    ("empty ED2K with a populated SHA1", hash_shape("", sha1=hf.hex40(112), crc32=112)),
+    ("empty ED2K with a populated SHA1", hash_shape("", sha1=hf.hex40(112), crc32=hf.hex8(112))),
     ("whitespace-only ED2K", hash_shape("   ")),
-    ("placeholder-shaped ED2K", hash_shape("ed2k-112", crc32=112)),
+    ("placeholder-shaped ED2K", hash_shape("ed2k-112", crc32=hf.hex8(112))),
     ("garbage ED2K", hash_shape("not-a-hash")),
-    ("numeric ED2K", hash_shape(112, crc32=112)),
-    ("ED2K without the ed2k:// scheme", hash_shape(VALID_ED2K.removeprefix(hf.ED2K_SCHEME))),
-    ("truncated ED2K (no closing slash)", hash_shape(VALID_ED2K[:-1])),
-    ("ED2K with a zero size segment", hash_shape(VALID_ED2K.replace("|1000|", "|0|"))),
-    ("ED2K with a negative size segment", hash_shape(VALID_ED2K.replace("|1000|", "|-1000|"))),
-    ("ED2K with a non-numeric size segment", hash_shape(VALID_ED2K.replace("|1000|", "|abc|"))),
-    (
-        "ED2K with an oversized numeric size segment",
-        hash_shape(VALID_ED2K.replace("|1000|", f"|{'9' * 40}|")),
-    ),
-    ("ED2K with an empty MD5 segment", hash_shape(VALID_ED2K.replace(f"|{hf.hex32(112)}|", "||"))),
-    (
-        "ED2K with a short MD5 segment",
-        hash_shape(VALID_ED2K.replace(hf.hex32(112), hf.hex32(112)[:-1])),
-    ),
-    ("ED2K with an empty file name", hash_shape(VALID_ED2K.replace("|a.mkv|", "||"))),
-    ("ED2K with a whitespace-only file name", hash_shape(VALID_ED2K.replace("|a.mkv|", "|   |"))),
-    ("ED2K with a non-file type segment", hash_shape(VALID_ED2K.replace("|file|", "|video|"))),
-    (
-        "ED2K with a non-hex hashlist segment",
-        hash_shape(VALID_ED2K.replace(f"h={hf.hex8(112)}", "h=zz")),
-    ),
-    ("ED2K with an extra segment", hash_shape(VALID_ED2K.replace("|/", "|extra|/"))),
+    ("numeric ED2K", hash_shape(112, crc32=hf.hex8(112))),
+    ("truncated ED2K (31 hex chars)", hash_shape(VALID_ED2K[:-1])),
+    ("oversized ED2K (33 hex chars)", hash_shape(VALID_ED2K + "a")),
+    ("non-hexadecimal ED2K (32 chars)", hash_shape("z" * 32)),
+    ("ED2K with surrounding non-hex", hash_shape(f" {VALID_ED2K[:-1]} ")),
+    ("missing ED2K key", {"SHA1": None, "CRC32": None, "MD5": None}),
     ("all-null Hashes object", hash_shape(None)),
     ("empty SHA1 string", hash_shape(VALID_ED2K, sha1="")),
     ("whitespace-only MD5 string", hash_shape(VALID_ED2K, md5=" ")),
-    ("short SHA1 string", hash_shape(VALID_ED2K, sha1="a" * 39)),
+    ("short SHA1 string (39 hex chars)", hash_shape(VALID_ED2K, sha1="a" * 39)),
+    ("oversized SHA1 string (41 hex chars)", hash_shape(VALID_ED2K, sha1="a" * 41)),
     ("non-hex MD5 string", hash_shape(VALID_ED2K, md5="z" * 32)),
     ("numeric SHA1", hash_shape(VALID_ED2K, sha1=112)),
     ("empty CRC32 string", hash_shape(VALID_ED2K, crc32="")),
-    ("short CRC32 string", hash_shape(VALID_ED2K, crc32="abc123")),
-    ("negative CRC32 integer", hash_shape(VALID_ED2K, crc32=-1)),
+    ("short CRC32 string (6 hex chars)", hash_shape(VALID_ED2K, crc32="ABC123")),
+    ("oversized CRC32 string (9 hex chars)", hash_shape(VALID_ED2K, crc32="ABCDEF1234")),
+    ("non-hex CRC32 string", hash_shape(VALID_ED2K, crc32="ZZZZZZZZ")),
+    ("numeric CRC32", hash_shape(VALID_ED2K, crc32=112)),
 ]
 
 
@@ -905,11 +891,11 @@ def test_unsettled_hash_identity_is_excluded_as_no_hashes(
     assert result.matches == ()
 
 
-def test_complete_ed2k_identity_with_numeric_crc32_is_a_candidate(
+def test_ed2k_only_candidate_with_null_optional_hashes_is_a_candidate(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
-    # ED2K settles the identity; CRC32 in Shoko's numeric form and unreported SHA1/MD5
-    # stay eligible, Imported=null included.
+    # A complete 32-hex ED2K settles the identity even when Shoko reports SHA1/CRC32/MD5
+    # as null (uncomputed optional hashes are permitted), Imported=null included.
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
     entry = shoko_file(
@@ -931,7 +917,8 @@ def test_complete_ed2k_identity_with_numeric_crc32_is_a_candidate(
 def test_full_valid_hash_set_without_xrefs_is_a_candidate(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
-    # ED2K + 40-hex SHA1 + 32-hex MD5 + 8-hex CRC32, zero cross-references: eligible.
+    # Raw-hex wire set: 32-hex ED2K + 40-hex SHA1 + 8-hex CRC32 + 32-hex MD5, zero
+    # cross-references: eligible.
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
     entry = shoko_file(
@@ -949,20 +936,19 @@ def test_full_valid_hash_set_without_xrefs_is_a_candidate(
     assert [match.shoko_file_id for match in result.matches] == [114]
 
 
-def test_ed2k_identity_without_a_hashlist_segment_is_a_candidate(
+def test_lowercase_ed2k_is_a_candidate(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
-    # The hashlist segment is optional: a complete ED2K identity settles candidacy even
-    # when Shoko reports no per-hash entries at all.
+    # Validation is case-insensitive: Shoko stores ED2K uppercase, but a 32-hex value in
+    # lowercase is accepted (the raw value is preserved, not case-normalized).
     stub = ShokoStub()
     stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
-    no_hashlist = f"{hf.ED2K_SCHEME}|file|a.mkv|1000|{hf.hex32(115)}|/"
     entry = shoko_file(
         115,
         1000,
         [location(1150, 115, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")],
         imported=None,
-        hashes=hash_shape(no_hashlist),
+        hashes=hash_shape(hf.hex32(115).lower()),
     )
     stub.pages = {1: envelope([entry], 1)}
     discovery = discover(stub)
@@ -971,6 +957,7 @@ def test_ed2k_identity_without_a_hashlist_segment_is_a_candidate(
     result = reconcile(discovery, files, shoko_settings(base_document, write_document))
     assert [item.reason for item in result.exclusions] == []
     assert [match.shoko_file_id for match in result.matches] == [115]
+    assert result.matches[0].hashes.ed2k == hf.hex32(115).lower()
 
 
 def test_file_without_locations_is_excluded(
@@ -1235,7 +1222,7 @@ def identity(id_: int, size: int, paths: tuple[str, ...], folders: tuple[int, ..
         is_ignored=False,
         is_variation=False,
         imported="2024-01-01T00:00:00",
-        hashes=ShokoHashes("ed2k-1", "sha1-1", 11, "md5-1"),
+        hashes=ShokoHashes(hf.hex32(id_), hf.hex40(id_), hf.hex8(id_), hf.hex32(id_)),
         xref_count=0,
         locations=tuple(
             ShokoLocation(place_id + 7000, id_, folder_id, "x.mkv", path, True)
@@ -1258,7 +1245,7 @@ def test_identity_comparison_reports_each_change_category() -> None:
             is_ignored=False,
             is_variation=False,
             imported=None,
-            hashes=ShokoHashes("ed2k-old", "sha1-old", 1, "md5-old"),
+            hashes=ShokoHashes(hf.hex32(1), hf.hex40(1), hf.hex8(1), hf.hex32(1)),
             xref_count=0,
             locations=(ShokoLocation(1, 900, 1, "x.mkv", "/anime/x.mkv", True),),
         )
@@ -1270,13 +1257,43 @@ def test_identity_comparison_reports_each_change_category() -> None:
             is_ignored=False,
             is_variation=False,
             imported=None,
-            hashes=ShokoHashes("ed2k-new", "sha1-old", 1, "md5-old"),
+            hashes=ShokoHashes(hf.hex32(2), hf.hex40(1), hf.hex8(1), hf.hex32(1)),
             xref_count=0,
             locations=(ShokoLocation(1, 900, 1, "x.mkv", "/anime/x.mkv", True),),
         )
     )
     hashes = compare_identity(hash_base, hash_next)
     assert hashes.categories == (IdentityChange.HASH_CHANGED,)
+
+    # Identity comparison is case-sensitive on the exact reported bytes: the same
+    # digest reported uppercase vs lowercase is a change (values preserved,
+    # never case-normalized).
+    upper = build_identity(
+        ShokoFile(
+            id=900,
+            size=1000,
+            is_ignored=False,
+            is_variation=False,
+            imported=None,
+            hashes=ShokoHashes(hf.hex32(0xABCDEF).upper(), None, None, None),
+            xref_count=0,
+            locations=(ShokoLocation(1, 900, 1, "x.mkv", "/anime/x.mkv", True),),
+        )
+    )
+    lower = build_identity(
+        ShokoFile(
+            id=900,
+            size=1000,
+            is_ignored=False,
+            is_variation=False,
+            imported=None,
+            hashes=ShokoHashes(hf.hex32(0xABCDEF).lower(), None, None, None),
+            xref_count=0,
+            locations=(ShokoLocation(1, 900, 1, "x.mkv", "/anime/x.mkv", True),),
+        )
+    )
+    assert compare_identity(upper, lower).categories == (IdentityChange.HASH_CHANGED,)
+    assert compare_identity(upper, upper).stable is True
 
     added = compare_identity(base, identity(900, 1000, ("/a/x.mkv", "/b/x.mkv"), (1, 2)))
     assert IdentityChange.LOCATIONS_ADDED in added.categories
@@ -1461,9 +1478,7 @@ def test_file_match_exposes_hash_values_as_received(
     result = reconcile(discovery, files, shoko_settings(base_document, write_document))
     match = result.matches[0]
     assert isinstance(match, FileMatch)
-    assert match.hashes == ShokoHashes(
-        hf.ed2k_uri("file-500.mkv", 1000, 500), hf.hex40(500), 500, hf.hex32(500)
-    )
+    assert match.hashes == ShokoHashes(hf.hex32(500), hf.hex40(500), hf.hex8(500), hf.hex32(500))
     assert match.shoko_paths == (f"{SONARR_ROOT}/Show A/S01E01.mkv",)
 
 
