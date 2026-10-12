@@ -38,7 +38,6 @@ from shoko_linker.cli import StopState, persist_cycle_meta
 from shoko_linker.config import Settings, parse_settings
 from shoko_linker.daemon import (
     DAEMON_HISTORY_MAXLEN,
-    ZERO_PROGRESS_PAUSE_CYCLES,
     CycleMode,
     DaemonDeps,
     attestation_gate,
@@ -59,7 +58,6 @@ from shoko_linker.reporting import (
     META_CYCLE_SUBMITTED,
 )
 from shoko_linker.state import (
-    META_CAMPAIGN_ATTESTATION_GATE,
     META_LAST_FULL_RECONCILE_ISO,
     META_NEXT_FULL_RECONCILE_ISO,
     BaselineFile,
@@ -4128,13 +4126,17 @@ def test_daemon_campaign_drain_skipped_when_disabled(
     assert all(cycle.campaign is None for cycle in report.cycles)
 
 
-def test_campaign_pending_target_deferrals_trip_zero_progress_then_resume(
+def test_campaign_pending_target_deferrals_defer_and_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2: a campaign whose remaining files never materialize (pending targets) makes zero
-    submissions every drain cycle, so the breaker trips; once targets materialize, submits resume
-    and the counter resets (no pause false-positive)."""
+    """F18: a campaign whose remaining files never materialize (pending targets) makes zero
+    submissions every drain cycle — a RECOVERABLE wait: the campaign defers with a bounded
+    cooldown (a real future retry, Finding 1), stays APPROVED (no permanent pause, breaker not
+    burned), YIELDS the queue while deferred (the later cycles skip it entirely at a frozen
+    clock), and resumes automatically once the cooldown passes and the targets materialize
+    (no operator resume needed)."""
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    cooldown_seconds = 1500.0  # STALL_YIELD_COOLDOWN_CYCLES x sync.interval_seconds (Finding 1)
     head = SpecFile(series_id=1, file_id=10, shoko_id=500, episodes=((1, 1, ANIDB_EP, SHOKO_EP),))
     pending = [
         SpecFile(
@@ -4178,36 +4180,342 @@ def test_campaign_pending_target_deferrals_trip_zero_progress_then_resume(
     campaign_id = plan.campaign_id
     try:
         canary = apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
-        assert canary.submitted == 1  # the materialized head opens the drain
+        assert canary.submitted == 1  # the materialized head file opens the drain
         assert campaign_send_progress(store, campaign_id) == 1
         authorize_campaign_drain(store, campaign_id, T0, note="canary inspected")  # F10
         posts_before = len(shoko.posts)
-        for index, key in enumerate(("p1", "p2", "p3")):
-            report = run_cycle(
+        stall = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.BACKLOG, cycle_key="p1"
+        )
+        assert stall.campaign is not None
+        assert stall.campaign.submitted == 0  # zero submissions every pending-target walk
+        assert stall.campaign.progress == 0  # pending-target deferrals make no progress
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"  # recoverable deferral — never a permanent pause
+        assert not any("campaign_zero_progress_pause" in reason for reason in stall.reasons)
+        expected_deferral = (
+            datetime.fromisoformat(T0) + timedelta(seconds=cooldown_seconds)
+        ).isoformat()
+        assert store.get_meta(f"campaign_deferred_until:{campaign_id}") == expected_deferral
+        assert any(
+            "pending_metadata_cooldown" in reason for reason in stall.reasons
+        )  # Finding 2: the label names the real wait
+        for key in ("p2", "p3", "p4", "p5"):
+            cycle = run_cycle(
                 deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.BACKLOG, cycle_key=key
             )
-            campaign = store.get_campaign(campaign_id)
-            assert campaign is not None
-            assert report.campaign is not None
-            assert report.campaign.submitted == 0  # zero submissions every cycle
-            assert report.campaign.progress == 0  # pending-target deferrals make no progress
-            if index < ZERO_PROGRESS_PAUSE_CYCLES - 1:
-                assert campaign.status == "approved"
-            else:
-                assert campaign.status == "paused"
-                assert campaign.status_reason == "no_queueable_candidates"
+            assert cycle.campaign is None  # the deferred head yields every cycle it is deferred
+            assert not any("campaign_zero_progress_pause" in reason for reason in cycle.reasons)
         assert len(shoko.posts) == posts_before  # zero POSTs across the zero-progress cycles
-
-        # Targets materialize; the operator resumes → later batches progress, counter resets.
+        assert store.get_meta(f"campaign_zero_progress:{campaign_id}") in (None, "0")
+        # Targets materialize and the cooldown passes: the campaign resumes automatically
+        # (no operator resume) and later batches progress with the counter intact.
         shoko.unmaterialized = set()
-        store.set_campaign_status(campaign_id, "approved", "resumed", iso=T0)
-        store.set_meta(f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}", "valid")
+        resume_iso = (
+            datetime.fromisoformat(T0) + timedelta(seconds=cooldown_seconds + 1.0)
+        ).isoformat()
         report = run_cycle(
-            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.BACKLOG, cycle_key="resume"
+            deps,
+            now_iso=resume_iso,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="resume",
         )
         assert report.campaign is not None
         assert report.campaign.submitted > 0  # submissions resumed, no pause false-positive
         assert len(shoko.posts) > posts_before
+    finally:
+        store.close()
+
+
+#: Finding 1: the stall-yield cooldown is ``STALL_YIELD_COOLDOWN_CYCLES`` daemon cycle intervals
+#: (the default ``sync.interval_seconds`` in :func:`_drain_settings` is 300.0 → 1500.0). The
+#: production daemon sleeps ``interval x (1 + jitter)`` AFTER each cycle (upper bound
+#: interval x 1.05 = 315.0), so the head-of-line span is walked at this realistic cadence.
+HOL_INTERVAL_SECONDS = 300.0
+HOL_CADENCE_SECONDS = HOL_INTERVAL_SECONDS * 1.05
+HOL_COOLDOWN_SECONDS = 5 * HOL_INTERVAL_SECONDS
+
+
+def _hol_two_campaigns(
+    tmp_path: Path,
+    *,
+    new_arrival: SpecFile | None = None,
+) -> tuple[DaemonDeps, StateStore, ShokoStub, str, str]:
+    """Two drain-authorized campaigns: the OLDEST (A) stalls every cycle (Shoko metadata never
+    materializes for its remaining files); the NEWER (B) is healthy with a queued
+    candidate. ``new_arrival`` (optional) is a materialized file present in both
+    inventories but seeded in NO baseline/campaign, so a daemon cycle classifies it
+    ``new_arrival`` and applies it independently of the campaign drain. Returns
+    (deps, store, shoko, campaign_a, campaign_b)."""
+    head = SpecFile(series_id=1, file_id=10, shoko_id=500, episodes=((1, 1, ANIDB_EP, SHOKO_EP),))
+    pending = [
+        SpecFile(
+            series_id=2 + index,
+            file_id=20 + index,
+            shoko_id=501 + index,
+            episodes=((1, 2 + index, ANIDB_EP + 1 + index, SHOKO_EP + 1 + index),),
+        )
+        for index in range(2)
+    ]
+    b_files = [
+        SpecFile(
+            series_id=6, file_id=60, shoko_id=400, episodes=((1, 6, ANIDB_EP + 5, SHOKO_EP + 5),)
+        ),
+        SpecFile(
+            series_id=7, file_id=61, shoko_id=401, episodes=((1, 7, ANIDB_EP + 6, SHOKO_EP + 6),)
+        ),
+    ]
+    inventory = [head, *pending, *b_files]
+    if new_arrival is not None:
+        inventory = [*inventory, new_arrival]
+    xml = (
+        "<anime-list>"
+        f"<anime anidbid='{ANIME_ID}' tvdbid='{TVDB_SERIES}' defaulttvdbseason='1'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1'>;1-1;2-2;6-6;7-7;</mapping>"
+        "</mapping-list></anime></anime-list>"
+    )
+    activate_mapping(tmp_path, xml)
+    settings = _drain_settings(tmp_path, batch=5)
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    store.set_meta("budget_last_cycle_key", "cycle-1")
+    seed_baseline(store, [head, *pending])
+    shoko = ShokoStub(inventory)
+    # The head campaign's remaining AniDB episodes never materialize → genuine pending targets.
+    shoko.unmaterialized = {ANIDB_EP + 1 + index for index in range(2)}
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=inventory,
+        shoko_files=inventory,
+        xml=xml,
+        monotonic=Clock([MONO_ZERO, MONO_ZERO, MONO_ZERO]),
+        advance=Sleeper().advance,
+        settings=settings,
+        max_submissions=10,
+        shoko=shoko,
+    )
+    plan_a, digest_a = prepare_campaign(deps, settings, store, T0, limit=3, deadline_hours=168.0)
+    write_plan_file(tmp_path / "planA.json", plan_a)
+    approve_campaign(store, tmp_path / "planA.json", digest_a, T0)
+    campaign_a = plan_a.campaign_id
+    canary_a = apply_campaign(deps, settings, store, tmp_path / "planA.json", T0, batch_size=1)
+    assert canary_a.submitted == 1  # the materialized head file opens the drain
+    authorize_campaign_drain(store, campaign_a, T0, note="canary inspected")  # F10
+    seed_baseline(store, [head, *pending, *b_files])  # B's files arrive as new backlog
+    store._conn.execute("UPDATE files SET cohort = 'backlog' WHERE shoko_file_id IN (400, 401)")
+    plan_b, digest_b = prepare_campaign(deps, settings, store, T0, limit=2, deadline_hours=168.0)
+    write_plan_file(tmp_path / "planB.json", plan_b)
+    later_iso = (datetime.fromisoformat(T0) + timedelta(seconds=60.0)).isoformat()
+    approve_campaign(
+        store, tmp_path / "planB.json", digest_b, later_iso
+    )  # B is NEWER: A is the head
+    campaign_b = plan_b.campaign_id
+    assert {item.shoko_file_id for item in plan_b.files} == {400, 401}
+    canary_b = apply_campaign(deps, settings, store, tmp_path / "planB.json", T0, batch_size=1)
+    assert canary_b.submitted == 1
+    authorize_campaign_drain(store, campaign_b, T0, note="canary inspected")
+    return deps, store, shoko, campaign_a, campaign_b
+
+
+def _hol_cycle(deps: DaemonDeps, key: str, now_iso: str) -> Any:
+    return run_cycle(
+        deps, now_iso=now_iso, mode=CycleMode.APPLY, policy=RunPolicy.BACKLOG, cycle_key=key
+    )
+
+
+def test_f18_stalled_head_cooldown_yields_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Head-of-line fix (Finding 1) at production cadence: the stalled head (pending Shoko
+    metadata → zero-progress every drain cycle) defers with a bounded FIVE-interval cooldown — a
+    FUTURE retry time, not the old retry==now no-op — so across a full cooldown span walked at the
+    realistic sleep-after-cycle cadence (interval x 1.05) the head yields the queue, the later
+    drain-authorized campaign (B) drains, the head is never paused, its authorization stays
+    intact, its files are never POSTed, and the head auto-resumes exactly at the cooldown mark."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    deps, store, shoko, campaign_a, campaign_b = _hol_two_campaigns(tmp_path)
+    base = datetime.fromisoformat(T0)
+    try:
+        posts_at_setup = len(shoko.posts)  # {500, 400} — one canary each
+        stall = _hol_cycle(deps, "hol-1", T0)
+        assert stall.campaign is not None
+        assert stall.campaign.submitted == 0  # pending targets: zero progress
+        assert stall.campaign.progress == 0
+        deferred_a = store.get_meta(f"campaign_deferred_until:{campaign_a}")
+        expected = (base + timedelta(seconds=HOL_COOLDOWN_SECONDS)).isoformat()
+        assert deferred_a == expected  # a real, bounded five-interval cooldown (Finding 1)
+        assert any(
+            reason.startswith("campaign_deferred:") and "pending_metadata_cooldown" in reason
+            for reason in stall.reasons
+        )  # Finding 2: the label names the real wait
+        # Walk the full five-interval span at the realistic sleep-after-cycle cadence.
+        b_drains = 0
+        idle_skips = 0
+        recoverable_surfaced = 0
+        head_resumes = 0
+        for step in range(1, 6):
+            iso = (base + timedelta(seconds=step * HOL_CADENCE_SECONDS)).isoformat()
+            cycle = _hol_cycle(deps, f"hol-span-{step}", iso)
+            campaign = store.get_campaign(campaign_a)
+            assert campaign is not None
+            assert campaign.status == "approved"  # the head never pauses across the span
+            assert campaign.drain_authorized_iso is not None  # authorization intact
+            assert store.get_meta(f"campaign_zero_progress:{campaign_a}") in (None, "0")
+            if cycle.campaign is None:
+                idle_skips += 1  # the deferred head yields every idle cycle inside the cooldown
+                if any(
+                    reason.startswith(f"campaign_deferred:{campaign_a}")
+                    and "recoverable_cooldown" in reason
+                    for reason in cycle.reasons
+                ):
+                    recoverable_surfaced += 1  # the deferral and its retry time are surfaced
+            elif cycle.campaign.campaign_id == campaign_b:
+                b_drains += 1  # the later drain-authorized campaign takes the yielded cycle
+                assert cycle.campaign.submitted >= 1  # B drains while the head defers
+            else:
+                assert cycle.campaign.campaign_id == campaign_a  # auto-resume at the cooldown mark
+                assert cycle.campaign.submitted == 0  # the metadata never landed: stalls again
+                head_resumes += 1
+                deferred_a = store.get_meta(f"campaign_deferred_until:{campaign_a}")
+                assert (
+                    deferred_a
+                    == (
+                        datetime.fromisoformat(iso) + timedelta(seconds=HOL_COOLDOWN_SECONDS)
+                    ).isoformat()
+                )  # the cooldown re-arms from the resume time
+        assert b_drains == 1  # campaign B drains while the head yields the queue
+        assert idle_skips == 3  # the head yields the queue for the idle cooldown cycles
+        assert recoverable_surfaced >= 2  # the recoverable_cooldown skip reason surfaces
+        assert head_resumes == 1  # the head is deterministically re-selected at 5x interval
+        assert len(shoko.posts) == posts_at_setup + 1  # the head's pending files never POST
+        post_paths = [request.url.path for request in shoko.requests if request.method == "POST"]
+        assert sorted(int(path.split("/")[4]) for path in post_paths) == [400, 401, 500]
+    finally:
+        store.close()
+
+
+def test_f18_stalled_head_deferral_survives_restart_and_rearms_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Head-of-line fix (Finding 1, continued): the cooldown deferral survives a store reopen
+    mid-cooldown (the head is skipped, zero POSTs, the deferral surfaces in the cycle reasons);
+    once the cooldown passes the head is SELECTED again automatically (no operator action),
+    stalls, and the cooldown re-arms from the new time — it never permanently pauses and
+    every file is POSTed exactly once across the whole sequence."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    deps, store, shoko, campaign_a, campaign_b = _hol_two_campaigns(tmp_path)
+    try:
+        stall = _hol_cycle(deps, "holr-1", T0)
+        assert stall.campaign is not None  # the head takes its first stall cycle
+        assert len(shoko.posts) == 2
+    finally:
+        store.close()
+    reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    reopened_deps = replace(deps, store=reopened)
+    try:
+        posts_at_restart = len(shoko.posts)
+        mid = _hol_cycle(reopened_deps, "holr-2", T0)
+        assert mid.campaign is not None  # restart mid-cooldown: the head yields, B drains
+        assert mid.campaign.campaign_id == campaign_b
+        assert mid.campaign.submitted == 1  # 401 takes the cycle the stalled head would burn
+        assert len(shoko.posts) == posts_at_restart + 1
+        after = _hol_cycle(reopened_deps, "holr-3", T0)
+        assert after.campaign is None  # B complete (max-submissions auto-pause)
+        surfaced = _hol_cycle(reopened_deps, "holr-4", T0)
+        assert surfaced.campaign is None  # nothing drainable: the deferred head yields
+        assert any(
+            reason.startswith(f"campaign_deferred:{campaign_a}") for reason in surfaced.reasons
+        )  # the durable deferral survived the restart and is surfaced
+        resume_iso = (
+            datetime.fromisoformat(T0) + timedelta(seconds=HOL_COOLDOWN_SECONDS + 1.0)
+        ).isoformat()
+        resumed = _hol_cycle(reopened_deps, "holr-5", resume_iso)
+        assert resumed.campaign is not None  # auto-resume: the head is selected again
+        assert resumed.campaign.campaign_id == campaign_a
+        assert resumed.campaign.submitted == 0  # the metadata never landed: it stalls again
+        deferred_again = reopened.get_meta(f"campaign_deferred_until:{campaign_a}")
+        assert (
+            deferred_again
+            == (
+                datetime.fromisoformat(resume_iso) + timedelta(seconds=HOL_COOLDOWN_SECONDS)
+            ).isoformat()
+        )  # the cooldown re-armed from the resume time
+        campaign = reopened.get_campaign(campaign_a)
+        assert campaign is not None
+        assert campaign.status == "approved"  # never permanently paused
+        assert campaign.drain_authorized_iso is not None
+        assert len(shoko.posts) == posts_at_restart + 1  # no POSTs after B's drain
+        post_paths = [request.url.path for request in shoko.requests if request.method == "POST"]
+        assert sorted(int(path.split("/")[4]) for path in post_paths) == [400, 401, 500]
+    finally:
+        reopened.close()
+
+
+def test_f18_deferred_head_leaves_daemon_duties_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F18 (Finding 1, verification): a recoverable cooldown-deferred head campaign is SKIPPED by
+    drain selection, yet the daemon's OTHER duties run unaffected — a new arrival applies in the
+    same cycle the head defers, and the head stays skipped (with the ``recoverable_cooldown`` skip
+    reason surfaced) once the later campaign drains out. The head never pauses, keeps its
+    authorization, and its pending files are never POSTed."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    na = SpecFile(
+        series_id=8,
+        file_id=70,
+        shoko_id=410,
+        episodes=((1, 6, ANIDB_EP + 5, SHOKO_EP + 5),),
+    )
+    deps, store, shoko, campaign_a, campaign_b = _hol_two_campaigns(tmp_path, new_arrival=na)
+    base = datetime.fromisoformat(T0)
+
+    def new_arrival_cycle(key: str, iso: str) -> Any:
+        return run_cycle(
+            deps, now_iso=iso, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key=key
+        )
+
+    try:
+        posts_at_setup = len(shoko.posts)  # {500, 400} — one canary each
+        # The head (A) stalls and defers in the SAME cycle a new arrival applies.
+        stall = new_arrival_cycle("holna-1", T0)
+        assert stall.campaign is not None
+        assert stall.campaign.campaign_id == campaign_a
+        assert stall.campaign.submitted == 0  # pending targets: the head makes zero drain progress
+        deferred_a = store.get_meta(f"campaign_deferred_until:{campaign_a}")
+        assert deferred_a == (base + timedelta(seconds=HOL_COOLDOWN_SECONDS)).isoformat()
+        assert stall.counts.submitted >= 1  # the new-arrival apply is NOT gated by the deferral
+        campaign = store.get_campaign(campaign_a)
+        assert campaign is not None
+        assert campaign.status == "approved"  # the head never pauses
+        assert campaign.drain_authorized_iso is not None  # authorization intact
+        # Walk the cooldown: B takes its cycles while the head defers, then drains out and the
+        # deferred head yields the idle cycles (campaign skipped, recoverable_cooldown surfaced).
+        for step in (2, 3, 4):
+            idle = new_arrival_cycle(
+                f"holna-{step}", (base + timedelta(seconds=step * HOL_CADENCE_SECONDS)).isoformat()
+            )
+            campaign = store.get_campaign(campaign_a)
+            assert campaign is not None
+            assert campaign.status == "approved"  # the head never pauses
+            assert campaign.drain_authorized_iso is not None  # authorization intact
+        assert idle.campaign is None  # the deferred head is SKIPPED by drain selection
+        assert any(
+            reason.startswith(f"campaign_deferred:{campaign_a}")
+            and "recoverable_cooldown" in reason
+            for reason in idle.reasons
+        ), idle.reasons  # the recoverable skip reason surfaces
+        # The new arrival posted exactly once; the head's pending files never posted.
+        post_paths = [request.url.path for request in shoko.requests if request.method == "POST"]
+        posted_ids = sorted(int(path.split("/")[4]) for path in post_paths)
+        assert posted_ids.count(na.shoko_id) == 1  # the new arrival POSTed once, no replay
+        assert 501 not in posted_ids  # the head's pending files never POST
+        assert 502 not in posted_ids
+        assert campaign_send_progress(store, campaign_a) == 1  # the head's only POST is its canary
+        # Across the span: the canaries (500, 400) + B's drain (401) + the new arrival (410).
+        assert sorted(set(posted_ids)) == [400, 401, 410, 500]
+        assert len(shoko.posts) == posts_at_setup + 2  # only B's drain and the new arrival added
     finally:
         store.close()
 

@@ -82,6 +82,12 @@ If a file contains multiple Sonarr episodes, **all** must map successfully; link
 - Do not modify, replace, or “repair” existing links automatically. Report conflicts for review.
 - Where the required Shoko anime/episode metadata is missing, optionally create/refresh the series through supported Shoko APIs in **apply mode** and retry once available. Never do this in dry-run mode.
 
+**Unattended backlog campaigns (M7) — drain authorization and budget cooldown:**
+
+- The daemon's automatic campaign drain runs only with the operator's explicit, digest-bound `campaign authorize-drain` confirmation of a **settled canary, judged from the durable send ledger**: every send ever attempted for the campaign must be terminal **VERIFIED**. A rejected/refused request (its file back in `waiting`), an in-flight send, and an indeterminate/partial/conflict outcome are *not* canary completion; the authorization visibly refuses and lists every outstanding send (file id, outcome, state). A rejected file must be resubmitted and verified through the normal bounded flow before the grant succeeds.
+- Recoverable waits must not permanently pause a campaign: normal rolling/cycle budget exhaustion, pending Shoko metadata, pending async verification jobs, and transient queue congestion mark the campaign **deferred** with a persisted retry time (the earliest rolling-slot expiry when the rolling budget blocks, otherwise a fixed daemon yield span of five cycle intervals that re-arms on every stall and never pauses the campaign). The campaign stays approved and drain-authorized, is skipped while the window is closed, and resumes automatically once the window permits — bounded by the same per-cycle cap and rolling ceilings. The zero-progress breaker pauses only genuinely-unexpected stalls (remaining rows parked in operator-review safety states).
+- Hard stops stay terminal: invalid/expired attestation lease, revoked approval, plan/mapping drift, source discontinuity, unexpected existing links, deadline expiry, and the `max_submissions` ceiling (plan complete) keep pausing writes for operator action.
+
 **No media files may be renamed, moved, deleted, rewritten, or opened for modification.** No media-directory Docker mount is necessary.
 
 ## 4. Configuration and operations

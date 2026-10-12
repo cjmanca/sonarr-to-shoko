@@ -22,13 +22,14 @@ from typing import Any, Final
 from .audit import AuditReport
 from .campaign import CampaignApplyReport, campaign_drain_selection
 from .config import Settings, apply_gate_status
-from .daemon import CycleReport, DaemonReport
+from .daemon import CycleReport, DaemonReport, rolling_budget_exhausted
 from .mapping_store import MappingStatus, RefreshOutcome
 from .state import (
     META_APPLY_LOCK,
     META_ATTESTATION_GATE,
     META_BASELINE_COMPLETED_ISO,
     META_BUDGET_CYCLE_KEY,
+    META_CAMPAIGN_DEFERRED_UNTIL,
     META_LAST_CYCLE_END_ISO,
     META_LAST_CYCLE_START_ISO,
     META_LAST_FULL_RECONCILE_ISO,
@@ -370,8 +371,14 @@ def _limits_payload(limits: BudgetLimits | None) -> dict[str, Any] | None:
     return None if limits is None else asdict(limits)
 
 
-def budgets_ok(store: StateStore) -> bool:
-    """Non-mutating budget-headroom peek mirroring the daemon's eligibility input."""
+def budgets_ok(store: StateStore, now_iso: str) -> bool:
+    """Non-mutating budget-headroom peek mirroring the daemon's eligibility input.
+
+    F18 (Finding 3): consults the shared :func:`shoko_linker.daemon.rolling_budget_exhausted`
+    peek, which applies the same rolling-window reset the daemon eligibility peek
+    (``daemon._budget_headroom``) and the reservation path (``state.StateStore._reserve_tx``)
+    apply — a persisted rolling counter whose window already elapsed counts as zero, so the
+    health/report rollup never shows ``budgets_exhausted`` after the window has reopened."""
     view = store.budget_view()
     if view.paused_reason is not None:
         return False
@@ -382,7 +389,7 @@ def budgets_ok(store: StateStore) -> bool:
         return False
     if view.pending_episode_jobs >= limits.max_pending_episode_jobs:
         return False
-    return view.rolling_new_submissions < limits.rolling_new
+    return not rolling_budget_exhausted(view, limits, now_iso)
 
 
 def state_rollup(store: StateStore) -> dict[str, Any]:
@@ -446,7 +453,11 @@ def _mapping_affected(store: StateStore) -> dict[str, int]:
 
 
 def _eligibility_inputs(
-    store: StateStore, settings: Settings, mapping_active: bool, attestation_status: str
+    store: StateStore,
+    settings: Settings,
+    mapping_active: bool,
+    attestation_status: str,
+    now_iso: str,
 ) -> dict[str, Any]:
     gate = apply_gate_status(settings)
     return {
@@ -454,7 +465,7 @@ def _eligibility_inputs(
         "attestation": attestation_status,
         "attestation_gate": store.get_meta(META_ATTESTATION_GATE),
         "mapping_generation_active": mapping_active,
-        "budgets_ok": budgets_ok(store),
+        "budgets_ok": budgets_ok(store, now_iso),
         "source_stable": store.get_meta(META_REQUIRES_REBASELINE) != INDICATOR_TRUE,
         "writes_disabled": store.writes_disabled,
     }
@@ -497,6 +508,10 @@ def campaign_rollup(store: StateStore) -> list[dict[str, Any]]:
                 "drain_authorized_digest": campaign.drain_authorized_digest,
                 "drain_invalidated_reason": campaign.drain_invalidated_reason,
                 "drain_selection": campaign_drain_selection(campaign),
+                # F18: recoverable drain deferral (budget cooldown retry ISO, if active).
+                "deferred_until": store.get_meta(
+                    f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign.campaign_id}"
+                ),
             }
         )
     return rows
@@ -606,7 +621,7 @@ def report_payload(
                 )
             },
             "eligibility_inputs": _eligibility_inputs(
-                store, settings, mapping_status.active_present, attestation_status
+                store, settings, mapping_status.active_present, attestation_status, _iso(now)
             ),
         },
         "generated_iso": _iso(now),

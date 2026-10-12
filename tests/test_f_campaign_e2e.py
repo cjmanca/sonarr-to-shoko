@@ -37,7 +37,12 @@ from shoko_linker.attestation import (
 )
 from shoko_linker.campaign import campaign_send_progress, read_plan_file
 from shoko_linker.config import load_settings
-from shoko_linker.daemon import ZERO_PROGRESS_PAUSE_CYCLES, CycleMode, run_cycle
+from shoko_linker.daemon import (
+    STALL_YIELD_COOLDOWN_CYCLES,
+    ZERO_PROGRESS_PAUSE_CYCLES,
+    CycleMode,
+    run_cycle,
+)
 from shoko_linker.linking import SendOutcome
 from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
@@ -66,6 +71,13 @@ JOBS_FIVE = 5
 MILESTONES = (5, 10, 20, 50, 100)
 MAX_DRAIN_CYCLES = 40
 CYCLE_SECONDS = 300.0
+# Production cadence: ``run_daemon`` sleeps ``interval_seconds * (1 + jitter)`` AFTER each
+# cycle (jitter_ratio 0.1 -> the upper bound is interval x 1.05). The stall-yield
+# cooldown is measured in cycle intervals, so the tests advance by this realistic
+# sleep-after-cycle step (not the exact interval), which a one-interval cooldown
+# always expires under (making the head-of-line yield inert in production).
+CADENCE_SECONDS = CYCLE_SECONDS * 1.05
+STALL_COOLDOWN_SECONDS = STALL_YIELD_COOLDOWN_CYCLES * CYCLE_SECONDS
 SWAP_ANIME = 999
 SWAP_TVDB = 11111
 ARRIVAL_ANIME = 4031
@@ -1104,43 +1116,58 @@ def test_f_campaign_outstanding_jobs_cap_defers_and_progresses_as_jobs_settle(
 def test_f_campaign_all_pending_targets_trip_zero_progress_then_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """F9 end-to-end honesty: a campaign whose remaining files are ALL non-materializing
-    pending targets trips the zero-progress pause in exactly ``ZERO_PROGRESS_PAUSE_CYCLES``
-    cycles (no infinite full-sweep churn, zero POSTs) and resumes cleanly once Shoko's
-    metadata materializes."""
+    """F18 end-to-end honesty at PRODUCTION cadence: a campaign whose remaining files are
+    ALL non-materializing pending targets makes zero submissions every drain cycle, but this is
+    a RECOVERABLE wait — the head defers for the full ``STALL_YIELD_COOLDOWN_CYCLES`` daemon-yield
+    span (5 cycle intervals at the realistic sleep-after-cycle cadence), YIELDS the queue
+    (the drain cycle is skipped with a surfaced ``recoverable_cooldown``), stays APPROVED and
+    drain-authorized with zero POSTs, and AUTO-RESUMES after each cooldown re-arm (well past the
+    ``ZERO_PROGRESS_PAUSE_CYCLES`` breaker, which is never burned). It completes automatically
+    once Shoko's metadata materializes (no operator resume/authorize round-trip needed)."""
     env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_TWELVE, per_series=N_ONE)
     for series in range(N_TWO, N_TWELVE + 1):  # every campaign file except the canary's is pending
         env.world.shoko.pending.add((4000 + series) * 1000 + 1)  # the AniDB episode id
     campaign_id = _ready_campaign(env, capsys, N_TWELVE)
     store = env.open_store()
     try:
-        for index in range(ZERO_PROGRESS_PAUSE_CYCLES - 1):
-            report = env.cycle(store)
+        posts_before = env.world.shoko.posts_count()
+        deferrals = 0
+        resumptions = 0
+        # Advance by the realistic sleep-after-cycle cadence (interval x 1.05), not the exact
+        # interval: a one-interval cooldown always expires before the next cycle, so only a
+        # multi-interval span yields the queue at all. Run well past the breaker bound.
+        churn_cycles = max(STALL_YIELD_COOLDOWN_CYCLES + 2, ZERO_PROGRESS_PAUSE_CYCLES + 2)
+        for index in range(churn_cycles):  # 7 cycles: a full deferral span, past the breaker
+            report = env.cycle(store, advance=CADENCE_SECONDS)
             batch = report.campaign
-            assert batch is not None, report.reasons
-            assert batch.submitted == N_ZERO  # pending targets defer: zero submissions
-            assert batch.progress == N_ZERO
-            assert any(reason.startswith("pending_target:") for reason in batch.reasons)
             campaign = store.get_campaign(campaign_id)
             assert campaign is not None
-            assert campaign.status == "approved", index
-        posts_before = env.world.shoko.posts_count()
-        report = env.cycle(store)  # the Nth consecutive zero-progress drain pauses it
-        assert any(reason.startswith("campaign_zero_progress_pause:") for reason in report.reasons)
-        campaign = store.get_campaign(campaign_id)
-        assert campaign is not None
-        assert campaign.status == "paused"
-        assert campaign.status_reason == "no_queueable_candidates"
-        assert env.world.shoko.posts_count() == posts_before  # zero POSTs across the churn
-        report = env.cycle(store)
-        assert report.campaign is None  # the paused campaign drops out: no further sweeps
-        assert env.world.shoko.posts_count() == posts_before
+            assert campaign.status == "approved", index  # recoverable deferral: never paused
+            assert campaign.drain_authorized_iso is not None  # authorization intact
+            assert not any(
+                reason.startswith("campaign_zero_progress_pause:") for reason in report.reasons
+            )
+            assert store.get_meta(f"campaign_zero_progress:{campaign_id}") in (None, "0")
+            if batch is None:
+                # The head yields the queue for the cooldown span, with the deferral surfaced.
+                deferrals += 1
+                assert any(
+                    reason.startswith(f"campaign_deferred:{campaign_id}")
+                    and "recoverable_cooldown" in reason
+                    for reason in report.reasons
+                ), report.reasons
+            else:
+                resumptions += 1
+                assert batch.submitted == N_ZERO  # pending targets defer: zero submissions
+                assert batch.progress == N_ZERO
+                assert any(reason.startswith("pending_target:") for reason in batch.reasons)
+            assert env.world.shoko.posts_count() == posts_before  # zero POSTs while deferred
+        assert deferrals > 0, "the head must yield the queue for a real multi-cycle span"
+        assert resumptions >= 2, "the head auto-resumes after each cooldown re-arm"
 
-        env.world.shoko.pending.clear()
-        assert env.resume(campaign_id) == cli.EXIT_OK
-        assert env.authorize(campaign_id) == cli.EXIT_OK
-        capsys.readouterr()
-        _drain(store, env, campaign_id, until=N_TWELVE)
+        env.world.shoko.pending.clear()  # Shoko metadata materializes
+        env.advance(STALL_COOLDOWN_SECONDS + 1.0)  # the last re-armed cooldown passes
+        _drain(store, env, campaign_id, until=N_TWELVE)  # automatic resume, no operator action
         assert env.world.shoko.posts_count() == N_TWELVE
         assert all(env.posts_for(file_id) == N_ONE for file_id in env.plan_file_ids())
         assert store.campaign_progress(campaign_id)[FileState.VERIFIED.value] == N_TWELVE

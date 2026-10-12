@@ -84,7 +84,10 @@ from .state import (
     CAMPAIGN_STATUS_APPROVED,
     CAMPAIGN_STATUS_REVOKED,
     META_CAMPAIGN_ATTESTATION_GATE,
+    META_CAMPAIGN_DEFERRED_UNTIL,
     META_CAMPAIGN_ZERO_PROGRESS,
+    OUTCOME_VERIFIED,
+    OUTCOME_VOIDED,
     ApplyLockUnavailableError,
     BudgetRefusal,
     CampaignBinding,
@@ -92,6 +95,7 @@ from .state import (
     Cohort,
     FileState,
     LockHeldError,
+    SendHistoryRow,
     SendToken,
     StateError,
     StateStore,
@@ -201,6 +205,24 @@ class CampaignPlanInvalidError(CampaignError):
     (exit 3). Campaign-state refusals (not-approved/paused/revoked/deadline/
     max-submissions/plan drift) stay ``CampaignError`` → exit 3.
     """
+
+
+class CampaignEligibilityRefusalError(CampaignError):
+    """The cycle eligibility verdict refused campaign apply.
+
+    F18 review (Finding 4): the refusal carries the **structured** verdict tuple, so the
+    daemon's recoverable-deferral branch triggers ONLY on the pure ``budgets_exhausted``
+    verdict. A mixed refusal (e.g. budget exhaustion together with ``mapping_unstable`` /
+    ``source_unstable``) auto-pauses the campaign through the drift family; a deferral
+    marker written there is inert while paused and stale on operator resume.
+    """
+
+    def __init__(self, reasons: tuple[str, ...]) -> None:
+        super().__init__(
+            f"campaign apply refused — eligibility reasons: {', '.join(reasons)} "
+            "(campaign status reported; zero POSTs)"
+        )
+        self.eligibility_reasons = reasons
 
 
 # ------------------------------------------------------------------ plan records
@@ -1090,10 +1112,7 @@ def _apply_sweep(
     eligibility = compute_eligibility(deps, now_iso, campaign=True)
     if not eligibility.eligible:
         _pause_for_eligibility(deps.store, campaign_id, eligibility.reasons, now_iso, reasons)
-        raise CampaignError(
-            f"campaign apply refused — eligibility reasons: {', '.join(eligibility.reasons)} "
-            "(campaign status reported; zero POSTs)"
-        )
+        raise CampaignEligibilityRefusalError(eligibility.reasons)
     return sweep
 
 
@@ -1688,11 +1707,13 @@ def _send_one(
 
 def clear_campaign_terminal_meta(store: StateStore, campaign_id: str) -> None:
     """P3: a campaign at a terminal state (``plan_complete`` / revoked) sheds its drain
-    bookkeeping metas — the per-campaign attestation gate marker and the zero-progress
-    counter. Best-effort: cleanup never changes campaign semantics and never fails a batch."""
+    bookkeeping metas — the per-campaign attestation gate marker, the zero-progress
+    counter, and the F18 recoverable-deferral marker. Best-effort: cleanup never changes
+    campaign semantics and never fails a batch."""
     for key in (
         f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}",
         f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}",
+        f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}",
     ):
         with contextlib.suppress(WriteDisabledError, StateError):
             store.clear_meta(key)
@@ -1752,18 +1773,20 @@ def campaign_revoke(store: StateStore, campaign_id: str, now_iso: str) -> int:
     return unbound
 
 
-# ----------------------------------------------------------- drain authorization (F10)
+# ----------------------------------------------------------- drain authorization (F10 + F19)
 
 #: The strict rule :func:`authorize_campaign_drain` enforces — documented once, reused by the
 #: CLI output and the selection/report surfaces.
 DRAIN_AUTHORIZATION_RULE: Final[str] = (
-    "drain authorization requires the campaign APPROVED and its canary SETTLED: at least one "
-    "submitted campaign file, and EVERY submitted campaign file VERIFIED (a file in "
-    "request_may_have_been_sent/verifying/partial/indeterminate_write/conflict is unreviewed "
-    "media-side-effect risk and refuses the grant). The grant binds the campaign's CURRENT "
-    "approval digest, persists across restarts, and is invalidated by a digest/plan-fingerprint "
-    "change or an operator revoke. Manual 'campaign apply' never requires it — only the "
-    "automatic daemon drain does."
+    "drain authorization requires the campaign APPROVED and its canary SETTLED "
+    "against the DURABLE SEND LEDGER: every send ever attempted for the campaign must be "
+    "terminal VERIFIED. A rejected/refused send (its file back in waiting), an in-flight "
+    "request_may_have_been_sent/verifying send, and an indeterminate_write/partial/conflict "
+    "outcome are unaccounted media-side-effect risk and REFUSE the grant, visibly listed by "
+    "file id + outcome + state. The grant binds the campaign's CURRENT approval digest, "
+    "persists across restarts, and is invalidated by a digest/plan-fingerprint change or "
+    "an operator revoke. Manual 'campaign apply' never requires it — only the automatic "
+    "daemon drain does."
 )
 
 
@@ -1784,16 +1807,57 @@ def campaign_drain_selection(campaign: CampaignRecord) -> str:
     return "authorized"
 
 
+def campaign_deferred_until_iso(store: StateStore, campaign_id: str, now_iso: str) -> str | None:
+    """F18: the campaign's ACTIVE recoverable drain deferral (durable meta), else ``None``.
+
+    A deferral marks a recoverable-wait retry time — a rolling-budget window expiry, a
+    bounded stall cooldown, or a pending-metadata cooldown: the campaign stays APPROVED and
+    drain-authorized, is skipped for automatic drain until the persisted retry ISO passes, and
+    resumes automatically afterwards. An unparseable marker is treated as no deferral
+    (fail-open for scheduling only; budgets stay authoritative inside
+    :func:`apply_campaign`)."""
+    raw = store.get_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}")
+    if raw is None:
+        return None
+    try:
+        expiry = _parse_iso(raw)
+    except ValueError:
+        return None
+    return expiry.isoformat() if expiry > _parse_iso(now_iso) else None
+
+
+def campaign_deferral_reasons(store: StateStore, now_iso: str) -> tuple[str, ...]:
+    """F18: ``campaign_deferred:<id>:recoverable_cooldown:until=<iso>`` for every
+    drain-eligible campaign currently skipped by its recoverable deferral (surfaced in cycle
+    reasons so the deferral and its retry time are visible). The durable meta stores only the
+    retry ISO, so the skip surface uses the family-neutral ``recoverable_cooldown`` label; the
+    write-time surface (``daemon._defer_campaign_drain``) names the exact family."""
+    reasons: list[str] = []
+    for campaign in store.list_campaigns():
+        if campaign_drain_selection(campaign) != "authorized":
+            continue
+        deferred = campaign_deferred_until_iso(store, campaign.campaign_id, now_iso)
+        if deferred is not None:
+            reasons.append(
+                f"campaign_deferred:{campaign.campaign_id}:recoverable_cooldown:until={deferred}"
+            )
+    return tuple(reasons)
+
+
 def authorize_campaign_drain(
     store: StateStore, campaign_id: str, now_iso: str, *, note: str
 ) -> CampaignRecord:
-    """F10: the operator's explicit, digest-bound confirmation that the canary passed.
+    """F10 + F19: the operator's explicit, digest-bound confirmation that the canary passed.
 
-    Enforces :data:`DRAIN_AUTHORIZATION_RULE` verbatim. Refuses a campaign that is unknown,
-    paused, or revoked, and refuses while ANY submitted campaign file is unsettled
-    (``request_may_have_been_sent`` / ``verifying`` / ``partial`` / ``indeterminate_write`` /
-    ``conflict``) — the canary gate is an *inspected, verified* canary, never a mere
-    submission attempt.
+    Enforces :data:`DRAIN_AUTHORIZATION_RULE` verbatim, computed from the **durable send
+    ledger** (``store.campaign_send_history``), never from current file states alone: a
+    REJECTED/REFUSED send returns its file to ``waiting`` while the send row stays durable,
+    and it is accounted here. Refuses a campaign that is unknown, paused, revoked, has no
+    attempted send (no canary), or whose latest send per attempted file is not terminal
+    VERIFIED — the refusal lists every outstanding send (file id, outcome, file state)
+    so the operator sees exactly what is unaccounted. A zero-write documented REJECTED
+    request is NOT a verified association; the file must be resubmitted and
+    verified through the normal bounded flows before the grant succeeds.
     """
     if not note.strip():
         raise CampaignError(
@@ -1808,31 +1872,52 @@ def authorize_campaign_drain(
             f"campaign {campaign_id} is {campaign.status} ({campaign.status_reason}): drain "
             "authorization requires an approved campaign — resume it first"
         )
-    sent_states = [
-        record.state
-        for record in store.campaign_files(campaign_id)
-        if record.state in _SEND_PROGRESS_STATES
-    ]
-    if not sent_states:
+    history = store.campaign_send_history(campaign_id)
+    # A voided ``prepared_not_sent`` row is a definite zero-write (never attempted):
+    # it is durable audit history but is not a canary send and never blocks the grant.
+    attempted = [row for row in history if row.outcome != OUTCOME_VOIDED]
+    if not attempted:
         raise CampaignError(
             f"campaign {campaign_id} has no completed canary (zero submitted files): run the "
             "manual canary batch, verify it, inspect the physical-media side effects, then "
             "authorize the drain"
         )
-    unsettled = sorted({state.value for state in sent_states if state is not FileState.VERIFIED})
-    if unsettled:
-        open_count = sum(1 for state in sent_states if state is not FileState.VERIFIED)
+    # Every attempted file is accounted only by its LATEST send being terminal VERIFIED (a
+    # rejected send resubmitted and verified is settled; the earlier rejected row stays
+    # visible in the audit). In-flight/indeterminate/conflict/partial/rejected/refused rows
+    # are unaccounted.
+    latest: dict[int, SendHistoryRow] = {row.shoko_file_id: row for row in attempted}
+    outstanding = sorted(
+        (
+            row
+            for row in latest.values()
+            if row.outcome != OUTCOME_VERIFIED or row.file_state is not FileState.VERIFIED
+        ),
+        key=lambda row: row.shoko_file_id,
+    )
+    if outstanding:
+        listing = "; ".join(
+            f"file {row.shoko_file_id} (send {row.send_id}: outcome {row.outcome}, "
+            f"file state {row.file_state.value})"
+            for row in outstanding
+        )
         raise CampaignError(
-            f"campaign {campaign_id} canary is not settled: {open_count} submitted file(s) await "
-            f"operator review ({', '.join(unsettled)}); drain authorization requires every "
-            "submitted campaign file VERIFIED"
+            f"campaign {campaign_id} canary is not settled: {len(outstanding)} attempted "
+            f"send(s) in the durable send ledger are not terminal VERIFIED — {listing}. Drain "
+            "authorization requires every attempted campaign send VERIFIED: a rejected/refused "
+            "send is not a verified association, and an in-flight/indeterminate_write/partial/"
+            "conflict send is unreviewed media-side-effect risk. Resubmit the refused file "
+            "through the normal bounded flow, verify it, inspect the side "
+            "effects, then authorize the drain"
         )
     store.authorize_campaign_drain(campaign_id, campaign.digest, iso=now_iso)
     logger.info(
-        "campaign %s drain authorized against digest %s at %s",
+        "campaign %s drain authorized against digest %s at %s (%d attempted send(s), all "
+        "terminal VERIFIED)",
         campaign_id,
         campaign.digest,
         now_iso,
+        len(attempted),
     )
     updated = store.get_campaign(campaign_id)
     assert updated is not None
@@ -1889,6 +1974,21 @@ def campaign_report(
         "drain_authorized_digest": campaign.drain_authorized_digest,
         "drain_invalidated_reason": campaign.drain_invalidated_reason,
         "drain_selection": campaign_drain_selection(campaign),
+        # F18: the recoverable drain deferral (retry ISO) when the campaign is cooling down.
+        "deferred_until": store.get_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}"),
+        # F19: the durable attempted-send audit — every send ever attempted for this campaign
+        # (ids, outcomes, current file states), including files that moved on (e.g. waiting).
+        "attempted_sends": [
+            {
+                "send_id": row.send_id,
+                "shoko_file_id": row.shoko_file_id,
+                "outcome": row.outcome,
+                "verification": row.verification,
+                "state": row.file_state.value,
+                "attempted_iso": row.attempted_iso,
+            }
+            for row in store.campaign_send_history(campaign_id)
+        ],
     }
 
 
@@ -1935,7 +2035,9 @@ def _short(campaign_id: str) -> str:
     return campaign_id[:8]
 
 
-def select_next_daemon_campaign(store: StateStore) -> CampaignRecord | None:
+def select_next_daemon_campaign(
+    store: StateStore, now_iso: str | None = None
+) -> CampaignRecord | None:
     """The F7 daemon's drain target: the oldest **approved, drain-authorized** campaign.
 
     Selection is by earliest ``approval_iso`` then ``campaign_id``; ``paused``/``revoked``
@@ -1950,7 +2052,12 @@ def select_next_daemon_campaign(store: StateStore) -> CampaignRecord | None:
     through the existing terminal transitions — normal completion (``max_submissions_reached``
     auto-pause), deadline expiry (``deadline_exceeded`` auto-pause, P1 fix), drift, attestation
     pause — plus the drain's ``no_queueable_candidates`` auto-pause (P2-3 fix), so a deferred
-    campaign never blocks the queue head. Returns ``None`` when nothing is drainable.
+    campaign never blocks the queue head. **F18:** when ``now_iso`` is supplied, a campaign
+    inside its recoverable budget-cooldown deferral (:func:`campaign_deferred_until_iso`) is
+    skipped for this cycle and stays in selection once the persisted retry time passes — the
+    deferral keeps the campaign APPROVED, so a later daemon cycle resumes it automatically
+    (and a deferring head-of-line campaign never starves a later drainable one). Returns
+    ``None`` when nothing is drainable.
     """
     drained = [
         campaign
@@ -1958,6 +2065,10 @@ def select_next_daemon_campaign(store: StateStore) -> CampaignRecord | None:
         if campaign.status == CAMPAIGN_STATUS_APPROVED
         and campaign_send_progress(store, campaign.campaign_id) >= 1
         and campaign_drain_selection(campaign) == "authorized"
+        and (
+            now_iso is None
+            or campaign_deferred_until_iso(store, campaign.campaign_id, now_iso) is None
+        )
     ]
     if not drained:
         return None

@@ -13,8 +13,8 @@
 | F15 (P0) file-quality-filter attestation hard refusal | **complete** | Implemented + reviewed (see Phase 1). Defect was: attestation.py `build_record`/`_parse_settings_summary` validated flag presence/type only |
 | F16 (P1) ED2K field format vs Shoko v3 API | **complete** | Implemented + reviewed (see Phase 1). Defect was: `_valid_ed2k` required `ed2k://` URI; fixtures built synthetic URIs |
 | F17 (P1) SQLite v1→v2 migration | **complete** | Implemented + reviewed (see Phase 2). Defect was: `SCHEMA_VERSION = 1` with drain columns only in fresh-install schema; empty registry; v1 DBs crashed on campaign queries |
-| F18 (P1/P2) budget cooldown vs permanent pause | pending | daemon zero-progress breaker pauses on `budgets_exhausted` |
-| F19 (P2) canary authorization history | pending | `_SEND_PROGRESS_STATES` excludes `waiting`; REJECTED/REFUSED map to `waiting` |
+| F18 (P1/P2) budget cooldown vs permanent pause | **complete** | Implemented + reviewed + fix round (see Phase 3) |
+| F19 (P2) canary authorization history | **complete** | Implemented + reviewed (see Phase 3) |
 | F20 (P2) plan-drift test fixture | pending | Confirmed: `write_plan_file` writes compact JSON (`"max_submissions":5`), so the test's space-form replace is a no-op; GitHub runs 38199820749/38199820737 failed, local suite green — discrepancy to reconcile |
 
 ## Baseline evidence (2026-10-12)
@@ -53,4 +53,12 @@ Phase 3: F18 (recoverable-wait vs permanent pause in the daemon zero-progress br
 ## Commits
 
 - `7a2e2bf` fix: remediation F15+F16 (incl. third-review PLAN.md baseline + STATUS.md)
-- (next) fix: remediation F17 — v1→v2 forward-only migration
+- `2374b8b` fix: remediation F17 — v1→v2 forward-only migration
+- (next) fix: remediation F18+F19 — recoverable-wait deferral + send-ledger canary authorization
+
+## Phase 3 — F18 + F19 (complete, review ACCEPTABLE after fix round)
+
+- F18: rolling-budget exhaustion and recoverable stalls (pending Shoko metadata, verifying async jobs, queue congestion, batch capacity) now DEFER via durable meta `campaign_deferred_until:<id>` (schema v2 unchanged); campaign stays APPROVED with drain authorization intact; auto-resumes (rolling-slot expiry when budget-caused; otherwise a 5-cycle-interval yield span that re-arms each stall — chosen over 1 interval after review showed 1 interval is inert under production sleep-after-cycle cadence); head-of-line stalled campaigns yield the queue to later authorized campaigns (two-campaign tests, restart tests); zero-progress breaker reduced to genuinely-unexpected stalls only (`no_queueable_candidates` for blocked_safety/conflict/unqueueable rows, pauses at 3, proven); all hard stops intact (lease, plan_drift, revoked, mapping drift, source discontinuity, writes_disabled, deadline, max_submissions_reached, indeterminate no-replay); no ceilings/rate-limits changed; latent `_budget_headroom` false-exhausted wedge fixed (peek now mirrors `_reserve_tx` rolling reset; reporting rollup shared).
+- F19: `authorize_campaign_drain` gates on the durable sends ledger — every attempted (non-voided) campaign send's latest row must be outcome `verified` AND file VERIFIED; refusals list outstanding sends visibly (file id + outcome + state); rejected→waiting canary sends cannot silently pass; resubmit+verified clears with earlier rejected rows visible in `attempted_sends` audit; confirm+note gate unchanged; authorization persists across restart. Documented in `DRAIN_AUTHORIZATION_RULE` + PROJECT.md §3.
+- Review (adversarial, 12 probes): ACCEPTABLE; P2 head-of-line starvation finding remediated (5-cycle cooldown + cadence-accurate tests); 4 P3s fixed (family labels, reporting peek, structured budget-refusal matching, `+N more` display); 1 P3 deferred (cosmetic docstring name in test_campaign.py:2529).
+- Checks: full suite 998 pass; ruff/format/mypy clean (orchestrator re-ran independently). Tests adapted to 5-interval semantics with assertions strengthened (zero-POST per cycle, no-replay ledgers, no-pause every cycle, breaker-not-burned preserved verbatim).

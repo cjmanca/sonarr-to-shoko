@@ -55,7 +55,7 @@ from shoko_linker.campaign import (
 )
 from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
 from shoko_linker.config import load_settings
-from shoko_linker.daemon import ZERO_PROGRESS_PAUSE_CYCLES, CycleMode, run_cycle
+from shoko_linker.daemon import CycleMode, run_cycle
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
@@ -68,6 +68,7 @@ from shoko_linker.state import (
     BaselineFile,
     BudgetRefusal,
     CampaignRecord,
+    Cohort,
     FileState,
     StateStore,
     acquire_apply_lock,
@@ -135,6 +136,9 @@ class Stubs:
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     shoko_requests: list[httpx.Request] = field(default_factory=list)
     post_hook: Callable[[int], None] | None = None
+    #: F19: when set, every Link POST responds with this status (e.g. 400 → REJECTED with
+    #: zero server-side writes) instead of the accepted 200, and nothing is linked.
+    post_status: int | None = None
     #: P2-1: fired on every Shoko GET with the request path — simulates a slow preflight
     #: network phase (authorization state flips mid-call, before the POST).
     get_hook: Callable[[str], None] | None = None
@@ -249,6 +253,9 @@ class Stubs:
             file_id = int(path.split("/")[4])
             self.posts.append(json.loads(request.content))
             self.posted_files.append(file_id)
+            if self.post_status is not None:
+                # F19: the server refuses the request (zero writes assumed).
+                return httpx.Response(self.post_status, json={"title": "problem"}, request=request)
             spec = next(item for item in self.specs if item.shoko_id == file_id)
             if file_id not in self.verify_empty:
                 self.linked[file_id] = [self.xref(spec)]
@@ -1480,6 +1487,7 @@ def test_apply_campaign_report_is_typed_batch_deferral(
 COUNT_ONE = 1
 BATCH_ONE = 1
 COUNT_SIX = 6
+COUNT_SEVEN = 7
 CAMPAIGN_DAEMON_KEY = "daemon-drain"
 LEASE_SHORT_HOURS = 1.0
 AUTH_NOTE = "canary inspected: renames/deletions/MyList side effects reviewed"
@@ -2236,15 +2244,16 @@ def test_f9_outstanding_job_cap_enforced_across_batches(
         store.close()
 
 
-def test_f9_budget_blocked_campaign_trips_zero_progress(
+def test_f9_budget_blocked_campaign_defers_not_pauses(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Scenario 6: a campaign whose submissions are every budget-refused makes zero successful
-    submissions across consecutive drains and auto-pauses via the zero-progress breaker (the old
-    accounting counted refused attempts as processed and stalled the campaign forever)."""
+    """Scenario 6 (F18 rewrite): a campaign whose submissions are every budget-refused is
+    DEFERRED with a persisted rolling-window retry time — it stays APPROVED and
+    drain-authorized, never burns the zero-progress breaker, and is skipped while the
+    rolling window is closed (the old ``no_budget_progress`` permanent pause is gone)."""
     _set_campaign(env, max_batch_size=5)
     # The canary's single submission spends the global rolling budget (window 168h), so every
-    # later drain is budget-blocked: zero successful submissions, permanently (until the window).
+    # later drain is budget-blocked: zero submissions until the rolling window reopens.
     _set_sync(env, max_new_per_cycle=1, rolling_new_limit=1)
     env.seed(specs(COUNT_FIVE))
     prepared = prepare(env, capsys)
@@ -2256,20 +2265,18 @@ def test_f9_budget_blocked_campaign_trips_zero_progress(
         _authorize_drain(env, store, campaign_id)  # F10: operator confirms the settled canary
         posts_before = len(env.stubs.posts)
         assert posts_before == 1
-        for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
+        for key in ZERO_PROGRESS_CYCLE_KEYS:
             cycle = _daemon_cycle(env, store, campaign_id, key)
             assert cycle.campaign is None  # budget-blocked batches defer
             assert any("budgets_exhausted" in reason for reason in cycle.reasons)
             campaign = store.get_campaign(campaign_id)
             assert campaign is not None
-            if index < ZERO_PROGRESS_PAUSE_CYCLES - 1:
-                assert campaign.status == "approved"
-            else:
-                assert campaign.status == "paused"
-                assert campaign.status_reason == "no_budget_progress"
+            assert campaign.status == "approved"  # recoverable deferral — never a permanent pause
+            assert not any("campaign_zero_progress_pause" in reason for reason in cycle.reasons)
         assert len(env.stubs.posts) == posts_before  # zero further POSTs
-        after = _daemon_cycle(env, store, campaign_id, "after-pause")
-        assert after.campaign is None  # drops out of drain selection
+        deferred = store.get_meta(f"{F18_DEFER_KEY}:{campaign_id}")
+        assert deferred is not None
+        assert store.get_meta(f"{F18_ZERO_KEY}:{campaign_id}") in (None, "0")  # breaker not burned
     finally:
         store.close()
 
@@ -2511,11 +2518,16 @@ def test_f9_all_refused_batch_is_not_plan_complete(
         store.close()
 
 
-def test_f9_per_file_refusals_trip_zero_progress_breaker(
+def test_f9_per_file_refusals_defer_without_pause(
     env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2: after the canary, every later file is per-file budget-refused → zero submissions
-    every drain cycle → the breaker trips ``no_budget_progress`` by the 3rd consecutive cycle."""
+    """P2 (F18 rewrite, Finding 1 head-of-line fix): after the canary, every later file is
+    per-file budget-refused → zero submissions every drain cycle. This is a RECOVERABLE budget
+    condition: the campaign defers with a bounded cooldown (a real future retry, not the old
+    retry==now no-op), stays APPROVED, the breaker is never burned, and the deferred head
+    YIELDS the queue — every later cycle skips it, so a queued campaign can drain.
+    ``test_f18_stalled_head_cooldown_yields_the_queue_and_auto_resumes`` proves the full
+    two-campaign yield/resume; here the same family at a frozen clock."""
     _set_campaign(env, max_batch_size=COUNT_FIVE)
     _set_sync(
         env, max_new_per_cycle=COUNT_FIVE, max_pending_episode_jobs=100, rolling_new_limit=1000
@@ -2532,19 +2544,24 @@ def test_f9_per_file_refusals_trip_zero_progress_breaker(
         _force_job_exhaustion(store, monkeypatch, exclude=canary_files)
         posts_before = len(env.stubs.posts)
         assert posts_before == 1
-        for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
+        first = _daemon_cycle(env, store, campaign_id, "zp1")
+        assert first.campaign is not None  # the drain runs (campaign is drain-eligible)
+        assert first.campaign.submitted == 0
+        assert first.campaign.progress == 0  # per-file refusals make zero real progress
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"  # recoverable deferral, never paused
+        assert not any("campaign_zero_progress_pause" in reason for reason in first.reasons)
+        deferred = store.get_meta(f"{F18_DEFER_KEY}:{campaign_id}")
+        assert deferred is not None  # a real bounded cooldown (Finding 1, not retry==now)
+        assert deferred > env.now_iso
+        assert any("budget_cooldown" in reason for reason in first.reasons)  # F2: budget family
+        for key in ("zp2", "zp3"):
             cycle = _daemon_cycle(env, store, campaign_id, key)
-            assert cycle.campaign is not None  # the drain runs (campaign is drain-eligible)
-            assert cycle.campaign.submitted == 0
-            assert cycle.campaign.progress == 0  # per-file refusals make zero real progress
-            campaign = store.get_campaign(campaign_id)
-            assert campaign is not None
-            if index < ZERO_PROGRESS_PAUSE_CYCLES - 1:
-                assert campaign.status == "approved"
-            else:
-                assert campaign.status == "paused"
-                assert campaign.status_reason == "no_budget_progress"
+            assert cycle.campaign is None  # the deferred head yields the queue every cycle
+            assert not any("campaign_zero_progress_pause" in reason for reason in cycle.reasons)
         assert len(env.stubs.posts) == posts_before  # zero further POSTs across the cycles
+        assert store.get_meta(f"{F18_ZERO_KEY}:{campaign_id}") in (None, "0")  # breaker not burned
     finally:
         store.close()
 
@@ -4422,5 +4439,431 @@ def test_f11_deadline_expires_during_preflight_stops_the_post(
         assert record.state is FileState.PLANNED
         rows = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
         assert int(rows[0]) == 0
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------------------ F18: budget cooldown defers
+
+# The zero-progress breaker must not pause a campaign for RECOVERABLE waits: a rolling/cycle
+# budget exhaustion marks the campaign DEFERRED (persisted retry iso, campaign stays APPROVED and
+# drain-authorized) and the daemon resumes it automatically once the rolling window permits.
+
+F18_DEFER_KEY = "campaign_deferred_until"
+F18_ZERO_KEY = "campaign_zero_progress"
+
+
+def _f18_setup(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    count: int,
+    *,
+    per_cycle: int,
+    rolling: int,
+    batch: int,
+    window_hours: float = 1.0,
+    jobs: int = 100,
+) -> tuple[str, StateStore]:
+    """Seed/approve/authorize a campaign under tight rolling-budget knobs (fake clock)."""
+    _set_campaign(env, max_batch_size=batch)
+    _set_sync(
+        env,
+        max_new_per_cycle=per_cycle,
+        rolling_new_limit=rolling,
+        rolling_window_hours=window_hours,
+        max_pending_episode_jobs=jobs,
+    )
+    env.seed(specs(count))
+    prepared = prepare(env, capsys, limit=str(count))
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    _canary(env, store, campaign_id)
+    _authorize_drain(env, store, campaign_id)
+    return campaign_id, store
+
+
+def test_f18_rolling_budget_defers_campaign_and_resumes_across_windows(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F18 core (100 files, per-cycle cap 5, rolling cap 10, 1-hour window): ≤5 per cycle, stops
+    at 10 within the window, stays APPROVED + drain-authorized while deferred, submits zero
+    before the window permits, and completes automatically across ≥3 rolling windows."""
+    campaign_id, store = _f18_setup(env, capsys, COUNT_HUNDRED, per_cycle=5, rolling=10, batch=5)
+    try:
+        assert _campaign_sent(store, campaign_id) == 1  # the canary
+        first = _daemon_cycle(env, store, campaign_id, "f18-c1")
+        assert first.campaign is not None
+        assert first.campaign.submitted == 5  # per-cycle cap, never more
+        assert _campaign_sent(store, campaign_id) == 6
+        second = _daemon_cycle(env, store, campaign_id, "f18-c2")
+        assert second.campaign is not None
+        assert second.campaign.submitted == 4  # stops at the rolling ceiling inside the window
+        assert _campaign_sent(store, campaign_id) == 10
+        posts_at_cap = len(env.stubs.posts)
+        blocked = _daemon_cycle(env, store, campaign_id, "f18-c3")
+        assert blocked.campaign is None  # budget-blocked: deferred this cycle, zero submissions
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"  # NOT paused
+        assert campaign.drain_authorized_iso is not None  # drain authorization intact
+        deferred = store.get_meta(f"{F18_DEFER_KEY}:{campaign_id}")
+        assert deferred == _iso_plus(T0, ROLLING_WINDOW_SECONDS)  # rolling-slot expiry
+        assert any("budget_cooldown:until=" in reason for reason in blocked.reasons)
+        before = _daemon_cycle(env, store, campaign_id, "f18-c4")
+        assert before.campaign is None  # window not open: skipped
+        assert len(env.stubs.posts) == posts_at_cap  # zero submissions before the window permits
+        env.now_iso = _iso_plus(T0, ROLLING_WINDOW_SECONDS + 1.0)
+        resumed = _daemon_cycle(env, store, campaign_id, "f18-c5")
+        assert resumed.campaign is not None  # automatic resume, no operator action
+        assert resumed.campaign.submitted == 5
+        cycles = 5
+        while _campaign_sent(store, campaign_id) < COUNT_HUNDRED and cycles < 60:
+            cycles += 1
+            cycle = _daemon_cycle(env, store, campaign_id, f"f18-loop-{cycles}")
+            if cycle.campaign is None:
+                env.now_iso = _iso_plus(env.now_iso, ROLLING_WINDOW_SECONDS + 1.0)
+        final = _daemon_cycle(env, store, campaign_id, "f18-final")
+        assert final.campaign is None  # max_submissions reached: the terminal auto-pause refuses
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == COUNT_HUNDRED
+        assert campaign.status == "paused"  # plan complete: max_submissions_reached terminal
+        assert campaign.status_reason == "max_submissions_reached"
+        posted = env.stubs.posted_files
+        assert len(set(posted)) == COUNT_HUNDRED  # every file sent exactly once
+        elapsed = (datetime.fromisoformat(env.now_iso) - datetime.fromisoformat(T0)).total_seconds()
+        assert elapsed >= 3 * ROLLING_WINDOW_SECONDS  # crossed at least 3 rolling windows
+    finally:
+        store.close()
+
+
+def test_f18_restart_mid_cooldown_preserves_deferral_schedule(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F18: the deferral is durable — a store reopen mid-cooldown respects the persisted
+    deferred-until (no immediate burst) and resumes once the window permits."""
+    campaign_id, store = _f18_setup(env, capsys, COUNT_FIVE, per_cycle=2, rolling=2, batch=2)
+    try:
+        first = _daemon_cycle(env, store, campaign_id, "f18-r1")
+        assert first.campaign is not None
+        assert first.campaign.submitted == 1  # rolling ceiling (2) reached
+        blocked = _daemon_cycle(env, store, campaign_id, "f18-r2")
+        assert blocked.campaign is None
+        assert store.get_meta(f"{F18_DEFER_KEY}:{campaign_id}") == _iso_plus(
+            T0, ROLLING_WINDOW_SECONDS
+        )
+    finally:
+        store.close()
+    reopened = env.open_store()
+    try:
+        posts_before = len(env.stubs.posts)
+        mid = _daemon_cycle(env, reopened, campaign_id, "f18-r3")
+        assert mid.campaign is None  # deferral respected after restart
+        assert len(env.stubs.posts) == posts_before  # zero burst
+        campaign = reopened.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert campaign.drain_authorized_iso is not None
+        env.now_iso = _iso_plus(T0, ROLLING_WINDOW_SECONDS + 1.0)
+        resumed = _daemon_cycle(env, reopened, campaign_id, "f18-r4")
+        assert resumed.campaign is not None  # auto-resume after the window
+        assert resumed.campaign.submitted <= 2  # bounded by the per-cycle cap — no burst
+    finally:
+        reopened.close()
+
+
+def test_f18_pending_verification_zero_progress_never_pauses(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F18: pending Shoko async jobs (files stuck in ``verifying``, holding their job slots)
+    make every later drain cycle budget-blocked with zero submissions — a RECOVERABLE wait:
+    the campaign defers durably with a bounded cooldown, stays APPROVED, the breaker is never
+    burned, and the campaign recovers automatically once the jobs land and the cooldown
+    passes (no operator resume)."""
+    # Finding 1: the non-rolling stall cooldown is STALL_YIELD_COOLDOWN_CYCLES interval
+    # seconds (5 x the default interval in this fixture), NOT one interval.
+    cooldown_seconds = 5 * load_settings(env.config_path).sync.interval_seconds
+    campaign_id, store = _f18_setup(
+        env, capsys, COUNT_SIX, per_cycle=5, rolling=1000, batch=5, jobs=2
+    )
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs(COUNT_SIX)[1:]}
+    try:
+        first = _daemon_cycle(env, store, campaign_id, "f18-p0")
+        assert first.campaign is not None
+        assert first.campaign.submitted == 2  # the 2-job ceiling fills with verifying files
+        for index in range(1, 6):  # five consecutive zero-progress verifying-pending cycles
+            cycle = _daemon_cycle(env, store, campaign_id, f"f18-p{index}")
+            assert cycle.campaign is None  # budget-blocked: deferred (index 1), skipped (2+)
+            assert any("budgets_exhausted" in reason for reason in cycle.reasons)
+            campaign = store.get_campaign(campaign_id)
+            assert campaign is not None
+            assert campaign.status == "approved"  # never a permanent pause
+            assert campaign.drain_authorized_iso is not None
+            assert not any("campaign_zero_progress_pause" in reason for reason in cycle.reasons)
+            assert store.get_meta(f"{F18_ZERO_KEY}:{campaign_id}") in (None, "0")
+        deferred = store.get_meta(f"{F18_DEFER_KEY}:{campaign_id}")
+        assert deferred == _iso_plus(T0, cooldown_seconds)  # Finding 1: a real cooldown, not now
+        env.stubs.verify_empty = set()  # the ManualLinkJobs land: XRefs materialize
+        for spec in specs(COUNT_SIX)[1:3]:
+            env.stubs.linked[spec.shoko_id] = [env.stubs.xref(spec)]
+        env.now_iso = _iso_plus(T0, cooldown_seconds + 1.0)  # the cooldown passes
+        recovered = _daemon_cycle(env, store, campaign_id, "f18-p-recover")
+        assert recovered.campaign is not None  # slots released → the drain resumes
+        assert recovered.campaign.submitted > 0
+        verified = sum(
+            1 for record in store.campaign_files(campaign_id) if record.state is FileState.VERIFIED
+        )
+        assert verified >= 3  # the pending jobs closed VERIFIED (canary + 2 repolls)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_f18_hard_safety_failures_still_pause_the_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F18: the deferral path never weakens the hard stops — an expired campaign lease pauses
+    the campaign (``attestation_expired``) and a revoked campaign is out of drain selection
+    with manual apply refused; both with zero further POSTs."""
+    campaign_id, store = _f18_setup(env, capsys, COUNT_FIVE, per_cycle=5, rolling=1000, batch=2)
+    try:
+        posts_before = len(env.stubs.posts)
+        env.write_campaign_lease(campaign_id, expired=True)
+        expired_cycle = _daemon_cycle(env, store, campaign_id, "f18-hard-lease")
+        assert expired_cycle.campaign is None
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "attestation_expired"
+        assert len(env.stubs.posts) == posts_before
+        campaign_revoke(store, campaign_id, env.now_iso)
+        revoked_cycle = _daemon_cycle(env, store, campaign_id, "f18-hard-revoked")
+        assert revoked_cycle.campaign is None
+        manual = apply(env, capsys, batch="1")
+        assert manual["exit"] == EXIT_APPLY_GATE_REFUSAL
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_f18_mixed_eligibility_refusal_pauses_without_deferral_meta(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 4: the deferral branch fires ONLY for a pure ``budgets_exhausted``
+    eligibility verdict. A mixed refusal (budget exhaustion + source instability)
+    pauses the campaign for the drift family and writes NO deferral meta (a stale marker on a
+    resumed campaign is exactly what the structured verdict must prevent)."""
+    _set_campaign(env, max_batch_size=BATCH_TWO)
+    _set_sync(env, max_new_per_cycle=1, rolling_new_limit=1, rolling_window_hours=168.0)
+    env.seed(specs(COUNT_FIVE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    store = env.open_store()
+    try:
+        _canary(env, store, campaign_id)  # the one submission spends the rolling budget
+        _authorize_drain(env, store, campaign_id)
+        store.pause("queue_anomaly", T0)  # a global pause rides with the budget stall
+        cycle = _daemon_cycle(env, store, campaign_id, "mixed-refusal")
+        assert cycle.campaign is None
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"  # the drift family keeps pausing
+        assert campaign.status_reason == "mapping_drift"
+        assert store.get_meta(f"{F18_DEFER_KEY}:{campaign_id}") is None  # no deferral meta
+        assert len(env.stubs.posts) == COUNT_ONE  # zero POSTs from the refused batch
+    finally:
+        store.close()
+
+
+def test_f18_reporting_budgets_ok_resets_the_elapsed_rolling_window(
+    env: Env,
+) -> None:
+    """Finding 3: the report/health ``budgets_ok`` peek applies the same rolling-window reset
+    the daemon eligibility peek and the reservation path apply — an exhausted rolling counter
+    whose window already elapsed is headroom, not exhaustion."""
+    from shoko_linker.reporting import budgets_ok
+
+    _set_sync(env, max_new_per_cycle=5, rolling_new_limit=1, rolling_window_hours=1.0)
+    store = env.open_store()
+    try:
+        store.record_file(
+            500,
+            sonarr_series_id=1,
+            sonarr_file_id=10,
+            sonarr_path=f"{SONARR_ROOT}/series1/500.mkv",
+            sonarr_size=FILE_SIZE,
+            cohort=Cohort.BACKLOG,
+            iso=T0,
+        )
+        store.begin_cycle("cycle", T0)
+        store.advance(500, FileState.WAITING, "report probe", iso=T0)
+        store.advance(500, FileState.MAPPED, "report probe", iso=T0)
+        store.advance(500, FileState.PLANNED, "report probe", iso=T0)
+        token = store.prepare_send(
+            500,
+            "a" * DIGEST_HEX,
+            "b" * DIGEST_HEX,
+            targets_digest="c" * DIGEST_HEX,
+            structure_digest="d" * DIGEST_HEX,
+            mapping_revision="1",
+            cycle_key="cycle",
+            iso=T0,
+            expected_episode_jobs=1,
+        )
+        assert not isinstance(token, BudgetRefusal)  # the one-slot rolling budget is spent
+        assert budgets_ok(store, T0) is False  # inside the window: exhausted
+        after = _iso_plus(T0, ROLLING_WINDOW_SECONDS + 1.0)
+        assert budgets_ok(store, after) is True  # window elapsed: headroom (mirrors the daemon)
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------------------ F19: canary send-history gate
+
+# Drain authorization is computed from the DURABLE send ledger: every send attempted for the
+# campaign must be terminal VERIFIED. A REJECTED/REFUSED send maps its file back to ``waiting``
+# — the send row stays in the ledger and REFUSES the grant, visibly listed.
+
+
+def test_f19_authorize_refuses_rejected_canary_then_succeeds_after_verified_resubmit(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F19 core: a REJECTED canary (file back in ``waiting``, send row durable) refuses the
+    authorization — visibly naming the outstanding send — and the grant succeeds (and persists
+    across restart) after the file is resubmitted and verified through the normal bounded flow.
+    The canary audit keeps BOTH sends visible."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        env.stubs.post_status = 400  # Shoko refuses with zero writes → REJECTED → waiting
+        canary = _canary(env, store, campaign_id)
+        env.stubs.post_status = None
+        assert canary.submitted == COUNT_ONE
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.WAITING
+        with pytest.raises(CampaignError, match="not settled") as exc:
+            _authorize(env, store, campaign_id)
+        message = str(exc.value)
+        assert "500" in message
+        assert "rejected" in message  # visible handling, not silent exclusion
+        report = campaign_report(store, campaign_id, None)
+        attempted = report["attempted_sends"]
+        assert [row["shoko_file_id"] for row in attempted] == [500]
+        assert attempted[0]["outcome"] == "rejected"
+        assert attempted[0]["state"] == "waiting"
+        walk = _daemon_cycle(env, store, campaign_id, "f19-replan")
+        assert walk.campaign is None  # zero VERIFIED canary progress keeps the drain closed
+        resubmitted = apply(env, capsys, batch="1")  # the recovery walk re-planned 500
+        assert resubmitted["exit"] == EXIT_OK
+        authorized = _authorize(env, store, campaign_id)
+        assert authorized.drain_authorized_iso == env.now_iso
+        final = campaign_report(store, campaign_id, None)
+        outcomes = [row["outcome"] for row in final["attempted_sends"]]
+        assert outcomes == ["rejected", "verified"]  # the earlier rejected send stays visible
+    finally:
+        store.close()
+    reopened = env.open_store()
+    try:
+        selected = select_next_daemon_campaign(reopened)
+        assert selected is not None
+        assert selected.campaign_id == campaign_id
+        assert selected.drain_authorized_iso is not None
+    finally:
+        reopened.close()
+
+
+def test_f19_verified_plus_rejected_cannot_silently_pass(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F19: a canary batch of one VERIFIED file + one REJECTED file cannot authorize on the
+    strength of the verified file alone — the rejected send is named in the refusal."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, campaign_id)
+        assert canary.verified == COUNT_ONE
+        env.stubs.post_status = 400
+        second = apply(env, capsys, batch="1")  # 501: REJECTED → waiting
+        env.stubs.post_status = None
+        assert second["exit"] == EXIT_OK
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state is FileState.WAITING
+        with pytest.raises(CampaignError, match="501") as exc:
+            _authorize(env, store, campaign_id)
+        assert "rejected" in str(exc.value)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None
+    finally:
+        store.close()
+
+
+def test_f19_authorize_refuses_inflight_and_indeterminate_canaries_visibly(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F19: in-flight (verifying) and indeterminate_write canary sends are refused with the
+    outstanding send listed by file id and state."""
+    campaign_id = _f10_campaign(env, capsys)
+    env.stubs.verify_empty = {spec.shoko_id for spec in specs(COUNT_FIVE)}
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, campaign_id)
+        assert canary.submitted == COUNT_ONE
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.VERIFYING
+        with pytest.raises(CampaignError, match="500") as inflight:
+            _authorize(env, store, campaign_id)
+        assert "verifying" in str(inflight.value)
+        store.advance(500, FileState.INDETERMINATE_WRITE, "ambiguous send", iso=env.now_iso)
+        with pytest.raises(CampaignError, match="500") as indeterminate:
+            _authorize(env, store, campaign_id)
+        assert "indeterminate_write" in str(indeterminate.value)
+    finally:
+        store.close()
+
+
+def test_cli_authorize_drain_refuses_rejected_canary_with_visible_history(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F19 CLI: authorize-drain on a rejected canary is a refusal that shows the send history;
+    the operator-confirmation gate (confirm + non-empty note) is unchanged."""
+    campaign_id = _f10_campaign(env, capsys)
+    store = env.open_store()
+    try:
+        env.stubs.post_status = 400
+        _canary(env, store, campaign_id)
+        env.stubs.post_status = None
+    finally:
+        store.close()
+    capsys.readouterr()
+    code = main(
+        [
+            "campaign",
+            "authorize-drain",
+            str(env.config_path),
+            "--campaign-id",
+            campaign_id,
+            "--note",
+            AUTH_NOTE,
+            "--confirm",
+            "--json",
+        ]
+    )
+    assert code == EXIT_CONFIG_INVALID
+    err = capsys.readouterr().err
+    assert "500" in err
+    assert "rejected" in err
+    store = env.open_store()
+    try:
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None
     finally:
         store.close()

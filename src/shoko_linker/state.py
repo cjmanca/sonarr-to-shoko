@@ -212,6 +212,12 @@ META_CAMPAIGN_ATTESTATION_GATE: Final[str] = "campaign_attestation_gate"
 #: Per-campaign zero-progress breaker counter key prefix (F7): consecutive drain cycles with
 #: zero real progress. Cleared when the campaign reaches a terminal state (plan complete/revoke).
 META_CAMPAIGN_ZERO_PROGRESS: Final[str] = "campaign_zero_progress"
+#: F18: per-campaign RECOVERABLE drain deferral (an ISO retry time, the earliest rolling-budget
+#: slot expiry for a budget-blocked campaign). A deferred campaign stays APPROVED and
+#: drain-authorized — it is skipped for the cycles inside the cooldown and resumes
+#: automatically once the window permits. Durable meta (survives restart); cleared on real
+#: progress and at terminal states. The zero-progress breaker never counts these cycles.
+META_CAMPAIGN_DEFERRED_UNTIL: Final[str] = "campaign_deferred_until"
 ATTESTATION_PAUSE_REASON: Final[str] = "attestation_expired"
 
 #: OS advisory lock file (the F5 ownership fence) living in the SAME
@@ -648,6 +654,23 @@ class SendInspection:
     target_ids: tuple[tuple[int, int, int], ...]
     attempted_iso: str
     slot_released: bool
+
+
+@dataclass(frozen=True)
+class SendHistoryRow:
+    """F19: one durable ``sends``-ledger row of a campaign's attempted-send history.
+
+    The campaign drain-authorization gate reads this history (not current file states): a
+    REJECTED/REFUSED send maps its file back to ``waiting`` while the row stays here, so
+    every attempted send remains visible and accountable."""
+
+    send_id: int
+    shoko_file_id: int
+    outcome: str
+    verification: str | None
+    attempted_iso: str
+    http_status: int | None
+    file_state: FileState
 
 
 @dataclass(frozen=True)
@@ -3325,6 +3348,34 @@ class StateStore:
     def campaign_files(self, campaign_id: str) -> tuple[FileRecord, ...]:
         rows = self._conn.execute(_SQL_CAMPAIGN_FILES, (campaign_id,)).fetchall()
         return tuple(_row_to_file_record(row) for row in rows)
+
+    def campaign_send_history(self, campaign_id: str) -> tuple[SendHistoryRow, ...]:
+        """F19: every send row ever attempted for one campaign, in send order (read-only).
+
+        The durable ``sends`` ledger is the campaign's attempted-send history: rows keep their
+        outcome after the file moves on (a REJECTED/REFUSED send's file returns to ``waiting``
+        and the row stays), so the drain-authorization gate can account for every attempt.
+        Rows of files unbound by a revoke (``campaign_id`` cleared) are outside the campaign's
+        durable scope; sent rows are never unbound (the revoke never rewinds them)."""
+        rows = self._conn.execute(
+            "SELECT s.send_id, s.shoko_file_id, s.outcome, s.verification, s.attempted_iso,"
+            " s.http_status, f.state FROM sends s"
+            " JOIN files f ON f.shoko_file_id = s.shoko_file_id"
+            " WHERE f.campaign_id = ? ORDER BY s.send_id",
+            (campaign_id,),
+        ).fetchall()
+        return tuple(
+            SendHistoryRow(
+                send_id=_as_int(row[0], "send_id"),
+                shoko_file_id=_as_int(row[1], "shoko_file_id"),
+                outcome=_as_str(row[2], "outcome"),
+                verification=_as_optional_str(row[3]),
+                attempted_iso=_as_str(row[4], "attempted_iso"),
+                http_status=_as_optional_int(row[5]),
+                file_state=FileState(_as_str(row[6], "state")),
+            )
+            for row in rows
+        )
 
     def campaign_progress(self, campaign_id: str) -> dict[str, int]:
         """Per-state file counts for one campaign (quarantined counted from detail)."""

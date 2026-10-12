@@ -189,6 +189,9 @@ _RESOLVE_REPLAN_NOTE: Final[str] = (
     "the closed send authorizes only a future re-plan with a FRESH request "
     "fingerprint; the resolved fingerprint is never resubmitted"
 )
+#: Human-output cap for the campaign report's attempted-send audit (F19);
+#: the ``--json`` payload always carries the full list.
+ATTEMPTED_SEND_DISPLAY_LIMIT: Final[int] = 10
 _ATTESTATION_NOTE: Final[str] = (
     "safety attestation: the daemon lease at safety.attestation_file and each campaign "
     "lease in its campaign-<id> sibling are evaluated offline before every apply; an invalid "
@@ -1602,6 +1605,20 @@ def _run_campaign_report(args: argparse.Namespace) -> int:
         f"invalidated={payload['drain_invalidated_reason'] or 'none'})"
     )
     print(f"  drain rule: {DRAIN_AUTHORIZATION_RULE}")
+    # F19: the durable attempted-send audit (every send ever attempted for this campaign).
+    attempted = payload["attempted_sends"]
+    print(f"  attempted sends: {len(attempted)}")
+    for row in attempted[:ATTEMPTED_SEND_DISPLAY_LIMIT]:
+        print(
+            f"    file {row['shoko_file_id']} send {row['send_id']}: outcome={row['outcome']} "
+            f"state={row['state']} attempted={row['attempted_iso']}"
+        )
+    remaining = len(attempted) - ATTEMPTED_SEND_DISPLAY_LIMIT
+    if remaining > 0:
+        print(f"    +{remaining} more")
+    # F18: recoverable budget-cooldown deferral (campaign stays approved; auto-resumes).
+    if payload["deferred_until"] is not None:
+        print(f"  drain deferral: retry at {payload['deferred_until']} (campaign stays approved)")
     if payload["plan_file_digest"] is not None:
         print(
             f"  plan file digest: {payload['plan_file_digest']} "

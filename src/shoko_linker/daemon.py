@@ -18,13 +18,22 @@ Hard safety properties this module enforces (PROJECT.md, docs/compatibility.md �
   ``request_may_have_been_sent``) is durably committed *before* any bytes are handed
   to HTTP; ``submit_link`` is called *after* it.
 * **Only the ``new_arrival`` cohort auto-applies in daemon cycles.** Backlog files are never
-  auto-submitted as new arrivals. An **approved** backlog campaign is drained by the daemon
-  (F7, when ``campaign.daemon_auto_apply`` is set) as ONE bounded batch per apply cycle, after
-  the operator's explicit approval + canary, through the full campaign guard chain under the
-  cycle's apply lock — the plan's approval digest, campaign status, deadline, budgets,
-  write gate, campaign-scope attestation, queue guard, and mapping revalidation all stay
-  authoritative. The one-batch CLI ``campaign apply`` remains for manual operation; a daemon
-  starting with ``apply_changes=true`` still never submits an unapproved backlog.
+   auto-submitted as new arrivals. An **approved** backlog campaign is drained by the daemon
+   (F7, when ``campaign.daemon_auto_apply`` is set) as ONE bounded batch per apply cycle, after
+   the operator's explicit approval + canary, through the full campaign guard chain under the
+   cycle's apply lock — the plan's approval digest, campaign status, deadline, budgets,
+   write gate, campaign-scope attestation, queue guard, and mapping revalidation all stay
+   authoritative. The one-batch CLI ``campaign apply`` remains for manual operation; a daemon
+   starting with ``apply_changes=true`` still never submits an unapproved backlog.
+    **F18 budget cooldown:** a budget-blocked (or pending-metadata / pending-verification /
+    queue-congested) campaign is a RECOVERABLE wait — it is DEFERRED with a persisted retry
+     time (the rolling-window expiry, or the bounded stall cooldown of
+     :data:`STALL_YIELD_COOLDOWN_CYCLES` cycle intervals when no window blocks), stays APPROVED and
+    drain-authorized, is skipped while the retry is in the future (so a later drain-authorized
+    campaign is never starved by a stalled head), and resumes automatically once it passes.
+    The 3-cycle zero-progress breaker pauses ONLY
+    genuinely-unexpected stalls (``no_queueable_candidates``); ``max_submissions_reached`` and
+    the safety pauses stay terminal.
   New arrivals inside ``sync.new_file_grace_period_seconds`` (default 300s, measured from
   the persisted ``first_seen_iso``) defer with ``grace_period`` — they stay ``planned``
   and consume no budget slot — so Shoko's post-arrival import state settles first.
@@ -118,11 +127,14 @@ from .state import (
     CAMPAIGN_STATUS_PAUSED,
     META_ATTESTATION_GATE,
     META_CAMPAIGN_ATTESTATION_GATE,
+    META_CAMPAIGN_DEFERRED_UNTIL,
     META_CAMPAIGN_ZERO_PROGRESS,
     META_NEXT_FULL_RECONCILE_ISO,
     ApplyLockUnavailableError,
     BaselineFile,
+    BudgetLimits,
     BudgetRefusal,
+    BudgetView,
     Cohort,
     EligibilityVerdict,
     FileIdentitySnapshot,
@@ -534,11 +546,15 @@ def _global_pause_reason(deps: DaemonDeps, *, campaign: bool) -> str | None:
     return reason
 
 
-def _budget_headroom(deps: DaemonDeps, *, campaign: bool = False) -> bool:
+def _budget_headroom(deps: DaemonDeps, now_iso: str, *, campaign: bool = False) -> bool:
     """Non-mutating peek: is there room for at least one more submission?
 
     The authoritative reservation happens in ``prepare_send``; this only feeds the
     cycle-level eligibility verdict so a saturated daemon suppresses apply early.
+    F18: the peek applies the same rolling-window reset the reservation path applies
+    (:meth:`shoko_linker.state.StateStore._reserve_tx`) — a persisted rolling counter whose
+    window has already elapsed counts as zero, so a window reopening is never
+    falsely reported exhausted (the deferral would never release).
     """
     view = deps.store.budget_view()
     limits = deps.store.budget_limits
@@ -550,18 +566,35 @@ def _budget_headroom(deps: DaemonDeps, *, campaign: bool = False) -> bool:
         return False
     if view.pending_episode_jobs >= limits.max_pending_episode_jobs:
         return False
-    return view.rolling_new_submissions < limits.rolling_new
+    return not rolling_budget_exhausted(view, limits, now_iso)
+
+
+def rolling_budget_exhausted(view: BudgetView, limits: BudgetLimits, now_iso: str) -> bool:
+    """The rolling-new-submission peek with the F18 window-elapsed reset.
+
+    Shared verbatim by :func:`_budget_headroom` (daemon eligibility), the campaign drain's
+    cooldown computation, and :func:`shoko_linker.reporting.budgets_ok` (report/health rollup):
+    a persisted rolling counter whose ``rolling_window_start_iso + rolling_window_hours`` has
+    already elapsed counts as ZERO — exactly the reset ``StateStore._reserve_tx`` applies at
+    reservation time — so an elapsed window is never reported exhausted."""
+    rolling = view.rolling_new_submissions
+    start = view.rolling_window_start_iso
+    if start is not None and _parse_iso(now_iso) - _parse_iso(start) >= timedelta(
+        hours=limits.rolling_window_hours
+    ):
+        rolling = 0
+    return rolling >= limits.rolling_new
 
 
 def _eligibility_flags(
-    deps: DaemonDeps, mapping_present: bool, *, campaign: bool = False
+    deps: DaemonDeps, mapping_present: bool, now_iso: str, *, campaign: bool = False
 ) -> _EligibilityFlags:
     source_stable = deps.store.get_meta("requires_rebaseline") != "1"
     paused = _global_pause_reason(deps, campaign=campaign) is not None
     return _EligibilityFlags(
         attestation=deps.attestation_valid(),
         gate=apply_gate(deps.settings),
-        budgets_ok=_budget_headroom(deps, campaign=campaign),
+        budgets_ok=_budget_headroom(deps, now_iso, campaign=campaign),
         mapping_stable=mapping_present and not paused,
         source_stable=source_stable,
     )
@@ -569,7 +602,7 @@ def _eligibility_flags(
 
 def compute_eligibility(
     deps: DaemonDeps,
-    now_iso: str,  # noqa: ARG001
+    now_iso: str,
     *,
     campaign: bool = False,
 ) -> EligibilityVerdict:
@@ -581,7 +614,7 @@ def compute_eligibility(
     it with ``campaign=True`` so a daemon-lease write pause never blocks an authorized campaign.
     """
     active = load_active(deps.mapping_store, _load_overrides(deps))
-    flags = _eligibility_flags(deps, active is not None, campaign=campaign)
+    flags = _eligibility_flags(deps, active is not None, now_iso, campaign=campaign)
     reasons: list[str] = []
     if deps.store.writes_disabled:
         reasons.append("writes_disabled")
@@ -1574,7 +1607,56 @@ _FILE_SCOPED_REASON_PREFIXES: Final[tuple[str, ...]] = (
 
 #: Consecutive zero-progress drain cycles before the campaign auto-pauses
 #: (F7 review P2-3: an all-quarantined campaign must not burn full sweeps forever).
+#: F18: the breaker counts ONLY genuinely-unexpected stalls (unqueueable/blocked rows,
+#: missing/unbound plan rows, revoked-authorization staleness) — recoverable
+#: waits (budget windows, pending Shoko metadata/async verification, transient queue
+#: congestion, batch capacity) defer durably instead of pausing (see :func:`_defer_campaign_drain`).
 ZERO_PROGRESS_PAUSE_CYCLES: Final[int] = 3
+
+#: F18 (Finding 1 head-of-line fix): recoverable drain stalls WITHOUT a future rolling-window
+#: expiry (pending Shoko metadata walks, per-file job-cap holds, transient queue/gate/batch
+#: capacity) defer with a bounded cooldown of ``max(cycle interval,
+#: STALL_YIELD_COOLDOWN_CYCLES x cycle interval)`` — the persisted deferral meta keeps the
+#: campaign APPROVED and drain-authorized, drain selection skips it while the
+#: retry time is in the future so a later queue campaign drains, and the head is deterministically
+#: re-selected once the cooldown passes (auto-resume, no operator action; every stall cycle re-arms
+#: the deferral, so a stalled head never permanently blocks the queue and never pauses).
+#: The cooldown is FIVE daemon cycle intervals (``sync.interval_seconds`` — no new config key),
+#: sized to the PRODUCTION cadence: :func:`run_daemon` sleeps ``interval x (1 + jitter)``
+#: AFTER each cycle, so a one-interval cooldown always expires before the next cycle starts and
+#: the stalled head is re-selected every cycle (the queue yield is inert). Five intervals is the
+#: smallest span that yields the queue for a meaningful multi-cycle window under that cadence:
+#: the head defers, a later drain-authorized campaign drains, and the head auto-resumes at the
+#: cooldown mark (the e2e suite pins this realistic interval x 1.05 cadence; frozen-clock
+#: daemon cycles land strictly before the expiry, so the stalled head yields them all).
+STALL_YIELD_COOLDOWN_CYCLES: Final[int] = 5
+
+#: Zero-progress reason families that are RECOVERABLE waits (F18): the campaign is not stalled
+#: — it waits on the rolling-budget window (``budget_refusal:``), Shoko metadata materialization
+#: (``pending_target:``), a transient queue/gate (``preflight_deferred:``), or batch capacity
+#: (``batch_limit:`` / ``batch_time_limit:`` / ``shutdown_requested:``). These cycles
+#: DEFER with a durable retry time and NEVER count toward the permanent-pause breaker.
+_RECOVERABLE_ZERO_PROGRESS_PREFIXES: Final[tuple[str, ...]] = (
+    "budget_refusal:",
+    "pending_target:",
+    "preflight_deferred:",
+    "batch_limit:",
+    "batch_time_limit:",
+    "shutdown_requested:",
+)
+#: Reason markers that keep the zero-progress breaker active (F18 hard category): rows parked
+#: in operator-review safety states never self-heal through daemon cycles.
+_HARD_ZERO_PROGRESS_MARKERS: Final[tuple[str, ...]] = (":blocked_safety", ":conflict")
+#: Campaign file states whose pending Shoko verification (ManualLinkJob async work, metadata
+#: not materialized) makes a zero-progress cycle recoverable (F18).
+_PENDING_VERIFICATION_STATES: Final[frozenset[FileState]] = frozenset(
+    {
+        FileState.VERIFYING,
+        FileState.REQUEST_MAY_HAVE_BEEN_SENT,
+        FileState.INDETERMINATE_WRITE,
+        FileState.PARTIAL,
+    }
+)
 
 
 def _aggregate_campaign_reasons(reasons: Sequence[str]) -> list[str]:
@@ -1600,13 +1682,121 @@ def _pause_deferred_campaign(deps: DaemonDeps, campaign_id: str, reason: str, no
         deps.store.set_campaign_status(campaign_id, CAMPAIGN_STATUS_PAUSED, reason, iso=now_iso)
 
 
-def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str, reason: str) -> bool:
-    """Count consecutive zero-progress drain cycles; pause at the bound.
+def _zero_progress_is_recoverable(
+    deps: DaemonDeps, campaign_id: str, reasons: Sequence[str]
+) -> bool:
+    """F18: classify a zero-progress drain cycle as a RECOVERABLE wait (defer) vs a genuinely
+    unexpected stall (burns the breaker).
 
-    ``reason`` names the auto-pause: ``no_queueable_candidates`` for a campaign whose remaining
-    files are unqueueable, ``no_budget_progress`` (F9) for one whose submissions were every
-    budget-refused — a budget-exhausted campaign must trip the breaker, not stall forever.
-    Returns True when the campaign was auto-paused."""
+    Recoverable: budget refusals, pending Shoko metadata, transient queue/gate preflight
+    deferrals, batch capacity, shutdown — or remaining campaign files sit in the pending
+    verification states (``verifying``/``request_may_have_been_sent``/``indeterminate_write``/
+    ``partial``), where the daemon's own recovery polling eventually closes them. Hard: any
+    unqueueable row parked in an operator-review safety state (``blocked_safety``/``conflict``)
+    keeps the breaker active — those never self-heal."""
+    hard = any(
+        reason.startswith("not_queueable:")
+        and any(marker in reason for marker in _HARD_ZERO_PROGRESS_MARKERS)
+        for reason in reasons
+    )
+    if hard:
+        return False
+    if any(reason.startswith(_RECOVERABLE_ZERO_PROGRESS_PREFIXES) for reason in reasons):
+        return True
+    return any(
+        record.state in _PENDING_VERIFICATION_STATES
+        for record in deps.store.campaign_files(campaign_id)
+    )
+
+
+def _stall_yield_cooldown_iso(deps: DaemonDeps, now_iso: str) -> str:
+    """F18 (Finding 1): the bounded cooldown retry for a recoverable stall with no future
+    rolling-window expiry — ``max(interval, STALL_YIELD_COOLDOWN_CYCLES x interval)`` seconds
+    after ``now`` (see :data:`STALL_YIELD_COOLDOWN_CYCLES` for the formula and its rationale)."""
+    interval = deps.settings.sync.interval_seconds
+    cooldown = max(interval, STALL_YIELD_COOLDOWN_CYCLES * interval)
+    return (_parse_iso(now_iso) + timedelta(seconds=cooldown)).isoformat()
+
+
+def _rolling_cooldown_retry_iso(deps: DaemonDeps, now_iso: str, reasons: Sequence[str]) -> str:
+    """F18: the expected retry time for a budget-deferred campaign — the earliest rolling
+    slot expiry (``rolling_window_start + rolling_window_hours``) when the rolling window
+    is what blocks, else the bounded stall cooldown (:func:`_stall_yield_cooldown_iso`).
+
+    Non-rolling stalls (the per-cycle cap resets with every batch's fresh window key; a
+    per-file pending-jobs refusal clears as jobs verify; a pending-target walk waits
+    on Shoko metadata) previously retried ``now`` — a no-op deferral that re-selected
+    the stalled head every cycle forever (Finding 1: head-of-line starvation). The cooldown
+    makes the deferral real: the campaign keeps its authorization, yields the queue,
+    and re-enters selection automatically once the cooldown passes. A rolling expiry that has
+    already elapsed returns ``now`` (the window is open — the campaign runs and is expected to
+    progress)."""
+    rolling_blocked = any("rolling_new_exhausted" in reason for reason in reasons)
+    limits = deps.store.budget_limits
+    if limits is None:
+        return _stall_yield_cooldown_iso(deps, now_iso)
+    view = deps.store.budget_view()
+    if not rolling_blocked and rolling_budget_exhausted(view, limits, now_iso):
+        rolling_blocked = True
+    if not rolling_blocked:
+        return _stall_yield_cooldown_iso(deps, now_iso)
+    start = view.rolling_window_start_iso
+    if start is None:
+        return _stall_yield_cooldown_iso(deps, now_iso)
+    expiry = _parse_iso(start) + timedelta(hours=limits.rolling_window_hours)
+    now = _parse_iso(now_iso)
+    return expiry.isoformat() if expiry > now else now.isoformat()
+
+
+def _recoverable_stall_family(deps: DaemonDeps, campaign_id: str, reasons: Sequence[str]) -> str:
+    """F18 (Finding 2): name what a recoverable zero-progress stall is waiting on, so the
+    deferral surface says the truth: Shoko metadata materialization (``pending_target:`` rows
+    or files parked in the pending-verification states) is a ``pending_metadata_cooldown``;
+    a per-file budget refusal is a ``budget_cooldown``; anything else recoverable (queue/gate
+    congestion, batch capacity) is a ``recoverable_cooldown``."""
+    if any(reason.startswith("pending_target:") for reason in reasons):
+        return "pending_metadata_cooldown"
+    if any(reason.startswith("budget_refusal:") for reason in reasons):
+        return "budget_cooldown"
+    if any(
+        record.state in _PENDING_VERIFICATION_STATES
+        for record in deps.store.campaign_files(campaign_id)
+    ):
+        return "pending_metadata_cooldown"
+    return "recoverable_cooldown"
+
+
+def _defer_campaign_drain(
+    deps: DaemonDeps, campaign_id: str, retry_iso: str, reasons: list[str], family: str
+) -> None:
+    """F18: persist a RECOVERABLE drain deferral durably (survives a container restart).
+
+    The campaign stays APPROVED and drain-authorized;
+    :func:`shoko_linker.campaign.select_next_daemon_campaign` skips it until the persisted
+    retry ISO passes, then a daemon cycle resumes it automatically — submissions stay bounded
+    by the per-cycle cap and the rolling budget (unchanged reservation path). The
+    zero-progress counter is reset so recoverable cycles never burn toward a permanent pause.
+    No rate limit, ceiling, or safety gate is touched. ``family`` names the wait
+    (:func:`_recoverable_stall_family`, Finding 2); the retry time is a future
+    cooldown/rolling expiry — the meta is never written as a retry==now no-op.
+    """
+    with contextlib.suppress(WriteDisabledError, StateError):
+        deps.store.set_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}", retry_iso)
+        deps.store.set_meta(f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}", "0")
+    reasons.append(f"campaign_deferred:{campaign_id}:{family}:until={retry_iso}")
+
+
+def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str, reason: str) -> bool:
+    """Count consecutive genuinely-unexpected zero-progress drain cycles; pause at
+    the bound (F7 review P2-3: an all-quarantined/unqueueable campaign must not burn full
+    sweeps forever).
+
+    F18: budget exhaustion, pending Shoko metadata/async verification, and transient
+    queue congestion do NOT reach this breaker — they defer durably
+    (:func:`_defer_campaign_drain`). ``reason`` names the auto-pause:
+    ``no_queueable_candidates`` for a campaign whose remaining files are parked in states the
+    daemon cannot re-queue (operator review required). Returns True when the campaign
+    was auto-paused."""
     key = f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}"
     raw = deps.store.get_meta(key)
     try:
@@ -1639,20 +1829,31 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
     remainder queueable).
 
     A missing plan path or an unreadable/malformed plan file defers (a named reason, no
-    crash, no POSTs); a campaign-state refusal defers the batch and is reported. Returns
-    the bounded :class:`~shoko_linker.campaign.CampaignApplyReport`, or ``None``.
+    crash, no POSTs); a campaign-state refusal defers the batch and is reported. **F18:** a
+    budget-blocked campaign (eligibility verdict PURELY ``budgets_exhausted`` (Finding 4) or a
+    zero-progress batch of budget/pending-metadata/pending-verification/queue deferrals) is
+    DEFERRED durably with a future retry time — the rolling-window expiry, else the bounded
+    stall cooldown (Finding 1: no more ``retry == now`` no-op, so a stalled head yields the
+    queue and auto-resumes) — it stays APPROVED, is skipped while the retry is in the future,
+    and resumes automatically in a later cycle (the old ``no_budget_progress`` permanent pause
+    is gone; only genuinely-unexpected stalls keep the 3-cycle breaker). Returns the bounded
+    :class:`~shoko_linker.campaign.CampaignApplyReport`, or ``None``.
     """
     from .campaign import (
+        CampaignEligibilityRefusalError,
         CampaignError,
         CampaignPlanInvalidError,
         apply_campaign,
+        campaign_deferral_reasons,
         clear_campaign_terminal_meta,
         select_next_daemon_campaign,
     )
 
     log = logging.getLogger(__name__)
-    campaign = select_next_daemon_campaign(deps.store)
+    campaign = select_next_daemon_campaign(deps.store, now_iso)
     if campaign is None:
+        # F18: surface the deferral (id + retry time) of a campaign skipped for the cooldown.
+        reasons.extend(campaign_deferral_reasons(deps.store, now_iso))
         return None
     if campaign.plan_path is None:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}:plan_path_missing")
@@ -1681,37 +1882,47 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
     except CampaignError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}")
         log.warning("campaign %s drain deferred: %s", campaign.campaign_id, exc)
-        # F9: a campaign the eligibility gate refuses purely on budget exhaustion makes zero
-        # submissions every cycle — feed the same zero-progress breaker so it
-        # auto-pauses (``no_budget_progress``) instead of churning full sweeps forever.
-        if "budgets_exhausted" in str(exc) and _record_zero_progress(
-            deps, campaign.campaign_id, now_iso, "no_budget_progress"
+        # F18: a campaign the eligibility gate refuses PURELY on budget exhaustion makes zero
+        # submissions every cycle — rolling-window exhaustion is a RECOVERABLE wait, so the
+        # campaign is DEFERRED with the earliest rolling-slot retry time (persisted; survives
+        # restart) and resumes automatically once the window permits. The old F9
+        # ``no_budget_progress`` permanent pause is gone: budget cycles never burn the
+        # zero-progress breaker. Finding 4: the structured eligibility verdict gates this branch —
+        # a MIXED refusal (budget exhaustion with a drift/source family, which auto-pauses the
+        # campaign) must NOT write a deferral marker, only a pure ``budgets_exhausted`` verdict
+        # defers. Hard-stop pauses (deadline, drift, attestation, revoked) raise their own
+        # CampaignErrors and stay untouched.
+        if isinstance(exc, CampaignEligibilityRefusalError) and exc.eligibility_reasons == (
+            "budgets_exhausted",
         ):
-            reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
+            retry = _rolling_cooldown_retry_iso(deps, now_iso, ())
+            _defer_campaign_drain(deps, campaign.campaign_id, retry, reasons, "budget_cooldown")
         return None
     reasons.extend(_aggregate_campaign_reasons(report.reasons))
     key = f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign.campaign_id}"
     # P2: the breaker keys on REAL progress (submissions/verifications/quarantines), not the
-    # scan counter — a batch of per-file budget deferrals or pending-target walks makes zero
-    # submissions and must trip the breaker, not reset it every cycle.
-    if report.progress == 0:
-        # F9: a zero-progress batch driven purely by budget refusals pauses as
-        # ``no_budget_progress`` (the campaign is budget-blocked, not unqueueable);
-        # any other zero-progress stall keeps the existing ``no_queueable_candidates``.
-        zero_reason = (
-            "no_budget_progress"
-            if any(reason.startswith("budget_refusal:") for reason in report.reasons)
-            else "no_queueable_candidates"
-        )
-        if _record_zero_progress(deps, campaign.campaign_id, now_iso, zero_reason):
-            reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
-    elif report.stopped == "plan_complete":
-        # P3: a campaign drained to plan_complete is terminal — its gate/zero-progress metas are
-        # cleared (inside apply_campaign); do not re-create the counter key here.
+    # scan counter — a batch of per-file deferrals or pending-target walks makes zero
+    # submissions and must not reset itself every cycle into endless full sweeps.
+    if report.stopped == "plan_complete":
+        # P3: a campaign drained to plan_complete is terminal — its gate/zero-progress/deferral
+        # metas are cleared (inside apply_campaign); do not re-create any of them here.
         clear_campaign_terminal_meta(deps.store, campaign.campaign_id)
+    elif report.progress == 0:
+        # F18: recoverable zero-progress (budget window / pending Shoko metadata / pending
+        # async verification / transient queue congestion / batch capacity) → durable deferral
+        # with the retry time, breaker NOT burned, campaign stays APPROVED. Only a
+        # genuinely-unexpected stall (unqueueable rows in operator-review safety states)
+        # counts toward the ``no_queueable_candidates`` auto-pause.
+        if _zero_progress_is_recoverable(deps, campaign.campaign_id, report.reasons):
+            family = _recoverable_stall_family(deps, campaign.campaign_id, report.reasons)
+            retry = _rolling_cooldown_retry_iso(deps, now_iso, report.reasons)
+            _defer_campaign_drain(deps, campaign.campaign_id, retry, reasons, family)
+        elif _record_zero_progress(deps, campaign.campaign_id, now_iso, "no_queueable_candidates"):
+            reasons.append(f"campaign_zero_progress_pause:{campaign.campaign_id}")
     else:
         with contextlib.suppress(WriteDisabledError, StateError):
             deps.store.set_meta(key, "0")
+            deps.store.clear_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign.campaign_id}")
     return report
 
 
@@ -1935,7 +2146,7 @@ def _run_cycle_body(
     for file_id, skip_reason in sorted(reconcile.skip_reasons.items()):
         reasons.append(f"skip:{file_id}:{skip_reason}")
 
-    flags = _eligibility_flags(deps, mapping_present=True)
+    flags = _eligibility_flags(deps, mapping_present=True, now_iso=now_iso)
     eligibility = compute_eligibility(deps, now_iso)
     cycle_eligible = eligibility.eligible
     if not cycle_eligible:
