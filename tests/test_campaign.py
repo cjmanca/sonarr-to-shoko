@@ -2527,7 +2527,7 @@ def test_f9_per_file_refusals_defer_without_pause(
     condition: the campaign defers with a bounded cooldown (a real future retry, not the old
     retry==now no-op), stays APPROVED, the breaker is never burned, and the deferred head
     YIELDS the queue — every later cycle skips it, so a queued campaign can drain.
-    ``test_f18_stalled_head_cooldown_yields_the_queue_and_auto_resumes`` proves the full
+    ``test_f18_stalled_head_cooldown_yields_the_queue`` (tests/test_daemon.py) proves the full
     two-campaign yield/resume; here the same family at a frozen clock."""
     _set_campaign(env, max_batch_size=COUNT_FIVE)
     _set_sync(

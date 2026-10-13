@@ -15,7 +15,7 @@
 | F17 (P1) SQLite v1→v2 migration | **complete** | Implemented + reviewed (see Phase 2). Defect was: `SCHEMA_VERSION = 1` with drain columns only in fresh-install schema; empty registry; v1 DBs crashed on campaign queries |
 | F18 (P1/P2) budget cooldown vs permanent pause | **complete** | Implemented + reviewed + fix round (see Phase 3) |
 | F19 (P2) canary authorization history | **complete** | Implemented + reviewed (see Phase 3) |
-| F20 (P2) plan-drift test fixture | pending | Confirmed: `write_plan_file` writes compact JSON (`"max_submissions":5`), so the test's space-form replace is a no-op; GitHub runs 38199820749/38199820737 failed, local suite green — discrepancy to reconcile |
+| F20 (P2) plan-drift test fixture | **complete** | Fixed + root-caused (see Phase 4) |
 
 ## Baseline evidence (2026-10-12)
 
@@ -54,7 +54,35 @@ Phase 3: F18 (recoverable-wait vs permanent pause in the daemon zero-progress br
 
 - `7a2e2bf` fix: remediation F15+F16 (incl. third-review PLAN.md baseline + STATUS.md)
 - `2374b8b` fix: remediation F17 — v1→v2 forward-only migration
-- (next) fix: remediation F18+F19 — recoverable-wait deferral + send-ledger canary authorization
+- `45cfebd` fix: remediation F18+F19 — recoverable-wait deferral + send-ledger canary authorization
+- `35b9583` test: remediation F20 — structural plan-drift tamper
+- (next) chore: remediation F15–F20 final review polish (P3 nits)
+
+## Phase 4 — F20 (complete)
+
+- Root cause PROVEN: space-form replace is a no-op against compact canonical JSON; Windows `Path.write_text` translates trailing `\n`→`\r\n`, changing bytes ⇒ digest mismatch ⇒ drift fires locally. Under simulated Linux semantics (`newline=""`) the ORIGINAL test fails exactly like CI (extra POSTs, no drift); the repaired test passes under the same simulation.
+- Repair: `_tamper_plan_file_canonical()` structurally lowers `totals.max_submissions` (5→4) WITH the bound file set (schema binds files==max_submissions), writes byte-exact canonical bytes via `write_bytes`; pre-cycle asserts: bytes changed, canonical file digest changed, original digest == stored approval digest, tampered digest != approval digest, canonical re-serialization stability guard (catches future newline regressions). Post-cycle: paused `plan_drift`, zero additional POSTs, canary file VERIFIED untouched, send history length unchanged, `total_sent` unchanged, drain selection `status_paused`, `select_next_daemon_campaign` None, second cycle zero POSTs. Reviewer mutation: neutered tamper IS caught by the guard.
+- CI reconciliation: local-pass artifact explained; GitHub green remains EXTERNAL/UNVERIFIED until Actions run on the corrected commit (no push authorized).
+
+## Phase 5 — Final integration (complete)
+
+- `uv run pytest -q` → 998 passed (orchestrator + final reviewer, independently). `ruff check`/`format --check`/`mypy`/`git diff --check` clean (reviewer re-ran all).
+- `docker build -t shoko-sonarr-linker:review .` → success (image sha256:940e8aa5…).
+- Default-deny CLI smoke (CI pattern, built image): `--help` rc=0; `validate --offline config.example.yaml` rc=0; `once --apply config.example.yaml` rc=3 with REFUSED message, zero writes.
+- Targeted integration mapping: every PLAN Phase-5 item maps to named passing tests (Shoko-style ED2K payloads, Imported=null pipeline, unsafe filter leases ×3 apply boundaries, F17 migration suite incl. verbatim-commit guard, multi-window F18 progression + restart, rejected/indeterminate canaries, digest-change/drain invalidation, restart/no-replay trio, existing-link protection, multi-episode verification, shutdown flow) — final reviewer verified no item lacks coverage.
+- Final adversarial review (every mutation path, 10-point checklist): **all 10 PASS**; verdict **ACCEPTABLE**; single Shoko POST site (`linking.py:1160`) gated by apply gate + live lease + digest + status/auth + fresh preflight + budget reservation + apply lock; intent committed before transmit; no blind replay (recovery → HOLD); XRef protection intact; no out-of-scope linking.
+- P3 polish committed with this entry: dead `allow_int` branch removed from `_settled_field` (non-string now fail-closed as not-settled), `state.py` F7 docstring folded into the F17 v2 framing, stale test-name citation in `test_campaign.py:2530` corrected.
+
+## Open items / external state
+
+- GitHub Actions (CI + GHCR) green status: **EXTERNAL/UNVERIFIED** — expected to pass on pushed commits (no push performed; publishing not authorized this run).
+- Deferred P2s from F17 review (pre-existing, out of upgrade-gate): fresh-init `executescript` non-atomicity; concurrent-open migration lock traceback vs clean StateError; cryptic fail-closed messages (v0-with-tables, v1-missing-schema_version); FD leak on failed open. Recommend as a future bounded task.
+- Deferred P3s: campaign metas retained through auto-pause (bounded, cleared on terminal transitions); F18 stall-cooldown span fixed at 5 intervals (no new config key by design).
+- Live Sonarr/Shoko validation: not performed (no credentials/access; all evidence is mocked/offline).
+
+## Completion audit
+
+F15–F20: all six corrected with source/test evidence (none disproved). Required targeted regression tests: all present and passing (mapping table in Phase 5). Full suite: 998 green. Docker + default-deny smoke: green. Independent reviews (Phase 1 adversarial, Phase 2 migration, Phase 3 campaign, final 10-point): all ACCEPTABLE, no unresolved P0/P1, no acceptance-blocking P2 (F18 head-of-line P2 fixed within phase). SQLite upgrade safety: proven against verbatim 6d4183b schema. Multi-window unattended progression: proven. PLAN.md digest unchanged (`7215769B…` — verified at this audit: `git diff PLAN.md` empty since baseline commit 7a2e2bf). STATUS.md: this ledger. External validations marked UNVERIFIED, not claimed.
 
 ## Phase 3 — F18 + F19 (complete, review ACCEPTABLE after fix round)
 

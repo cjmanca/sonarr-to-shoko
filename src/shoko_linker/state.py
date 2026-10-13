@@ -81,7 +81,9 @@ same reason, and :meth:`StateStore.prepare_send` takes ``campaign_id: str | None
 F7 (also schema v1, unshipped — no image shipped with v1 columns has ever been released):
 ``campaigns.plan_path`` records the canonical plan file path bound at approval, so the daemon
 drains an approved campaign against the same file the ``plan_drift`` digest gate re-verifies;
-it is appended to ``_SCHEMA_SQL`` with **no** migration entry.
+it is appended to ``_SCHEMA_SQL`` (schema v1, unshipped). **F17 supersedes this framing:** the
+schema now ships at v2 and the registered ``1 → 2`` migration (below) upgrades any existing v1
+database in place — no database is rebuilt.
 
 **F17 (schema v2): the F10 drain-authorization columns ARE a schema change.** A database created
 by the previous implementation carries ``user_version = 1`` **without** those columns, so

@@ -1236,9 +1236,9 @@ def _hashes_settled(hashes: ShokoHashes) -> bool:
     if not _valid_ed2k(hashes.ed2k):
         return False
     return (
-        _settled_field(hashes.sha1, _SHA1_HEX_RE, allow_int=False)
-        and _settled_field(hashes.md5, _MD5_HEX_RE, allow_int=False)
-        and _settled_field(hashes.crc32, _CRC32_HEX_RE, allow_int=False)
+        _settled_field(hashes.sha1, _SHA1_HEX_RE)
+        and _settled_field(hashes.md5, _MD5_HEX_RE)
+        and _settled_field(hashes.crc32, _CRC32_HEX_RE)
     )
 
 
@@ -1249,14 +1249,16 @@ def _valid_ed2k(value: str | int | None) -> bool:
     return bool(_ED2K_HEX_RE.fullmatch(value.strip()))
 
 
-def _settled_field(value: str | int | None, pattern: re.Pattern[str], *, allow_int: bool) -> bool:
-    """Unreported (``None``) is fine; a populated value must be non-empty and plausible."""
+def _settled_field(value: str | int | None, pattern: re.Pattern[str]) -> bool:
+    """Unreported (``None``) is fine; a populated value must be a plausible hex string.
+
+    F16: Shoko's wire hash fields are strings, so any non-string populated value
+    (int, bool, …) is malformed and means *not settled* (fail closed).
+    """
     if value is None:
         return True
-    if isinstance(value, bool):
+    if not isinstance(value, str):
         return False
-    if isinstance(value, int):
-        return allow_int and value >= 0
     return bool(pattern.fullmatch(value.strip()))
 
 
