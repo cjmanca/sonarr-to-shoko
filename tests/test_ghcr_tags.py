@@ -17,6 +17,8 @@ import json
 import sys
 import urllib.error
 import urllib.parse
+import urllib.request
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,12 @@ def _load_module() -> Any:
 tags = _load_module()
 
 
+def test_unknown_provenance_documentation_does_not_claim_tag_exists() -> None:
+    documentation = tags.__doc__ or ""
+    assert "registry/tag state or provenance could not be verified" in documentation
+    assert "The tag EXISTS and its content cannot be verified" not in documentation
+
+
 class FakeTransport:
     """Scripted OCI transport: (method-path prefix match) -> canned response."""
 
@@ -68,6 +76,25 @@ class RaisingTransport:
         self, url: str, headers: dict[str, str], timeout: float
     ) -> tuple[int, dict[str, str], bytes]:
         raise self.exc
+
+
+class FakeHttpResponse:
+    def __init__(self, status: int, headers: list[tuple[str, str]], body: bytes) -> None:
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    def read(self) -> bytes:
+        return self.body
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        return self.headers
+
+    def __enter__(self) -> FakeHttpResponse:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
 
 
 def _token_ok(token: str = TOKEN) -> tuple[int, dict[str, str], bytes]:
@@ -115,9 +142,23 @@ def test_list_package_missing_on_401_name_unknown_after_token() -> None:
 
 
 def test_list_package_missing_on_404() -> None:
-    transport = FakeTransport([_token_ok(), (404, {}, b"{}")])
+    body = json.dumps({"errors": [{"code": "NAME_UNKNOWN"}]}).encode()
+    transport = FakeTransport([_token_ok(), (404, {}, body)])
     result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
     assert result["status"] == tags.STATUS_PACKAGE_MISSING
+    assert "NAME_UNKNOWN" in result["detail"]
+
+
+def test_list_generic_401_after_token_exchange_is_auth_failure() -> None:
+    transport = FakeTransport([_token_ok(), _token_401()])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_AUTH_FAILURE
+
+
+def test_list_generic_404_after_token_exchange_is_unavailable() -> None:
+    transport = FakeTransport([_token_ok(), (404, {}, b'{"errors":[{"code":"DENIED"}]}')])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
 
 
 def test_list_token_401_is_auth_failure_not_package_missing() -> None:
@@ -160,6 +201,19 @@ def test_list_malformed_json_is_unavailable() -> None:
     assert result["status"] == tags.STATUS_UNAVAILABLE
 
 
+def test_list_response_without_tags_array_is_unavailable() -> None:
+    transport = FakeTransport([_token_ok(), (200, {}, b"{}")])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+
+
+def test_list_explicit_empty_tags_array_is_valid_empty_registry() -> None:
+    transport = FakeTransport([_token_ok(), (200, {}, b'{"tags":[]}')])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_OK
+    assert result["tags"] == []
+
+
 def test_list_token_json_malformed_is_unavailable() -> None:
     transport = FakeTransport([(200, {}, b"<html>proxy error</html>")])
     result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
@@ -186,6 +240,106 @@ def test_list_rejects_offsite_link_header() -> None:
     assert "ghcr.io" in result["detail"]
 
 
+@pytest.mark.parametrize(
+    "link_value",
+    [
+        '</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel="next"; type="application/json"',
+        "</v2/octo/shoko-sonarr-linker/tags/list?last=x>; type=application/json; rel=next",
+        '</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel="prev next"',
+        '</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel="next"; foo',
+        ", </v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next",
+        "</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next,",
+        ",, </v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next,,",
+        "<https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list?last=prev>; "
+        'rel="prev"; title="previous, page", '
+        '</v2/octo/shoko-sonarr-linker/tags/list?last=x>; title="part, two"; rel="next"',
+    ],
+)
+def test_list_pagination_parses_link_parameters_and_quoted_commas(link_value: str) -> None:
+    page1 = json.dumps({"tags": [f"sha-{SHA_A}"]}).encode()
+    page2 = json.dumps({"tags": [f"sha-{SHA_B}"]}).encode()
+    transport = FakeTransport(
+        [
+            _token_ok(),
+            (200, {"link": link_value}, page1),
+            (200, {}, page2),
+        ]
+    )
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_OK
+    assert result["tags"] == [f"sha-{SHA_A}", f"sha-{SHA_B}"]
+    assert transport.calls[2][0] == ("https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list?last=x")
+
+
+@pytest.mark.parametrize(
+    "link_value",
+    [
+        ", </v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next",
+        "</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next,",
+        ", , </v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next, ,",
+    ],
+)
+def test_list_pagination_ignores_empty_link_list_members(link_value: str) -> None:
+    page1 = json.dumps({"tags": [f"sha-{SHA_A}"]}).encode()
+    page2 = json.dumps({"tags": [f"sha-{SHA_B}"]}).encode()
+    transport = FakeTransport(
+        [
+            _token_ok(),
+            (200, {"link": link_value}, page1),
+            (200, {}, page2),
+        ]
+    )
+
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+
+    assert result["status"] == tags.STATUS_OK
+    assert result["tags"] == [f"sha-{SHA_A}", f"sha-{SHA_B}"]
+
+
+def test_list_rejects_duplicate_rel_parameters() -> None:
+    page1 = json.dumps({"tags": [f"sha-{SHA_A}"]}).encode()
+    link = {"link": '</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel="prev"; rel="next"'}
+    transport = FakeTransport([_token_ok(), (200, link, page1)])
+
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+    assert "Link" in result["detail"]
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "link_value",
+    [
+        "</v2/octo/shoko-sonarr-linker/tags/list?last=x>; title=page",
+        "</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel",
+        "</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=",
+        '</v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=""',
+    ],
+)
+def test_list_rejects_link_values_without_a_valued_relation(link_value: str) -> None:
+    body = json.dumps({"tags": [f"sha-{SHA_A}"]}).encode()
+    transport = FakeTransport([_token_ok(), (200, {"link": link_value}, body)])
+
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+    assert "Link" in result["detail"]
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "link_value",
+    ['<https://ghcr.io/v2/octo/package/tags/list; rel="next"', ""],
+)
+def test_list_malformed_link_header_is_unavailable(link_value: str) -> None:
+    body = json.dumps({"tags": [f"sha-{SHA_A}"]}).encode()
+    transport = FakeTransport([_token_ok(), (200, {"link": link_value}, body)])
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+    assert result["status"] == tags.STATUS_UNAVAILABLE
+    assert "Link" in result["detail"]
+
+
 def test_list_rejects_non_lowercase_namespace() -> None:
     with pytest.raises(ValueError, match="lowercase GHCR namespace"):
         tags.list_tags("Octo", "shoko-sonarr-linker", TOKEN, transport=FakeTransport([]))
@@ -206,6 +360,41 @@ def test_plan_consumer_helper_aborts_on_unknown_state() -> None:
             tags.PlanAbortedError, match="refusing to publish against unknown state"
         ):
             tags.plan_sha_tags(tags._result(status, [], "x"))
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"status": tags.STATUS_OK},
+        {"status": tags.STATUS_OK, "tags": f"sha-{SHA_A}"},
+        {"status": tags.STATUS_OK, "tags": [f"sha-{SHA_A}", None]},
+        {"status": tags.STATUS_PACKAGE_MISSING},
+        {"status": tags.STATUS_PACKAGE_MISSING, "tags": [f"sha-{SHA_A}"]},
+        {"status": tags.STATUS_PACKAGE_MISSING, "tags": None},
+    ],
+)
+def test_plan_sha_tags_rejects_missing_malformed_or_contradictory_tags(
+    document: dict[str, Any],
+) -> None:
+    with pytest.raises(tags.PlanAbortedError):
+        tags.plan_sha_tags(document)
+
+
+@pytest.mark.parametrize(
+    "malformed_tag",
+    ["sha-short", f"sha-{SHA_A[:-1]}", f"sha-{'A' * len(SHA_A)}"],
+)
+def test_plan_sha_tags_rejects_malformed_sha_tag_names(malformed_tag: str) -> None:
+    document = {"status": tags.STATUS_OK, "tags": [malformed_tag]}
+    with pytest.raises(tags.PlanAbortedError, match="invalid sha tag"):
+        tags.plan_sha_tags(document)
+
+
+@pytest.mark.parametrize("malformed_tag", [f"SHA-{SHA_A}", f" {f'sha-{SHA_A}'}"])
+def test_plan_sha_tags_rejects_noncanonical_sha_prefixes(malformed_tag: str) -> None:
+    document = {"status": tags.STATUS_OK, "tags": [malformed_tag]}
+    with pytest.raises(tags.PlanAbortedError, match="invalid sha tag"):
+        tags.plan_sha_tags(document)
 
 
 def test_exit_status_table() -> None:
@@ -395,7 +584,7 @@ def test_verify_index_manifest_chain_published() -> None:
         "application/vnd.oci.image.manifest.v1+json",
         {
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {"digest": config_digest},
+            "config": {"mediaType": OCI_CONFIG, "digest": config_digest},
         },
     )
     inner_digest = "sha256:" + hashlib.sha256(inner[2]).hexdigest()
@@ -434,17 +623,138 @@ def test_verify_index_annotation_revision_published() -> None:
     assert len(transport.calls) == 2
 
 
+@pytest.mark.parametrize("index_media_type", [OCI_INDEX, DOCKER_LIST])
+def test_verify_case_varied_supported_index_media_types_published(index_media_type: str) -> None:
+    child = _child(b"{}", annotations={REVISION_KEY: SHA_A})
+    index = _index(
+        [_descriptor(child[2], OCI_MANIFEST, PREFERRED_PLATFORM)],
+        media_type=index_media_type,
+    )
+    index_document = json.loads(index[2])
+    index_document["mediaType"] = index_media_type.lower()
+    index_response = (
+        200,
+        {"content-type": index_media_type.upper()},
+        json.dumps(index_document).encode(),
+    )
+    transport = FakeTransport([_token_ok(), index_response, child])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+
+
 def test_verify_plain_manifest_config_chain_published() -> None:
     config = _config_blob(SHA_A)
     digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
     manifest = _manifest(
         "application/vnd.oci.image.manifest.v1+json",
-        {"mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {"digest": digest}},
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": OCI_CONFIG, "digest": digest},
+        },
     )
     transport = FakeTransport([_token_ok(), manifest, config])
     assert tags.verify_sha_tag(
         SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
     ) == (tags.PROVENANCE_PUBLISHED)
+
+
+@pytest.mark.parametrize("config_media_type", [OCI_CONFIG, DOCKER_CONFIG])
+def test_verify_supported_config_descriptor_types_published(config_media_type: str) -> None:
+    config = _config(config_media_type)
+    manifest_type = DOCKER_MANIFEST if config_media_type == DOCKER_CONFIG else OCI_MANIFEST
+    manifest = _manifest(
+        manifest_type,
+        {
+            "mediaType": manifest_type,
+            "config": {
+                "mediaType": config_media_type,
+                "digest": _digest_of(config[2]),
+            },
+        },
+    )
+    transport = FakeTransport([_token_ok(), manifest, config])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+
+
+def test_verify_config_content_type_normalizes_case_and_parameters() -> None:
+    config = _config(OCI_CONFIG)
+    config_response = (
+        config[0],
+        {"content-type": "APPLICATION/VND.OCI.IMAGE.CONFIG.V1+JSON; charset=utf-8"},
+        config[2],
+    )
+    manifest = _child(config[2], config_media_type=OCI_CONFIG)
+    transport = FakeTransport([_token_ok(), manifest, config_response])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+
+
+def test_verify_generic_octet_stream_config_content_type_is_accepted() -> None:
+    config = _config(OCI_CONFIG)
+    config_response = (
+        config[0],
+        {"content-type": "application/octet-stream; charset=binary"},
+        config[2],
+    )
+    manifest = _child(config[2], config_media_type=OCI_CONFIG)
+    transport = FakeTransport([_token_ok(), manifest, config_response])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+
+
+def test_verify_missing_config_content_type_uses_descriptor_media_type() -> None:
+    config = _config(OCI_CONFIG)
+    config_response: tuple[int, dict[str, str], bytes] = (config[0], {}, config[2])
+    manifest = _child(config[2], config_media_type=OCI_CONFIG)
+    transport = FakeTransport([_token_ok(), manifest, config_response])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+
+
+def test_verify_unsupported_config_descriptor_type_is_unknown_without_blob_fetch() -> None:
+    config = _config(OCI_CONFIG)
+    manifest = _child(config[2], config_media_type=INTOTO_CONFIG)
+    transport = FakeTransport([_token_ok(), manifest, config])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "response_media_type",
+    ["text/plain; charset=utf-8", DOCKER_CONFIG],
+)
+def test_verify_unsupported_or_conflicting_config_content_type_is_unknown(
+    response_media_type: str,
+) -> None:
+    config = _config(OCI_CONFIG)
+    config_response = (config[0], {"content-type": response_media_type}, config[2])
+    manifest = _child(config[2], config_media_type=OCI_CONFIG)
+    transport = FakeTransport([_token_ok(), manifest, config_response])
+
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
 
 
 def test_verify_manifest_level_annotations_published() -> None:
@@ -454,7 +764,7 @@ def test_verify_manifest_level_annotations_published() -> None:
         {
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "annotations": {"org.opencontainers.image.revision": SHA_A},
-            "config": {"digest": ZERO_DIGEST},
+            "config": {"mediaType": OCI_CONFIG, "digest": ZERO_DIGEST},
         },
     )
     transport = FakeTransport([_token_ok(), manifest])
@@ -482,7 +792,7 @@ def test_verify_docker_schema2_config_labels_published() -> None:
         "application/vnd.docker.distribution.manifest.v2+json",
         {
             "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-            "config": {"digest": digest},
+            "config": {"mediaType": DOCKER_CONFIG, "digest": digest},
         },
     )
     transport = FakeTransport([_token_ok(), manifest, config])
@@ -498,7 +808,7 @@ def test_verify_revision_mismatch_is_unknown_provenance() -> None:
         "application/vnd.docker.distribution.manifest.v2+json",
         {
             "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-            "config": {"digest": digest},
+            "config": {"mediaType": OCI_CONFIG, "digest": digest},
         },
     )
     transport = FakeTransport([_token_ok(), manifest, config])
@@ -508,10 +818,166 @@ def test_verify_revision_mismatch_is_unknown_provenance() -> None:
 
 
 def test_verify_404_is_not_published() -> None:
-    transport = FakeTransport([_token_ok(), (404, {}, b"{}")])
+    body = json.dumps({"errors": [{"code": "MANIFEST_UNKNOWN"}]}).encode()
+    transport = FakeTransport([_token_ok(), (404, {}, body)])
     assert tags.verify_sha_tag(
         SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport
     ) == (tags.PROVENANCE_NOT_PUBLISHED)
+
+
+def test_verify_unsupported_top_level_manifest_type_is_unknown() -> None:
+    body = json.dumps({"mediaType": "text/plain", "annotations": {REVISION_KEY: SHA_A}}).encode()
+    transport = FakeTransport([_token_ok(), (200, {"content-type": "text/plain"}, body)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+def test_verify_unsupported_child_manifest_type_is_unknown() -> None:
+    child_body = json.dumps(
+        {"mediaType": "text/plain", "annotations": {REVISION_KEY: SHA_A}}
+    ).encode()
+    index = _index([_descriptor(child_body, OCI_MANIFEST, PREFERRED_PLATFORM)])
+    child = (200, {"content-type": "text/plain"}, child_body)
+    transport = FakeTransport([_token_ok(), index, child])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+def test_verify_index_descriptor_child_media_type_mismatch_is_unknown() -> None:
+    child_body = json.dumps(
+        {
+            "mediaType": OCI_INDEX,
+            "annotations": {REVISION_KEY: SHA_A},
+            "manifests": [],
+        }
+    ).encode()
+    index = _index([_descriptor(child_body, OCI_MANIFEST, PREFERRED_PLATFORM)])
+    child = (200, {"content-type": OCI_INDEX}, child_body)
+    transport = FakeTransport([_token_ok(), index, child])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+def test_verify_rejects_header_and_body_media_type_mismatch() -> None:
+    body = json.dumps({"mediaType": "text/plain", "annotations": {REVISION_KEY: SHA_A}}).encode()
+    transport = FakeTransport([_token_ok(), (200, {"content-type": OCI_MANIFEST}, body)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+def test_verify_supported_manifest_media_type_is_case_insensitive() -> None:
+    body = json.dumps({"mediaType": OCI_MANIFEST, "annotations": {REVISION_KEY: SHA_A}}).encode()
+    header = "APPLICATION/VND.OCI.IMAGE.MANIFEST.V1+JSON; charset=utf-8"
+    transport = FakeTransport([_token_ok(), (200, {"content-type": header}, body)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_PUBLISHED
+    )
+
+
+@pytest.mark.parametrize(
+    "content_types",
+    [
+        ("text/plain", OCI_MANIFEST),
+        (OCI_MANIFEST, "text/plain"),
+    ],
+)
+def test_verify_conflicting_duplicate_content_type_top_level_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, content_types: tuple[str, str]
+) -> None:
+    body = json.dumps({"mediaType": OCI_MANIFEST, "annotations": {REVISION_KEY: SHA_A}}).encode()
+    responses = [
+        FakeHttpResponse(200, [], json.dumps({"token": TOKEN}).encode()),
+        FakeHttpResponse(
+            200,
+            [("Content-Type", content_types[0]), ("content-type", content_types[1])],
+            body,
+        ),
+    ]
+
+    def fake_open(request: Any, timeout: float) -> FakeHttpResponse:
+        assert responses
+        return responses.pop(0)
+
+    monkeypatch.setattr(tags, "_open", fake_open)
+    assert (
+        tags.verify_sha_tag(
+            SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=tags.UrllibTransport()
+        )
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+def test_verify_conflicting_duplicate_content_type_child_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_body = json.dumps(
+        {"mediaType": OCI_MANIFEST, "annotations": {REVISION_KEY: SHA_A}}
+    ).encode()
+    index = _index([_descriptor(child_body, OCI_MANIFEST, PREFERRED_PLATFORM)])
+    responses = [
+        FakeHttpResponse(200, [], json.dumps({"token": TOKEN}).encode()),
+        FakeHttpResponse(index[0], list(index[1].items()), index[2]),
+        FakeHttpResponse(
+            200,
+            [("Content-Type", "text/plain"), ("content-type", OCI_MANIFEST)],
+            child_body,
+        ),
+    ]
+
+    def fake_open(request: Any, timeout: float) -> FakeHttpResponse:
+        assert responses
+        return responses.pop(0)
+
+    monkeypatch.setattr(tags, "_open", fake_open)
+    assert (
+        tags.verify_sha_tag(
+            SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=tags.UrllibTransport()
+        )
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps({"errors": [{"code": "DENIED"}]}).encode(),
+        b"{}",
+        b"not-json",
+    ],
+)
+def test_verify_generic_or_malformed_404_is_unknown_provenance(body: bytes) -> None:
+    transport = FakeTransport([_token_ok(), (404, {}, body)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+def test_verify_manifest_401_name_unknown_is_not_published() -> None:
+    body = json.dumps({"errors": [{"code": "NAME_UNKNOWN"}]}).encode()
+    transport = FakeTransport([_token_ok(), (401, {}, body)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_NOT_PUBLISHED
+    )
+
+
+def test_verify_manifest_generic_401_is_unknown_provenance() -> None:
+    body = json.dumps({"errors": [{"code": "DENIED"}]}).encode()
+    transport = FakeTransport([_token_ok(), (401, {}, body)])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", "shoko-sonarr-linker", TOKEN, transport=transport)
+        == tags.PROVENANCE_UNKNOWN
+    )
 
 
 def test_verify_manifest_5xx_is_unknown_provenance() -> None:
@@ -526,7 +992,10 @@ def test_verify_config_blob_failure_is_unknown_provenance() -> None:
     digest = "sha256:" + hashlib.sha256(config[2]).hexdigest()
     manifest = _manifest(
         "application/vnd.oci.image.manifest.v1+json",
-        {"mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {"digest": digest}},
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": OCI_CONFIG, "digest": digest},
+        },
     )
     transport = FakeTransport([_token_ok(), manifest, (503, {}, b"unavailable")])
     assert tags.verify_sha_tag(
@@ -587,6 +1056,164 @@ def test_urllib_transport_maps_http_and_network_errors(monkeypatch: pytest.Monke
     monkeypatch.setattr(tags, "_open", boom)
     with pytest.raises(tags.NetworkFailureError):
         transport.get("https://ghcr.io/v2/x/tags/list", {}, 1.0)
+
+
+def test_redirect_to_same_https_origin_keeps_authorization() -> None:
+    handler = tags._AuthorizationSafeRedirectHandler()
+    request = urllib.request.Request(
+        "https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        io.BytesIO(),
+        302,
+        "Found",
+        Message(),
+        "https://GHCR.IO:443/v2/octo/shoko-sonarr-linker/tags/list?last=x",
+    )
+
+    assert redirected is not None
+    assert redirected.get_header("Authorization") == f"Bearer {TOKEN}"
+
+
+def test_redirect_to_https_cross_origin_strips_authorization_headers() -> None:
+    handler = tags._AuthorizationSafeRedirectHandler()
+    request = urllib.request.Request(
+        "https://ghcr.io/v2/octo/shoko-sonarr-linker/manifests/sha-tag",
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Proxy-Authorization": "Basic proxy-secret",
+        },
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        io.BytesIO(),
+        302,
+        "Found",
+        Message(),
+        "https://redirect.example/v2/octo/shoko-sonarr-linker/manifests/sha-tag",
+    )
+
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
+    assert redirected.get_header("Proxy-Authorization") is None
+
+
+def test_redirect_from_https_to_http_is_rejected() -> None:
+    handler = tags._AuthorizationSafeRedirectHandler()
+    request = urllib.request.Request(
+        "https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(
+            request,
+            io.BytesIO(),
+            302,
+            "Found",
+            Message(),
+            "http://redirect.example/v2/octo/shoko-sonarr-linker/tags/list",
+        )
+
+
+def test_open_uses_a_fresh_opener_with_the_safe_redirect_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built_handlers: list[tuple[Any, ...]] = []
+
+    class FakeOpener:
+        def open(self, request: Any, timeout: float) -> Any:
+            return object()
+
+    def build_opener(*handlers: Any) -> FakeOpener:
+        built_handlers.append(handlers)
+        return FakeOpener()
+
+    def unexpected_urlopen(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("_open must use its redirect-safe per-call opener")
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    monkeypatch.setattr(urllib.request, "urlopen", unexpected_urlopen)
+
+    request = urllib.request.Request("https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list")
+    tags._open(request, 1.0)
+    tags._open(request, 1.0)
+
+    assert len(built_handlers) == 2
+    assert all(
+        len(handlers) == 1 and isinstance(handlers[0], tags._AuthorizationSafeRedirectHandler)
+        for handlers in built_handlers
+    )
+
+
+def test_urllib_transport_pagination_combines_repeated_link_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        def __init__(self, body: bytes, headers: list[tuple[str, str]], status: int = 200) -> None:
+            self.body = body
+            self.headers = headers
+            self.status = status
+
+        def read(self) -> bytes:
+            return self.body
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return self.headers
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+    next_link = "<https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list?last=x>; rel=next"
+    prev_link = "<https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list?last=prev>; rel=prev"
+    responses = [
+        FakeResponse(json.dumps({"token": TOKEN}).encode(), []),
+        FakeResponse(
+            json.dumps({"tags": [f"sha-{SHA_A}"]}).encode(),
+            [("Link", next_link), ("lInK", prev_link)],
+        ),
+        FakeResponse(json.dumps({"tags": [f"sha-{SHA_B}"]}).encode(), []),
+    ]
+
+    def fake_open(request: Any, timeout: float) -> FakeResponse:
+        assert responses
+        return responses.pop(0)
+
+    monkeypatch.setattr(tags, "_open", fake_open)
+    result = tags.list_tags("octo", "shoko-sonarr-linker", TOKEN, transport=tags.UrllibTransport())
+    assert result["status"] == tags.STATUS_OK
+    assert result["tags"] == [f"sha-{SHA_A}", f"sha-{SHA_B}"]
+    assert not responses
+
+
+def test_urllib_transport_combines_repeated_link_headers_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = Message()
+    headers.add_header("Link", "<https://ghcr.io/prev>; rel=prev")
+    headers.add_header("lInK", "<https://ghcr.io/next>; rel=next")
+
+    def fake_open(request: Any, timeout: float) -> Any:
+        raise urllib.error.HTTPError(
+            request.full_url, 404, "Not Found", headers, io.BytesIO(b"error")
+        )
+
+    monkeypatch.setattr(tags, "_open", fake_open)
+    status, response_headers, body = tags.UrllibTransport().get(
+        "https://ghcr.io/v2/octo/shoko-sonarr-linker/tags/list", {}, 1.0
+    )
+    assert status == 404
+    assert body == b"error"
+    assert response_headers["link"] == (
+        "<https://ghcr.io/prev>; rel=prev, <https://ghcr.io/next>; rel=next"
+    )
 
 
 # --- F12: OCI index provenance (manifests endpoint, runnable-descriptor selection) ---

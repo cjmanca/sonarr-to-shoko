@@ -142,6 +142,32 @@ def test_feature_branch_uses_merge_base_and_skips_shared_history(
     assert any("not re-tagged" in note for note in result.notes)
 
 
+def test_first_feature_push_uses_remote_tracking_default_branch(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    for i in range(12):
+        main_tip = _commit(repo, f"main-{i}")
+    _git(repo, "update-ref", "refs/remotes/origin/main", main_tip)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    feature_1 = _commit(repo, "feature-1")
+    feature_2 = _commit(repo, "feature-2")
+    _git(repo, "branch", "-D", "main")
+
+    result = enum.enumerate_introduced(
+        repo,
+        after=feature_2,
+        before=None,
+        ref="refs/heads/feature",
+        default_branch="main",
+        max_shas=10,
+    )
+
+    assert result.shas == [feature_1, feature_2]
+    assert result.overflow == []
+    assert any("merge-base" in note for note in result.notes)
+
+
 def test_force_push_non_ancestor_falls_back_to_merge_base(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     m = _commit(repo, "m")

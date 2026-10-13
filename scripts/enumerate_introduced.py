@@ -205,11 +205,19 @@ def _enumerate_from_boundary(
 def _enumerate_new_branch(
     repo_dir: Path, after_full: str, default_branch: str, result: EnumerationResult
 ) -> None:
-    default = _run(repo_dir, "rev-parse", "--verify", f"refs/heads/{default_branch}^{{commit}}")
+    default = _run(
+        repo_dir,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{default_branch}^{{commit}}",
+    )
+    if default.returncode != 0:
+        default = _run(repo_dir, "rev-parse", "--verify", f"refs/heads/{default_branch}^{{commit}}")
     if default.returncode != 0:
         result.shas = _rev_list(repo_dir, after_full)
         result.notes.append(
-            f"new branch push: default branch '{default_branch}' not found locally; "
+            f"new branch push: default branch '{default_branch}' not found as a remote-tracking "
+            "or local ref; "
             "enumerated full history"
         )
         return

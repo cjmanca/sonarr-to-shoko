@@ -28,8 +28,9 @@
 # * Shell-injection hygiene (F1): NO `${{ }}` expression is expanded inside a
 #   `run:` script body. Every github.*/inputs.* value reaches the shell only via
 #   job/step-level `env:` indirection ("$ENV_VAR"), and dispatch SHA inputs are
-#   validated as 40-char lowercase hex before any use, with the range
-#   end gated against main (see the plan step). Interpolation remains in
+#   validated as 40-char lowercase hex before any use, with dispatch ranges
+#   gated against the selected branch head and from_sha gated against to_sha
+#   (see the plan step). Interpolation remains in
 #   `uses:`/`with:`/`if:`/`tags:` — those contexts are evaluated by GitHub, not
 #   a shell (build-push `tags:` values become CLI args, never shell text).
 # * GHCR image reference (F2): the GitHub context property is
@@ -58,13 +59,16 @@
 # * Provenance verification (F3, F12, best-effort bounded): a registry `sha-<fullsha>`
 #   tag counts as published only when the manifest/config chain carries
 #   `org.opencontainers.image.revision` == the full SHA. Up to 10 tags are
-#   verified per run (VERIFY_CAP in scripts/ghcr_tags.py). Tag states and their
-#   ONLY allowed actions:
+#   verified per run (VERIFY_CAP in scripts/ghcr_tags.py); the verification
+#   window rotates across runs using GITHUB_RUN_NUMBER while the matrix cap stays 10.
+#   scripts/ghcr_plan.py is the shared, tested tag-normalization, membership, and
+#   outcome planner.
+#   Tag states and their ONLY allowed actions:
 #     published           -> skip (already published; never re-pushed)
 #     not_published       -> tag is ABSENT -> safe to publish/backfill
-#     unknown_provenance  -> tag EXISTS and is unverifiable -> NEVER
-#                            published/overwritten; the plan ABORTS and lists
-#                            the SHA for operator reconciliation.
+#     unknown_provenance  -> registry/tag state or provenance could not be
+#                            verified -> NEVER published/overwritten; the plan
+#                            ABORTS and lists the SHA for reconciliation.
 #   A `sha-` tag NAME derived from a commit is NOT proof that the existing
 #   image is immutable/correct, so an unverified existing tag is never
 #   silently replaced. Registry discovery + provenance need read-only pull
@@ -82,6 +86,11 @@
 #   unverifiable ABORTED with a reconciliation list), so published sha-
 #   tags are never overwritten — tag-name derivation is not the safety
 #   argument, the registry-state gate is.
+# * Per-SHA registry race: each publish leg is serialized by its exact SHA and
+#   re-verifies the tag after acquiring that lock. A verified existing image is
+#   skipped, an absent tag may publish, and unknown state fails closed. GHCR has
+#   no atomic conditional tag write here; this lock covers this workflow's legs,
+#   not out-of-band writers that race after verification.
 # * Fork/PR isolation: this workflow's publish/plan/promote jobs are
 #   gated to push / schedule / workflow_dispatch events; `pull_request`
 #   runs ONLY the read-only test job (GitHub gives PR runs a read-only token,
@@ -91,48 +100,56 @@
 #   and re-runs the checks available FOR THAT COMMIT (scripts/ci_checks.sh
 #   from M8 onward, the uploaded historical validator before that) —
 #   no cross-commit cached "pass" is trusted.
-# * `latest` is promoted only by promote-latest, serialized via its dedicated
-#   concurrency group (`cancel-in-progress: false` so a pending promotion is
-#   never cancelled; SHA matrix jobs live under the workflow-level group and
-#   are a *different* job, so they are never cancelled by promotion).
-#   The promotion step re-reads `git ls-remote` and aborts if this run's SHA is
-#   no longer the current head of main -> an old queued run can never
-#   revert `latest` to an older build.
+# * `latest` is promoted only after test and plan pass for default-branch pushes,
+#   the main-only schedule, or safe workflow_dispatch backfills on main, under
+#   its dedicated serialized group. Manual backfills dispatched against any
+#   other branch can publish sha- tags but cannot promote latest.
+#   The per-SHA matrix does not mask failures: fail-fast is false so siblings
+#   finish, but any failed leg blocks promotion. An empty matrix may be skipped;
+#   promotion then still verifies this exact SHA's immutable registry tag and
+#   provenance. Immediately before pushing latest it re-reads `git ls-remote`
+#   and aborts if this run's SHA is no longer the current head of main. GHCR has
+#   no atomic conditional tag update; serialization plus the immediate head
+#   check prevents an older completed promotion from replacing a newer one.
 # * Least privilege: top-level `contents: read`; only publish/promote-latest
-#   add `packages: write`; plan adds `packages: read` (registry discovery is
-#   pull-only) and `actions: write`, and publish adds `actions: read` — the
-#   minimum scopes for the historical-validator artifact handoff. No repository
-#   secrets are referenced at all
-#   (`secrets.GITHUB_TOKEN` only) — Sonarr/Shoko keys never exist in CI.
+#   add `packages: write`; plan adds `packages: read` for pull-only registry
+#   discovery. Same-run artifact upload/download needs no Actions API permission.
+#   No repository secrets are referenced (`secrets.GITHUB_TOKEN` only);
+#   Sonarr/Shoko keys never exist in CI.
 # * Event gap (documented; GitHub does NOT fire `push` workflows for commits
 #   created by workflows using GITHUB_TOKEN, e.g. merge-queue/auto-commits).
 #   This project never self-commits, so the gap does not arise from our own
 #   automation; if a GITHUB_TOKEN-authored commit ever lands
 #   on main, the weekly `schedule` backfill and manual
-#   `gh workflow run publish.yml -f backfill=true [-f from_sha=... -f to_sha=...]`
-#   recover the untagged SHAs. Because the registry (not git tags) is the
-#   publication state, recovery is idempotent: a repeated backfill against an
-#   unchanged registry schedules ZERO already-published images.
+#   `gh workflow run publish.yml --ref <branch> -f backfill=true`
+#   recover the untagged SHAs on the selected in-repository branch. Optional
+#   `from_sha`/`to_sha` bound the range; `to_sha` must be an ancestor of that
+#   branch's fetched head and `from_sha` an ancestor of `to_sha`. Because the
+#   registry (not git tags) is the publication state, recovery is idempotent: a
+#   repeated backfill against an unchanged registry schedules ZERO already-
+#   published images.
 #   Enumeration/backfill semantics are covered by tests/test_publish_enumeration.py.
 # * Dispatch trust boundary (F3): workflow_dispatch requires repository write
 #   access — anyone who can dispatch can already run code in this repo. The
-#   gate is defense-in-depth, not a secret boundary: `to_sha` must
-#   be a 40-hex SHA AND an ancestor of the current main head
-#   (`not-ancestor-of-main` fails the plan) so dispatch cannot publish
-#   arbitrary out-of-main ranges.
+#   gate is defense-in-depth, not a secret boundary: `PUSH_REF` must be a
+#   `refs/heads/*` branch, fetched from origin; `to_sha` must be a 40-hex SHA
+#   AND an ancestor of that selected branch head, and a supplied `from_sha`
+#   must be an ancestor of `to_sha`, so dispatch cannot publish arbitrary
+#   unrelated ranges.
 # * Cap: plan enforces max 10 SHAs per run (must match DEFAULT_MAX_SHAS in
 #   scripts/enumerate_introduced.py); overflow is reported in the job summary
 #   as a warning (failing-soft note) and recovered by backfill — never dropped.
 #   A non-positive `max_shas` dispatch input fails closed (plan aborts).
-# * Concurrency caveat (documented): the workflow group uses
-#   `cancel-in-progress: false`, which keeps at most ONE queued run per group
-#   and replaces an older queued run when a newer one arrives; replaced
-#   runs publish nothing. This is safe *because* the registry is the
-#   publication state: the weekly schedule backfill (and manual dispatch)
-#   re-schedules every commit whose `sha-` image is missing.
-# * Failed legs: `continue-on-error: true` keeps a failing intermediate SHA from
-#   blocking its siblings; the failed SHA stays untagged in the registry, so
-#   the next backfill re-schedules it, and the leg report names it.
+# * Push retention: there is deliberately no workflow-level concurrency group,
+#   because Actions can replace a pending run when another push arrives. The
+#   weekly schedule scans main only; a manual `workflow_dispatch --ref <branch>`
+#   fetches that branch tip to recover capped/unmerged topic-branch SHAs. Per-SHA
+#   job locks deduplicate publication and recheck registry provenance without
+#   dropping push events.
+# * Failed legs: `fail-fast: false` lets sibling SHA legs finish, but any failed
+#   leg fails the publish job and blocks latest promotion. A later backfill
+#   rechecks registry provenance for the failed SHA (skip if already published,
+#   publish only if proven absent); the per-leg report identifies the SHA.
 
 name: Publish (GHCR)
 
@@ -143,15 +160,15 @@ on:
   workflow_dispatch:
     inputs:
       from_sha:
-        description: Range-gap backfill start SHA (exclusive). Empty = whole history up to to_sha.
+        description: Backfill range start SHA (exclusive; full lowercase SHA and ancestor of to_sha).
         required: false
         type: string
       to_sha:
-        description: "Backfill range end SHA (default: current default-branch head). Must be a 40-hex SHA and an ancestor of the current main head."
+        description: "Backfill range end SHA (full lowercase SHA; default: fetched head of the selected refs/heads/* branch; must be its ancestor)."
         required: false
         type: string
       backfill:
-        description: Recover untagged SHAs (registry-gap scan) instead of doing nothing.
+        description: Recover untagged SHAs on the selected repository branch (registry-gap scan); each run remains capped.
         required: false
         type: boolean
         default: true
@@ -165,16 +182,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: publish-${{ github.ref }}
-  # F2: cancel-in-progress MUST be false here. Cancelling a queued SHA leg
-  # silently drops that commit's sha- tag (the leg publishes nothing and
-  # nothing re-enumerates it). false keeps one queued run per ref:
-  # every queued commit still publishes, just serialized. The cancelled-SHA
-  # gap this replaces is eliminated. `latest` promotion keeps its own
-  # dedicated serialized group below.
-  cancel-in-progress: false
 
 jobs:
   test:
@@ -197,13 +204,11 @@ jobs:
     runs-on: ubuntu-latest
     # F1: all github.*/inputs.* values reach the shell ONLY through these env
     # indirections; the run bodies below contain zero `${{ }}` expressions.
-    # F3: registry discovery is pull-only, so this job carries packages:read
-    # (publish/promote-latest own the only packages:write grants), and
-    # actions:read is only for publishing the historical-validator artifact.
+    # F3: registry discovery is pull-only, so this job carries packages:read;
+    # publish/promote-latest own the only packages:write grants.
     permissions:
       contents: read
       packages: read
-      actions: write
     env:
       EVENT_NAME: ${{ github.event_name }}
       PUSH_BEFORE: ${{ github.event.before }}
@@ -218,9 +223,11 @@ jobs:
     outputs:
       shas: ${{ steps.plan.outputs.shas }}
       image: ${{ steps.image_name.outputs.image }}
+      owner: ${{ steps.image_name.outputs.owner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.ref }}
           fetch-depth: 0 # full history + merge-base needed for enumeration
       - name: Compute & validate lowercase GHCR image reference
         # F2: github.repository_owner (snake_case) via env indirection, lowercased
@@ -250,8 +257,7 @@ jobs:
           STATUS=$(jq -r '.status' registry.json)
           DETAIL=$(jq -r '.detail' registry.json)
           case "${STATUS}" in
-            ok) jq -r '.tags[]' registry.json > known_tags.txt ;;
-            package_missing) : > known_tags.txt ;;
+            ok|package_missing) python3 scripts/ghcr_plan.py tags --registry registry.json > known_tags.txt ;;
             *) die "GHCR registry discovery failed (${STATUS}: ${DETAIL}); refusing to publish against unknown registry state" ;;
           esac
           echo "- registry: ${STATUS} (${DETAIL})" >> "$GITHUB_STEP_SUMMARY"
@@ -266,11 +272,8 @@ jobs:
           is_full_sha() {
             [ "${#1}" -eq 40 ] && printf '%s' "$1" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'
           }
-          MAX="${MAX_SHAS_INPUT}"
-          if [ -z "$MAX" ]; then MAX=10; fi # matrix cap; MUST match DEFAULT_MAX_SHAS in scripts/enumerate_introduced.py
-          case "$MAX" in ''|*[!0-9]*) die "max_shas must be a positive decimal integer (got '$MAX')";; esac
-          if [ "$MAX" -le 0 ]; then die "max_shas must be positive (got '$MAX'); refusing to publish under a non-positive cap"; fi
-          if [ "$MAX" -gt 10 ]; then MAX=10; fi # hard clamp: dispatch cannot exceed the matrix cap
+          # Python validates/clamps decimal input without shell integer overflow.
+          MAX=$(python3 scripts/ghcr_plan.py max-shas --value "${MAX_SHAS_INPUT}")
           FIRST_BUILDABLE=aa6b85ea71192d9c94c7f3c8a58d715c6c37db42 # recorded first-buildable boundary (M1)
           if [ "$EVENT_NAME" = "push" ] && [ "$PUSH_SHA" = "$ZERO_SHA" ]; then
             # F6: branch-deletion push (before=<tip>, after=0000...0) publishes
@@ -282,108 +285,79 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          : > unverified.txt
-          : > nonpublished.txt
-          : > absent.txt
-          : > cap_unverified.txt
-          # F12 publication policy for EXISTING registry tags:
-          #   published          -> trusted skip (never re-pushed)
-          #   not_published      -> tag absent -> safe to publish/backfill
-          #   unknown_provenance -> tag EXISTS, unverifiable -> NEVER published;
-          #                        reported for operator reconciliation and the
-          #                        plan ABORTS (a sha- tag NAME derived from a
-          #                        commit is not proof the image is immutable).
-          report_unverified() {
-            [ -s unverified.txt ] || return 0
-            {
-              echo "## Provenance reconciliation required"
-              echo "- existing sha- tag(s) with unverifiable provenance are NEVER published/overwritten"
-              jq -r -n --rawfile unv unverified.txt --rawfile res provenance.json '
-                ($res.results // {}) as $r
-                | [$unv | split("\n")[] | select(length > 0)][]
-                | "- sha-\(.): registry tag state \($r[.] // "unknown_provenance") — reconcile the existing tag (inspect/pin/delete), then re-run backfill"
-              '
-            } >> "$GITHUB_STEP_SUMMARY"
-            die "existing sha- tag(s) with unverifiable provenance: $(tr '\n' ' ' < unverified.txt); refusing to publish over an unverifiable image — reconcile the tag(s) manually, then re-run"
+          run_missing() {
+            local extra_unverified="${1:-}"
+            local args=(missing --repo . --upto "$TO" --known-tags-file known_tags.txt --max-shas "$MAX")
+            if [ -n "$FROM" ]; then args+=(--since "$FROM"); fi
+            if [ -n "$extra_unverified" ]; then args+=(--unverified-file "$extra_unverified"); fi
+            python3 scripts/enumerate_introduced.py "${args[@]}" > plan.json
           }
           if [ "$EVENT_NAME" = "push" ]; then
             python3 scripts/enumerate_introduced.py introduced \
               --repo . --before "$PUSH_BEFORE" --after "$PUSH_SHA" \
               --ref "$PUSH_REF" --default-branch main \
               --first-buildable "$FIRST_BUILDABLE" --max-shas "$MAX" > plan.json
-            # Tag immutability: a SHA whose image already exists in the registry is
-            # NEVER re-pushed. Provenance verification only decides what to REPORT:
-            # verified-published SHAs are skipped, SHAs proven ABSENT stay
-            # publishable, and unverified EXISTING tags abort for reconciliation.
-            TAGGED=$(jq -r --rawfile tags known_tags.txt '
-              ([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-")
-                | split("^")[0] | ascii_downcase] | map(select(length == 40))) as $pub
-              | [.shas[] | select($pub | index(.))][:10] | join(",")' plan.json)
-            # Registry-tagged SHAs beyond the bounded verify cap are LEFT UNTOUCHED
-            # (never overwritten) and reported: their provenance is unconfirmed.
-            jq -r --rawfile tags known_tags.txt '
-              ([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-")
-                | split("^")[0] | ascii_downcase] | map(select(length == 40))) as $pub
-              | [.shas[] | select($pub | index(.))][10:] | .[]' plan.json > cap_unverified.txt
-            if [ -n "$TAGGED" ]; then
-              python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" --shas "${TAGGED}" > provenance.json
-              VSTATUS=$(jq -r '.status' provenance.json)
-              [ "$VSTATUS" = "ok" ] || die "provenance verification failed (${VSTATUS}: $(jq -r '.detail' provenance.json)); refusing to publish against unknown registry state"
-              jq -r '.results | to_entries[] | select(.value != "published") | .key' provenance.json > nonpublished.txt
-              jq -r '.results | to_entries[] | select(.value == "not_published") | .key' provenance.json > absent.txt
-              jq -r '.results | to_entries[] | select(.value == "unknown_provenance") | .key' provenance.json > unverified.txt
-            fi
-            # Drop every SHA that carries a registry tag, EXCEPT the ones
-            # provenance verification proved ABSENT: existing tags are never
-            # overwritten, and unverified ones are excluded before the abort.
-            jq -c --rawfile tags known_tags.txt --rawfile abs absent.txt \
-              '.shas -= (([$tags | split("\n")[] | ltrimstr("refs/tags/") | ltrimstr("sha-") | split("^")[0] | ascii_downcase] | map(select(length == 40))) - ([$abs | split("\n")[] | ascii_downcase] | map(select(length == 40))))' \
-              plan.json > plan.filtered.json && mv plan.filtered.json plan.json
-            report_unverified
           else
             TO="$TO_SHA_INPUT"
             FROM="$FROM_SHA_INPUT"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              # F3 dispatch trust boundary: only fetch the selected in-repository
+              # branch, and constrain the backfill to its fetched tip.
+              case "$PUSH_REF" in
+                refs/heads/*) ;;
+                *) die "workflow_dispatch ref must be a branch (refs/heads/*), got '$PUSH_REF'" ;;
+              esac
+              git fetch --no-tags origin "$PUSH_REF"
+              BRANCH_HEAD=$(git rev-parse FETCH_HEAD)
+              if [ -z "$BRANCH_HEAD" ]; then die "could not resolve selected branch head for '$PUSH_REF'"; fi
+              if [ -z "$TO" ]; then TO="$BRANCH_HEAD"; fi
+            else
+              if [ -z "$TO" ]; then TO="$PUSH_SHA"; fi
+            fi
             if [ -n "$TO" ] && ! is_full_sha "$TO"; then die "invalid to_sha input: not-40-hex (must be a 40-char lowercase hex commit SHA)"; fi
             if [ -n "$FROM" ] && ! is_full_sha "$FROM"; then die "invalid from_sha input: not-40-hex (must be a 40-char lowercase hex commit SHA)"; fi
-            if [ -z "$TO" ]; then TO="$PUSH_SHA"; fi
             if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-              # F3 dispatch trust boundary (defense-in-depth; dispatch already implies
-              # repo write access): the range end must be an ancestor of the current
-              # main head, so dispatch cannot publish arbitrary out-of-main ranges.
-              MAIN_HEAD=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-              if [ -z "$MAIN_HEAD" ]; then die "no refs/heads/main on origin: refusing dispatch publish without a main head to validate against"; fi
-              if ! git merge-base --is-ancestor "$TO" "$MAIN_HEAD"; then
-                die "invalid to_sha input: not-ancestor-of-main ($TO is not an ancestor of current main head ${MAIN_HEAD}); refusing to publish an out-of-main range"
+              if ! git merge-base --is-ancestor "$TO" "$BRANCH_HEAD"; then
+                die "invalid to_sha input: not-ancestor-of-selected-branch-head ($TO is not an ancestor of selected branch '$PUSH_REF' at ${BRANCH_HEAD}); refusing to publish an out-of-branch range"
               fi
             fi
-            run_missing() {
-              local args=(missing --repo . --upto "$TO" --known-tags-file known_tags.txt --max-shas "$MAX")
-              if [ -n "$FROM" ]; then args+=(--since "$FROM"); fi
-              # Only SHAs whose registry tag provenance verification proved ABSENT
-              # are re-scheduled; an EXISTING unverified tag never enters the
-              # publish set — the plan aborts and reports it for reconciliation.
-              if [ -s absent.txt ]; then args+=(--unverified-file absent.txt); fi
-              python3 scripts/enumerate_introduced.py "${args[@]}" > plan.json
-            }
+            if [ -n "$FROM" ] && ! git merge-base --is-ancestor "$FROM" "$TO"; then
+              die "invalid from_sha input: not-ancestor-of-to-sha ($FROM is not an ancestor of to_sha $TO); refusing a reversed or unrelated range"
+            fi
             run_missing
-            # F3 provenance: an existing sha- tag counts as published only when its
-            # revision annotation verifies. Bounded (cap 10 tags/run, oldest-first
-            # from the scan). F12: verification never re-publishes an existing
-            # tag — `not_published` (absent) is re-scheduled, `unknown_provenance`
-            # (existing and unverifiable) is reported and aborts the plan.
-            TAGGED=$(jq -r '[.skipped[] | select(.reason == "already-tagged") | .sha][:10] | join(",")' plan.json)
-            if [ -n "$TAGGED" ]; then
-              python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" --shas "${TAGGED}" > provenance.json
-              VSTATUS=$(jq -r '.status' provenance.json)
-              [ "$VSTATUS" = "ok" ] || die "provenance verification failed (${VSTATUS}: $(jq -r '.detail' provenance.json)); refusing to publish against unknown registry state"
-              jq -r '.results | to_entries[] | select(.value != "published") | .key' provenance.json > nonpublished.txt
-              jq -r '.results | to_entries[] | select(.value == "not_published") | .key' provenance.json > absent.txt
-              jq -r '.results | to_entries[] | select(.value == "unknown_provenance") | .key' provenance.json > unverified.txt
-              if [ -s absent.txt ]; then
-                run_missing
-              fi
-            fi
-            report_unverified
+          fi
+
+          # One shared planner owns tag parsing, membership, the bounded verify
+          # set, and every provenance outcome for both push and backfill plans.
+          python3 scripts/ghcr_plan.py prepare --plan plan.json \
+            --known-tags-file known_tags.txt --max-verify 10 \
+            --rotation "$GITHUB_RUN_NUMBER" > ghcr_prepared.json
+          VERIFY_SHAS=$(jq -r '.verify_shas | join(",")' ghcr_prepared.json)
+          if [ -n "$VERIFY_SHAS" ]; then
+            python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" \
+              --shas "${VERIFY_SHAS}" > provenance.json
+            VSTATUS=$(jq -r '.status' provenance.json)
+            [ "$VSTATUS" = "ok" ] || die "provenance verification failed (${VSTATUS}: $(jq -r '.detail' provenance.json)); refusing to publish against unknown registry state"
+          else
+            printf '{"status":"ok","results":{},"detail":"no existing candidate tags to verify"}\n' > provenance.json
+          fi
+          python3 scripts/ghcr_plan.py finalize --plan plan.json \
+            --known-tags-file known_tags.txt --prepared ghcr_prepared.json \
+            --provenance provenance.json --max-verify 10 \
+            --rotation "$GITHUB_RUN_NUMBER" > ghcr_decision.json
+          DECISION_STATUS=$(jq -r '.status' ghcr_decision.json)
+          if [ "$DECISION_STATUS" != "ok" ]; then
+            {
+              echo "## Provenance reconciliation required"
+              echo "- registry/tag state or provenance could not be verified; publication/overwrite is refused"
+              jq -r '.reconciliation[]' ghcr_decision.json
+            } >> "$GITHUB_STEP_SUMMARY"
+            die "registry/tag state or provenance could not be verified for SHA(s): $(jq -r '.unknown_shas | join(" ")' ghcr_decision.json); refusing to publish while registry state or provenance is unverified — reconcile and re-run"
+          fi
+          jq -c '.plan' ghcr_decision.json > plan.json
+          if [ "$EVENT_NAME" != "push" ] && [ "$(jq '.absent_shas | length' ghcr_decision.json)" -gt 0 ]; then
+            python3 scripts/ghcr_plan.py absent --decision ghcr_decision.json > absent.txt
+            run_missing absent.txt
           fi
           echo "shas=$(jq -c '.shas' plan.json)" >> "$GITHUB_OUTPUT"
           {
@@ -392,8 +366,9 @@ jobs:
             echo "- skipped: $(jq -r '[.skipped[] | "\(.sha[:12]) (\(.reason))"] | join(", ")' plan.json)"
             echo "- overflow: $(jq -r '.overflow | join(" ")' plan.json)"
             echo "- re-scheduled (registry tag proven ABSENT by verification; safe to publish): $(jq -r '[.skipped[] | select(.reason == "tag-provenance-unverified") | .sha[:12]] | join(", ")' plan.json)"
-            echo "- existing tags not verified-published: $(wc -l < nonpublished.txt) (proven absent: $(wc -l < absent.txt); unverifiable -> reconciliation: $(wc -l < unverified.txt))"
-            echo "- existing tags beyond the verify cap (left untouched, provenance unconfirmed): $(tr '\n' ' ' < cap_unverified.txt)"
+            echo "- existing tags verified-published: $(jq '.published_shas | length' ghcr_decision.json)"
+            echo "- existing tags proven absent: $(jq -r '.absent_shas | join(" ")' ghcr_decision.json)"
+            echo "- existing tags beyond the verify cap (left untouched, provenance unconfirmed): $(jq -r '.over_cap_shas | join(" ")' ghcr_decision.json)"
             jq -r '.notes[] | "- " + .' plan.json
           } >> "$GITHUB_STEP_SUMMARY"
           OVERFLOW=$(jq '.overflow | length' plan.json)
@@ -410,6 +385,17 @@ jobs:
           path: scripts/validate_historical.py
           if-no-files-found: error
           retention-days: 1
+      - name: Publish current GHCR verification tools for historical SHA legs
+        # Matrix checkouts may predate these scripts; distribute the trusted
+        # current versions so every locked leg can re-query registry provenance.
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: ghcr-publish-tools
+          path: |
+            scripts/ghcr_tags.py
+            scripts/ghcr_plan.py
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     # PR events never reach plan/publish (event gate + read-only PR token).
@@ -418,9 +404,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-      actions: read # download the historical-validator artifact (F3)
     runs-on: ubuntu-latest
-    continue-on-error: true # per-SHA isolation: a failing intermediate SHA skips its own tag and is reported; other SHAs proceed
+    # Different refs may plan the same SHA as absent. Serialize all publisher
+    # legs for that immutable tag and re-check registry state once the lock is held.
+    concurrency:
+      group: publish-sha-${{ matrix.sha }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -434,6 +423,10 @@ jobs:
         with:
           name: historical-validator
           path: historical-validator
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          name: ghcr-publish-tools
+          path: ghcr-publish-tools
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
       - name: Install (locked dev group)
         run: uv sync --frozen
@@ -450,13 +443,37 @@ jobs:
             echo "- validation: historical validator (commit predates scripts/ci_checks.sh)" >> "$GITHUB_STEP_SUMMARY"
             python3 historical-validator/validate_historical.py --repo .
           fi
+      - name: Recheck SHA tag after acquiring per-SHA lock
+        id: registry_check
+        env:
+          GHCR_OWNER: ${{ needs.plan.outputs.owner }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          if ! python3 ghcr-publish-tools/ghcr_tags.py verify --owner "${GHCR_OWNER}" \
+            --shas "${MATRIX_SHA}" > sha_provenance.json; then
+            echo "::error::post-lock immutable SHA provenance query failed; refusing to publish" >&2
+            exit 1
+          fi
+          ACTION=$(python3 ghcr-publish-tools/ghcr_plan.py verify-publish \
+            --provenance sha_provenance.json --sha "${MATRIX_SHA}")
+          case "$ACTION" in
+            skip) echo "- sha-$MATRIX_SHA: already published with matching provenance; skipped" >> "$GITHUB_STEP_SUMMARY" ;;
+            publish) echo "- sha-$MATRIX_SHA: tag is absent; safe to publish" >> "$GITHUB_STEP_SUMMARY" ;;
+            *) echo "::error::invalid per-SHA publication decision '$ACTION'" >&2; exit 1 ;;
+          esac
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: ${{ steps.registry_check.outputs.action == 'publish' }}
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: ${{ steps.registry_check.outputs.action == 'publish' }}
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate image reference before push
+        if: ${{ steps.registry_check.outputs.action == 'publish' }}
         # F2: fail loudly BEFORE docker/build-push-action receives any
         # reference. Tag reaches the shell only via env indirection.
         env:
@@ -466,6 +483,7 @@ jobs:
           printf '%s' "${IMAGE_TAG}" | LC_ALL=C grep -Eq '^ghcr\.io/[a-z0-9._-]+/shoko-sonarr-linker:sha-[0-9a-f]{40}$' \
             || { echo "::error::invalid image reference '${IMAGE_TAG}'; refusing to invoke docker/build-push-action" >&2; exit 1; }
       - name: Build & push immutable sha-<fullsha> tag
+        if: ${{ steps.registry_check.outputs.action == 'publish' }}
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -486,34 +504,24 @@ jobs:
         run: 'echo "- sha-$MATRIX_SHA: $JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"'
 
   promote-latest:
-    # latest ONLY on default-branch pushes, serialized, head-verified.
+    # latest only for default-branch pushes or main backfills after test/plan
+    # success, serialized, head-verified, and backed by exact-SHA provenance.
     needs: [test, plan, publish]
-    # F5: deliberately NOT gated on needs.publish.result. The publish matrix runs
-    # with continue-on-error: true, so "needs.publish.result == 'success'" is a
-    # vacuous gate (it does not mean every SHA verified). This job's real gate is
-    # its own full re-check: ci_checks.sh against the checked-out SHA plus the
-    # git ls-remote head confirmation below.
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success' }}
+    # fail-fast:false lets every SHA leg run; without job-level continue-on-error,
+    # a failed leg fails publish and blocks promotion. A skipped empty matrix is
+    # allowed only because the exact RUN_SHA provenance check below remains required.
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.backfill)) && github.ref == 'refs/heads/main' && needs.test.result == 'success' && needs.plan.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
     concurrency:
       group: latest-promotion
-      cancel-in-progress: false # never cancel a queued promotion; serialize promotions
+      cancel-in-progress: false
+      # A running promotion is preserved; a newer run may replace an older pending promotion.
+      # The head check immediately before the latest push rejects stale candidates before update.
     permissions:
       contents: read
       packages: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: Confirm this run is still the head of main
-        env:
-          RUN_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          HEAD=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-          if [ "$HEAD" != "$RUN_SHA" ]; then
-            echo "::error::latest NOT promoted: this run's SHA $RUN_SHA is no longer the head of main (now $HEAD); a newer push owns latest — refusing to revert latest to an older build"
-            echo "- latest promotion skipped: run SHA superseded by $HEAD" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
       - name: Install (locked dev group)
         run: uv sync --frozen
@@ -533,6 +541,33 @@ jobs:
           set -euo pipefail
           printf '%s' "${IMAGE_TAG}" | LC_ALL=C grep -Eq '^ghcr\.io/[a-z0-9._-]+/shoko-sonarr-linker:latest$' \
             || { echo "::error::invalid image reference '${IMAGE_TAG}'; refusing to invoke docker/build-push-action" >&2; exit 1; }
+      - name: Verify immutable SHA image and provenance
+        # A successful or skipped matrix result is not image identity proof.
+        # Verify the exact candidate tag now; absent/mismatched images block latest.
+        env:
+          GHCR_OWNER: ${{ needs.plan.outputs.owner }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" \
+            --shas "${RUN_SHA}" > immutable_provenance.json; then
+            echo "::error::immutable SHA provenance query failed; refusing to promote latest" >&2
+            exit 1
+          fi
+          python3 scripts/ghcr_plan.py verify-promotion \
+            --provenance immutable_provenance.json --sha "${RUN_SHA}"
+      - name: Confirm this run is still the head of main
+        env:
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          HEAD=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          if [ "$HEAD" != "$RUN_SHA" ]; then
+            echo "::error::latest NOT promoted: this run's SHA $RUN_SHA is no longer the head of main (now $HEAD); a newer push owns latest — refusing to revert latest to an older build"
+            echo "- latest promotion skipped: run SHA superseded by $HEAD" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
       - name: Build & push latest from the verified head SHA
         # sha- tags are immutable and untouched here; latest is rebuilt from the
         # head SHA's source with identical labels (no mutable tag in publish job).

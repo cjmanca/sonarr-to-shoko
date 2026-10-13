@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,18 @@ def _load_enumerator() -> Any:
     return module
 
 
+def _load_ghcr_planner() -> Any:
+    script = ROOT / "scripts" / "ghcr_plan.py"
+    assert script.is_file(), "the workflow's shared GHCR planner must exist"
+    spec = importlib.util.spec_from_file_location("ghcr_plan", script)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 publish = _load("publish", PUBLISH_TEXT)
 ci = _load("ci", CI_TEXT)
 enum = _load_enumerator()
@@ -68,20 +81,19 @@ def test_publish_permissions_are_least_privilege() -> None:
     assert publish["jobs"]["publish"]["permissions"] == {
         "contents": "read",
         "packages": "write",
-        "actions": "read",
     }
     assert publish["jobs"]["promote-latest"]["permissions"] == {
         "contents": "read",
         "packages": "write",
     }
-    # M8 F3 update: plan legitimately carries packages:read (registry tag
-    # discovery is pull-only) and actions:write (historical-validator artifact);
-    # only publish/promote-latest get packages:write, and the test job keeps none.
+    # Registry discovery is pull-only. Same-run artifact handoff needs no
+    # additional Actions API permission; only publisher jobs need packages:write.
     assert publish["jobs"]["plan"]["permissions"] == {
         "contents": "read",
         "packages": "read",
-        "actions": "write",
     }
+    assert "actions" not in publish["jobs"]["plan"]["permissions"]
+    assert "actions" not in publish["jobs"]["publish"]["permissions"]
     assert "packages" not in json.dumps(publish["jobs"]["test"].get("permissions", {}))
     for name in ("test", "plan"):
         assert "packages: write" not in json.dumps(publish["jobs"][name].get("permissions", {}))
@@ -120,6 +132,12 @@ def test_promote_latest_concurrency_is_serialized() -> None:
     assert "git ls-remote" in _steps(publish["jobs"]["promote-latest"])
 
 
+def test_latest_concurrency_comment_documents_pending_replacement_and_head_guard() -> None:
+    assert "a newer run may replace an older pending promotion" in PUBLISH_TEXT
+    assert "head check immediately before the latest push rejects stale candidates" in PUBLISH_TEXT
+    assert "never cancel a queued promotion" not in PUBLISH_TEXT
+
+
 def test_no_repository_secrets_in_workflows() -> None:
     secret_refs = set(re.findall(r"secrets\.[A-Za-z0-9_]+", PUBLISH_TEXT)) | set(
         re.findall(r"secrets\.[A-Za-z0-9_]+", CI_TEXT)
@@ -138,18 +156,43 @@ def test_triggers_declared_dispatch_inputs_and_schedule() -> None:
     assert triggers["schedule"], "weekly backfill schedule must be declared"
 
 
+def test_dispatch_input_descriptions_explain_selected_branch_recovery() -> None:
+    dispatch_inputs = publish["_triggers"]["workflow_dispatch"]["inputs"]
+    assert "selected refs/heads/* branch" in dispatch_inputs["to_sha"]["description"]
+    assert "fetched head" in dispatch_inputs["to_sha"]["description"]
+    assert "selected repository branch" in dispatch_inputs["backfill"]["description"]
+    assert "each run remains capped" in dispatch_inputs["backfill"]["description"]
+
+
 def test_matrix_cap_matches_script_constant() -> None:
     expected_cap = 10  # published matrix size guidance (plan enforces per run)
     assert expected_cap == enum.DEFAULT_MAX_SHAS
+    planner = _load_ghcr_planner()
+    assert expected_cap == planner.MAX_SHAS_CAP
     plan_dump = _steps(publish["jobs"]["plan"])
-    assert f"MAX={expected_cap}" in plan_dump
     assert "--max-shas" in plan_dump
     assert "$MAX" in plan_dump
-    cap = re.search(r"MAX=(\d+)", plan_dump)
-    assert cap is not None
-    assert int(cap.group(1)) == enum.DEFAULT_MAX_SHAS == expected_cap
-    assert "-gt 10" in plan_dump  # dispatch max_shas is hard-clamped to the cap
-    assert ".shas -=" in plan_dump  # already-tagged SHAs dropped (tag immutability)
+    assert "ghcr_plan.py max-shas" in plan_dump
+    assert "MAX_SHAS_INPUT" in plan_dump
+    assert "ghcr_plan.py prepare" in plan_dump
+    assert "ghcr_plan.py finalize" in plan_dump
+    assert "--max-verify 10" in plan_dump
+    assert '[ "$MAX" -gt 10 ]' not in plan_dump
+    run_missing = re.search(r"(?ms)^[ \t]*run_missing\(\)[ \t]*\{(.*?)^[ \t]*\}", _plan_run())
+    assert run_missing is not None
+    assert '--max-shas "$MAX"' in run_missing.group(1)
+
+
+def test_plan_verification_rotation_uses_same_run_number_for_prepare_and_finalize() -> None:
+    plan_run = _plan_run()
+    prepare = re.search(r"(?ms)^python3 scripts/ghcr_plan.py prepare(.*?)^VERIFY_SHAS=", plan_run)
+    finalize = re.search(
+        r"(?ms)^python3 scripts/ghcr_plan.py finalize(.*?)^DECISION_STATUS=", plan_run
+    )
+    assert prepare is not None
+    assert finalize is not None
+    assert '--rotation "$GITHUB_RUN_NUMBER"' in prepare.group(0)
+    assert '--rotation "$GITHUB_RUN_NUMBER"' in finalize.group(0)
 
 
 def test_shared_check_list_parity() -> None:
@@ -170,7 +213,52 @@ def test_publish_matrix_wired_to_plan_and_isolated() -> None:
     matrix = job["strategy"]["matrix"]
     assert matrix["sha"] == "${{ fromJSON(needs.plan.outputs.shas) }}"
     assert job["strategy"]["fail-fast"] is False
-    assert job["continue-on-error"] is True
+    assert "continue-on-error" not in job
+    assert job["concurrency"] == {
+        "group": "publish-sha-${{ matrix.sha }}",
+        "cancel-in-progress": False,
+    }
+
+
+def test_publish_sha_is_reverified_under_lock_before_docker_steps() -> None:
+    job = publish["jobs"]["publish"]
+    steps = job["steps"]
+    verify_index = next(
+        index
+        for index, step in enumerate(steps)
+        if "ghcr_tags.py verify" in str(step.get("run", ""))
+    )
+    verify = steps[verify_index]
+    assert verify["id"] == "registry_check"
+    assert verify["env"]["MATRIX_SHA"] == "${{ matrix.sha }}"
+    assert "ghcr_plan.py verify-publish" in verify["run"]
+    assert "ghcr-publish-tools/ghcr_tags.py" in verify["run"]
+    assert "ghcr-publish-tools/ghcr_plan.py" in verify["run"]
+    assert "needs.plan.outputs.owner" in verify["env"]["GHCR_OWNER"]
+
+    docker_steps = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith(
+            ("docker/setup-buildx-action@", "docker/login-action@", "docker/build-push-action@")
+        )
+    ]
+    assert docker_steps
+    for step in docker_steps:
+        assert step["if"] == "${{ steps.registry_check.outputs.action == 'publish' }}"
+        assert steps.index(step) > verify_index
+    image_validation = next(
+        step for step in steps if str(step.get("name", "")).startswith("Validate image reference")
+    )
+    assert image_validation["if"] == "${{ steps.registry_check.outputs.action == 'publish' }}"
+
+    tool_download = next(
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+        and step.get("with", {}).get("name") == "ghcr-publish-tools"
+    )
+    assert tool_download < verify_index
 
 
 def test_publish_build_uses_labels_and_scoped_cache() -> None:
@@ -228,11 +316,15 @@ def test_pinned_action_shas_match_tag_header_records() -> None:
             assert f"{tag} " in text
 
 
-def test_publish_workflow_concurrency_never_cancels_queued_sha_runs() -> None:
-    """F2: cancel-in-progress true on publish-* silently drops SHA tags."""
-    concurrency = publish["concurrency"]
-    assert concurrency["group"] == "publish-${{ github.ref }}"
-    assert concurrency["cancel-in-progress"] is False
+def test_publish_workflow_does_not_drop_pushes_and_keeps_job_locks() -> None:
+    """Avoid workflow-level pending-run replacement; retain SHA/latest serialization."""
+    assert "concurrency" not in publish
+    publish_concurrency = publish["jobs"]["publish"]["concurrency"]
+    assert publish_concurrency["group"] == "publish-sha-${{ matrix.sha }}"
+    assert publish_concurrency["cancel-in-progress"] is False
+    latest_concurrency = publish["jobs"]["promote-latest"]["concurrency"]
+    assert latest_concurrency["group"] == "latest-promotion"
+    assert latest_concurrency["cancel-in-progress"] is False
 
 
 def test_plan_dispatch_inputs_flow_only_through_env() -> None:
@@ -253,21 +345,92 @@ def test_plan_dispatch_inputs_flow_only_through_env() -> None:
 
 
 def test_plan_validates_dispatch_shas_and_gates_range() -> None:
-    """F1 hex validation + F3 ancestry gate for dispatch/backfill ranges."""
+    """F1 hex validation + selected-branch ancestry gate for dispatch/backfills."""
     run = next(step for step in publish["jobs"]["plan"]["steps"] if step.get("id") == "plan")["run"]
     assert "not-40-hex" in run
     assert "{40}" in run  # 40-hex regex guard on from_sha/to_sha inputs
     assert "merge-base --is-ancestor" in run
-    assert "not-ancestor-of-main" in run
-    assert "refs/heads/main" in run  # ancestry checked against the current main head
+    assert "not-ancestor-of-selected-branch-head" in run
+    assert "not-ancestor-of-to-sha" in run
+    assert "refs/heads/*" in run
+
+
+def test_dispatch_uses_trusted_plan_checkout_and_fetches_selected_branch() -> None:
+    plan_checkout = next(
+        step
+        for step in publish["jobs"]["plan"]["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert plan_checkout.get("with", {}).get("ref") == (
+        "${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.ref }}"
+    )
+    assert plan_checkout["with"]["fetch-depth"] == 0
+
+    run = _plan_run()
+    dispatch = run.find('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then')
+    branch_guard = run.find('case "$PUSH_REF" in', dispatch)
+    fetch_selected = run.find('git fetch --no-tags origin "$PUSH_REF"', branch_guard)
+    resolve_branch = run.find("BRANCH_HEAD=$(git rev-parse FETCH_HEAD)", fetch_selected)
+    default_branch = run.find('if [ -z "$TO" ]; then TO="$BRANCH_HEAD"; fi', resolve_branch)
+    validate_to = run.find('if [ -n "$TO" ] && ! is_full_sha "$TO";', default_branch)
+    ancestry = run.find('git merge-base --is-ancestor "$TO" "$BRANCH_HEAD"', validate_to)
+    enumerate_missing = run.find("run_missing\n", ancestry)
+
+    assert (
+        min(
+            dispatch,
+            branch_guard,
+            fetch_selected,
+            resolve_branch,
+            default_branch,
+            validate_to,
+            ancestry,
+            enumerate_missing,
+        )
+        >= 0
+    )
+    assert (
+        dispatch
+        < branch_guard
+        < fetch_selected
+        < resolve_branch
+        < default_branch
+        < validate_to
+        < ancestry
+        < enumerate_missing
+    )
+    assert "refs/heads/*)" in run
+    assert '*) die "workflow_dispatch ref must be a branch' in run
+    assert "git fetch --no-tags origin refs/heads/main" not in run
+    assert 'if [ -z "$TO" ]; then TO="$PUSH_SHA"; fi' in run
+
+
+def test_backfill_from_sha_must_be_ancestor_of_to_sha_before_enumeration() -> None:
+    run = _plan_run()
+    validate_from = run.find('if [ -n "$FROM" ] && ! is_full_sha "$FROM";')
+    from_boundary = run.find('git merge-base --is-ancestor "$FROM" "$TO"', validate_from)
+    enumerate_missing = run.find("run_missing\n", from_boundary)
+
+    assert validate_from >= 0
+    assert from_boundary > validate_from
+    assert enumerate_missing > from_boundary
+    assert "not-ancestor-of-to-sha" in run
+
+
+def test_failed_sha_backfill_comment_describes_registry_recheck() -> None:
+    assert re.search(
+        r"later backfill\s+#\s+rechecks registry provenance for the failed SHA",
+        PUBLISH_TEXT,
+    )
+    assert "The missing SHA stays untagged for the next backfill" not in PUBLISH_TEXT
 
 
 def test_plan_cap_fails_closed_on_nonpositive_value() -> None:
-    """F4: max_shas <= 0 must abort the plan, never bypass the matrix cap."""
+    """F4: Python validates/clamps the decimal input before shell integer operations."""
     run = next(step for step in publish["jobs"]["plan"]["steps"] if step.get("id") == "plan")["run"]
-    assert '[ "$MAX" -le 0 ]' in run
-    assert "positive" in run
-    assert "-gt 10" in run  # clamp ceiling retained
+    assert 'MAX=$(python3 scripts/ghcr_plan.py max-shas --value "${MAX_SHAS_INPUT}")' in run
+    assert '[ "$MAX" -le 0 ]' not in run
+    assert '[ "$MAX" -gt 10 ]' not in run
 
 
 def test_plan_handles_branch_deletion_push() -> None:
@@ -279,15 +442,80 @@ def test_plan_handles_branch_deletion_push() -> None:
     assert 'echo "shas=[]"' in run
 
 
-def test_promote_gate_does_not_rely_on_publish_result() -> None:
-    """F5: continue-on-error makes needs.publish.result vacuous; promote re-checks fully."""
+def test_promote_gate_requires_successful_publish_or_empty_matrix_skip() -> None:
+    """A failed per-SHA publish blocks latest; an empty matrix still has a registry gate."""
     promote_if = str(publish["jobs"]["promote-latest"]["if"])
-    assert "needs.publish.result" not in promote_if
+    assert publish["jobs"]["promote-latest"]["needs"] == ["test", "plan", "publish"]
+    assert "needs.publish.result == 'success'" in promote_if
+    assert "needs.publish.result == 'skipped'" in promote_if
+    assert "needs.publish.result == 'failure'" not in promote_if
     assert "needs.test.result == 'success'" in promote_if
+    assert "needs.plan.result == 'success'" in promote_if
     assert "!cancelled()" in promote_if
-    steps_dump = _steps(publish["jobs"]["promote-latest"])
-    assert "scripts/ci_checks.sh" in steps_dump  # the real gate: full per-SHA re-check
-    assert "git ls-remote" in steps_dump
+    promote = publish["jobs"]["promote-latest"]
+    steps = promote["steps"]
+    assert "scripts/ci_checks.sh" in _steps(promote)
+    verify = next(
+        i for i, step in enumerate(steps) if "ghcr_tags.py verify" in str(step.get("run", ""))
+    )
+    push = next(
+        i
+        for i, step in enumerate(steps)
+        if "docker/build-push-action@" in str(step.get("uses", ""))
+    )
+    assert verify < push
+    verify_run = steps[verify]["run"]
+    assert "ghcr_plan.py verify-promotion" in verify_run
+    assert "set -euo pipefail" in verify_run
+    assert "needs.plan.result == 'success'" in promote_if
+    assert "RUN_SHA" in steps[verify]["env"]
+    assert "git ls-remote" in _steps(promote)
+
+
+def test_latest_allows_safe_main_backfill_events() -> None:
+    promote = publish["jobs"]["promote-latest"]
+    promote_if = str(promote["if"])
+    assert "github.event_name == 'push'" in promote_if
+    assert "github.event_name == 'schedule'" in promote_if
+    assert "(github.event_name == 'workflow_dispatch' && inputs.backfill)" in promote_if
+    assert "github.ref == 'refs/heads/main'" in promote_if
+    assert "needs.test.result == 'success'" in promote_if
+    assert "needs.plan.result == 'success'" in promote_if
+    assert "needs.publish.result == 'success'" in promote_if
+    assert "needs.publish.result == 'skipped'" in promote_if
+    assert promote_if.count("github.ref == 'refs/heads/main'") == 1
+    assert "PUSH_REF" not in promote_if
+
+    steps = promote["steps"]
+    assert "scripts/ci_checks.sh" in _steps(promote)
+    verify = next(step for step in steps if "ghcr_tags.py verify" in str(step.get("run", "")))
+    assert verify["env"]["RUN_SHA"] == "${{ github.sha }}"
+    head_check = next(
+        index
+        for index, step in enumerate(steps)
+        if "git ls-remote origin refs/heads/main" in str(step.get("run", ""))
+    )
+    latest_push = next(
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("docker/build-push-action@")
+        and step.get("with", {}).get("tags") == "${{ needs.plan.outputs.image }}:latest"
+    )
+    assert head_check + 1 == latest_push
+
+
+def test_skipped_empty_publish_matrix_still_requires_exact_sha_verification() -> None:
+    publish_job = publish["jobs"]["publish"]
+    promote_if = str(publish["jobs"]["promote-latest"]["if"])
+    assert publish_job["strategy"]["fail-fast"] is False
+    assert "needs.publish.result == 'skipped'" in promote_if
+
+    steps = publish["jobs"]["promote-latest"]["steps"]
+    verify = next(step for step in steps if "ghcr_tags.py verify" in str(step.get("run", "")))
+    assert verify.get("if") is None
+    assert verify["env"]["RUN_SHA"] == "${{ github.sha }}"
+    assert '--shas "${RUN_SHA}"' in verify["run"]
+    assert "ghcr_plan.py verify-promotion" in verify["run"]
 
 
 def _plan_run() -> str:
@@ -386,6 +614,8 @@ def test_plan_discovers_registry_tags_not_git_tags() -> None:
     )
     assert registry_step["env"]["GHCR_OWNER"] == "${{ steps.image_name.outputs.owner }}"
     assert "refusing to publish against unknown registry state" in registry_step["run"]
+    assert "ghcr_plan.py tags --registry registry.json" in registry_step["run"]
+    assert "jq -r '.tags[]'" not in registry_step["run"]
     assert (
         "package_missing" in registry_step["run"]
     )  # fresh-package state is explicit, not a failure
@@ -404,20 +634,27 @@ def test_plan_verifies_tag_provenance_before_trusting_it() -> None:
     (a sha- tag name derived from a commit is not proof of immutability)."""
     plan_run = _plan_run()
     assert "ghcr_tags.py verify" in plan_run
+    assert "ghcr_plan.py prepare" in plan_run
+    assert "ghcr_plan.py finalize" in plan_run
+    assert "ghcr_plan.py absent" in plan_run
     assert "provenance verification failed" in plan_run
-    assert 'select(.value != "published")' in plan_run
-    assert 'select(.value == "not_published")' in plan_run  # absent -> publishable
-    assert 'select(.value == "unknown_provenance")' in plan_run  # existing -> reconciliation
-    assert "unverified.txt" in plan_run
-    assert "--unverified-file absent.txt" in plan_run  # only proven-absent SHAs re-enter the set
-    # F12: an EXISTING unverifiable tag never enters the publish set:
-    assert "--unverified-file unverified.txt" not in plan_run
-    assert "report_unverified" in plan_run
-    assert "cap_unverified.txt" in plan_run  # beyond-cap existing tags reported, never pushed
+    assert "reconciliation" in plan_run
+    assert '--unverified-file "$extra_unverified"' in plan_run
+    assert "run_missing absent.txt" in plan_run  # only proven-absent SHAs re-enter the set
+    assert "over_cap_shas" in plan_run
     assert "Provenance reconciliation required" in plan_run
-    assert "refusing to publish over an unverifiable image" in plan_run
-    assert plan_run.count("ghcr_tags.py verify") == 2  # push path + backfill path
-    assert plan_run.count("report_unverified") == 3  # definition + both event paths
+    assert "refusing to publish while registry state or provenance is unverified" in plan_run
+    assert "--rawfile res provenance.json" not in plan_run
+    assert "select($pub | index(.))" not in plan_run
+    assert plan_run.count("ghcr_tags.py verify") == 1  # common planner path for push and backfill
+
+
+def test_unknown_provenance_wording_does_not_assert_tag_exists() -> None:
+    tag_tool_text = (ROOT / "scripts" / "ghcr_tags.py").read_text(encoding="utf-8")
+    assert "unknown_provenance  -> registry/tag state or provenance could not be" in PUBLISH_TEXT
+    assert "unknown_provenance  -> tag EXISTS" not in PUBLISH_TEXT
+    assert "registry/tag state or provenance could not be verified" in tag_tool_text
+    assert "The tag EXISTS and its content is unknown" not in tag_tool_text
 
 
 def test_plan_uploads_and_publish_downloads_historical_validator() -> None:
@@ -447,3 +684,420 @@ def test_plan_uploads_and_publish_downloads_historical_validator() -> None:
     assert "validate_historical.py" in leg_run
     assert (ROOT / "scripts" / "validate_historical.py").is_file()
     assert (ROOT / "scripts" / "ghcr_tags.py").is_file()
+
+
+def test_plan_uploads_and_publish_downloads_current_ghcr_tools() -> None:
+    upload = next(
+        step
+        for step in publish["jobs"]["plan"]["steps"]
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        and step.get("with", {}).get("name") == "ghcr-publish-tools"
+    )
+    assert "scripts/ghcr_tags.py" in upload["with"]["path"]
+    assert "scripts/ghcr_plan.py" in upload["with"]["path"]
+
+    download = next(
+        step
+        for step in publish["jobs"]["publish"]["steps"]
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+        and step.get("with", {}).get("name") == "ghcr-publish-tools"
+    )
+    assert download["with"]["path"] == "ghcr-publish-tools"
+
+
+def _sha(number: int) -> str:
+    return f"{number:040x}"
+
+
+def test_registry_tag_normalization_handles_empty_single_multiple_and_newlines() -> None:
+    planner = _load_ghcr_planner()
+
+    assert planner.registry_tags_to_text({"status": "package_missing", "tags": []}) == ""
+    assert planner.registry_tags_to_text({"status": "ok", "tags": []}) == ""
+    assert planner.normalize_tag_lines("") == set()
+    assert planner.normalize_tag_lines("\n\n") == set()
+    one = f"sha-{_sha(1)}"
+    two = f"sha-{_sha(2)}"
+    with pytest.raises(planner.PlanError, match="package_missing.*empty tags"):
+        planner.registry_tags_to_text({"status": "package_missing", "tags": [one]})
+    assert planner.normalize_tag_lines(one) == {_sha(1)}
+    assert planner.normalize_tag_lines(f"{one}\n") == {_sha(1)}
+    assert planner.normalize_tag_lines(f"{one}\n\n{two}\nlatest\n") == {
+        _sha(1),
+        _sha(2),
+    }
+    assert planner.registry_tags_to_text({"status": "ok", "tags": [one, two, "latest"]}) == (
+        f"{one}\n{two}\n"
+    )
+
+
+def test_malformed_sha_tag_fails_closed() -> None:
+    planner = _load_ghcr_planner()
+    for malformed in ("sha-not-a-full-sha", f"SHA-{_sha(1)}", f"sha-{_sha(1)} "):
+        with pytest.raises(planner.PlanError, match="invalid sha tag"):
+            planner.normalize_tag_lines(malformed)
+
+
+def test_planner_membership_skips_only_published_candidate_and_keeps_missing() -> None:
+    planner = _load_ghcr_planner()
+    a, b, c = _sha(1), _sha(2), _sha(3)
+    plan = {"shas": [a, b, c], "skipped": [], "overflow": [], "notes": []}
+    known_tags = f"sha-{b}\n"
+
+    prepared = planner.prepare_plan(plan, known_tags, max_verify=10)
+    assert prepared["verify_shas"] == [b]
+
+    decision = planner.finalize_plan(
+        plan,
+        known_tags,
+        prepared,
+        {"status": "ok", "results": {b: "published"}},
+        max_verify=10,
+    )
+    assert decision["status"] == "ok"
+    assert decision["plan"]["shas"] == [a, c]
+    assert decision["published_shas"] == [b]
+    assert decision["absent_shas"] == []
+
+
+def test_absent_and_unverified_existing_tags_have_distinct_safe_outcomes() -> None:
+    planner = _load_ghcr_planner()
+    a, b = _sha(4), _sha(5)
+    plan = {"shas": [a, b], "skipped": [], "overflow": [], "notes": []}
+    known_tags = f"sha-{a}\nsha-{b}\n"
+    prepared = planner.prepare_plan(plan, known_tags)
+
+    decision = planner.finalize_plan(
+        plan,
+        known_tags,
+        prepared,
+        {
+            "status": "ok",
+            "results": {a: "not_published", b: "unknown_provenance"},
+        },
+    )
+    assert decision["status"] == "reconciliation_required"
+    assert decision["plan"]["shas"] == [a]
+    assert decision["absent_shas"] == [a]
+    assert decision["unknown_shas"] == [b]
+    assert decision["reconciliation"] == planner.reconciliation_lines(
+        {"status": "ok", "results": {b: "unknown_provenance"}}, [b]
+    )
+    assert f"sha-{b}" in decision["reconciliation"][0]
+
+
+def test_omitted_expected_provenance_is_unknown_and_never_publishable() -> None:
+    planner = _load_ghcr_planner()
+    sha = _sha(6)
+    plan = {"shas": [sha], "skipped": [], "overflow": [], "notes": []}
+    known_tags = f"sha-{sha}\n"
+    prepared = planner.prepare_plan(plan, known_tags)
+
+    decision = planner.finalize_plan(
+        plan,
+        known_tags,
+        prepared,
+        {"status": "ok", "results": {}},
+    )
+    assert decision["status"] == "reconciliation_required"
+    assert decision["unknown_shas"] == [sha]
+    assert decision["plan"]["shas"] == []
+    assert decision["reconciliation"] == planner.reconciliation_lines(
+        {"status": "ok", "results": {}}, [sha]
+    )
+
+
+def test_finalized_backfill_absent_skipped_sha_does_not_grow_capped_plan() -> None:
+    planner = _load_ghcr_planner()
+    shas = [_sha(number) for number in range(30, 40)]
+    skipped_sha = _sha(40)
+    plan = {
+        "shas": shas,
+        "skipped": [{"sha": skipped_sha, "reason": "already-tagged"}],
+        "overflow": [],
+        "notes": [],
+    }
+    known_tags = f"sha-{skipped_sha}\n"
+    prepared = planner.prepare_plan(plan, known_tags, max_verify=10)
+    decision = planner.finalize_plan(
+        plan,
+        known_tags,
+        prepared,
+        {"status": "ok", "results": {skipped_sha: "not_published"}},
+        max_verify=10,
+    )
+
+    assert decision["plan"]["shas"] == shas
+    assert len(decision["plan"]["shas"]) == 10
+    assert decision["absent_shas"] == [skipped_sha]
+
+
+def test_verification_cap_excludes_all_existing_tags_beyond_ten() -> None:
+    planner = _load_ghcr_planner()
+    shas = [_sha(i) for i in range(10, 22)]
+    plan = {
+        "shas": [],
+        "skipped": [{"sha": sha, "reason": "already-tagged"} for sha in shas],
+        "overflow": [],
+        "notes": [],
+    }
+    known_tags = "".join(f"sha-{sha}\n" for sha in shas)
+
+    prepared = planner.prepare_plan(plan, known_tags, max_verify=10)
+    assert prepared["verify_shas"] == shas[:10]
+    assert prepared["over_cap_shas"] == shas[10:]
+    decision = planner.finalize_plan(
+        plan,
+        known_tags,
+        prepared,
+        {"status": "ok", "results": {sha: "published" for sha in shas[:10]}},
+        max_verify=10,
+    )
+    assert decision["plan"]["shas"] == []
+    assert decision["over_cap_shas"] == shas[10:]
+    assert not set(decision["plan"]["shas"]) & set(shas[10:])
+
+
+def test_verification_window_rotates_across_existing_candidates_and_finalize_matches() -> None:
+    planner = _load_ghcr_planner()
+    shas = [_sha(number) for number in range(10, 30)]
+    plan = {"shas": shas, "skipped": [], "overflow": [], "notes": []}
+    known_tags = "".join(f"sha-{sha}\n" for sha in shas)
+
+    first = planner.prepare_plan(plan, known_tags, max_verify=10, rotation=0)
+    second = planner.prepare_plan(plan, known_tags, max_verify=10, rotation=10)
+
+    assert first["verify_shas"] == shas[:10]
+    assert second["verify_shas"] == shas[10:]
+    assert not set(first["verify_shas"]) & set(second["verify_shas"])
+    assert set(first["verify_shas"]) | set(second["verify_shas"]) == set(shas)
+    assert first["over_cap_shas"] == shas[10:]
+    assert second["over_cap_shas"] == shas[:10]
+
+    with pytest.raises(planner.PlanError, match="rotation"):
+        planner.finalize_plan(
+            plan,
+            known_tags,
+            first,
+            {"status": "ok", "results": {sha: "published" for sha in shas[:10]}},
+            max_verify=10,
+            rotation=10,
+        )
+
+    decision = planner.finalize_plan(
+        plan,
+        known_tags,
+        second,
+        {"status": "ok", "results": {sha: "not_published" for sha in shas[10:]}},
+        max_verify=10,
+        rotation=10,
+    )
+    assert decision["verify_shas"] == shas[10:]
+    assert decision["over_cap_shas"] == shas[:10]
+    assert decision["absent_shas"] == shas[10:]
+    assert decision["plan"]["shas"] == shas[10:]
+    assert not set(decision["plan"]["shas"]) & set(shas[:10])
+
+
+def test_rotation_wraps_while_preserving_candidate_order() -> None:
+    planner = _load_ghcr_planner()
+    shas = [_sha(number) for number in range(20, 40)]
+    plan = {
+        "shas": [],
+        "skipped": [{"sha": sha, "reason": "already-tagged"} for sha in shas],
+        "overflow": [],
+        "notes": [],
+    }
+    known_tags = "".join(f"sha-{sha}\n" for sha in shas)
+
+    prepared = planner.prepare_plan(plan, known_tags, max_verify=10, rotation=15)
+
+    assert prepared["verify_shas"] == shas[:5] + shas[15:]
+    assert prepared["over_cap_shas"] == shas[5:15]
+
+
+def test_rotation_cli_accepts_nonnegative_value_and_rejects_negative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    planner = _load_ghcr_planner()
+    shas = [_sha(number) for number in range(40, 60)]
+    plan_path = tmp_path / "plan.json"
+    known_tags_path = tmp_path / "known-tags.txt"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "shas": [],
+                "skipped": [{"sha": sha, "reason": "already-tagged"} for sha in shas],
+            }
+        ),
+        encoding="utf-8",
+    )
+    known_tags_path.write_text("".join(f"sha-{sha}\n" for sha in shas), encoding="utf-8")
+
+    assert (
+        planner.main(
+            [
+                "prepare",
+                "--plan",
+                str(plan_path),
+                "--known-tags-file",
+                str(known_tags_path),
+                "--rotation",
+                "10",
+            ]
+        )
+        == 0
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    assert prepared["rotation"] == 10
+    assert prepared["verify_shas"] == shas[10:]
+
+    prepared_path = tmp_path / "prepared.json"
+    provenance_path = tmp_path / "provenance.json"
+    prepared_path.write_text(json.dumps(prepared), encoding="utf-8")
+    provenance_path.write_text(
+        json.dumps({"status": "ok", "results": {sha: "published" for sha in shas[10:]}}),
+        encoding="utf-8",
+    )
+    assert (
+        planner.main(
+            [
+                "finalize",
+                "--plan",
+                str(plan_path),
+                "--known-tags-file",
+                str(known_tags_path),
+                "--prepared",
+                str(prepared_path),
+                "--provenance",
+                str(provenance_path),
+                "--rotation",
+                "10",
+            ]
+        )
+        == 0
+    )
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["verify_shas"] == shas[10:]
+
+    assert (
+        planner.main(
+            [
+                "prepare",
+                "--plan",
+                str(plan_path),
+                "--known-tags-file",
+                str(known_tags_path),
+                "--rotation",
+                "-1",
+            ]
+        )
+        == 2
+    )
+    assert "rotation" in capsys.readouterr().err
+
+    assert (
+        planner.main(
+            [
+                "finalize",
+                "--plan",
+                str(plan_path),
+                "--known-tags-file",
+                str(known_tags_path),
+                "--prepared",
+                str(prepared_path),
+                "--provenance",
+                str(provenance_path),
+                "--rotation",
+                "-1",
+            ]
+        )
+        == 2
+    )
+    assert "rotation" in capsys.readouterr().err
+
+
+def test_planner_rejects_negative_rotation_for_prepare_and_finalize() -> None:
+    planner = _load_ghcr_planner()
+    sha = _sha(61)
+    plan = {"shas": [sha], "skipped": [], "overflow": [], "notes": []}
+    known_tags = f"sha-{sha}\n"
+
+    with pytest.raises(planner.PlanError, match="rotation"):
+        planner.prepare_plan(plan, known_tags, rotation=-1)
+
+    prepared = planner.prepare_plan(plan, known_tags)
+    with pytest.raises(planner.PlanError, match="rotation"):
+        planner.finalize_plan(
+            plan,
+            known_tags,
+            prepared,
+            {"status": "ok", "results": {sha: "published"}},
+            rotation=-1,
+        )
+
+
+def test_provenance_report_uses_parsed_json_results() -> None:
+    planner = _load_ghcr_planner()
+    sha = _sha(23)
+    provenance = json.loads(json.dumps({"status": "ok", "results": {sha: "unknown_provenance"}}))
+    assert planner.reconciliation_lines(provenance, [sha]) == [
+        f"- sha-{sha}: registry tag state unknown_provenance — reconcile the existing tag "
+        "(inspect/pin/delete), then re-run backfill"
+    ]
+
+
+def test_latest_requires_exact_verified_immutable_sha_provenance() -> None:
+    planner = _load_ghcr_planner()
+    sha = _sha(24)
+    assert planner.promotion_provenance_is_valid(
+        {"status": "ok", "results": {sha: "published"}}, sha
+    )
+    for provenance in (
+        {"status": "ok", "results": {sha: "not_published"}},
+        {"status": "ok", "results": {sha: "unknown_provenance"}},
+        {"status": "ok", "results": {_sha(25): "published"}},
+        {"status": "auth_failure", "results": {sha: "published"}},
+    ):
+        assert not planner.promotion_provenance_is_valid(provenance, sha)
+
+
+def test_publish_provenance_recheck_skips_published_and_allows_absent() -> None:
+    planner = _load_ghcr_planner()
+    decide = getattr(planner, "publish_provenance_action", None)
+    assert callable(decide), "the workflow's publish decision must be shared and executable"
+    sha = _sha(26)
+    assert decide({"status": "ok", "results": {sha: "published"}}, sha) == "skip"
+    assert decide({"status": "ok", "results": {sha: "not_published"}}, sha) == "publish"
+
+
+def test_publish_provenance_recheck_fails_closed_on_unknown_or_malformed_results() -> None:
+    planner = _load_ghcr_planner()
+    decide = getattr(planner, "publish_provenance_action", None)
+    assert callable(decide), "the workflow's publish decision must be shared and executable"
+    sha = _sha(27)
+    for provenance in (
+        {"status": "ok", "results": {sha: "unknown_provenance"}},
+        {"status": "ok", "results": {}},
+        {"status": "ok", "results": {sha: "unexpected"}},
+        {"status": "network_failure", "results": {sha: "published"}},
+        {"status": "ok", "results": []},
+    ):
+        with pytest.raises(planner.PlanError):
+            decide(provenance, sha)
+
+
+def test_max_shas_parser_validates_and_clamps_without_integer_overflow() -> None:
+    planner = _load_ghcr_planner()
+    parse_max = getattr(planner, "parse_max_shas", None)
+    assert callable(parse_max), "max_shas must be parsed through the shared safe planner"
+
+    assert parse_max("") == 10
+    assert parse_max("1") == 1
+    assert parse_max("10") == 10
+    assert parse_max("0007") == 7
+    assert parse_max("00010") == 10
+    assert parse_max("999999999999999999999999999999999999999999999999") == 10
+    for invalid in ("0", "0000", "-1", "1.5", " 2", "abc"):
+        with pytest.raises(planner.PlanError, match="positive decimal"):
+            parse_max(invalid)

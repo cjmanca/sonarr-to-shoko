@@ -31,11 +31,13 @@ ABORT the run on that outcome — never publish against unknown registry state.
 Provenance verification (``verify``) is best-effort and bounded. A ``sha-``
 tag counts as published ONLY when the manifest/config chain carries the OCI
 annotation ``org.opencontainers.image.revision`` equal to the full SHA. A tag
-that the registry answers 404 for is ``not_published`` (absent, safe to
-publish). Any fetch/parse failure yields ``unknown_provenance``: the tag
-EXISTS and its content cannot be verified, so the CONSUMER must NOT re-push or
-overwrite it — a ``sha-`` tag NAME derived from a commit is not proof that the
-existing image is the right or immutable one. Publication policy (skip /
+that the registry answers 404 for, or a manifest 401 carrying the OCI error
+code ``NAME_UNKNOWN`` after token exchange, is ``not_published`` (absent, safe
+to publish). Other auth/fetch/parse failures yield ``unknown_provenance``:
+registry/tag state or provenance could not be verified, so the CONSUMER must
+NOT publish or overwrite until reconciled — a ``sha-`` tag NAME derived from
+a commit is not proof that registry state or image provenance is known.
+Publication policy (skip /
 publish / reconcile) is owned by ``.github/workflows/publish.yml``.
 
 Per the OCI Distribution Spec, manifests are read through
@@ -68,7 +70,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any, Protocol, cast
 
 REGISTRY = "https://ghcr.io"
@@ -77,7 +79,7 @@ USER_AGENT = "shoko-sonarr-linker-ghcr-tags/1.0"
 NAME_SEGMENT = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
-LINK_NEXT = re.compile(r'^<([^>]+)>\s*;\s*rel\s*=\s*"?next"?$', flags=re.IGNORECASE)
+LINK_PARAM_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 STATUS_OK = "ok"
 STATUS_PACKAGE_MISSING = "package_missing"
@@ -109,6 +111,9 @@ _MANIFEST_MEDIA_TYPES = (
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 )
+_SUPPORTED_MANIFEST_MEDIA_TYPES = frozenset(
+    media_type.lower() for media_type in _MANIFEST_MEDIA_TYPES
+)
 ACCEPT_MANIFESTS = ", ".join(_MANIFEST_MEDIA_TYPES)
 _INDEX_TYPES = frozenset(
     {
@@ -122,6 +127,13 @@ _IMAGE_MANIFEST_TYPES = frozenset(
         "application/vnd.docker.distribution.manifest.v2+json",
     }
 )
+_SUPPORTED_CONFIG_MEDIA_TYPES = frozenset(
+    {
+        "application/vnd.oci.image.config.v1+json",
+        "application/vnd.docker.container.image.v1+json",
+    }
+)
+_GENERIC_CONFIG_MEDIA_TYPE = "application/octet-stream"
 ACCEPT_CONFIG = ", ".join(
     (
         "application/vnd.oci.image.config.v1+json",
@@ -179,9 +191,53 @@ class Response(Protocol):
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None: ...
 
 
+def _https_origin(url: str) -> tuple[str, str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    hostname = parsed.hostname
+    if parsed.scheme.lower() != "https" or hostname is None:
+        raise ValueError("redirect URL must have an HTTPS origin")
+    port = parsed.port
+    return "https", hostname.lower(), 443 if port is None else port
+
+
+class _AuthorizationSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Restrict redirects to HTTPS and credentials to their original origin."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        try:
+            source_origin = _https_origin(req.full_url)
+            destination_origin = _https_origin(newurl)
+        except ValueError as exc:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                "refusing redirect without a valid HTTPS origin",
+                headers,
+                fp,
+            ) from exc
+
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and source_origin != destination_origin:
+            protected_headers = {"authorization", "proxy-authorization"}
+            for header_map in (redirected.headers, redirected.unredirected_hdrs):
+                for name in list(header_map):
+                    if name.lower() in protected_headers:
+                        del header_map[name]
+        return redirected
+
+
 def _open(request: urllib.request.Request, timeout: float) -> Response:
     """Single seam for the HTTP opener so tests can monkeypatch it."""
-    response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - ghcr.io https only
+    opener = urllib.request.build_opener(_AuthorizationSafeRedirectHandler())
+    response = opener.open(request, timeout=timeout)
     return cast(Response, response)  # URL host/scheme enforced by _registry_url
 
 
@@ -202,15 +258,15 @@ class UrllibTransport:
             with _open(request, timeout) as response:
                 body = response.read()
                 status = int(response.status)
-                raw_headers = dict(response.getheaders())
+                raw_headers = response.getheaders()
         except urllib.error.HTTPError as exc:
             body = exc.read()
             status = int(exc.code)
-            raw_headers = dict(exc.headers.items())
+            raw_headers = exc.headers.items()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             msg = f"transport error for {url}: {exc}"
             raise NetworkFailureError(msg) from exc
-        lowered = {key.lower(): value for key, value in raw_headers.items()}
+        lowered = _normalize_headers(raw_headers)
         return status, lowered, body
 
 
@@ -230,6 +286,25 @@ def _registry_url(path: str) -> str:
         msg = f"refusing non-ghcr.io URL: {path!r}"
         raise RegistryUnavailableError(msg)
     return path
+
+
+def _normalize_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """Lowercase response header names and combine repeated Link fields."""
+    normalized: dict[str, str] = {}
+    link_values: list[str] = []
+    for name, value in headers:
+        key = name.lower()
+        if key == "link":
+            link_values.append(value.strip())
+        elif key == "content-type":
+            if key in normalized and normalized[key] != value:
+                raise RegistryUnavailableError("conflicting duplicate Content-Type headers")
+            normalized[key] = value
+        else:
+            normalized[key] = value
+    if link_values:
+        normalized["link"] = ", ".join(link_values)
+    return normalized
 
 
 def _exchange_token(
@@ -281,15 +356,171 @@ def _oci_error_detail(body: bytes) -> str:
     return "<no OCI error codes>"
 
 
-def _next_page_url(headers: dict[str, str]) -> str | None:
+def _has_oci_error_code(body: bytes, code: str) -> bool:
+    """Return whether an OCI error response explicitly carries ``code``."""
+    try:
+        document = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    errors = document.get("errors") if isinstance(document, dict) else None
+    return isinstance(errors, list) and any(
+        isinstance(item, dict) and item.get("code") == code for item in errors
+    )
+
+
+def _advance_link_state(
+    char: str, in_target: bool, in_quote: bool, escaped: bool
+) -> tuple[bool, bool, bool, bool]:
+    """Advance Link-field scanning state; the final item marks a list comma."""
+    separator = False
+    if in_quote:
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            in_quote = False
+    elif in_target:
+        if char == ">":
+            in_target = False
+        elif char in '<"':
+            raise RegistryUnavailableError("malformed Link header: invalid URI-reference")
+    elif char == '"':
+        in_quote = True
+    elif char == "<":
+        in_target = True
+    elif char == ">":
+        raise RegistryUnavailableError("malformed Link header: unmatched '>'")
+    elif char == ",":
+        separator = True
+    return in_target, in_quote, escaped, separator
+
+
+def _split_link_values(header: str) -> list[str]:
+    """Split a Link field at commas outside targets and quoted parameter values."""
+    values: list[str] = []
+    start = 0
+    in_target = False
+    in_quote = False
+    escaped = False
+    for index, char in enumerate(header):
+        in_target, in_quote, escaped, separator = _advance_link_state(
+            char, in_target, in_quote, escaped
+        )
+        if separator:
+            value = header[start:index].strip()
+            if value:
+                values.append(value)
+            start = index + 1
+    if in_quote or escaped or in_target:
+        raise RegistryUnavailableError("malformed Link header: unterminated quote or URI-reference")
+    final_value = header[start:].strip()
+    if final_value:
+        values.append(final_value)
+    return values
+
+
+def _skip_link_whitespace(value: str, position: int) -> int:
+    while position < len(value) and value[position] in " \t":
+        position += 1
+    return position
+
+
+def _parse_quoted_link_parameter(value: str, position: int) -> tuple[str, int]:
+    parsed: list[str] = []
+    position += 1
+    while position < len(value):
+        char = value[position]
+        position += 1
+        if char == "\\":
+            if position == len(value):
+                raise RegistryUnavailableError("malformed Link header: invalid quoted escape")
+            parsed.append(value[position])
+            position += 1
+        elif char == '"':
+            return "".join(parsed), position
+        else:
+            parsed.append(char)
+    raise RegistryUnavailableError("malformed Link header: unterminated quoted value")
+
+
+def _parse_link_parameter(value: str, position: int) -> tuple[str, str | None, int]:
+    position = _skip_link_whitespace(value, position)
+    name_match = LINK_PARAM_TOKEN.match(value, position)
+    if name_match is None:
+        raise RegistryUnavailableError("malformed Link header: invalid parameter name")
+    name = name_match.group(0).lower()
+    position = _skip_link_whitespace(value, name_match.end())
+    if position == len(value) or value[position] != "=":
+        return name, None, position
+    position = _skip_link_whitespace(value, position + 1)
+    if position == len(value):
+        raise RegistryUnavailableError("malformed Link header: parameter has no value")
+    if value[position] == '"':
+        parameter_value, position = _parse_quoted_link_parameter(value, position)
+        return name, parameter_value, position
+
+    value_start = position
+    while position < len(value) and value[position] not in "; \t":
+        if value[position] in '<">':
+            raise RegistryUnavailableError("malformed Link header: invalid parameter value")
+        position += 1
+    if position == value_start:
+        raise RegistryUnavailableError("malformed Link header: parameter has no value")
+    return name, value[value_start:position], position
+
+
+def _parse_link_value(value: str) -> tuple[str, list[str]]:
+    """Parse one Link value and collect its relation types."""
+    value = value.strip()
+    if not value.startswith("<"):
+        raise RegistryUnavailableError("malformed Link header: link-value must start with '<'")
+    target_end = value.find(">")
+    if target_end <= 1:
+        raise RegistryUnavailableError("malformed Link header: empty or unterminated target")
+    target = value[1:target_end]
+    if any(char.isspace() for char in target):
+        raise RegistryUnavailableError("malformed Link header: whitespace in URI-reference")
+
+    relations: list[str] | None = None
+    rel_seen = False
+    position = target_end + 1
+    while position < len(value):
+        position = _skip_link_whitespace(value, position)
+        if position == len(value):
+            break
+        if value[position] != ";":
+            raise RegistryUnavailableError("malformed Link header: expected ';' parameter")
+        name, parameter_value, position = _parse_link_parameter(value, position + 1)
+        if name == "rel":
+            if rel_seen:
+                raise RegistryUnavailableError("malformed Link header: duplicate rel parameter")
+            rel_seen = True
+            if parameter_value is None:
+                raise RegistryUnavailableError("malformed Link header: rel parameter has no value")
+            relations = parameter_value.split()
+            if not relations:
+                raise RegistryUnavailableError("malformed Link header: rel parameter has no value")
+    if relations is None:
+        raise RegistryUnavailableError("malformed Link header: missing rel parameter")
+    return target, [relation.lower() for relation in relations]
+
+
+def _next_page_url(headers: dict[str, str], current_url: str) -> str | None:
     link = headers.get("link")
-    if not link:
+    if link is None:
         return None
-    for part in link.split(","):
-        match = LINK_NEXT.match(part.strip())
-        if match:
-            return _registry_url(match.group(1))
-    return None
+    if not link.strip():
+        raise RegistryUnavailableError("malformed Link header: empty field value")
+    targets: list[str] = []
+    for link_value in _split_link_values(link):
+        target, relations = _parse_link_value(link_value)
+        if "next" in relations:
+            resolved = urllib.parse.urljoin(current_url, target)
+            targets.append(_registry_url(resolved))
+    if len(targets) > 1:
+        raise RegistryUnavailableError("malformed Link header: multiple rel=next targets")
+    return targets[0] if targets else None
 
 
 def _tag_names(body: bytes) -> list[str]:
@@ -300,7 +531,9 @@ def _tag_names(body: bytes) -> list[str]:
         raise RegistryUnavailableError(msg) from exc
     if not isinstance(document, dict):
         raise RegistryUnavailableError("tags/list response is not a JSON object")
-    tags = document.get("tags", [])
+    if "tags" not in document:
+        raise RegistryUnavailableError("tags/list response is missing the required 'tags' array")
+    tags = document["tags"]
     if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
         raise RegistryUnavailableError("tags/list 'tags' field is not a list of strings")
     return [str(tag) for tag in tags]
@@ -321,10 +554,16 @@ def _tags_page_outcome(
     }
     status, response_headers, body = transport.get(url, headers, timeout)
     if status == HTTP_OK:
-        return _tag_names(body), _next_page_url(response_headers)
+        return _tag_names(body), _next_page_url(response_headers, url)
     if status in (HTTP_UNAUTHORIZED, HTTP_NOT_FOUND):
-        msg = f"tags/list returned {status} ({_oci_error_detail(body)}) after token exchange"
-        raise PackageMissingError(msg)
+        detail = _oci_error_detail(body)
+        if _has_oci_error_code(body, "NAME_UNKNOWN"):
+            raise PackageMissingError(
+                f"tags/list returned {status} ({detail}) after token exchange"
+            )
+        if status == HTTP_UNAUTHORIZED:
+            raise AuthFailureError(f"tags/list returned 401 ({detail}) after token exchange")
+        raise RegistryUnavailableError(f"tags/list returned 404 ({detail}) after token exchange")
     if status == HTTP_FORBIDDEN:
         msg = f"tags/list returned 403 ({_oci_error_detail(body)}): state is unknown, not absent"
         raise PermissionFailureError(msg)
@@ -389,12 +628,49 @@ def _fetch_json(
     }
     status, response_headers, body = transport.get(url, headers, timeout)
     if status != HTTP_OK:
-        return status, response_headers, None, b""
+        return status, response_headers, None, body
     try:
         return status, response_headers, json.loads(body), body
     except (ValueError, UnicodeDecodeError) as exc:
         msg = f"non-JSON document from {url}: {exc}"
         raise RegistryUnavailableError(msg) from exc
+
+
+def _validated_manifest_media_type(headers: dict[str, str], document: dict[str, Any]) -> str:
+    """Require a supported image manifest/index type and consistent declarations."""
+    header_media_type: str | None = None
+    if "content-type" in headers:
+        raw_header_type = headers["content-type"]
+        if not isinstance(raw_header_type, str):
+            raise RegistryUnavailableError("manifest Content-Type is not a string")
+        header_media_type = raw_header_type.split(";", 1)[0].strip().lower()
+        if not header_media_type:
+            raise RegistryUnavailableError("manifest Content-Type is empty")
+
+    body_media_type: str | None = None
+    if "mediaType" in document:
+        raw_body_type = document["mediaType"]
+        if not isinstance(raw_body_type, str):
+            raise RegistryUnavailableError("manifest mediaType field is not a string")
+        body_media_type = raw_body_type.split(";", 1)[0].strip().lower()
+        if not body_media_type:
+            raise RegistryUnavailableError("manifest mediaType field is empty")
+
+    if (
+        header_media_type is not None
+        and body_media_type is not None
+        and header_media_type != body_media_type
+    ):
+        raise RegistryUnavailableError(
+            f"manifest Content-Type {header_media_type!r} disagrees with body mediaType "
+            f"{body_media_type!r}"
+        )
+    media_type = header_media_type or body_media_type
+    if media_type not in _SUPPORTED_MANIFEST_MEDIA_TYPES:
+        raise RegistryUnavailableError(
+            f"unsupported or missing image manifest media type {media_type!r}"
+        )
+    return media_type
 
 
 def _require_digest_format(digest: str) -> None:
@@ -436,6 +712,26 @@ def _config_label_revision(config_document: dict[str, Any]) -> str | None:
     return None
 
 
+def _validate_config_content_type(headers: dict[str, str], descriptor_media_type: str) -> None:
+    if "content-type" not in headers:
+        return
+    raw_response_type = headers["content-type"]
+    if not isinstance(raw_response_type, str):
+        raise RegistryUnavailableError("config blob Content-Type is not a string")
+    response_media_type = raw_response_type.split(";", 1)[0].strip().lower()
+    if not response_media_type:
+        raise RegistryUnavailableError("config blob Content-Type is empty")
+    if response_media_type not in (_SUPPORTED_CONFIG_MEDIA_TYPES | {_GENERIC_CONFIG_MEDIA_TYPE}):
+        raise RegistryUnavailableError(
+            f"unsupported config blob Content-Type {response_media_type!r}"
+        )
+    if response_media_type not in {_GENERIC_CONFIG_MEDIA_TYPE, descriptor_media_type}:
+        raise RegistryUnavailableError(
+            f"config blob Content-Type {response_media_type!r} disagrees with "
+            f"descriptor mediaType {descriptor_media_type!r}"
+        )
+
+
 def _fetch_config_revision(
     transport: Transport,
     owner: str,
@@ -446,8 +742,18 @@ def _fetch_config_revision(
 ) -> str | None:
     """Follow the bounded manifest -> config chain to the revision annotation."""
     config = document.get("config")
-    if not isinstance(config, dict) or not isinstance(config.get("digest"), str):
-        raise RegistryUnavailableError("manifest is missing config.digest")
+    if not isinstance(config, dict):
+        raise RegistryUnavailableError("manifest is missing config descriptor")
+    raw_media_type = config.get("mediaType")
+    if not isinstance(raw_media_type, str):
+        raise RegistryUnavailableError("manifest config descriptor is missing mediaType")
+    descriptor_media_type = raw_media_type.strip().lower()
+    if descriptor_media_type not in _SUPPORTED_CONFIG_MEDIA_TYPES:
+        raise RegistryUnavailableError(
+            f"unsupported config descriptor mediaType {descriptor_media_type!r}"
+        )
+    if not isinstance(config.get("digest"), str):
+        raise RegistryUnavailableError("manifest config descriptor is missing digest")
     digest = str(config["digest"])
     # Format is validated BEFORE the URL is built: an unverifiable digest must
     # never become a request path, and never yield provenance trust.
@@ -458,10 +764,11 @@ def _fetch_config_revision(
         "Accept": ACCEPT_CONFIG,
         "User-Agent": USER_AGENT,
     }
-    status, _, body = transport.get(url, blob_headers, timeout)
+    status, response_headers, body = transport.get(url, blob_headers, timeout)
     if status != HTTP_OK:
         msg = f"config blob fetch returned {status}"
         raise RegistryUnavailableError(msg)
+    _validate_config_content_type(response_headers, descriptor_media_type)
     _require_digest(digest, body)
     try:
         config_document = json.loads(body)
@@ -543,7 +850,7 @@ def _select_runnable_descriptor(manifests: list[Any]) -> dict[str, Any] | None:
         if (
             isinstance(media_type, str)
             and media_type.strip()
-            and media_type not in _IMAGE_MANIFEST_TYPES
+            and media_type.strip().lower() not in _IMAGE_MANIFEST_TYPES
         ):
             # Non-image media types (nested index, artifact/attestation-only types)
             # are never treated as the runnable image.
@@ -561,21 +868,20 @@ def _select_runnable_descriptor(manifests: list[Any]) -> dict[str, Any] | None:
     return ranked[0][1]
 
 
-def _child_media_type(headers: dict[str, str], document: dict[str, Any]) -> str:
-    content_type = str(headers.get("content-type", "")).split(";")[0].strip()
-    return content_type or str(document.get("mediaType", ""))
-
-
 def _index_revision(
     transport: Transport,
     owner: str,
     package: str,
     bearer: str,
     document: dict[str, Any],
+    headers: dict[str, str],
     timeout: float,
     depth: int = 0,
 ) -> str | None:
     """Resolve the revision of an image index (annotations, else the runnable manifest chain)."""
+    media_type = _validated_manifest_media_type(headers, document)
+    if media_type not in _INDEX_TYPES:
+        raise RegistryUnavailableError(f"expected an image index, got media type {media_type!r}")
     revision = _annotation_revision(document)
     if revision is not None:
         return revision
@@ -605,12 +911,25 @@ def _index_revision(
         raise RegistryUnavailableError(msg)
     if not isinstance(inner, dict):
         raise RegistryUnavailableError("nested manifest fetch is not a JSON object")
+    inner_media_type = _validated_manifest_media_type(inner_headers, inner)
+    if "mediaType" in descriptor:
+        descriptor_media_type = descriptor["mediaType"]
+        if not isinstance(descriptor_media_type, str) or not descriptor_media_type.strip():
+            raise RegistryUnavailableError("index descriptor mediaType is malformed")
+        normalized_descriptor_type = descriptor_media_type.strip().lower()
+        if normalized_descriptor_type != inner_media_type:
+            raise RegistryUnavailableError(
+                f"index descriptor mediaType {normalized_descriptor_type!r} disagrees with "
+                f"fetched child media type {inner_media_type!r}"
+            )
     _require_digest(digest, inner_body)
     revision = _annotation_revision(inner)
     if revision is not None:
         return revision
-    if _child_media_type(inner_headers, inner) in _INDEX_TYPES:
-        return _index_revision(transport, owner, package, bearer, inner, timeout, depth + 1)
+    if inner_media_type in _INDEX_TYPES:
+        return _index_revision(
+            transport, owner, package, bearer, inner, inner_headers, timeout, depth + 1
+        )
     return _fetch_config_revision(transport, owner, package, bearer, inner, timeout)
 
 
@@ -637,18 +956,26 @@ def verify_sha_tag(
         # digest-addressed document it references — child manifests and config
         # blobs — is format-validated and hash-verified before use.
         manifest_url = f"{REGISTRY}/v2/{owner}/{package}/manifests/{tag}"
-        status, headers, document, _raw = _fetch_json(http, manifest_url, bearer, timeout)
+        status, headers, document, raw = _fetch_json(http, manifest_url, bearer, timeout)
         if status == HTTP_NOT_FOUND:
+            if _has_oci_error_code(raw, "MANIFEST_UNKNOWN") or _has_oci_error_code(
+                raw, "NAME_UNKNOWN"
+            ):
+                return PROVENANCE_NOT_PUBLISHED
+            raise RegistryUnavailableError(
+                "manifest fetch returned 404 without a recognized absence code "
+                f"({_oci_error_detail(raw)})"
+            )
+        if status == HTTP_UNAUTHORIZED and _has_oci_error_code(raw, "NAME_UNKNOWN"):
             return PROVENANCE_NOT_PUBLISHED
         if status != HTTP_OK:
             msg = f"manifest fetch returned {status}"
             raise RegistryUnavailableError(msg)
         if not isinstance(document, dict):
             raise RegistryUnavailableError("manifest document is not a JSON object")
-        content_type = str(headers.get("content-type", "")).split(";")[0].strip()
-        media_type = content_type or str(document.get("mediaType", ""))
+        media_type = _validated_manifest_media_type(headers, document)
         if media_type in _INDEX_TYPES:
-            revision = _index_revision(http, owner, package, bearer, document, timeout)
+            revision = _index_revision(http, owner, package, bearer, document, headers, timeout)
         else:
             revision = _annotation_revision(document)
             if revision is None:
@@ -664,10 +991,8 @@ def verify_sha_tag(
         NetworkFailureError,
         RegistryUnavailableError,
     ):
-        # Conservative: an unverifiable tag is NOT counted as published.
-        # The tag EXISTS and its content is unknown, so the consumer must not
-        # re-push/overwrite it — operator reconciliation is required (see the
-        # publication policy in .github/workflows/publish.yml).
+        # Conservative: registry/tag state or provenance is not verified, so
+        # the consumer must not publish or overwrite (see workflow policy).
         return PROVENANCE_UNKNOWN
 
 
@@ -678,10 +1003,27 @@ def plan_sha_tags(document: dict[str, Any]) -> list[str]:
         detail = document.get("detail", "")
         msg = f"registry status {status!r} ({detail}); refusing to publish against unknown state"
         raise PlanAbortedError(msg)
-    tags = document.get("tags", [])
-    if not isinstance(tags, list):
-        raise PlanAbortedError("registry discovery document has a non-list tags field")
-    return [str(tag) for tag in tags if str(tag).startswith("sha-")]
+    raw_tags = document.get("tags")
+    if not isinstance(raw_tags, list) or any(not isinstance(tag, str) for tag in raw_tags):
+        raise PlanAbortedError("registry discovery document must contain a list of string tags")
+    if status == STATUS_PACKAGE_MISSING and raw_tags:
+        raise PlanAbortedError("package_missing registry response must have an empty tags list")
+    sha_tags: list[str] = []
+    for tag in raw_tags:
+        if tag.startswith("sha-"):
+            sha_value = tag.removeprefix("sha-")
+        elif tag.lstrip().lower().startswith("sha-"):
+            raise PlanAbortedError(
+                f"invalid sha tag {tag!r}; expected sha- followed by 40 lowercase hex digits"
+            )
+        else:
+            continue
+        if FULL_SHA.fullmatch(sha_value) is None:
+            raise PlanAbortedError(
+                f"invalid sha tag {tag!r}; expected sha- followed by 40 lowercase hex digits"
+            )
+        sha_tags.append(tag)
+    return sha_tags
 
 
 def _read_token(token_env: str) -> str:

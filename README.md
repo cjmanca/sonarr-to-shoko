@@ -10,8 +10,9 @@ Sonarr; Shoko writes are gated. See [PROJECT.md](PROJECT.md) for requirements,
 durable SQLite state, the daemon cycle engine, the Anime-Lists cache, the safety
 attestation lease (`attestation status|record|invalidate`), the backlog campaign
 (`campaign prepare|approve|apply|verify|report|pause|resume|revoke|authorize-drain|revoke-drain`), and the
-read-only existing-link audit (`audit`) are wired with offline tests. GHCR
-publishing (M8) and delta-fetch light cycles (M9) remain open.
+read-only existing-link audit (`audit`) are wired with offline tests. The GHCR
+publishing workflow (M8) is implemented and covered by offline checks; live GHCR
+publication remains externally unverified. Delta-fetch light cycles (M9) remain open.
 
 ## Install
 
@@ -402,30 +403,42 @@ pushed commit** (including commits inside multi-commit pushes), `latest` only fo
 newest successfully built default-branch revision, never from untrusted pull requests,
 least-privilege `GITHUB_TOKEN`.
 
-> **EXTERNAL/UNVERIFIED:** the workflow is validated offline (enumeration tests,
-> YAML structural tests, permission gates). No GHCR publication has been performed from
-> this session — no pushes were made and publishing was never exercised against GitHub.
+> **EXTERNAL/UNVERIFIED:** the workflow code is implemented and covered by offline
+> enumeration tests, YAML structural tests, and permission-gate checks. It has not been
+> validated by a live GitHub Actions run or GHCR publication.
 
 **Publishing semantics.** The `plan` job runs `scripts/enumerate_introduced.py`
 over the push event (`before..after`; first-push from the first-buildable boundary
 `aa6b85e` inclusive, older history skipped; force-push/non-ancestor falls back to the
 merge-base; branch pushes enumerate from `merge-base(main, head)` so shared history
 is never re-tagged). Each enumerated SHA becomes one matrix leg: checkout that SHA,
-**re-run the full check list for that commit** (`scripts/ci_checks.sh` — same commands
-as CI, per commit, never a cached pass), then build & push
+**re-run the checks available for that commit**: `scripts/ci_checks.sh` when present,
+or the trusted uploaded `scripts/validate_historical.py` for older commits. No cached
+pass is substituted for per-commit validation. Then build & push
 `ghcr.io/<owner>/shoko-sonarr-linker:sha-<full-sha>` (provenance on, labels point at
 the commit, registry cache scoped per SHA so builds can't contaminate each other).
-A failing intermediate SHA skips only its own tag and is reported in the job summary;
-the rest of the push publishes normally. PR events run the read-only test job only —
-publish/promote jobs are gated to push/schedule/dispatch and fork PRs get a read-only
-token, so untrusted code can never publish. SHA-tag publishing is serialized **per
-ref** (`concurrency: publish-<ref>` with `cancel-in-progress: false`) so a queued
-commit's `sha-` tag is never silently dropped by a cancel. `latest` is promoted **only** from the
-default branch by `promote-latest`, serialized (`concurrency: latest-promotion`,
-`cancel-in-progress: false`) and guarded: it aborts if the run's SHA is no longer
-`git ls-remote`-confirmed head of main, so a queued old run can never revert `latest`.
-SHA tags are immutable in practice: names are derived from the commit SHA and backfill
-skips already-tagged SHAs, so tags are never overwritten.
+After acquiring its exact-SHA lock, each leg re-queries registry provenance: a
+matching existing image is skipped, a proven-absent tag may be published, and unknown
+state fails closed. Any failed leg fails the publish job and blocks `latest`, even
+though `fail-fast: false` lets sibling legs finish and report their outcomes. A later
+bounded backfill re-reads registry state and can safely retry an absent SHA; it skips
+an already-verified immutable tag and blocks on unknown provenance. PR events run the
+read-only test job only — publish/promote jobs are gated to push/schedule/dispatch
+and fork PRs get a read-only token, so untrusted code can never publish.
+
+There is no workflow-level concurrency group because GitHub may replace a pending
+workflow run when another push arrives. Publisher legs instead serialize **per exact
+SHA** (`concurrency: publish-sha-<sha>`, `cancel-in-progress: false`) and recheck
+registry provenance after acquiring that lock, so duplicate plans do not overwrite an
+existing tag from another run of this workflow. GHCR does not provide a conditional
+tag update in this workflow, so an out-of-band writer could still race after the
+preflight; SHA-tag immutability is enforced only among these workflow publisher legs.
+`latest` is promoted only for a
+push, schedule, or backfill whose selected ref is `main`, by `promote-latest` under
+its own serialized group (`concurrency: latest-promotion`, `cancel-in-progress: false`).
+Promotion requires successful tests and plan, all publish legs successful (or an
+empty matrix), exact-SHA provenance, and a final check that the run SHA is still
+the current `main` head immediately before the latest push.
 
 **Shell-injection hygiene & trust boundary.** No `${{ }}` expression is expanded inside
 a `run:` script body — `github.*`/`inputs.*` values reach the shell only through job/step
@@ -433,8 +446,12 @@ a `run:` script body — `github.*`/`inputs.*` values reach the shell only throu
 lowercase hex before use. Dispatch trust boundary: `workflow_dispatch` requires repository
 **write access**, and write access is already a code-execution trust boundary (anyone who can
 dispatch can run code here), so the dispatch gates are defense-in-depth, not a secret
-boundary: the plan additionally refuses any range whose `to_sha` is not an ancestor of the
-current main head (`not-ancestor-of-main`). A non-positive `max_shas` fails closed.
+boundary. Dispatch accepts only a selected `refs/heads/*` ref, fetches that exact branch,
+defaults an empty `to_sha` to its fetched head, and requires any explicit `to_sha` to be
+a full lowercase SHA that is an ancestor of that head. A supplied `from_sha` must also
+be an ancestor of `to_sha`; reversed or unrelated ranges fail before enumeration. A
+feature-branch backfill can publish immutable SHA tags but cannot promote `latest`.
+A non-positive `max_shas` fails closed.
 
 **Action pins.** Every `uses:` ref in `publish.yml`/`ci.yml` is pinned to a full commit
 SHA with its release tag in a trailing comment (SHAs fetched from the GitHub refs API,
@@ -446,14 +463,17 @@ lock is stale, with `uv pip check` verifying the environment).
 publish/promote jobs — no repository secrets, no Sonarr/Shoko keys exist in CI.
 
 **Event gap.** GitHub does **not** fire `push` workflows for commits created by
-workflows using `GITHUB_TOKEN` (merge queues, auto-commits). This project never
-self-commits; if such a commit ever lands, recovery is via the weekly `schedule`
-backfill or a dispatch — capped per run (10 by default; `max_shas` must be positive,
-non-positive values fail closed), oldest-first, overflow
-reported and recovered, never dropped:
+workflows using `GITHUB_TOKEN` (merge queues, auto-commits). The weekly schedule scans
+the default branch. For a capped or unmerged topic branch, manually dispatch a backfill
+against that in-repository branch with `--ref <branch>`; each run is capped (10 by
+default; `max_shas` is clamped to 10 and must be positive), oldest-first, with overflow
+reported for a later run rather than dropped. `to_sha` defaults to the fetched branch
+head; explicit `to_sha` and `from_sha` values are checked as ancestors of the selected
+branch head and of `to_sha`, respectively:
 
-```powershell
-gh workflow run publish.yml -f backfill=true -f from_sha=<sha> -f to_sha=<sha>
+```sh
+gh workflow run publish.yml --ref <branch> -f backfill=true
+gh workflow run publish.yml --ref <branch> -f backfill=true -f from_sha=<exclusive-start-sha> -f to_sha=<end-sha>
 gh workflow run publish.yml -f backfill=true   # whole-history tag-gap scan
 ```
 
