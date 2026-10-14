@@ -30,6 +30,7 @@ import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import campaign as campaign_mod
 from shoko_linker import cli
+from shoko_linker import daemon as daemon_mod
 from shoko_linker.attestation import (
     SCOPE_DAEMON,
     build_record,
@@ -62,6 +63,7 @@ from shoko_linker.linking import EpisodeIdResolver, LinkPlan
 from shoko_linker.mapping_store import MappingStore, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
+from shoko_linker.shoko import collect_shoko_discovery
 from shoko_linker.state import (
     ATTESTATION_PAUSE_REASON,
     CAMPAIGN_DRAIN_FINGERPRINT_REASON,
@@ -137,6 +139,13 @@ class Stubs:
     posted_files: list[int] = field(default_factory=list)
     linked: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     ed2k_overrides: dict[int, str] = field(default_factory=dict)
+    sonarr_episodefile_failures: set[int] = field(default_factory=set)
+    shoko_page_failures: set[int] = field(default_factory=set)
+    shoko_empty_pages: set[int] = field(default_factory=set)
+    shoko_malformed_file_ids: set[int] = field(default_factory=set)
+    shoko_total_overrides: dict[int, int] = field(default_factory=dict)
+    shoko_file_list_calls: int = 0
+    malformed_shoko_list_call: int | None = None
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     shoko_requests: list[httpx.Request] = field(default_factory=list)
     post_hook: Callable[[int], None] | None = None
@@ -234,6 +243,8 @@ class Stubs:
             )
         if path == "/api/v3/episodefile":
             series_id = int(request.url.params["seriesId"])
+            if series_id in self.sonarr_episodefile_failures:
+                return httpx.Response(503, json={}, request=request)
             return httpx.Response(
                 200,
                 json=[
@@ -319,15 +330,30 @@ class Stubs:
                 )
             return httpx.Response(404, json={"title": "not found"}, request=request)
         if path == "/api/v3/File":
-            rows = [
-                self.file_row(spec) for spec in sorted(self.specs, key=lambda item: item.shoko_id)
-            ]
-            return httpx.Response(200, json={"Total": len(rows), "List": rows}, request=request)
+            return self._file_listing(request)
         if path.startswith("/api/v3/File/"):
             file_id = int(path.split("/")[4])
             spec = next(item for item in self.specs if item.shoko_id == file_id)
             return httpx.Response(200, json=self.file_row(spec), request=request)
         return httpx.Response(404, json={}, request=request)
+
+    def _file_listing(self, request: httpx.Request) -> httpx.Response:
+        self.shoko_file_list_calls += 1
+        page = int(request.url.params.get("page", "1"))
+        if page in self.shoko_page_failures:
+            return httpx.Response(503, json={}, request=request)
+        rows = [self.file_row(spec) for spec in sorted(self.specs, key=lambda item: item.shoko_id)]
+        if self.malformed_shoko_list_call == self.shoko_file_list_calls and rows:
+            rows[0].pop("Size", None)
+        page_size = int(request.url.params.get("pageSize", str(len(rows) or 1)))
+        page_rows = rows[(page - 1) * page_size : page * page_size]
+        for row in page_rows:
+            if row["ID"] in self.shoko_malformed_file_ids:
+                row.pop("Size", None)
+        if page in self.shoko_empty_pages:
+            page_rows = []
+        total = self.shoko_total_overrides.get(page, len(rows))
+        return httpx.Response(200, json={"Total": total, "List": page_rows}, request=request)
 
 
 def _source_xml() -> bytes:
@@ -579,6 +605,45 @@ def apply(
     if code == EXIT_OK:
         return {"exit": code, "payload": json.loads(captured.out)}
     return {"exit": code, "payload": captured.err + captured.out}
+
+
+def _force_shoko_page_size_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    collect = collect_shoko_discovery
+    monkeypatch.setattr(
+        daemon_mod,
+        "collect_shoko_discovery",
+        lambda endpoint: collect(endpoint, page_size=1),
+    )
+
+
+def _configure_incomplete_campaign_snapshot(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    candidate: SpecFile,
+) -> None:
+    if scenario in {"short_shoko_page", "changed_shoko_total", "later_shoko_page_failure"}:
+        _force_shoko_page_size_one(monkeypatch)
+    if scenario == "short_shoko_page":
+        env.stubs.shoko_empty_pages.add(2)
+    elif scenario == "changed_shoko_total":
+        env.stubs.shoko_total_overrides.update({1: COUNT_TWO, 2: COUNT_THREE})
+    elif scenario == "malformed_shoko_file":
+        env.stubs.shoko_malformed_file_ids.add(candidate.shoko_id)
+    elif scenario == "later_shoko_page_failure":
+        env.stubs.shoko_page_failures.add(2)
+    elif scenario == "incomplete_sonarr_inventory":
+        env.stubs.sonarr_episodefile_failures.add(candidate.series_id)
+    else:
+        raise AssertionError(f"unknown incomplete snapshot scenario: {scenario}")
+
+
+def _clear_incomplete_campaign_snapshot(env: Env) -> None:
+    env.stubs.sonarr_episodefile_failures.clear()
+    env.stubs.shoko_page_failures.clear()
+    env.stubs.shoko_empty_pages.clear()
+    env.stubs.shoko_malformed_file_ids.clear()
+    env.stubs.shoko_total_overrides.clear()
 
 
 # ------------------------------------------------------------------ main flow
@@ -1017,6 +1082,141 @@ def test_legacy_campaign_approval_requires_reprepare_and_reapproval(
     assert result["exit"] == EXIT_CONFIG_INVALID
     assert "re-prepare and re-approve" in str(result["payload"])
     assert env.stubs.posts == []
+
+
+@pytest.mark.parametrize(
+    ("scenario", "reason"),
+    [
+        ("short_shoko_page", "shoko_snapshot_incomplete:pages_exhausted"),
+        ("changed_shoko_total", "shoko_snapshot_incomplete:total_changed"),
+        ("malformed_shoko_file", "shoko_snapshot_incomplete:malformed_file"),
+        ("later_shoko_page_failure", "shoko_snapshot_incomplete:transport_failure"),
+        ("incomplete_sonarr_inventory", "sonarr_inventory_incomplete:transport_failure"),
+    ],
+)
+def test_campaign_apply_defers_incomplete_reconciliation_then_recovers(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    reason: str,
+) -> None:
+    specs_list = specs(COUNT_TWO)
+    candidate = specs_list[1]
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    first = apply(env, capsys, batch="1")
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["submitted"] == COUNT_ONE
+    posts_before_incomplete = len(env.stubs.posts)
+
+    store = env.open_store()
+    try:
+        campaign_before = store.get_campaign(prepared["campaign_id"])
+        candidate_before = store.get_file(candidate.shoko_id)
+        assert campaign_before is not None
+        assert candidate_before is not None
+        assert candidate_before.state is FileState.PLANNED
+        progress_before = campaign_send_progress(store, prepared["campaign_id"])
+        quarantines_before = store.campaign_progress(prepared["campaign_id"])["quarantined"]
+    finally:
+        store.close()
+
+    _configure_incomplete_campaign_snapshot(env, monkeypatch, scenario, candidate)
+    deferred = apply(env, capsys)
+
+    assert deferred["exit"] == EXIT_APPLY_GATE_REFUSAL
+    assert "reconciliation incomplete" in str(deferred["payload"])
+    assert reason in str(deferred["payload"])
+    assert len(env.stubs.posts) == posts_before_incomplete
+
+    store = env.open_store()
+    try:
+        campaign_after = store.get_campaign(prepared["campaign_id"])
+        candidate_after = store.get_file(candidate.shoko_id)
+        assert campaign_after is not None
+        assert candidate_after is not None
+        assert campaign_after.status == campaign_before.status == "approved"
+        assert campaign_after.digest == campaign_before.digest
+        assert campaign_after.bindings == campaign_before.bindings
+        assert candidate_after.state is candidate_before.state
+        assert candidate_after.campaign_id == candidate_before.campaign_id
+        assert campaign_send_progress(store, prepared["campaign_id"]) == progress_before
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == quarantines_before
+    finally:
+        store.close()
+
+    _clear_incomplete_campaign_snapshot(env)
+    recovered = apply(env, capsys)
+
+    assert recovered["exit"] == EXIT_OK
+    assert recovered["payload"]["submitted"] == COUNT_ONE
+    assert len(env.stubs.posts) == posts_before_incomplete + COUNT_ONE
+    assert candidate.shoko_id in env.stubs.posted_files
+
+
+def test_daemon_outer_complete_inner_incomplete_sweep_defers_campaign_drain(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, daemon_auto_apply=True)
+    specs_list = specs(COUNT_TWO)
+    candidate = specs_list[1]
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, prepared["campaign_id"])
+        assert canary.verified == COUNT_ONE
+        _authorize_drain(env, store, prepared["campaign_id"])
+        posts_before_incomplete = len(env.stubs.posts)
+        progress_before = campaign_send_progress(store, prepared["campaign_id"])
+        env.stubs.shoko_file_list_calls = 0
+        env.stubs.malformed_shoko_list_call = 2
+
+        incomplete = _daemon_cycle(
+            env,
+            store,
+            prepared["campaign_id"],
+            "daemon-outer-complete-inner-incomplete",
+        )
+
+        assert incomplete.reconciliation_ready is True
+        assert incomplete.campaign is None
+        assert any(
+            reason.startswith(
+                f"campaign_deferred:{prepared['campaign_id']}:reconciliation_incomplete"
+            )
+            for reason in incomplete.reasons
+        )
+        assert "shoko_snapshot_incomplete:malformed_file" in incomplete.reasons
+        assert len(env.stubs.posts) == posts_before_incomplete
+        quarantined = store.get_file(candidate.shoko_id)
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert quarantined is not None
+        assert quarantined.state is FileState.PLANNED
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert campaign_send_progress(store, prepared["campaign_id"]) == progress_before
+        assert store.get_meta(f"campaign_zero_progress:{prepared['campaign_id']}") is None
+
+        env.stubs.malformed_shoko_list_call = None
+        recovered = _daemon_cycle(
+            env,
+            store,
+            prepared["campaign_id"],
+            "daemon-retry-after-complete-snapshot",
+        )
+
+        assert recovered.reconciliation_ready is True
+        assert recovered.campaign is not None
+        assert recovered.campaign.submitted == COUNT_ONE
+        assert len(env.stubs.posts) == posts_before_incomplete + COUNT_ONE
+        assert candidate.shoko_id in env.stubs.posted_files
+    finally:
+        store.close()
 
 
 # ------------------------------------------------------------------ pending targets

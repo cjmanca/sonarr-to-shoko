@@ -227,6 +227,18 @@ class CampaignEligibilityRefusalError(CampaignError):
         self.eligibility_reasons = reasons
 
 
+class CampaignReconciliationIncompleteError(CampaignError):
+    """The dry-run inventory snapshot is insufficient to make campaign drift decisions."""
+
+    def __init__(self, reason_codes: Sequence[str]) -> None:
+        self.reason_codes = tuple(dict.fromkeys(reason_codes))
+        detail = ", ".join(self.reason_codes) or "reconciliation_not_ready"
+        super().__init__(
+            f"campaign apply deferred: reconciliation incomplete ({detail}); "
+            "approved targets and progress are unchanged, zero POSTs"
+        )
+
+
 # ------------------------------------------------------------------ plan records
 
 
@@ -1137,6 +1149,22 @@ def _apply_sweep(
         raise CampaignError(
             "campaign apply: the reconciliation sweep failed (transport); zero POSTs"
         )
+    if not sweep.reconciliation_ready:
+        reason_codes = tuple(
+            reason
+            for reason in sweep.reasons
+            if reason.startswith(
+                (
+                    "sonarr_inventory_incomplete:",
+                    "shoko_snapshot_incomplete:",
+                    "mapping_unavailable",
+                )
+            )
+        )
+        if not reason_codes:
+            reason_codes = ("reconciliation_not_ready",)
+        reasons.append("campaign_deferred:reconciliation_incomplete")
+        raise CampaignReconciliationIncompleteError(reason_codes)
     eligibility = compute_eligibility(deps, now_iso, campaign=True)
     if not eligibility.eligible:
         _pause_for_eligibility(deps.store, campaign_id, eligibility.reasons, now_iso, reasons)

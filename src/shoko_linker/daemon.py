@@ -1965,6 +1965,7 @@ def _drain_campaign(
         CampaignEligibilityRefusalError,
         CampaignError,
         CampaignPlanInvalidError,
+        CampaignReconciliationIncompleteError,
         apply_campaign,
         campaign_deferral_reasons,
         clear_campaign_terminal_meta,
@@ -2000,6 +2001,15 @@ def _drain_campaign(
             "campaign %s drain deferred: plan file unreadable (%s): paused, zero POSTs",
             campaign.campaign_id,
             exc,
+        )
+        return None
+    except CampaignReconciliationIncompleteError as exc:
+        reasons.append(f"campaign_deferred:{campaign.campaign_id}:reconciliation_incomplete")
+        reasons.extend(exc.reason_codes)
+        log.warning(
+            "campaign %s drain deferred: incomplete reconciliation (%s)",
+            campaign.campaign_id,
+            ", ".join(exc.reason_codes) or "reconciliation_not_ready",
         )
         return None
     except CampaignError as exc:
@@ -2104,6 +2114,17 @@ def _establish_baseline(
         reason="daemon_first_cycle",
     )
     return ()
+
+
+def _incomplete_reconciliation_reasons(
+    source: str, complete: bool, reasons: Sequence[str]
+) -> tuple[str, ...]:
+    """Name an incomplete source and preserve its stable machine-readable causes."""
+    if complete:
+        return ()
+    if reasons:
+        return tuple(f"{source}:{reason}" for reason in reasons)
+    return (source,)
 
 
 def _read_only_report(
@@ -2211,6 +2232,20 @@ def _run_cycle_body(
     discovery = collect_shoko_discovery(deps.shoko)
     reconciliation_ready = (
         inventory.verdict.complete and discovery.verdict.complete and phase.active is not None
+    )
+    reasons.extend(
+        _incomplete_reconciliation_reasons(
+            "sonarr_inventory_incomplete",
+            inventory.verdict.complete,
+            tuple(reason.value for reason in inventory.verdict.reasons),
+        )
+    )
+    reasons.extend(
+        _incomplete_reconciliation_reasons(
+            "shoko_snapshot_incomplete",
+            discovery.verdict.complete,
+            tuple(reason.value for reason in discovery.verdict.reasons),
+        )
     )
     reasons.extend(_establish_baseline(deps, inventory, discovery, now_iso))
     snapshot_id = inventory_snapshot_hash(inventory, discovery)
