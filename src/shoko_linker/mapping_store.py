@@ -77,6 +77,7 @@ from .state import ApplyProcessLock
 
 ACCEPT_ENCODING: Final[str] = "identity"
 DEFAULT_MAX_BYTES: Final[int] = 10_000_000
+MAX_READ_CHUNK_BYTES: Final[int] = 64 * 1024
 MAX_BACKOFF_HOURS: Final[float] = 24.0
 GENERATION_LOCK_POLL_SECONDS: Final[float] = 0.01
 GENERATION_LOCK_REFRESH_WAIT_SECONDS: Final[float] = 1.0
@@ -242,11 +243,13 @@ class MappingStatus:
     explicit_pairs: int | None
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(path: Path, payload: bytes | bytearray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.parent / f"{path.name}.new"
     try:
-        temp.write_bytes(payload)
+        # ``Path.write_bytes`` accepts the buffer protocol at runtime; this cast avoids
+        # copying a capped bytearray mapping body into a second full-size bytes object.
+        temp.write_bytes(cast(bytes, payload))
         temp.replace(path)
     finally:
         if temp.exists():
@@ -635,7 +638,7 @@ def _record_success(
 
 def _activate(
     store: MappingStore,
-    body: bytes,
+    body: bytes | bytearray,
     state_view: tuple[str, str, str, int],
     now: datetime,
     index: MappingIndex,
@@ -663,7 +666,7 @@ def _accept_content(
     response: httpx.Response,
     refresh_hours: float,
     overrides_text: str | None,
-    body: bytes,
+    body: bytes | bytearray,
 ) -> RefreshOutcome:
     overrides: Overrides | None = None
     if overrides_text is not None:
@@ -772,10 +775,17 @@ def refresh(
         # max_redirects=0: the canonical source answers 200 (docs §3);
         # any redirect (same- or cross-origin) is a contract violation and
         # foreign content must never be activated as canonical provenance.
-        response = resolve_and_send(endpoint, "GET", store.source_path, max_redirects=0)
+        response = resolve_and_send(
+            endpoint, "GET", store.source_path, max_redirects=0, stream=True
+        )
     except (HttpPolicyError, httpx.HTTPError):
         return _record_failure(store, state, now_utc, RefreshOutcome.FAILED_TRANSPORT)
-    return _dispatch(store, state, now_utc, response, refresh_hours, max_bytes, overrides_text)
+    try:
+        return _dispatch(store, state, now_utc, response, refresh_hours, max_bytes, overrides_text)
+    except httpx.HTTPError:
+        # Stream failures occur while _dispatch reads the body. _read_capped closes the
+        # response in its finally block before the failed refresh is recorded.
+        return _record_failure(store, state, now_utc, RefreshOutcome.FAILED_TRANSPORT)
 
 
 def _dispatch(
@@ -800,21 +810,22 @@ def _dispatch(
     return _accept_content(store, state, now_utc, response, refresh_hours, overrides_text, body)
 
 
-def _read_capped(response: httpx.Response, max_bytes: int) -> tuple[bytes, bool]:
-    """Accumulate the streamed body with a hard cap so RAM never exceeds ``max_bytes``."""
-    chunks: list[bytes] = []
+def _read_capped(response: httpx.Response, max_bytes: int) -> tuple[bytearray, bool]:
+    """Accumulate raw response bytes with a cap plus one bounded transport chunk."""
+    body = bytearray()
     total = 0
     overflow = False
+    chunk_size = min(max_bytes + 1, MAX_READ_CHUNK_BYTES)
     try:
-        for chunk in response.iter_bytes():
+        for chunk in response.iter_raw(chunk_size=chunk_size):
             total += len(chunk)
             if total > max_bytes:
                 overflow = True
                 break
-            chunks.append(chunk)
+            body.extend(chunk)
     finally:
         response.close()
-    return b"".join(chunks), overflow
+    return body, overflow
 
 
 def _handle_not_modified(

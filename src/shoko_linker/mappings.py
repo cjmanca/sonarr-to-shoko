@@ -359,7 +359,7 @@ class MappingIndex:
 
 
 def parse_anime_lists(
-    xml_text: str | bytes, *, max_entries: int = DEFAULT_MAX_ENTRIES
+    xml_text: str | bytes | bytearray, *, max_entries: int = DEFAULT_MAX_ENTRIES
 ) -> ParsedMappings:
     """Parse Anime-Lists XML; a malformed entry is recorded and excluded, never guessed.
 
@@ -398,9 +398,12 @@ def parse_anime_lists(
     )
 
 
-def _parse_root(xml_text: str | bytes) -> Element:
+def _parse_root(xml_text: str | bytes | bytearray) -> Element:
     try:
-        return cast("Element", SafeElementTree.fromstring(xml_text))
+        # ``defusedxml`` accepts any bytes-like buffer at runtime, although its bundled
+        # annotation only lists ``bytes``. Keeping the capped bytearray avoids a second
+        # full-size copy before parsing the streamed source.
+        return cast("Element", SafeElementTree.fromstring(cast(bytes, xml_text)))
     except DefusedXmlException as exc:
         raise MappingError(f"Anime-Lists XML rejected as unsafe XML: {exc}") from exc
     except (ParseError, ValueError, SyntaxError) as exc:
@@ -1366,7 +1369,7 @@ def targets_digest(index: MappingIndex) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def content_digest(xml_bytes: bytes) -> str:
+def content_digest(xml_bytes: bytes | bytearray) -> str:
     """SHA-256 of raw mapping bytes (source provenance, not target semantics)."""
     return hashlib.sha256(xml_bytes).hexdigest()
 

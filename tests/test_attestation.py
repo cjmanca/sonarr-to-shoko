@@ -455,7 +455,12 @@ def _source_handler() -> Any:
     )
 
     def handle(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers={"ETag": '"src"'}, content=xml.encode(), request=request)
+        return httpx.Response(
+            200,
+            headers={"ETag": '"src"'},
+            stream=httpx.ByteStream(xml.encode()),
+            request=request,
+        )
 
     return handle
 

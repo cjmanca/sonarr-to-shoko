@@ -518,7 +518,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
             base_url="https://raw.githubusercontent.com/",
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(
-                    200, headers={"ETag": '"s"'}, content=_source_xml(), request=request
+                    200,
+                    headers={"ETag": '"s"'},
+                    stream=httpx.ByteStream(_source_xml()),
+                    request=request,
                 )
             ),
             follow_redirects=False,
@@ -1341,7 +1344,7 @@ def test_campaign_quarantine_serializes_mapping_activation(
                 lambda request: httpx.Response(
                     200,
                     headers={"ETag": '"concurrent"'},
-                    content=unrelated,
+                    stream=httpx.ByteStream(unrelated),
                     request=request,
                 )
             ),
@@ -3662,7 +3665,10 @@ def dual_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DualEnv:
             base_url="https://raw.githubusercontent.com/",
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(
-                    200, headers={"ETag": '"s"'}, content=_source_xml(), request=request
+                    200,
+                    headers={"ETag": '"s"'},
+                    stream=httpx.ByteStream(_source_xml()),
+                    request=request,
                 )
             ),
             follow_redirects=False,
@@ -4949,7 +4955,10 @@ def _swap_mapping_generation(env: Env) -> None:
         base_url="https://raw.githubusercontent.com/",
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
-                200, headers={"ETag": '"s"'}, content=_extra_source_xml(), request=request
+                200,
+                headers={"ETag": '"s"'},
+                stream=httpx.ByteStream(_extra_source_xml()),
+                request=request,
             )
         ),
         follow_redirects=False,

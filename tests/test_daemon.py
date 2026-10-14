@@ -521,7 +521,10 @@ def source_endpoint(handler: Callable[[httpx.Request], httpx.Response]) -> ApiEn
 def source_handler(xml: str) -> Callable[[httpx.Request], httpx.Response]:
     def build(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, headers={"ETag": '"identity-src"'}, content=xml.encode(), request=request
+            200,
+            headers={"ETag": '"identity-src"'},
+            stream=httpx.ByteStream(xml.encode()),
+            request=request,
         )
 
     return build
@@ -1478,7 +1481,10 @@ def test_restart_does_not_disable_refresh_or_tight_loop(
     def source(request: httpx.Request) -> httpx.Response:
         requests.append(1)
         return httpx.Response(
-            200, headers={"ETag": '"identity-src"'}, content=mapping_xml().encode(), request=request
+            200,
+            headers={"ETag": '"identity-src"'},
+            stream=httpx.ByteStream(mapping_xml().encode()),
+            request=request,
         )
 
     endpoint = source_endpoint(source)
@@ -1507,7 +1513,7 @@ def test_daemon_recovers_missing_active_cache_before_weekly_due_time(
         return httpx.Response(
             200,
             headers={"ETag": '"recovered"'},
-            content=mapping_xml().encode(),
+            stream=httpx.ByteStream(mapping_xml().encode()),
             request=request,
         )
 

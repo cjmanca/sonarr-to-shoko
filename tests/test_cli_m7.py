@@ -198,7 +198,7 @@ class Stubs:
         return httpx.Response(
             200,
             headers={"ETag": self.source_etag},
-            content=self.source_xml.encode(),
+            stream=httpx.ByteStream(self.source_xml.encode()),
             request=request,
         )
 

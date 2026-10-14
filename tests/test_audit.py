@@ -268,7 +268,10 @@ def stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AuditStubs:
             base_url="https://raw.githubusercontent.com/",
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(
-                    200, headers={"ETag": '"a"'}, content=_mapping_xml(), request=request
+                    200,
+                    headers={"ETag": '"a"'},
+                    stream=httpx.ByteStream(_mapping_xml()),
+                    request=request,
                 )
             ),
             follow_redirects=False,
@@ -291,7 +294,10 @@ def _seed_mapping(tmp_path: Path) -> MappingStore:
         base_url="https://raw.githubusercontent.com/",
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
-                200, headers={"ETag": '"a"'}, content=_mapping_xml(), request=request
+                200,
+                headers={"ETag": '"a"'},
+                stream=httpx.ByteStream(_mapping_xml()),
+                request=request,
             )
         ),
         follow_redirects=False,

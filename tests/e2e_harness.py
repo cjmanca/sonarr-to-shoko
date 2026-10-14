@@ -496,7 +496,9 @@ class SourceStub:
         body = b"<anime-list><anime anidbid='x'" if self.corrupt else self.xml
         if not self.corrupt and request.headers.get("if-none-match") == self.etag:
             return httpx.Response(304, headers={"ETag": self.etag}, request=request)
-        return httpx.Response(200, headers={"ETag": self.etag}, content=body, request=request)
+        return httpx.Response(
+            200, headers={"ETag": self.etag}, stream=httpx.ByteStream(body), request=request
+        )
 
 
 class SonarrStub:

@@ -152,6 +152,7 @@ def resolve_and_send(
     params: Mapping[str, Any] | None = None,
     json: Any | None = None,
     max_redirects: int = MAX_REDIRECTS,
+    stream: bool = False,
 ) -> httpx.Response:
     """Send one request, following same-origin redirects manually.
 
@@ -162,6 +163,8 @@ def resolve_and_send(
     Raises:
         HttpPolicyError: when the redirect cap is exceeded, when a 303 follows a
             non-idempotent method, or when a redirect carries no usable ``Location``.
+
+    When ``stream=True``, the returned body is unconsumed; the caller must close the response.
     """
     verb = method.upper()
     request_headers = dict(endpoint.headers_factory())
@@ -183,7 +186,8 @@ def resolve_and_send(
                 params=params if hop == 0 else None,
                 json=json,
                 headers=request_headers,
-            )
+            ),
+            stream=stream,
         )
         location = response.headers.get("location")
         if response.status_code not in REDIRECT_STATUSES:

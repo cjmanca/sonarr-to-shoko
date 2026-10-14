@@ -23,8 +23,8 @@
 | F26/F27 — Mapping source provenance and recovery | complete | Active authorization and persisted refresh state are now bound to the normalized full source URL. Source transitions immediately clear validators/schedule and remain non-authorizing through failures/backoff until a successful fetch activates that source. Invalid active generations trigger immediate recovery; failed recovery honors persisted backoff across restart. Sequential read-only review found no remaining mapping-provenance/recovery issue. |
 | F28 — Shared daemon-cycle budget | complete | Automatic campaign sends now reserve against the daemon's existing durable cycle key; manual apply still allocates a unique batch key. An integration test proved five completed arrival sends leave zero pending slots but still prevent five more campaign submissions in the same cycle; the deferred campaign uses the next cycle's fresh cap. |
 | F29 — Bounded campaign processing | complete | Direct work-attempt accounting replaces subtraction. Reconciliation defers campaign identity quarantines to the bounded candidate loop in both manual and automatic apply paths. A 100-file `--batch-size 1` canary quarantines one file; a 100-file all-mapping-drift batch of five quarantines five. Mixed sends/quarantines and preexisting quarantine cases pass. |
-| F30 — Streamed mapping download | pending | |
-| Final checks and read-only review | pending | |
+| F30 — Streamed mapping download | complete | Mapping refresh uses HTTPX streaming, reads capped raw chunks into one bytearray without a second body-sized copy, and closes responses on success, overflow, errors, 304, and interruption. Focused streaming tests and related source-wiring tests pass. |
+| Final checks and read-only review | in progress | Full configured tests, quality checks, Docker build/smoke, and final read-only review have passed. F30 local commit and final SHA/status audit remain. |
 
 ## F26/F27 — Mapping source provenance and recovery (complete)
 
@@ -74,6 +74,32 @@
 - `uv run --offline --group dev mypy` → passed (**47 source files**); `git diff --check` → no whitespace errors (Windows CRLF/LF working-copy warning only).
 - Local combined F28/F29 implementation commit: `053bdaa` (`fix: enforce campaign cycle and batch limits`).
 
+## F30 — Streamed mapping download (complete)
+
+- Added opt-in `stream=True` to the shared HTTP sender, preserving its buffered default for unrelated Sonarr/Shoko callers. Mapping refresh alone selects streaming and retains the existing source-origin binding, identity encoding, no-redirect policy, timeouts, ETag/304 behavior, validation, and atomic activation.
+- `_read_capped()` now iterates raw bytes using chunks no larger than 64 KiB (or `max_bytes + 1` for smaller caps), appends only bytes within the cap to a single `bytearray`, stops at first overflow, and closes in `finally`. The parser/hash/activation path accepts that bytearray without making a second full-size body copy.
+- Refresh converts streaming `httpx.HTTPError` into the existing transport-failure/backoff outcome after the response is closed. Interruptions propagate while the `finally` still closes the response. Last-known-good data remains active on same-source read failures and is never replaced by oversize or malformed content.
+- Source-response test fixtures now use HTTPX byte streams. A focused sender test confirms opt-in streaming leaves the body unconsumed on return and default callers remain buffered. Mapping tests cover below/exact/over limits, one-chunk early stop without generating the oversized tail, response closure for oversize/non-200/304/read-error/interruption, unchanged LKG data, and successful mapping parsing.
+- Sequential read-only review checked the sender flag reaches `Client.send(stream=True)`, mapping refresh is the only production opt-in, redirects still close/refuse at `max_redirects=0`, all response terminal paths close, and raw-byte accounting plus bytearray retention avoid whole-response buffering. No unresolved finding.
+
+### F30 verification evidence
+
+- `uv run --offline --group dev pytest -o addopts="" -q tests/test_mapping_store.py tests/test_http.py` → **75 passed**.
+- Related source-wiring checks: daemon **80 passed**; CLI/attestation **62 passed**; end-to-end **28 passed** and F campaign e2e **22 passed**.
+- Full Ruff check/format → passed (**51 files already formatted**); `uv run --offline --group dev mypy` → passed (**47 source files**); `git diff --check` → no whitespace errors (Windows CRLF/LF working-copy warnings only).
+- All requests remained mocked/offline; no live Sonarr/Shoko requests or writes occurred.
+
 ## Next action
 
-Add an incremental streaming-response regression for F30 covering the cap boundary, early stop on overflow, and response closure.
+Commit the validated F30 changes locally on `main`, record its SHA below, then verify the final clean diff apart from the pre-existing immutable `PLAN.md` change and recheck its approved digest.
+
+## Final verification and handoff
+
+- Full configured suite: `uv run pytest -q` completed through **100%** and exited successfully.
+- `uv run ruff check .` → passed; `uv run ruff format --check .` → **51 files already formatted**; `uv run mypy` → passed (**47 source files**); `git diff --check` → no whitespace errors (Git reports Windows CRLF/LF working-copy warnings for changed files).
+- `docker build -t shoko-sonarr-linker:review .` → passed. Container `--help` passed; `validate --offline /app/config.example.yaml` passed with placeholder API-key environment values and made no Sonarr/Shoko requests; runtime UID/GID is `1000:1000`.
+- Final sequential read-only review across mapping provenance/recovery, combined budget reservations/restarts, reconciliation plus candidate-loop batch bounds/protected associations, streaming byte limits/response closure, and no-replay behavior found no unresolved P0/P1 or acceptance-blocking P2 issue.
+- Live Sonarr/Shoko integration, production writes, GitHub Actions/GHCR, and deployment remain **EXTERNAL/UNVERIFIED**; none were performed.
+- Approved `PLAN.md` SHA-256 rechecked as `CE5993C0E5F1DF5E2F33F18344E2A96C35E88B9817C9F554CA395B6E913CD272`. It remains an uncommitted pre-existing user change and is excluded from implementation commits.
+- Local commits so far: `b2b920d` (F26/F27 implementation), `c6a408b` (F26/F27 evidence), `053bdaa` (F28/F29 implementation), `d6f7901` (F28/F29 evidence). F30 commit pending.
+- Changed implementation/test/documentation files: `README.md`, `src/shoko_linker/campaign.py`, `src/shoko_linker/daemon.py`, `src/shoko_linker/http.py`, `src/shoko_linker/mapping_store.py`, `src/shoko_linker/mappings.py`, `tests/e2e_harness.py`, `tests/test_attestation.py`, `tests/test_audit.py`, `tests/test_campaign.py`, `tests/test_cli_m7.py`, `tests/test_daemon.py`, `tests/test_f_campaign_e2e.py`, `tests/test_http.py`, and `tests/test_mapping_store.py`.

@@ -5,7 +5,7 @@ All requests go through httpx.MockTransport: nothing in this module touches the 
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -37,6 +37,20 @@ FAKE_KEY = "fake-key-never-a-real-one-0000"
 HOPS_AFTER_ONE_REDIRECT = 2
 REGISTERED_KEY_COUNT = 2
 Handler = Callable[[httpx.Request], httpx.Response]
+
+
+class StreamingBody(httpx.SyncByteStream):
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.read = False
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        self.read = True
+        yield self.payload
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def endpoint_for(handler: Handler, base_url: str = "http://shoko:8111") -> ApiEndpoint:
@@ -89,6 +103,38 @@ def test_urlbase_is_preserved_for_api_paths() -> None:
     assert str(seen[0].url) == "http://host/sonarr/api/v3/series"
     assert str(seen[1].url) == "http://host/sonarr/api/v3/episodefile"
     endpoint.client.close()
+
+
+def test_resolve_and_send_stream_mode_does_not_buffer_the_response() -> None:
+    body = StreamingBody(b"mapping data")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body, request=request)
+
+    endpoint = endpoint_for(handler)
+    try:
+        response = resolve_and_send(endpoint, "GET", "/mapping.xml", stream=True)
+        assert body.read is False
+        assert response.is_closed is False
+        response.close()
+        assert body.closed is True
+    finally:
+        endpoint.client.close()
+
+
+def test_resolve_and_send_remains_buffered_by_default() -> None:
+    body = StreamingBody(b"api response")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body, request=request)
+
+    endpoint = endpoint_for(handler)
+    try:
+        response = resolve_and_send(endpoint, "GET", "/File")
+        assert body.read is True
+        assert response.is_closed is True
+    finally:
+        endpoint.client.close()
 
 
 def test_auth_header_names_match_the_documented_contracts() -> None:

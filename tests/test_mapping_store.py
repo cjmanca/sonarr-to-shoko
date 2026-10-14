@@ -8,7 +8,7 @@ or Shoko. Datetimes are fake UTC values.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -104,13 +104,58 @@ class ScriptedSource:
         return self._script.pop(0)(request)
 
 
+class IncrementalBody(httpx.SyncByteStream):
+    """Generate response chunks only as the consumer requests them."""
+
+    def __init__(
+        self,
+        chunks: Iterable[bytes],
+        *,
+        fail_after_chunks: int | None = None,
+        interrupt_after_chunks: int | None = None,
+    ) -> None:
+        self.chunks = iter(chunks)
+        self.fail_after_chunks = fail_after_chunks
+        self.interrupt_after_chunks = interrupt_after_chunks
+        self.chunks_read = 0
+        self.closed = False
+        self.request: httpx.Request | None = None
+
+    def __iter__(self) -> Iterator[bytes]:
+        for chunk in self.chunks:
+            self.chunks_read += 1
+            yield chunk
+            if self.fail_after_chunks == self.chunks_read:
+                assert self.request is not None
+                raise httpx.ReadError("stream interrupted", request=self.request)
+            if self.interrupt_after_chunks == self.chunks_read:
+                raise KeyboardInterrupt
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def streaming_response(
+    body: IncrementalBody,
+    *,
+    status_code: int = 200,
+    etag: str | None = ETAG_B,
+) -> Callable[[httpx.Request], httpx.Response]:
+    def build(request: httpx.Request) -> httpx.Response:
+        body.request = request
+        headers = {} if etag is None else {"ETag": etag}
+        return httpx.Response(status_code, headers=headers, stream=body, request=request)
+
+    return build
+
+
 def ok_response(
     body: bytes, etag: str | None = ETAG_A
 ) -> Callable[[httpx.Request], httpx.Response]:
     headers = {"ETag": etag} if etag is not None else {}
 
     def build(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers=headers, content=body, request=request)
+        return httpx.Response(200, headers=headers, stream=httpx.ByteStream(body), request=request)
 
     return build
 
@@ -315,6 +360,103 @@ def test_identical_200_content_is_unchanged_with_validator_update(tmp_path: Path
     assert outcome is RefreshOutcome.UNCHANGED
     assert store.active_path.read_bytes() == before
     assert read_json(store.state_path)["etag"] == ETAG_B
+
+
+@pytest.mark.parametrize("extra_capacity", [0, 1])
+def test_streamed_mapping_body_accepts_below_and_exact_byte_cap(
+    tmp_path: Path, extra_capacity: int
+) -> None:
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    body = IncrementalBody([SMALL_XML[:11], SMALL_XML[11:]])
+    source.queue(streaming_response(body))
+    endpoint = endpoint_for(source, store)
+    try:
+        outcome = refresh(
+            store,
+            endpoint,
+            now=NOW,
+            refresh_hours=HOURS,
+            max_bytes=len(SMALL_XML) + extra_capacity,
+        )
+    finally:
+        endpoint.client.close()
+
+    assert outcome is RefreshOutcome.ACTIVATED
+    assert body.chunks_read == 2
+    assert body.closed is True
+    assert load_active(store) is not None
+
+
+def test_streamed_mapping_body_stops_at_overflow_and_closes_response(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    meta_before = store.meta_path.read_bytes()
+    generated_chunks = 20
+    body = IncrementalBody(b"x" * (SMALL_MAX_BYTES + 1) for _ in range(generated_chunks))
+    source.queue(streaming_response(body))
+
+    outcome = refresh(
+        store,
+        endpoint,
+        now=LATER,
+        refresh_hours=HOURS,
+        force=True,
+        max_bytes=SMALL_MAX_BYTES,
+    )
+
+    assert outcome is RefreshOutcome.FAILED_SIZE
+    assert body.chunks_read == 1
+    assert body.chunks_read < generated_chunks
+    assert body.closed is True
+    assert store.active_path.read_bytes() == active_before
+    assert store.meta_path.read_bytes() == meta_before
+
+
+def test_stream_read_error_closes_response_and_preserves_last_known_good(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    body = IncrementalBody([SMALL_XML[:10], SMALL_XML[10:]], fail_after_chunks=1)
+    source.queue(streaming_response(body))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert outcome is RefreshOutcome.FAILED_TRANSPORT
+    assert body.closed is True
+    assert store.active_path.read_bytes() == active_before
+    assert load_active(store) is not None
+
+
+def test_stream_interruption_closes_response_and_propagates(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    body = IncrementalBody([SMALL_XML[:10], SMALL_XML[10:]], interrupt_after_chunks=1)
+    source.queue(streaming_response(body))
+
+    with pytest.raises(KeyboardInterrupt):
+        refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert body.closed is True
+    assert store.active_path.read_bytes() == active_before
+
+
+def test_streamed_non_success_and_304_responses_close_without_reading_body(
+    tmp_path: Path,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    error_body = IncrementalBody([b"error body"])
+    source.queue(streaming_response(error_body, status_code=503, etag=None))
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+    assert outcome is RefreshOutcome.FAILED_TRANSPORT
+    assert error_body.chunks_read == 0
+    assert error_body.closed is True
+
+    unchanged_body = IncrementalBody([b"unused 304 body"])
+    source.queue(streaming_response(unchanged_body, status_code=304, etag=ETAG_A))
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+    assert outcome is RefreshOutcome.UNCHANGED
+    assert unchanged_body.chunks_read == 0
+    assert unchanged_body.closed is True
 
 
 def test_oversized_body_is_size_failure_and_caps_backoff(tmp_path: Path) -> None:
