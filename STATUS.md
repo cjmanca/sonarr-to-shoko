@@ -19,7 +19,7 @@
 | Orient and adopt plan baseline | complete | Current PLAN.md hash captured; HEAD matches its reviewed commit. |
 | F23 — GHCR workflow planning and latest gate | complete | Shared offline-tested planner; safe per-SHA publication/rechecks; branch-tip backfill; strict provenance/media validation; latest gated on verified current main head. Independent spec and code-quality review accepted after fixes/adjudication. Local implementation commit: `22ecaff86266c88152a2f7b45cb01745098a1870`. |
 | F21 — Frozen Shoko file identity | complete | ED2K is bound to link plans, fingerprints, durable campaign approval, discovery continuity, preflight, and async verification. Legacy campaign plans require re-prepare/re-approval. Campaign drift quarantine accounting is persisted and counts once. Independent sequential review accepted after two P2 fixes. Local implementation commit: `5eff64ee6bdaf89faad05993d62da005fc7010c4`. |
-| F22 — Incomplete reconciliation handling | pending |  |
+| F22 — Incomplete reconciliation handling | complete | Manual apply and the daemon's inner campaign sweep now require `reconciliation_ready` before campaign drift decisions. Incomplete snapshots defer with stable source reason codes, zero POSTs, unchanged approvals/progress, and no zero-progress breaker update. Sequential read-only review accepted. Local implementation commit: `70628e8f4229540afc5335f7d7e13a6dc8924bea`. |
 | F24 — Candidate-level mapping drift | pending |  |
 | F25 — Cross-scope write reporting | pending |  |
 | Final checks and adversarial review | pending |  |
@@ -65,6 +65,23 @@
 - `git diff --check` → passed (no whitespace errors).
 - Local implementation commit: `5eff64e` (`fix: bind Shoko ED2K to approved link plans`). `PLAN.md` SHA-256 remains `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`.
 
+## F22 — Defer incomplete campaign reconciliations (complete)
+
+- Campaign apply now refuses candidate and mapping-drift decisions unless its inner dry-run sweep reports `reconciliation_ready=True`. On an incomplete sweep it raises a dedicated deferral error before eligibility/mapping changes or candidate processing. Manual apply reports the source reason; daemon drains surface `campaign_deferred:<id>:reconciliation_incomplete` and source reason codes, then return without touching the zero-progress breaker.
+- Daemon cycle reports now include stable `sonarr_inventory_incomplete:<reason>` and `shoko_snapshot_incomplete:<reason>` codes. Existing outer-cycle readiness gating remains in place; the inner-sweep exception covers the case where the outer daemon snapshot was complete but the campaign's fresh sweep is not.
+- Mocked regression coverage includes an incomplete/short Shoko page, inconsistent Shoko `Total`, malformed Shoko file field, transient failure on a later Shoko page, incomplete Sonarr episode-file inventory, and a daemon cycle whose outer snapshot is complete but inner campaign sweep is incomplete. Tests verify zero additional POSTs, unchanged campaign status/digest/bindings/progress, no quarantines, and normal processing after a subsequent complete snapshot. Existing complete-snapshot ED2K drift coverage remains passing.
+- All validation is offline/mocked; no production Sonarr/Shoko calls or writes were performed.
+
+### F22 verification evidence
+
+- `uv run --offline --group dev pytest -o addopts="" -q tests/test_campaign.py tests/test_daemon.py tests/test_shoko.py tests/test_sonarr.py` → **338 passed**.
+- `uv run --offline --group dev pytest -o addopts="" -q` → **1111 passed** (2026-10-14).
+- `uv run --offline --group dev ruff check .` → passed.
+- `uv run --offline --group dev ruff format --check .` → passed (51 files already formatted).
+- `uv run --offline --group dev mypy` → passed (47 source files).
+- `git diff --check` → passed (no whitespace errors).
+- Sequential read-only F22 review found no remaining findings. Local implementation commit: `70628e8f4229540afc5335f7d7e13a6dc8924bea`. `PLAN.md` SHA-256 remains `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`.
+
 ## Next action
 
-Begin Phase 3 (F22): require complete reconciliation snapshots before manual or daemon campaign candidate-drift decisions; incomplete observations must defer without quarantine or approval mutation.
+Begin Phase 4 (F24): preserve approved AniDB episode identities while allowing unrelated Anime-Lists updates, and quarantine only candidates whose effective mappings genuinely changed.
