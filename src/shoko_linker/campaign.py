@@ -128,11 +128,6 @@ PLAN_DOCUMENT_FIELDS: Final[frozenset[str]] = frozenset(
         "stop_conditions",
     }
 )
-_MAPPING_DRIFT_DETAIL: Final[str] = (
-    "the active mapping generation no longer matches the approved plan digests: the campaign "
-    "is paused (mapping_drift); a new mapping never expands the approved set — prepare a new "
-    "campaign for newly mapped files. Zero POSTs"
-)
 STOP_CONDITIONS: Final[tuple[str, ...]] = (
     "mapping_churn",
     "mapping_drift",
@@ -227,15 +222,38 @@ class CampaignEligibilityRefusalError(CampaignError):
         self.eligibility_reasons = reasons
 
 
-class CampaignReconciliationIncompleteError(CampaignError):
+class CampaignDeferredError(CampaignError):
+    """A non-destructive campaign batch deferral with stable machine-readable reasons."""
+
+    def __init__(self, reason_code: str, reason_codes: Sequence[str], message: str) -> None:
+        self.reason_code = reason_code
+        self.reason_codes = tuple(dict.fromkeys(reason_codes))
+        super().__init__(message)
+
+
+class CampaignReconciliationIncompleteError(CampaignDeferredError):
     """The dry-run inventory snapshot is insufficient to make campaign drift decisions."""
 
     def __init__(self, reason_codes: Sequence[str]) -> None:
-        self.reason_codes = tuple(dict.fromkeys(reason_codes))
-        detail = ", ".join(self.reason_codes) or "reconciliation_not_ready"
+        normalized = tuple(dict.fromkeys(reason_codes))
+        detail = ", ".join(normalized) or "reconciliation_not_ready"
         super().__init__(
+            "reconciliation_incomplete",
+            normalized,
             f"campaign apply deferred: reconciliation incomplete ({detail}); "
-            "approved targets and progress are unchanged, zero POSTs"
+            "approved targets and progress are unchanged, zero POSTs",
+        )
+
+
+class CampaignMappingGenerationChangedError(CampaignDeferredError):
+    """The mapping generation changed after the campaign sweep; retry with a fresh sweep."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "mapping_generation_changed",
+            (),
+            "campaign apply deferred: mapping generation changed after reconciliation; "
+            "retry with a fresh sweep, zero POSTs",
         )
 
 
@@ -937,8 +955,9 @@ def apply_campaign(
             and record.state_detail.startswith("campaign_quarantine:")
         )
         sweep = _apply_sweep(deps, campaign.campaign_id, now_iso, reasons)
-        active = _apply_mapping(deps, store, plan, campaign.campaign_id, now_iso)
+        active = _apply_mapping(deps, sweep)
         counters = _CampaignCounters(sent_running=campaign.total_sent)
+        queue = _campaign_queue_snapshot(deps, active, now_iso)
         # F9: a fresh durable budget-window key for this batch (unique across restarts), so the
         # per-cycle submission cap is per batch — never a constant key that accumulates forever.
         batch_cycle_key = store.begin_cycle(f"campaign-{_short(campaign.campaign_id)}", now_iso)
@@ -950,7 +969,7 @@ def apply_campaign(
             sweep=sweep,
             active=active,
             resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
-            queue=fetch_queue(deps.shoko),
+            queue=queue,
             now_iso=now_iso,
             cycle_key=batch_cycle_key,
             preexisting_quarantines=preexisting_quarantines,
@@ -1069,6 +1088,34 @@ def _batch_size(settings: Settings, batch_size: int | None) -> int:
     return size
 
 
+def _campaign_mapping_resolution_skip(sweep: CycleReport, file_id: int) -> str | None:
+    prefix = f"skip:{file_id}:"
+    mapping_statuses = (
+        "target_ambiguous",
+        "target_conflict",
+        "target_unmapped",
+        "target_no_equivalent",
+    )
+    for reason in sweep.reasons:
+        if reason.startswith(prefix):
+            detail = reason.removeprefix(prefix)
+            if detail.startswith(mapping_statuses):
+                return detail
+    return None
+
+
+def _campaign_mapping_drift_detail(
+    entry: CampaignFile, active: ActiveMappings, resolution: str
+) -> str:
+    approved = sorted(entry.anidb_target_identities)
+    return (
+        f"mapping_target_drift:resolution={resolution}; approved={approved!r}; "
+        f"approved_targets_digest={entry.mapping_targets_digest}; "
+        f"current_targets_digest={active.targets_digest}; "
+        f"current_structure_digest={active.structure_digest}; current_revision={active.revision}"
+    )
+
+
 def _apply_guards(
     deps: DaemonDeps,
     settings: Settings,
@@ -1145,6 +1192,7 @@ def _apply_sweep(
         cycle_key=f"campaign-{_short(campaign_id)}-apply",
     )
     reasons.extend(sweep.reasons)
+    reasons.extend(f"historical_mapping_drift:{item}" for item in sweep.existing_link_drift)
     if sweep.failed:
         raise CampaignError(
             "campaign apply: the reconciliation sweep failed (transport); zero POSTs"
@@ -1174,22 +1222,42 @@ def _apply_sweep(
 
 def _apply_mapping(
     deps: DaemonDeps,
-    store: StateStore,
-    plan: CampaignPlan,
-    campaign_id: str,
-    now_iso: str,
+    sweep: CycleReport,
 ) -> ActiveMappings:
-    """The approved plan digests must still equal the active generation (mapping_drift)."""
-    active = load_active(deps.mapping_store, _load_overrides(deps))
-    if active is None:
+    """Use the sweep's generation and fail non-destructively if it changed afterward."""
+    swept = sweep.mapping_snapshot
+    if swept is None:
+        raise CampaignError("campaign apply: reconciliation sweep omitted its mapping snapshot")
+    current = load_active(deps.mapping_store, _load_overrides(deps))
+    if current is None:
         raise CampaignError("campaign apply: the active mapping generation vanished; zero POSTs")
-    if active.targets_digest != plan.targets_digest:
-        _pause_campaign(store, campaign_id, "mapping_drift", now_iso)
-        raise CampaignError(_MAPPING_DRIFT_DETAIL)
-    if active.structure_digest != plan.structure_digest:
-        _pause_campaign(store, campaign_id, "mapping_drift", now_iso)
-        raise CampaignError(_MAPPING_DRIFT_DETAIL)
-    return active
+    current_generation = (
+        current.revision,
+        current.content_sha256,
+        current.targets_digest,
+        current.structure_digest,
+        current.overrides_applied,
+    )
+    if current_generation != swept:
+        raise CampaignMappingGenerationChangedError
+    return current
+
+
+def _ensure_campaign_mapping_generation(
+    deps: DaemonDeps, active: ActiveMappings, now_iso: str
+) -> None:
+    """Do not make drift/quarantine decisions from a sweep stale before candidate processing."""
+    if mapping_generation_stale(deps, active, now_iso):
+        raise CampaignMappingGenerationChangedError()
+
+
+def _campaign_queue_snapshot(
+    deps: DaemonDeps, active: ActiveMappings, now_iso: str
+) -> QueueSnapshot | None:
+    """Read the queue, then ensure its network interval did not cross a mapping swap."""
+    queue = fetch_queue(deps.shoko)
+    _ensure_campaign_mapping_generation(deps, active, now_iso)
+    return queue
 
 
 def _entry_gate(
@@ -1205,14 +1273,23 @@ def _entry_gate(
         reasons.append(f"max_submissions_reached:{file_id}")
         return None
     record = store.get_file(file_id)
-    if record is None:
+    if record is None or record.campaign_id != campaign.campaign_id:
         counters.deferred += 1
-        reasons.append(f"file_missing:{file_id}")
+        reasons.append(f"file_missing:{file_id}" if record is None else f"unbound:{file_id}")
         return None
-    if record.campaign_id != campaign.campaign_id:
-        counters.deferred += 1
-        reasons.append(f"unbound:{file_id}")
-        return None
+    if record.state is FileState.AMBIGUOUS:
+        mapping_skip = _campaign_mapping_resolution_skip(context.sweep, file_id)
+        if mapping_skip is not None:
+            _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
+            _campaign_quarantine(
+                store,
+                file_id,
+                _campaign_mapping_drift_detail(entry, context.active, mapping_skip),
+                context.now_iso,
+                counters,
+                reasons,
+            )
+            return None
     if record.state is FileState.BLOCKED_SAFETY and record.state_detail.startswith(
         "campaign_quarantine:"
     ):
@@ -1251,13 +1328,32 @@ def _prepare_candidate(
     record = _entry_gate(context, entry, counters, reasons)
     if record is None:
         return None
-    drift = _candidate_drift(record, entry)
+    fingerprints_changed = (
+        record.plan_fingerprint != entry.plan_fingerprint
+        or record.mapping_targets_digest != entry.mapping_targets_digest
+    )
+    # prepare_send persists its current-generation request fingerprint before transport. A
+    # changed fingerprint therefore marks a durable prior intent whose resulting candidate is
+    # still checked against the immutable target set below (not against global mapping digests).
+    prior_send = fingerprints_changed and record.request_fingerprint not in (
+        None,
+        entry.request_fingerprint,
+    )
+    drift = _candidate_drift(record, entry, prior_send=prior_send)
     if drift is not None:
         _campaign_quarantine(store, file_id, drift, now_iso, counters, reasons)
         return None
     candidate = context.sweep.plans.get(file_id)
     if candidate is None:
-        _campaign_quarantine(store, file_id, "plan_no_longer_frozen", now_iso, counters, reasons)
+        mapping_skip = _campaign_mapping_resolution_skip(context.sweep, file_id)
+        if mapping_skip is not None:
+            _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
+        reason = (
+            _campaign_mapping_drift_detail(entry, context.active, mapping_skip)
+            if mapping_skip is not None
+            else "plan_no_longer_frozen"
+        )
+        _campaign_quarantine(store, file_id, reason, now_iso, counters, reasons)
         return None
     return _candidate_plan(context, entry, record, candidate, counters, reasons)
 
@@ -1270,20 +1366,73 @@ def _candidate_plan(
     counters: _CampaignCounters,
     reasons: list[str],
 ) -> LinkPlan | None:
-    """Approved-plan identity rules: pending targets, materialization, fingerprint drift."""
+    """Approved-plan identity rules: source identity and effective mapped target equality."""
     store, now_iso, file_id = context.store, context.now_iso, entry.shoko_file_id
-    if canonical_ed2k(candidate.shoko_ed2k) != entry.shoko_ed2k:
-        _campaign_quarantine(store, file_id, "ed2k_drift", now_iso, counters, reasons)
+    source_drift = _campaign_candidate_source_drift(entry, record, candidate)
+    if source_drift is not None:
+        _campaign_quarantine(store, file_id, source_drift, now_iso, counters, reasons)
         return None
     if entry.shoko_episode_ids == ():
+        _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
         return _pending_plan(context, entry, record, candidate, counters, reasons)
     if candidate.status is not PlanStatus.LINKABLE:
+        _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
         _campaign_quarantine(store, file_id, "plan_not_linkable", now_iso, counters, reasons)
         return None
-    if candidate.fingerprint != entry.plan_fingerprint:
-        _campaign_quarantine(store, file_id, "fingerprint_drift", now_iso, counters, reasons)
+    approved_targets = set(entry.anidb_target_identities)
+    current_targets = {
+        (
+            target.anidb_anime_id,
+            target.anidb_episode_number,
+            target.episode_type,
+            target.anidb_episode_id,
+        )
+        for target in candidate.targets
+    }
+    if current_targets != approved_targets:
+        _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
+        current_source_rules = sorted({target.source_rule for target in candidate.targets})
+        detail = (
+            f"mapping_target_drift:approved={sorted(approved_targets)!r}; "
+            f"current={sorted(current_targets)!r}; current_source_rules={current_source_rules!r}; "
+            f"approved_targets_digest={entry.mapping_targets_digest}; "
+            f"current_targets_digest={context.active.targets_digest}; "
+            f"current_structure_digest={context.active.structure_digest}; "
+            f"current_revision={context.active.revision}"
+        )
+        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
+        return None
+    if candidate.episode_ids != entry.shoko_episode_ids:
+        _ensure_campaign_mapping_generation(context.deps, context.active, now_iso)
+        detail = (
+            f"shoko_target_identity_drift:approved_episode_ids={entry.shoko_episode_ids!r}; "
+            f"current_episode_ids={candidate.episode_ids!r}; "
+            f"current_source_rules={sorted({target.source_rule for target in candidate.targets})!r}"
+        )
+        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
         return None
     return candidate
+
+
+def _campaign_candidate_source_drift(
+    entry: CampaignFile, record: Any, candidate: LinkPlan
+) -> str | None:
+    """Keep the approved file/source binding independent of global mapping-generation digests."""
+    if canonical_ed2k(candidate.shoko_ed2k) != entry.shoko_ed2k:
+        return "ed2k_drift"
+    source_identity = getattr(record, "identity", None)
+    if (
+        candidate.shoko_file_id != entry.shoko_file_id
+        or candidate.sonarr_series_id != entry.sonarr_series_id
+        or candidate.sonarr_episode_file_id != entry.sonarr_file_id
+        or candidate.sonarr_path != entry.path
+        or candidate.sonarr_size != entry.size
+        or candidate.shoko_size != entry.size
+        or source_identity is None
+        or canonical_ed2k(source_identity.ed2k) != entry.shoko_ed2k
+    ):
+        return "file_identity_drift"
+    return None
 
 
 def _pending_plan(
@@ -1322,7 +1471,25 @@ def _resolve_and_rebuild(
         reasons.append(f"pending_target:{file_id}")
         return None
     if reason is not None:
-        _campaign_quarantine(store, file_id, reason, now_iso, counters, reasons)
+        _ensure_campaign_mapping_generation(context.deps, context.active, now_iso)
+        detail = reason
+        if reason == "target_drift":
+            current = sorted(
+                (
+                    target.anidb_anime_id,
+                    target.anidb_episode_number,
+                    target.episode_type,
+                    target.anidb_episode_id,
+                    target.source_rule,
+                )
+                for target in candidate.pending_targets
+            )
+            detail = (
+                f"target_drift:approved_anidb_target_identities="
+                f"{sorted(entry.anidb_target_identities)!r}; current_pending_targets={current!r}; "
+                f"current_revision={context.active.revision}"
+            )
+        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
         return None
     assert resolved_plan is not None
     _materialize_planned(store, record, file_id, now_iso)
@@ -1349,7 +1516,25 @@ def _materialized_candidate(
         for target in candidate.targets
     }
     if observed != set(entry.anidb_target_identities) or candidate.targets == ():
-        _campaign_quarantine(store, file_id, "target_drift", now_iso, counters, reasons)
+        _ensure_campaign_mapping_generation(context.deps, context.active, now_iso)
+        current = sorted(
+            (
+                target.anidb_anime_id,
+                target.anidb_episode_number,
+                target.episode_type,
+                target.anidb_episode_id,
+                target.source_rule,
+            )
+            for target in candidate.targets
+        )
+        detail = (
+            f"target_drift:approved_anidb_target_identities="
+            f"{sorted(entry.anidb_target_identities)!r}; current_targets={current!r}; "
+            f"approved_shoko_episode_ids={entry.shoko_episode_ids!r}; "
+            f"current_shoko_episode_ids={candidate.episode_ids!r}; "
+            f"current_revision={context.active.revision}"
+        )
+        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
         return None
     _materialize_planned(store, record, file_id, now_iso)
     return candidate
@@ -1413,15 +1598,19 @@ def _pause_campaign(
     logger.warning("campaign %s paused: %s", campaign_id, reason)
 
 
-def _candidate_drift(record: Any, entry: CampaignFile) -> str | None:
-    if record.plan_fingerprint != entry.plan_fingerprint:
+def _candidate_drift(record: Any, entry: CampaignFile, *, prior_send: bool = False) -> str | None:
+    # prepare_send persists the live generation's plan/request fingerprints on the row. A
+    # rejected/refused send can return to the campaign queue after an unrelated mapping update;
+    # in that case candidate-level target validation below is the authorization check, while
+    # the immutable campaign binding remains in the plan digest and campaign record.
+    if record.plan_fingerprint != entry.plan_fingerprint and not prior_send:
         return "binding_fingerprint"
     if record.sonarr_path != entry.path:
         return "path_drift"
     if record.sonarr_size != entry.size:
         return "size_drift"
     stored = getattr(record, "mapping_targets_digest", None)
-    if stored is not None and stored != entry.mapping_targets_digest:
+    if stored is not None and stored != entry.mapping_targets_digest and not prior_send:
         return "targets_digest_drift"
     return None
 

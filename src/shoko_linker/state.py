@@ -188,6 +188,7 @@ META_REQUIRES_REBASELINE: Final[str] = "requires_rebaseline"
 META_APPLY_LOCK_STEALS: Final[str] = "apply_lock_steals"
 META_LAST_REFUSAL: Final[str] = "last_refusal"
 META_SLOT_RELEASE_NOOPS: Final[str] = "slot_release_noops"
+META_GLOBAL_PAUSE_ORIGIN: Final[str] = "global_pause_origin"
 META_BASELINE_COMPLETED_ISO: Final[str] = "baseline_completed_iso"
 META_BUDGET_CYCLE_KEY: Final[str] = "budget_last_cycle_key"
 #: Durable budget-cycle identity (F9). ``budget_run_id`` is a random nonce written once
@@ -1906,15 +1907,21 @@ class StateStore:
         ).fetchone()
         assert global_row is not None
         paused = _as_optional_str(global_row[4])
-        # F8: the daemon attestation gate's global pause never blocks a campaign
-        # submission — origin-gated on the gate's own marker (gate meta "paused" AND reason
-        # "attestation_expired"). Any other pause reason (churn/source/queue/operator pause)
-        # gates every scope, including campaigns.
+        # F8/F24: the daemon attestation pause and daemon-origin mapping-churn pause may be
+        # bypassed by an authorized campaign. Both are origin-gated; operator pauses and every
+        # other global pause still gate all scopes. Mapping churn is safe for a campaign because
+        # every approved candidate is re-evaluated against its immutable target set.
         daemon_attestation_pause = (
             paused == ATTESTATION_PAUSE_REASON
             and _as_optional_str(self.get_meta(META_ATTESTATION_GATE)) == "paused"
+            and _as_optional_str(self.get_meta(META_GLOBAL_PAUSE_ORIGIN))
+            in (None, "attestation_gate")
         )
-        if paused and not (campaign and daemon_attestation_pause):
+        daemon_mapping_churn_pause = (
+            paused == "mapping_churn"
+            and _as_optional_str(self.get_meta(META_GLOBAL_PAUSE_ORIGIN)) == "mapping_churn"
+        )
+        if paused and not (campaign and (daemon_attestation_pause or daemon_mapping_churn_pause)):
             return BudgetRefusal(False, "paused", f"writes paused: {paused}")
         rolling = _as_int(global_row[0], "rolling_new_submissions")
         rolling_start = _as_optional_str(global_row[1])
@@ -2091,15 +2098,35 @@ class StateStore:
         )
 
     @_mutation
-    def pause(self, reason: str, iso: str) -> None:
+    def pause(self, reason: str, iso: str, *, origin: str = "operator") -> None:
         """Persisted write pause (mapping churn, queue anomalies, lease, source breaks)."""
         _require_iso(iso, "iso")
+        if not origin.strip():
+            raise StateError("pause origin must be a non-empty string")
         with self._transaction():
             self._ensure_global_budget_tx()
             self._conn.execute(
                 "UPDATE budgets SET paused_reason = ? WHERE window_key = ?",
                 (_clip(reason), GLOBAL_BUDGET_KEY),
             )
+            self._set_meta_tx(META_GLOBAL_PAUSE_ORIGIN, origin)
+
+    @_mutation
+    def pause_if_unpaused(self, reason: str, iso: str, *, origin: str) -> bool:
+        """Install an origin-tagged pause only if no other pause has already won the race."""
+        _require_iso(iso, "iso")
+        if not origin.strip():
+            raise StateError("pause origin must be a non-empty string")
+        with self._transaction():
+            self._ensure_global_budget_tx()
+            changed = self._conn.execute(
+                "UPDATE budgets SET paused_reason = ? WHERE window_key = ?"
+                " AND paused_reason IS NULL",
+                (_clip(reason), GLOBAL_BUDGET_KEY),
+            ).rowcount
+            if changed == 1:
+                self._set_meta_tx(META_GLOBAL_PAUSE_ORIGIN, origin)
+        return changed == 1
 
     @_mutation
     def resume(self, iso: str) -> None:
@@ -2110,6 +2137,37 @@ class StateStore:
                 "UPDATE budgets SET paused_reason = NULL WHERE window_key = ?",
                 (GLOBAL_BUDGET_KEY,),
             )
+            self._conn.execute("DELETE FROM meta WHERE key = ?", (META_GLOBAL_PAUSE_ORIGIN,))
+
+    @_mutation
+    def resume_if_pause(
+        self,
+        reason: str,
+        iso: str,
+        *,
+        allowed_origins: Sequence[str | None],
+    ) -> bool:
+        """Atomically clear only the expected pause from an explicitly allowed origin."""
+        _require_iso(iso, "iso")
+        with self._transaction():
+            self._ensure_global_budget_tx()
+            row = self._conn.execute(
+                "SELECT paused_reason FROM budgets WHERE window_key = ?",
+                (GLOBAL_BUDGET_KEY,),
+            ).fetchone()
+            current_reason = None if row is None else _as_optional_str(row[0])
+            origin = self.get_meta(META_GLOBAL_PAUSE_ORIGIN)
+            if current_reason != reason or origin not in allowed_origins:
+                return False
+            changed = self._conn.execute(
+                "UPDATE budgets SET paused_reason = NULL"
+                " WHERE window_key = ? AND paused_reason = ?",
+                (GLOBAL_BUDGET_KEY, reason),
+            ).rowcount
+            if changed != 1:
+                return False
+            self._conn.execute("DELETE FROM meta WHERE key = ?", (META_GLOBAL_PAUSE_ORIGIN,))
+        return True
 
     # ---------------------------------------------------------- send machine
 

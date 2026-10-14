@@ -29,7 +29,9 @@ import e2e_harness as eh
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker import campaign as campaign_mod
 from shoko_linker import cli
+from shoko_linker import daemon as daemon_mod
 from shoko_linker.attestation import (
     SCOPE_DAEMON,
     campaign_lease_path,
@@ -43,12 +45,13 @@ from shoko_linker.daemon import (
     CycleMode,
     run_cycle,
 )
-from shoko_linker.linking import SendOutcome
-from shoko_linker.mapping_store import MappingStore
+from shoko_linker.linking import SendOutcome, fetch_queue
+from shoko_linker.mapping_store import MappingStore, RefreshOutcome, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
 from shoko_linker.state import (
     ATTESTATION_PAUSE_REASON,
+    META_GLOBAL_PAUSE_ORIGIN,
     FileState,
     SendToken,
     StateStore,
@@ -396,6 +399,7 @@ def _campaign_env(
     jobs: int = JOBS_TEN,
     rolling: int = ROLLING_BIG,
     batch: int = BATCH_TEN,
+    churn_limit: int | None = None,
     extra_xml: str = "",
 ) -> CampEnv:
     """A mapped backlog world + config with tiny budgets and real lease paths."""
@@ -408,6 +412,8 @@ def _campaign_env(
         "rolling_new_limit": rolling,
         "new_file_grace_period_seconds": 0,
     }
+    if churn_limit is not None:
+        sync_extra["mapping_churn_limit"] = churn_limit
     campaign = {
         "max_campaign_files": FILES_HUNDRED,
         "max_batch_size": batch,
@@ -548,13 +554,13 @@ def _add_new_arrival(env: CampEnv) -> eh.FileSpec:
     return spec
 
 
-def _refresh_generation(env: CampEnv, xml: str) -> None:
+def _refresh_generation(env: CampEnv, xml: str) -> RefreshOutcome:
     """Force a mapping refresh (the mid-batch concurrent-refresh producer)."""
     env.world.source.set_xml(xml)
     store = MappingStore(env.world.mapping_dir, source_url=eh.SOURCE_URL)
     endpoint = eh.source_endpoint(env.world.source.handler)
     try:
-        mapping_refresh(
+        return mapping_refresh(
             store,
             endpoint,
             now=datetime.fromisoformat(env.now),
@@ -563,6 +569,22 @@ def _refresh_generation(env: CampEnv, xml: str) -> None:
         )
     finally:
         endpoint.client.close()
+
+
+def _activate_generation_on_next_cycle(
+    env: CampEnv, monkeypatch: pytest.MonkeyPatch, xml: str
+) -> None:
+    """Make the production mapping phase observe and activate one scheduled generation."""
+    activated = {"value": False}
+
+    def refresh_once(_deps: Any, _now_iso: str, **_kwargs: Any) -> RefreshOutcome:
+        if activated["value"]:
+            return RefreshOutcome.NOT_DUE
+        activated["value"] = True
+        return _refresh_generation(env, xml)
+
+    monkeypatch.setattr(daemon_mod, "mapping_due", lambda *_args: True)
+    monkeypatch.setattr(daemon_mod, "run_mapping_check", refresh_once)
 
 
 def _arrival_xml() -> str:
@@ -991,23 +1013,18 @@ def _swap_mid_batch(env: CampEnv, store: StateStore, swapped_xml: str) -> Any:
 def test_f_campaign_mapping_swap_mid_drain_defers_then_resumes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """F11 end-to-end: a concurrent generation swap between candidates defers the rest of
-    the batch (``mapping_generation_changed``, zero POSTs under the swapped generation);
-    later cycles refuse at the batch guard (``mapping_drift``, zero POSTs); a clean cycle
-    back on the approved digests re-validates (the campaign never rides the moved
-    generation), and the operator's re-prepare + re-approve resumes the drain to
-    completion with exactly one POST per file."""
+    """An unrelated new Anime-Lists series changes global digests without invalidating A."""
     env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_TWENTY, per_series=N_ONE)
     campaign_id = _ready_campaign(env, capsys, N_TWENTY)
     plan_ids = env.plan_file_ids()
     base_xml = env.world.source.xml.decode("utf-8")
-    swapped = base_xml.replace("</anime-list>", EXTRA_SWAP_ENTRY)
+    unrelated = base_xml.replace("</anime-list>", EXTRA_SWAP_ENTRY)
     store = env.open_store()
     try:
         _drain(store, env, campaign_id, until=N_FIVE + N_ONE)
 
         posts_before = env.world.shoko.posts_count()
-        report = _swap_mid_batch(env, store, swapped)
+        report = _swap_mid_batch(env, store, unrelated)
         batch = report.campaign
         assert batch is not None
         assert batch.submitted == N_ONE  # only the in-flight candidate POSTs
@@ -1016,37 +1033,473 @@ def test_f_campaign_mapping_swap_mid_drain_defers_then_resumes(
             reason.startswith("send_stale:") and "mapping_generation_changed" in reason
             for reason in batch.reasons
         )
-        assert env.world.shoko.posts_count() == posts_before + N_ONE  # zero POSTs under the swap
+        assert env.world.shoko.posts_count() == posts_before + N_ONE  # in-flight POST completes
         for record in store.files_in_state(FileState.PLANNED):
             assert record.state is FileState.PLANNED  # deferred remainder stays queueable
 
-        sent_before = env.total_sent(store, campaign_id)
+        sent_after_swap = env.total_sent(store, campaign_id)
         posts_before = env.world.shoko.posts_count()
         for _ in range(N_TWO):
             report = env.cycle(store)
-            assert report.campaign is None
-        assert env.world.shoko.posts_count() == posts_before  # zero POSTs while mapping_drift
+            assert report.campaign is not None
+            assert report.campaign.quarantined == N_ZERO
+            assert report.reconciliation_ready is True
         campaign = store.get_campaign(campaign_id)
         assert campaign is not None
-        assert campaign.status == "paused"
-        assert campaign.status_reason == "mapping_drift"
-        assert env.total_sent(store, campaign_id) == sent_before
+        assert campaign.status == "approved"
+        assert env.total_sent(store, campaign_id) > sent_after_swap
 
-        _refresh_generation(env, base_xml)  # a clean cycle back on the approved digests
-        # The paused campaign never rides the moved generation: the operator's documented
-        # recovery is re-prepare + re-approve (a new plan binding), and the daemon drain
-        # resumes the remainder under it.
+        _refresh_generation(env, base_xml)  # removing B is also unrelated to the approved set
         report = env.cycle(store)
-        assert report.campaign is None  # still paused: no POST rides a stale binding
-        assert env.world.shoko.posts_count() == posts_before
-        remaining = N_TWENTY - env.total_sent(store, campaign_id)
-        campaign_id_2, planned_2 = _reprepare_campaign(env, capsys, N_TWENTY)
-        assert planned_2 == remaining
-        plan_ids_2 = env.plan_file_ids()
-        assert plan_ids_2 <= plan_ids
-        _drain(store, env, campaign_id_2, until=remaining)
+        assert report.campaign is not None
+        assert env.world.shoko.posts_count() > posts_before
+        _drain(store, env, campaign_id, until=N_TWENTY)
         _assert_one_post_per_file(env, plan_ids, N_TWENTY)
-        assert all(env.posts_for(file_id) == N_ONE for file_id in plan_ids_2)
+    finally:
+        store.close()
+
+
+def test_f_campaign_unrelated_mapping_addition_continues_under_new_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    campaign_id = _ready_campaign(env, capsys, 3)
+    plan, _digest = read_plan_file(env.plan_path)
+    plan_ids = {item.shoko_file_id for item in plan.files}
+    unrelated = env.world.source.xml.decode("utf-8").replace("</anime-list>", EXTRA_SWAP_ENTRY)
+    _activate_generation_on_next_cycle(env, monkeypatch, unrelated)
+
+    store = env.open_store()
+    try:
+        report = env.cycle(store)
+        batch = report.campaign
+        active = load_active(env.world.mapping_store())
+
+        assert report.mapping_outcome is RefreshOutcome.ACTIVATED
+        assert report.reconciliation_ready is True
+        assert active is not None
+        assert active.targets_digest != plan.targets_digest
+        assert batch is not None
+        assert batch.submitted == N_TWO
+        assert batch.quarantined == N_ZERO
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert {file_id for file_id, _ids in env.world.shoko.posts} == plan_ids
+        approved_episode_ids = {
+            item.shoko_file_id: set(item.shoko_episode_ids) for item in plan.files
+        }
+        assert all(
+            set(episode_ids) == approved_episode_ids[file_id]
+            for file_id, episode_ids in env.world.shoko.posts
+        )
+    finally:
+        store.close()
+
+
+def test_f_campaign_unrelated_mapping_churn_pause_does_not_block_campaign_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        n_series=N_ONE,
+        per_series=3,
+        churn_limit=N_ONE,
+    )
+    campaign_id = _ready_campaign(env, capsys, 3)
+    plan, _digest = read_plan_file(env.plan_path)
+    plan_ids = {item.shoko_file_id for item in plan.files}
+    unrelated = env.world.source.xml.decode("utf-8").replace("</anime-list>", EXTRA_SWAP_ENTRY)
+    _activate_generation_on_next_cycle(env, monkeypatch, unrelated)
+
+    store = env.open_store()
+    try:
+        report = env.cycle(store)
+
+        assert report.mapping_outcome is RefreshOutcome.ACTIVATED
+        assert "mapping_churn" in report.reasons
+        assert report.campaign is not None
+        assert report.campaign.submitted == N_TWO
+        assert report.campaign.quarantined == N_ZERO
+        assert store.budget_view().paused_reason == "mapping_churn"
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert {file_id for file_id, _ids in env.world.shoko.posts} == plan_ids
+    finally:
+        store.close()
+
+
+def test_mapping_churn_cannot_relabel_operator_pause_for_campaign_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        n_series=N_ONE,
+        per_series=3,
+        churn_limit=N_ONE,
+    )
+    _ready_campaign(env, capsys, 3)
+    unrelated = env.world.source.xml.decode("utf-8").replace("</anime-list>", EXTRA_SWAP_ENTRY)
+    _activate_generation_on_next_cycle(env, monkeypatch, unrelated)
+    store = env.open_store()
+    try:
+        original_pause_if_unpaused = store.pause_if_unpaused
+
+        def operator_pauses_before_churn(reason: str, iso: str, *, origin: str) -> bool:
+            store.pause("mapping_churn", iso, origin="operator")
+            return original_pause_if_unpaused(reason, iso, origin=origin)
+
+        monkeypatch.setattr(store, "pause_if_unpaused", operator_pauses_before_churn)
+        posts_before = env.world.shoko.posts_count()
+
+        report = env.cycle(store)
+
+        assert report.mapping_outcome is RefreshOutcome.ACTIVATED
+        assert store.budget_view().paused_reason == "mapping_churn"
+        assert store.get_meta(META_GLOBAL_PAUSE_ORIGIN) == "operator"
+        assert report.campaign is None
+        assert env.world.shoko.posts_count() == posts_before
+    finally:
+        store.close()
+
+
+def test_attestation_gate_cannot_overwrite_concurrent_operator_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    _ready_campaign(env, capsys, 3)
+    env.write_daemon_lease(hours=0.5)
+    env.advance(31 * 60.0)
+    store = env.open_store()
+    try:
+        original_pause_if_unpaused = store.pause_if_unpaused
+
+        def operator_pauses_before_attestation(reason: str, iso: str, *, origin: str) -> bool:
+            if origin == "attestation_gate":
+                store.pause("disk_review", iso, origin="operator")
+            return original_pause_if_unpaused(reason, iso, origin=origin)
+
+        monkeypatch.setattr(store, "pause_if_unpaused", operator_pauses_before_attestation)
+        posts_before = env.world.shoko.posts_count()
+
+        cycle = env.cycle(store)
+
+        assert store.budget_view().paused_reason == "disk_review"
+        assert store.get_meta(META_GLOBAL_PAUSE_ORIGIN) == "operator"
+        assert store.get_meta("attestation_gate") == "paused"
+        assert cycle.campaign is None
+        assert env.world.shoko.posts_count() == posts_before
+    finally:
+        store.close()
+
+
+def test_attestation_recovery_cannot_clear_concurrent_operator_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    _ready_campaign(env, capsys, 3)
+    settings = yaml.safe_load(env.config_path.read_text(encoding="utf-8"))
+    settings["campaign"]["daemon_auto_apply"] = False
+    env.config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    env.write_daemon_lease(hours=0.5)
+    env.advance(31 * 60.0)
+
+    store = env.open_store()
+    try:
+        expired = env.cycle(store)
+        assert store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON
+        assert store.get_meta(META_GLOBAL_PAUSE_ORIGIN) == "attestation_gate"
+        posts_before = env.world.shoko.posts_count()
+        env.write_daemon_lease()
+        original_resume_if_pause = store.resume_if_pause
+
+        def operator_pauses_before_resume(reason: str, iso: str, *, allowed_origins: Any) -> bool:
+            store.pause("disk_review", iso, origin="operator")
+            return original_resume_if_pause(reason, iso, allowed_origins=allowed_origins)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(store, "resume_if_pause", operator_pauses_before_resume)
+            recovered = env.cycle(store)
+
+        assert recovered.campaign is None
+        assert recovered.counts.submitted == N_ZERO
+        assert store.budget_view().paused_reason == "disk_review"
+        assert store.get_meta(META_GLOBAL_PAUSE_ORIGIN) == "operator"
+        assert store.get_meta("attestation_gate") == "valid"
+        manual_code, _manual_payload = env.apply(batch=N_ONE)
+        assert manual_code == cli.EXIT_APPLY_GATE_REFUSAL
+        assert env.world.shoko.posts_count() == posts_before
+        assert expired.counts.submitted == N_ZERO
+    finally:
+        store.close()
+
+
+def test_f_campaign_defers_when_generation_changes_after_sweep_before_batch_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    campaign_id = _ready_campaign(env, capsys, 3)
+    plan, _digest = read_plan_file(env.plan_path)
+    candidate = next(item for item in plan.files if item.shoko_file_id not in env.posted_files())
+    unrelated = env.world.source.xml.decode("utf-8").replace("</anime-list>", EXTRA_SWAP_ENTRY)
+    original_sweep = campaign_mod._apply_sweep
+    activated = {"value": False}
+
+    def sweep_then_activate(*args: Any, **kwargs: Any) -> Any:
+        sweep = original_sweep(*args, **kwargs)
+        if not activated["value"]:
+            activated["value"] = True
+            _refresh_generation(env, unrelated)
+        return sweep
+
+    store = env.open_store()
+    try:
+        posts_before = env.world.shoko.posts_count()
+        progress_before = campaign_send_progress(store, campaign_id)
+        with monkeypatch.context() as patcher:
+            patcher.setattr(campaign_mod, "_apply_sweep", sweep_then_activate)
+            deferred = env.apply(batch=N_ONE)
+
+        assert deferred[0] == cli.EXIT_APPLY_GATE_REFUSAL
+        assert env.world.shoko.posts_count() == posts_before
+        assert env.posts_for(candidate.shoko_file_id) == N_ZERO
+        record = store.get_file(candidate.shoko_file_id)
+        campaign = store.get_campaign(campaign_id)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert campaign_send_progress(store, campaign_id) == progress_before
+        assert store.campaign_progress(campaign_id)["quarantined"] == N_ZERO
+
+        retry_code, retry = env.apply(batch=N_ONE)
+        assert retry_code == cli.EXIT_OK
+        assert isinstance(retry, dict)
+        assert retry["submitted"] == N_ONE
+        assert retry["quarantined"] == N_ZERO
+        assert env.posts_for(candidate.shoko_file_id) == N_ONE
+    finally:
+        store.close()
+
+
+def test_f_campaign_defers_if_generation_changes_during_queue_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=N_ONE)
+    env.world.shoko.register(
+        [
+            eh.RegistryEpisode(
+                anime=4001,
+                type="Episode",
+                number=2,
+                anidb_ep=4_001_002,
+                shoko_ep=4_501_002,
+            )
+        ]
+    )
+    prepared = env.prepare(N_ONE)
+    campaign_id = str(prepared["campaign_id"])
+    env.approve(str(prepared["approval_digest"]))
+    env.write_daemon_lease()
+    env.write_campaign_lease(campaign_id)
+    plan = read_plan_file(env.plan_path)[0]
+    candidate = plan.files[0]
+    base_xml = env.world.source.xml.decode("utf-8")
+    changed = eh.xml_document(eh.pair_entry(4001, 300001, ";2-1;"))
+    _refresh_generation(env, changed)
+    original_fetch = fetch_queue
+
+    def fetch_then_restore(endpoint: Any) -> Any:
+        queue = original_fetch(endpoint)
+        _refresh_generation(env, base_xml)
+        return queue
+
+    store = env.open_store()
+    try:
+        progress_before = campaign_send_progress(store, campaign_id)
+        with monkeypatch.context() as patcher:
+            patcher.setattr(campaign_mod, "fetch_queue", fetch_then_restore)
+            deferred = env.apply(batch=N_ONE)
+
+        assert deferred[0] == cli.EXIT_APPLY_GATE_REFUSAL
+        assert env.world.shoko.posts_count() == N_ZERO
+        record = store.get_file(candidate.shoko_file_id)
+        campaign = store.get_campaign(campaign_id)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert campaign is not None
+        assert campaign.status == "approved"
+        assert campaign_send_progress(store, campaign_id) == progress_before
+        assert store.campaign_progress(campaign_id)["quarantined"] == N_ZERO
+
+        retry_code, retry = env.apply(batch=N_ONE)
+        assert retry_code == cli.EXIT_OK
+        assert isinstance(retry, dict)
+        assert retry["submitted"] == N_ONE
+        assert retry["quarantined"] == N_ZERO
+        assert env.world.shoko.posts_count() == N_ONE
+    finally:
+        store.close()
+
+
+def test_f_campaign_retries_rejected_candidate_after_unrelated_mapping_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    campaign_id = _ready_campaign(env, capsys, 3)
+    plan, _digest = read_plan_file(env.plan_path)
+    candidate = next(item for item in plan.files if item.shoko_file_id not in env.posted_files())
+    unrelated = env.world.source.xml.decode("utf-8").replace("</anime-list>", EXTRA_SWAP_ENTRY)
+    _refresh_generation(env, unrelated)
+    posts_before = env.world.shoko.posts_count()
+    env.world.shoko.post_status = 400
+
+    rejected_code, rejected = env.apply(batch=N_ONE)
+
+    assert rejected_code == cli.EXIT_OK
+    assert isinstance(rejected, dict)
+    assert rejected["submitted"] == N_ONE
+    assert rejected["quarantined"] == N_ZERO
+    assert env.posts_for(candidate.shoko_file_id) == N_ONE
+    store = env.open_store()
+    try:
+        waiting = store.get_file(candidate.shoko_file_id)
+        assert waiting is not None
+        assert waiting.state is FileState.WAITING
+        assert waiting.plan_fingerprint != candidate.plan_fingerprint
+    finally:
+        store.close()
+
+    env.world.shoko.post_status = None
+    retry_code, retry = env.apply(batch=N_ONE)
+
+    assert retry_code == cli.EXIT_OK
+    assert isinstance(retry, dict)
+    assert retry["submitted"] == N_ONE
+    assert retry["verified"] == N_ONE
+    assert retry["quarantined"] == N_ZERO
+    assert env.world.shoko.posts_count() == posts_before + 2
+    assert env.posts_for(candidate.shoko_file_id) == 2
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_file_id)
+        campaign = store.get_campaign(campaign_id)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+        assert campaign is not None
+        assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_f_campaign_mapping_target_drift_is_candidate_scoped_and_reports_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    campaign_id = _ready_campaign(env, capsys, 3)
+    plan_ids = env.plan_file_ids()
+    verified_id = env.posted_files()[N_ZERO]
+    remaining_ids = sorted(plan_ids - {verified_id})
+    affected_id, unaffected_id = remaining_ids
+    env.world.shoko.register(
+        [
+            eh.RegistryEpisode(
+                anime=4001,
+                type="Episode",
+                number=4,
+                anidb_ep=4_001_004,
+                shoko_ep=4_501_004,
+            )
+        ]
+    )
+    changed = eh.xml_document(eh.pair_entry(4001, 300001, ";2-1;4-2;3-3;"))
+    _activate_generation_on_next_cycle(env, monkeypatch, changed)
+
+    store = env.open_store()
+    try:
+        posts_before = env.world.shoko.posts_count()
+        existing_xrefs = list(env.world.shoko.rows[verified_id].xrefs)
+        report = env.cycle(store)
+        batch = report.campaign
+
+        assert batch is not None
+        assert batch.quarantined == N_ONE
+        assert batch.submitted == N_ONE
+        assert batch.verified == N_ONE
+        assert any("mapping_target_drift" in reason for reason in batch.reasons)
+        assert any("source_rules" in reason for reason in batch.reasons)
+        assert any(
+            f"verified file {verified_id}" in reason for reason in report.existing_link_drift
+        )
+        assert env.world.shoko.posts_count() == posts_before + N_ONE
+        assert env.posts_for(verified_id) == N_ONE
+        assert env.posts_for(affected_id) == N_ZERO
+        assert env.posts_for(unaffected_id) == N_ONE
+        assert set(env.posted_files()) == {verified_id, unaffected_id}
+        assert env.world.shoko.rows[verified_id].xrefs == existing_xrefs
+
+        affected = store.get_file(affected_id)
+        unaffected = store.get_file(unaffected_id)
+        campaign = store.get_campaign(campaign_id)
+        assert affected is not None
+        assert affected.state is FileState.BLOCKED_SAFETY
+        assert affected.state_detail.startswith("campaign_quarantine:mapping_target_drift")
+        assert unaffected is not None
+        assert unaffected.state is FileState.VERIFIED
+        assert campaign is not None
+        assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_f_campaign_ambiguous_mapping_drift_keeps_resolution_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=3)
+    campaign_id = _ready_campaign(env, capsys, 3)
+    plan_ids = env.plan_file_ids()
+    verified_id = env.posted_files()[N_ZERO]
+    affected_id, unaffected_id = sorted(plan_ids - {verified_id})
+    ambiguous = eh.xml_document(
+        "<anime anidbid='4001' tvdbid='300001' defaulttvdbseason='1'>"
+        "<mapping-list>"
+        "<mapping anidbseason='1' tvdbseason='1'>;1-1;2-2;3-3;</mapping>"
+        "<mapping anidbseason='1' tvdbseason='1'>;4-2;</mapping>"
+        "</mapping-list></anime>"
+    )
+    _activate_generation_on_next_cycle(env, monkeypatch, ambiguous)
+
+    store = env.open_store()
+    try:
+        report = env.cycle(store)
+        batch = report.campaign
+
+        assert batch is not None
+        assert batch.quarantined == N_ONE
+        assert batch.submitted == N_ONE
+        assert any("mapping_target_drift" in reason for reason in batch.reasons)
+        assert any("target_ambiguous" in reason for reason in batch.reasons)
+        assert any("TVDB 300001 S1E2" in reason for reason in batch.reasons)
+        assert env.posts_for(verified_id) == N_ONE
+        assert env.posts_for(affected_id) == N_ZERO
+        assert env.posts_for(unaffected_id) == N_ONE
+        affected = store.get_file(affected_id)
+        unaffected = store.get_file(unaffected_id)
+        campaign = store.get_campaign(campaign_id)
+        assert affected is not None
+        assert affected.state is FileState.BLOCKED_SAFETY
+        assert affected.state_detail.startswith("campaign_quarantine:mapping_target_drift")
+        assert "candidate_provenance=" in affected.state_detail
+        assert "explicit_pair@" in affected.state_detail
+        assert unaffected is not None
+        assert unaffected.state is FileState.VERIFIED
+        assert campaign is not None
+        assert campaign.status == "approved"
     finally:
         store.close()
 

@@ -18,13 +18,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import hash_fixtures as hf
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker import daemon as daemon_module
 from shoko_linker.attestation import AttestationVerdict
 from shoko_linker.campaign import (
     apply_campaign,
@@ -48,8 +49,15 @@ from shoko_linker.daemon import (
     run_mapping_check,
 )
 from shoko_linker.http import ApiEndpoint, make_timeout
-from shoko_linker.linking import SendOutcome, VerificationVerdict
-from shoko_linker.mapping_store import MappingStore, RefreshOutcome, refresh
+from shoko_linker.linking import EpisodeIdResolver, SendOutcome, VerificationVerdict
+from shoko_linker.mapping_store import ActiveMappings, MappingStore, RefreshOutcome, refresh
+from shoko_linker.mappings import (
+    EpisodeType,
+    MappingTarget,
+    Resolution,
+    ResolutionStatus,
+    SourceRule,
+)
 from shoko_linker.policies import RunPolicy
 from shoko_linker.reporting import (
     META_CYCLE_CAMPAIGN_ID,
@@ -58,6 +66,7 @@ from shoko_linker.reporting import (
     META_CYCLE_SUBMITTED,
 )
 from shoko_linker.state import (
+    MAX_DETAIL_CHARS,
     META_LAST_FULL_RECONCILE_ISO,
     META_NEXT_FULL_RECONCILE_ISO,
     BaselineFile,
@@ -1140,6 +1149,55 @@ class _PartialStub(ShokoStub):
 
 
 # ------------------------------------------------------------------ gate: mapping reactivation
+
+
+def test_ambiguous_mapping_provenance_fits_durable_detail_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = tuple(
+        MappingTarget(
+            anidb_id=4000 + index,
+            anidb_episode_number=1,
+            episode_type=EpisodeType.EPISODE,
+            source_rule=SourceRule.EXPLICIT_PAIR,
+            precedence_rank=1,
+            origin="anime-list-full.xml:explicit-pair",
+        )
+        for index in range(32)
+    )
+    answer = Resolution(
+        status=ResolutionStatus.AMBIGUOUS,
+        target=None,
+        candidates=candidates,
+        detail="TVDB 300001 S1E2 writes prohibited",
+    )
+    monkeypatch.setattr(daemon_module, "resolve_mapping", lambda *_args: answer)
+    match = SimpleNamespace(
+        sonarr_file=SimpleNamespace(
+            episodes=(
+                SimpleNamespace(
+                    season_number=1,
+                    episode_number=2,
+                    absolute_episode_number=None,
+                ),
+            )
+        )
+    )
+
+    reason = daemon_module._episode_resolutions(
+        resolver=cast(EpisodeIdResolver, None),
+        match=match,
+        tvdb_series=300001,
+        active=cast(ActiveMappings, SimpleNamespace(index=object())),
+    )
+
+    assert isinstance(reason, str)
+    assert len(reason) <= MAX_DETAIL_CHARS - 300
+    assert "TVDB 300001 S1E2" in reason
+    assert "4000" in reason
+    assert "4031" in reason
+    assert "explicit_pair" in reason
+    assert "anime-list-full.xml:explicit-pair" in reason
 
 
 def test_mapping_activated_reevaluates_backlog_without_posts(

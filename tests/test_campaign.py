@@ -43,6 +43,7 @@ from shoko_linker.campaign import (
     CampaignApplyReport,
     CampaignDigestMismatchError,
     CampaignError,
+    CampaignMappingGenerationChangedError,
     CampaignPlanInvalidError,
     apply_campaign,
     approve_campaign,
@@ -133,6 +134,8 @@ class Stubs:
     sizes: dict[int, int] = field(default_factory=dict)
     pending: set[int] = field(default_factory=set)
     divergent: bool = False
+    available_anidb_episodes: dict[int, int] = field(default_factory=dict)
+    shoko_internal_overrides: dict[int, int] = field(default_factory=dict)
     verify_empty: set[int] = field(default_factory=set)
     blocked_count: int = 0
     posts: list[dict[str, Any]] = field(default_factory=list)
@@ -297,18 +300,21 @@ class Stubs:
                 request=request,
             )
         if path.startswith("/api/v3/Series/AniDB/"):
-            episode_id = DIVERGENT_EP if self.divergent else ANIDB_EP
+            episode_rows = self.available_anidb_episodes or {
+                1: DIVERGENT_EP if self.divergent else ANIDB_EP
+            }
             return httpx.Response(
                 200,
                 json={
-                    "Total": 1,
+                    "Total": len(episode_rows),
                     "List": [
                         {
                             "ID": episode_id,
                             "AnimeID": ANIME_ID,
                             "Type": "Episode",
-                            "EpisodeNumber": 1,
+                            "EpisodeNumber": episode_number,
                         }
+                        for episode_number, episode_id in sorted(episode_rows.items())
                     ],
                 },
                 request=request,
@@ -319,7 +325,9 @@ class Stubs:
             if queried == materialized and not any(
                 spec.shoko_id in self.pending for spec in self.specs
             ):
-                internal = DIVERGENT_SHOKO_EP if self.divergent else SHOKO_EP
+                internal = self.shoko_internal_overrides.get(
+                    queried, DIVERGENT_SHOKO_EP if self.divergent else SHOKO_EP
+                )
                 return httpx.Response(
                     200,
                     json={
@@ -1035,6 +1043,149 @@ def test_pending_campaign_candidate_quarantines_ed2k_drift_before_target_resolut
             deps.sonarr.client.close()
             deps.shoko.client.close()
             deps.mapping_source.client.close()
+        store.close()
+
+
+def test_pending_target_drift_defers_if_mapping_changes_during_resolution(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    specs_list = specs(COUNT_TWO)
+    pending = specs_list[1]
+    env.stubs.pending.add(pending.shoko_id)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    plan, _digest = read_plan_file(env.tmp_path / "plan.json")
+    entry = next(item for item in plan.files if item.shoko_file_id == pending.shoko_id)
+    store = env.open_store()
+    deps: DaemonDeps | None = None
+    try:
+        deps = _campaign_deps(env, store, plan.campaign_id)
+        assert deps is not None
+        sweep = run_cycle(
+            deps,
+            now_iso=env.now_iso,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="pending-mapping-generation-probe",
+        )
+        candidate = sweep.plans[pending.shoko_id]
+        assert candidate.status.value == "pending_targets"
+        record = store.get_file(pending.shoko_id)
+        campaign = store.get_campaign(plan.campaign_id)
+        active = load_active(deps.mapping_store, campaign_mod._load_overrides(deps))
+        assert record is not None
+        assert campaign is not None
+        assert active is not None
+        stale = {"value": False}
+
+        def resolve_as_drift(*_args: Any) -> tuple[None, str]:
+            stale["value"] = True
+            return None, "target_drift"
+
+        monkeypatch.setattr(
+            campaign_mod,
+            "mapping_generation_stale",
+            lambda *_args: stale["value"],
+        )
+        monkeypatch.setattr(campaign_mod, "_resolved_pending_plan", resolve_as_drift)
+        counters = campaign_mod._CampaignCounters()
+        reasons: list[str] = []
+        context = campaign_mod._ApplyContext(
+            deps=deps,
+            settings=load_settings(env.config_path),
+            store=store,
+            campaign=campaign,
+            sweep=sweep,
+            active=active,
+            resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
+            queue=None,
+            now_iso=env.now_iso,
+            cycle_key="pending-mapping-generation-probe",
+        )
+
+        with pytest.raises(CampaignMappingGenerationChangedError, match="generation changed"):
+            campaign_mod._candidate_plan(context, entry, record, candidate, counters, reasons)
+
+        after = store.get_file(pending.shoko_id)
+        assert after is not None
+        assert after.state is FileState.MAPPED
+        assert counters.quarantined == 0
+        assert env.stubs.posts == []
+    finally:
+        if deps is not None:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+        store.close()
+
+
+def test_campaign_shoko_episode_id_drift_reports_approved_and_current_ids(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_ONE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    changed = specs(COUNT_ONE)[0]
+    env.stubs.shoko_internal_overrides[ANIDB_EP] = DIVERGENT_SHOKO_EP
+
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["quarantined"] == COUNT_ONE
+    assert result["payload"]["submitted"] == 0
+    assert any("shoko_target_identity_drift" in reason for reason in result["payload"]["reasons"])
+    assert any("approved_episode_ids=(777,)" in r for r in result["payload"]["reasons"])
+    assert any("current_episode_ids=(778,)" in r for r in result["payload"]["reasons"])
+    assert env.stubs.posts == []
+
+    store = env.open_store()
+    try:
+        record = store.get_file(changed.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert "approved_episode_ids=(777,)" in record.state_detail
+        assert "current_episode_ids=(778,)" in record.state_detail
+    finally:
+        store.close()
+
+
+def test_campaign_shoko_episode_id_drift_defers_if_mapping_generation_changes(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env.seed(specs(COUNT_ONE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    changed = specs(COUNT_ONE)[0]
+    env.stubs.shoko_internal_overrides[ANIDB_EP] = DIVERGENT_SHOKO_EP
+    stale_checks = 0
+
+    def generation_changes_after_queue_read(*_args: Any) -> bool:
+        nonlocal stale_checks
+        stale_checks += 1
+        return stale_checks >= 2
+
+    monkeypatch.setattr(
+        campaign_mod, "mapping_generation_stale", generation_changes_after_queue_read
+    )
+
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_APPLY_GATE_REFUSAL
+    assert stale_checks == 2
+    assert "mapping generation changed" in str(result["payload"])
+    assert env.stubs.posts == []
+    store = env.open_store()
+    try:
+        record = store.get_file(changed.shoko_id)
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert campaign is not None
+        assert campaign.status == "approved"
+    finally:
         store.close()
 
 
