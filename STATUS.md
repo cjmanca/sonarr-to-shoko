@@ -21,7 +21,7 @@
 | F21 — Frozen Shoko file identity | complete | ED2K is bound to link plans, fingerprints, durable campaign approval, discovery continuity, preflight, and async verification. Legacy campaign plans require re-prepare/re-approval. Campaign drift quarantine accounting is persisted and counts once. Independent sequential review accepted after two P2 fixes. Local implementation commit: `5eff64ee6bdaf89faad05993d62da005fc7010c4`. |
 | F22 — Incomplete reconciliation handling | complete | Manual apply and the daemon's inner campaign sweep now require `reconciliation_ready` before campaign drift decisions. Incomplete snapshots defer with stable source reason codes, zero POSTs, unchanged approvals/progress, and no zero-progress breaker update. Sequential read-only review accepted. Local implementation commit: `70628e8f4229540afc5335f7d7e13a6dc8924bea`. |
 | F24 — Candidate-level mapping drift | complete | Candidate-level mapping continuity, generation freshness, origin-bound pause handling, and durable ambiguity provenance. Sequential adversarial review findings fixed. Local implementation commit: `9ebf445`. |
-| F25 — Cross-scope write reporting | pending |  |
+| F25 — Cross-scope write reporting | complete | Cycle/health/report output now separates new-arrival and campaign eligibility, submissions, total link requests, and path/all-path suppression. Sequential read-only review found no remaining findings. Local implementation commit: `b0bfe47`. |
 | Final checks and adversarial review | pending |  |
 
 ## F23 — Restore automated publication (complete)
@@ -103,6 +103,26 @@
 - Adopted `PLAN.md` SHA-256 rechecked as `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`; the pre-existing plan modification remains uncommitted and unchanged.
 - Local F24 implementation commit: `9ebf445` (`fix: preserve campaign approval across mapping updates`). Live Sonarr/Shoko integration remains unverified; F24 push-triggered CI/GHCR status will be recorded after push.
 
+## F25 — Report cross-scope write activity accurately (complete)
+
+- `CycleReport` now names new-arrival eligibility/submissions and campaign drain selection/eligibility/submissions separately. `total_link_requests_attempted` is the sum of actual `submit_link` attempts across both cycle paths. The legacy `apply_eligible` and `counts.submitted` remain new-arrival scoped; `writes_suppressed` now means both mutation paths were gated, with per-path suppression fields retained alongside it.
+- Cycle JSON, daemon summaries, human report output, and persisted `health`/`report` metadata include the scoped values. The health/report payload returns unknown (`null`) for new metrics when reading older state that predates those metadata keys.
+- Regression coverage exercises both leases valid, daemon lease invalid with campaign drain valid, daemon lease valid with campaign lease invalid, both leases invalid, explicit operator global pause, and eligible new-arrival processing with zero requests. It checks the actual request sum and verifies the same cycle activity reaches both `health` and `report` payloads.
+- F25 read-only second-pass review found no unresolved findings. All service integration remains mocked/offline; no production calls or writes occurred.
+
+### F25 verification evidence
+
+- `uv run --offline --group dev pytest -o addopts="" -q` → **1127 passed** (2026-10-14).
+- Targeted lease/global-pause/zero-request matrix and payload regressions → **6 passed**.
+- `uv run --offline --group dev ruff check .` → passed.
+- `uv run --offline --group dev ruff format --check .` → passed (51 files already formatted).
+- `uv run --offline --group dev mypy` → passed (47 source files).
+- `git diff --check` → passed (only expected Windows CRLF-to-LF warnings from Git).
+- `docker build -t shoko-sonarr-linker:review .` → passed; runtime user verified as UID/GID `1000:1000`.
+- Docker smoke: CLI help passed; `validate --offline config.example.yaml` passed with no Sonarr/Shoko requests; `once --apply config.example.yaml` refused with exit **3** under default-deny configuration and reported no remote writes.
+- `PLAN.md` SHA-256 rechecked as `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`; the pre-existing plan modification remains uncommitted and unchanged.
+- Local F25 implementation commit: `b0bfe47` (`fix: report campaign and arrival writes separately`). Live Sonarr/Shoko behavior and push-triggered CI/GHCR for the new commits remain unverified pending push.
+
 ## Next action
 
-Begin Phase 5 (F25): make health and cycle reports distinguish new-arrival and campaign eligibility, submissions, and actual Shoko write activity.
+Push the authorized F24/F25 commits to `main`, verify the triggered CI/GHCR workflows, record their outcomes, and complete the overall PLAN.md acceptance audit.
