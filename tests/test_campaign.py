@@ -61,7 +61,7 @@ from shoko_linker.config import load_settings
 from shoko_linker.daemon import CycleMode, DaemonDeps, run_cycle
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.linking import EpisodeIdResolver, LinkPlan
-from shoko_linker.mapping_store import MappingStore, load_active
+from shoko_linker.mapping_store import MappingStore, RefreshOutcome, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
 from shoko_linker.shoko import collect_shoko_discovery
@@ -1165,7 +1165,7 @@ def test_campaign_shoko_episode_id_drift_defers_if_mapping_generation_changes(
     def generation_changes_after_queue_read(*_args: Any) -> bool:
         nonlocal stale_checks
         stale_checks += 1
-        return stale_checks >= 2
+        return stale_checks >= 3
 
     monkeypatch.setattr(
         campaign_mod, "mapping_generation_stale", generation_changes_after_queue_read
@@ -1174,7 +1174,7 @@ def test_campaign_shoko_episode_id_drift_defers_if_mapping_generation_changes(
     result = apply(env, capsys)
 
     assert result["exit"] == EXIT_APPLY_GATE_REFUSAL
-    assert stale_checks == 2
+    assert stale_checks == 3
     assert "mapping generation changed" in str(result["payload"])
     assert env.stubs.posts == []
     store = env.open_store()
@@ -1185,6 +1185,78 @@ def test_campaign_shoko_episode_id_drift_defers_if_mapping_generation_changes(
         assert record.state is FileState.PLANNED
         assert campaign is not None
         assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_campaign_quarantine_serializes_mapping_activation(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env.seed(specs(COUNT_ONE))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    changed = specs(COUNT_ONE)[0]
+    env.stubs.shoko_internal_overrides[ANIDB_EP] = DIVERGENT_SHOKO_EP
+    mapping_store = MappingStore(env.tmp_path / "mappings")
+    active_before = load_active(mapping_store)
+    assert active_before is not None
+    unrelated = _source_xml().replace(
+        b"</anime-list>",
+        b"<anime anidbid='98765' tvdbid='87654' defaulttvdbseason='1'>"
+        b"<mapping-list><mapping anidbseason='1' tvdbseason='1'>;1-1;</mapping>"
+        b"</mapping-list></anime></anime-list>",
+    )
+    refresh_outcomes: list[RefreshOutcome] = []
+    original_quarantine = campaign_mod._campaign_quarantine
+
+    def refresh_before_quarantine(*args: Any, **kwargs: Any) -> None:
+        client = httpx.Client(
+            base_url="https://raw.githubusercontent.com/",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"ETag": '"concurrent"'},
+                    content=unrelated,
+                    request=request,
+                )
+            ),
+            follow_redirects=False,
+            timeout=httpx.Timeout(5.0),
+        )
+        endpoint = ApiEndpoint(client, lambda: {"Accept-Encoding": "identity"})
+        try:
+            refresh_outcomes.append(
+                mapping_refresh(
+                    mapping_store,
+                    endpoint,
+                    now=datetime.fromisoformat(env.now_iso),
+                    force=True,
+                )
+            )
+        finally:
+            client.close()
+        original_quarantine(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_mod, "_campaign_quarantine", refresh_before_quarantine)
+
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["quarantined"] == COUNT_ONE
+    assert result["payload"]["submitted"] == 0
+    assert env.stubs.posts == []
+    assert [outcome.value for outcome in refresh_outcomes] == ["failed_locked"]
+    active_after = load_active(MappingStore(env.tmp_path / "mappings"))
+    assert active_after is not None
+    assert active_after.revision == active_before.revision
+    assert active_after.targets_digest == active_before.targets_digest
+    store = env.open_store()
+    try:
+        record = store.get_file(changed.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
     finally:
         store.close()
 

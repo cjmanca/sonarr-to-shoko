@@ -1251,6 +1251,33 @@ def _ensure_campaign_mapping_generation(
         raise CampaignMappingGenerationChangedError()
 
 
+def _campaign_quarantine_with_generation_guard(
+    context: _ApplyContext,
+    file_id: int,
+    reason: str,
+    counters: _CampaignCounters,
+    reasons: list[str],
+) -> None:
+    """Fence mapping-derived quarantine against activation until its state write commits."""
+    try:
+        with context.deps.mapping_store.generation_lock() as acquired:
+            if not acquired:
+                raise CampaignDeferredError(
+                    "mapping_generation_busy",
+                    (),
+                    "campaign apply deferred: mapping generation is being activated; "
+                    "retry with a fresh sweep, zero POSTs",
+                )
+            _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
+            _campaign_quarantine(context.store, file_id, reason, context.now_iso, counters, reasons)
+    except ApplyLockUnavailableError as exc:
+        raise CampaignDeferredError(
+            "mapping_generation_lock_unavailable",
+            (),
+            "campaign apply deferred: mapping generation lock is unavailable; zero POSTs",
+        ) from exc
+
+
 def _campaign_queue_snapshot(
     deps: DaemonDeps, active: ActiveMappings, now_iso: str
 ) -> QueueSnapshot | None:
@@ -1281,14 +1308,8 @@ def _entry_gate(
         mapping_skip = _campaign_mapping_resolution_skip(context.sweep, file_id)
         if mapping_skip is not None:
             _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
-            _campaign_quarantine(
-                store,
-                file_id,
-                _campaign_mapping_drift_detail(entry, context.active, mapping_skip),
-                context.now_iso,
-                counters,
-                reasons,
-            )
+            detail = _campaign_mapping_drift_detail(entry, context.active, mapping_skip)
+            _campaign_quarantine_with_generation_guard(context, file_id, detail, counters, reasons)
             return None
     if record.state is FileState.BLOCKED_SAFETY and record.state_detail.startswith(
         "campaign_quarantine:"
@@ -1353,7 +1374,10 @@ def _prepare_candidate(
             if mapping_skip is not None
             else "plan_no_longer_frozen"
         )
-        _campaign_quarantine(store, file_id, reason, now_iso, counters, reasons)
+        if mapping_skip is not None:
+            _campaign_quarantine_with_generation_guard(context, file_id, reason, counters, reasons)
+        else:
+            _campaign_quarantine(store, file_id, reason, now_iso, counters, reasons)
         return None
     return _candidate_plan(context, entry, record, candidate, counters, reasons)
 
@@ -1376,8 +1400,9 @@ def _candidate_plan(
         _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
         return _pending_plan(context, entry, record, candidate, counters, reasons)
     if candidate.status is not PlanStatus.LINKABLE:
-        _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
-        _campaign_quarantine(store, file_id, "plan_not_linkable", now_iso, counters, reasons)
+        _campaign_quarantine_with_generation_guard(
+            context, file_id, "plan_not_linkable", counters, reasons
+        )
         return None
     approved_targets = set(entry.anidb_target_identities)
     current_targets = {
@@ -1400,7 +1425,7 @@ def _candidate_plan(
             f"current_structure_digest={context.active.structure_digest}; "
             f"current_revision={context.active.revision}"
         )
-        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
+        _campaign_quarantine_with_generation_guard(context, file_id, detail, counters, reasons)
         return None
     if candidate.episode_ids != entry.shoko_episode_ids:
         _ensure_campaign_mapping_generation(context.deps, context.active, now_iso)
@@ -1409,7 +1434,7 @@ def _candidate_plan(
             f"current_episode_ids={candidate.episode_ids!r}; "
             f"current_source_rules={sorted({target.source_rule for target in candidate.targets})!r}"
         )
-        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
+        _campaign_quarantine_with_generation_guard(context, file_id, detail, counters, reasons)
         return None
     return candidate
 
@@ -1489,7 +1514,7 @@ def _resolve_and_rebuild(
                 f"{sorted(entry.anidb_target_identities)!r}; current_pending_targets={current!r}; "
                 f"current_revision={context.active.revision}"
             )
-        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
+        _campaign_quarantine_with_generation_guard(context, file_id, detail, counters, reasons)
         return None
     assert resolved_plan is not None
     _materialize_planned(store, record, file_id, now_iso)
@@ -1534,7 +1559,7 @@ def _materialized_candidate(
             f"current_shoko_episode_ids={candidate.episode_ids!r}; "
             f"current_revision={context.active.revision}"
         )
-        _campaign_quarantine(store, file_id, detail, now_iso, counters, reasons)
+        _campaign_quarantine_with_generation_guard(context, file_id, detail, counters, reasons)
         return None
     _materialize_planned(store, record, file_id, now_iso)
     return candidate

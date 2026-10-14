@@ -40,6 +40,9 @@ and send ``Accept-Encoding: identity`` (see :func:`make_source_endpoint`).
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -70,10 +73,13 @@ from .mappings import (
     structure_digest,
     targets_digest,
 )
+from .state import ApplyProcessLock
 
 ACCEPT_ENCODING: Final[str] = "identity"
 DEFAULT_MAX_BYTES: Final[int] = 10_000_000
 MAX_BACKOFF_HOURS: Final[float] = 24.0
+GENERATION_LOCK_POLL_SECONDS: Final[float] = 0.01
+GENERATION_LOCK_REFRESH_WAIT_SECONDS: Final[float] = 1.0
 _OK: Final[int] = 200
 _NOT_MODIFIED: Final[int] = 304
 _HEX64: Final[int] = 64
@@ -119,6 +125,7 @@ class RefreshOutcome(Enum):
     FAILED_TRANSPORT = "failed_transport"
     FAILED_INVALID = "failed_invalid"
     FAILED_SIZE = "failed_size"
+    FAILED_LOCKED = "failed_locked"
     NO_ACTIVE_BUT_FAILED = "no_active_but_failed"
 
 
@@ -384,6 +391,33 @@ class MappingStore:
     def state_path(self) -> Path:
         return self.directory / "state.json"
 
+    @property
+    def generation_lock_path(self) -> Path:
+        return self.directory / "generation.lock"
+
+    @contextmanager
+    def generation_lock(self, *, wait_seconds: float = 0.0) -> Iterator[bool]:
+        """Serialize mapping activation with campaign decisions that must use one generation.
+
+        Campaign quarantine checks use a non-blocking take and defer on contention. Refresh may
+        wait briefly for an in-flight campaign decision; if it still cannot acquire the lock, it
+        leaves the active generation unchanged and schedules the normal bounded retry.
+        """
+        if wait_seconds < 0:
+            raise ValueError("wait_seconds must be non-negative")
+        lock = ApplyProcessLock(self.generation_lock_path)
+        deadline = time.monotonic() + wait_seconds
+        while not lock.acquire():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                yield False
+                return
+            time.sleep(min(GENERATION_LOCK_POLL_SECONDS, remaining))
+        try:
+            yield True
+        finally:
+            lock.release()
+
     def request_headers(self) -> dict[str, str]:
         """Headers for source requests: ``Accept-Encoding: identity`` plus the stored ETag.
 
@@ -577,34 +611,41 @@ def _accept_content(
     content_sha256 = content_digest(body)
     targets = targets_digest(index)
     structure = structure_digest(index)
-    meta = store._load_meta()
-    if meta is not None and targets == meta.targets_digest and structure == meta.structure_digest:
+    with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return _record_failure(store, state, now, RefreshOutcome.FAILED_LOCKED)
+        meta = store._load_meta()
+        if (
+            meta is not None
+            and targets == meta.targets_digest
+            and structure == meta.structure_digest
+        ):
+            return _record_success(
+                store,
+                state,
+                now,
+                response,
+                refresh_hours,
+                meta.content_sha256,
+                targets,
+                structure,
+                meta.revision,
+                RefreshOutcome.UNCHANGED,
+            )
+        revision = meta.revision + 1 if meta is not None else 1
+        _activate(store, body, (content_sha256, targets, structure, revision), now, index)
         return _record_success(
             store,
             state,
             now,
             response,
             refresh_hours,
-            meta.content_sha256,
+            content_sha256,
             targets,
             structure,
-            meta.revision,
-            RefreshOutcome.UNCHANGED,
+            revision,
+            RefreshOutcome.ACTIVATED,
         )
-    revision = meta.revision + 1 if meta is not None else 1
-    _activate(store, body, (content_sha256, targets, structure, revision), now, index)
-    return _record_success(
-        store,
-        state,
-        now,
-        response,
-        refresh_hours,
-        content_sha256,
-        targets,
-        structure,
-        revision,
-        RefreshOutcome.ACTIVATED,
-    )
 
 
 def refresh(
