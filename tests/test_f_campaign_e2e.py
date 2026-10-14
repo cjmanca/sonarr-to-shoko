@@ -626,6 +626,80 @@ def test_f_campaign_hundred_file_daemon_drain_crosses_every_cycle_cap(
         store.close()
 
 
+def test_daemon_arrivals_and_campaign_share_one_cycle_submission_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Completed arrival sends still consume the daemon cycle's shared campaign budget."""
+    extra_xml = "".join(
+        eh.range_entry(ARRIVAL_ANIME + index, ARRIVAL_TVDB + index, 1, 1)
+        for index in range(PER_CYCLE)
+    )
+    env = _campaign_env(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        n_series=PER_CYCLE + 1,
+        per_series=N_ONE,
+        per_cycle=PER_CYCLE,
+        jobs=JOBS_TEN,
+        rolling=ROLLING_BIG,
+        batch=PER_CYCLE,
+        extra_xml=extra_xml,
+    )
+    campaign_id = _ready_campaign(env, capsys, PER_CYCLE + 1)
+    campaign_plan_ids = env.plan_file_ids()
+    arrival_ids: set[int] = set()
+    for index in range(PER_CYCLE):
+        series_id = ARRIVAL_SERIES + index
+        spec = eh.FileSpec(series_id, series_id * 1000 + 1, ARRIVAL_SHOKO + index)
+        series = eh.SeriesSpec(
+            series_id,
+            ARRIVAL_TVDB + index,
+            (ARRIVAL_ANIME + index,),
+            (eh.EpisodeSpec(season=1, number=N_ONE),),
+        )
+        eh.add_new_arrival(env.world, series, spec)
+        arrival_ids.add(spec.shoko_id)
+
+    store = env.open_store()
+    try:
+        first = env.cycle(store)
+        first_batch = first.campaign
+        assert first.new_arrival_submitted == PER_CYCLE
+        assert first.total_link_requests_attempted == PER_CYCLE
+        assert first_batch is not None
+        assert first_batch.submitted == N_ZERO
+        assert any("cycle_new_exhausted" in reason for reason in first_batch.reasons)
+        first_budget = store.budget_view()
+        assert first_budget.window_key == first.cycle_key
+        assert first_budget.cycle_new_submissions == PER_CYCLE
+        assert first_budget.pending_file_requests == N_ZERO
+        assert first_budget.pending_episode_jobs == N_ZERO
+        assert store.live_send_counts() == (N_ZERO, N_ZERO)
+        assert arrival_ids <= set(env.posted_files())
+        assert len(set(env.posted_files()) & campaign_plan_ids) == N_ONE  # canary only
+
+        env.advance(STALL_COOLDOWN_SECONDS + 1.0)
+        second = env.cycle(store)
+        second_batch = second.campaign
+        assert second.cycle_key != first.cycle_key
+        assert second.new_arrival_submitted == N_ZERO
+        assert second.total_link_requests_attempted == PER_CYCLE
+        assert second_batch is not None
+        assert second_batch.submitted == PER_CYCLE
+        second_budget = store.budget_view()
+        assert second_budget.window_key == second.cycle_key
+        assert second_budget.cycle_new_submissions == PER_CYCLE
+        assert second_budget.rolling_new_submissions == N_ONE + PER_CYCLE * 2
+        assert second_budget.pending_file_requests == N_ZERO
+        assert second_budget.pending_episode_jobs == N_ZERO
+        assert env.total_sent(store, campaign_id) == PER_CYCLE + N_ONE
+        assert len(env.posted_files()) == N_ONE + PER_CYCLE * 2
+        assert len(set(env.posted_files())) == N_ONE + PER_CYCLE * 2
+    finally:
+        store.close()
+
+
 # ---------------------------------------------------------------------- 2. restart
 
 
@@ -1453,6 +1527,57 @@ def test_f_campaign_mapping_target_drift_is_candidate_scoped_and_reports_history
         assert unaffected.state is FileState.VERIFIED
         assert campaign is not None
         assert campaign.status == "approved"
+    finally:
+        store.close()
+
+
+def test_f_campaign_batch_bounds_all_mapping_drift_quarantines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        n_series=N_TWENTY,
+        per_series=N_FIVE,
+        batch=PER_CYCLE,
+    )
+    campaign_id = _ready_campaign(env, capsys, FILES_HUNDRED)
+    canary_id = env.posted_files()[N_ZERO]
+    new_mappings: list[str] = []
+    for series_id in range(1, N_TWENTY + 1):
+        new_anime = 5_000 + series_id
+        tvdb_series = 300_000 + series_id
+        episodes = tuple(eh.EpisodeSpec(season=1, number=number) for number in range(1, N_FIVE + 1))
+        env.world.shoko.register(
+            eh.registry_for(eh.SeriesSpec(series_id, tvdb_series, (new_anime,), episodes))
+        )
+        new_mappings.append(eh.range_entry(new_anime, tvdb_series, 1, N_FIVE))
+    mapping_outcome = _refresh_generation(env, eh.xml_document("".join(new_mappings)))
+    assert mapping_outcome is RefreshOutcome.ACTIVATED
+
+    store = env.open_store()
+    try:
+        posts_before = env.world.shoko.posts_count()
+        code, payload = env.apply(batch=PER_CYCLE)
+        assert code == cli.EXIT_OK
+        assert isinstance(payload, dict)
+        assert payload["quarantined"] == PER_CYCLE
+        assert payload["submitted"] == N_ZERO
+        assert payload["processed"] == PER_CYCLE
+        assert env.world.shoko.posts_count() == posts_before
+
+        plan_ids = env.plan_file_ids()
+        quarantined = [
+            record
+            for record in store.campaign_files(campaign_id)
+            if record.state is FileState.BLOCKED_SAFETY
+            and record.state_detail.startswith("campaign_quarantine:")
+        ]
+        assert len(quarantined) == PER_CYCLE
+        assert canary_id not in {record.shoko_file_id for record in quarantined}
+        assert {record.shoko_file_id for record in quarantined} <= plan_ids
+        assert all("mapping_target_drift" in record.state_detail for record in quarantined)
     finally:
         store.close()
 

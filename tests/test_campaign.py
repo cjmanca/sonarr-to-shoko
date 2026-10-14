@@ -833,6 +833,129 @@ def test_approved_campaign_quarantines_changed_ed2k_before_post(
         store.close()
 
 
+def test_one_file_canary_bounds_reconciliation_sweep_quarantines(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pre-apply reconciliation sweep must not bypass ``--batch-size 1``."""
+    _set_campaign(env, max_batch_size=BATCH_ONE)
+    specs_list = specs(COUNT_HUNDRED)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys, limit=str(COUNT_HUNDRED))
+    approve(env, capsys, prepared["approval_digest"])
+    env.stubs.ed2k_overrides.update(
+        {item.shoko_id: hf.hex32(item.shoko_id + 1) for item in specs_list}
+    )
+
+    result = apply(env, capsys, batch=str(BATCH_ONE))
+
+    assert result["exit"] == EXIT_OK
+    payload = result["payload"]
+    assert payload["submitted"] == 0
+    assert payload["quarantined"] == BATCH_ONE
+    assert payload["processed"] == BATCH_ONE
+    assert env.stubs.posts == []
+    store = env.open_store()
+    try:
+        campaign_records = store.campaign_files(prepared["campaign_id"])
+        quarantines = [
+            record
+            for record in campaign_records
+            if record.state is FileState.BLOCKED_SAFETY
+            and record.state_detail.startswith("campaign_quarantine:")
+        ]
+        assert len(quarantines) == BATCH_ONE
+        assert "source_hash_identity_drift" in quarantines[0].state_detail
+    finally:
+        store.close()
+
+
+def test_daemon_one_file_batch_bounds_outer_and_inner_identity_sweeps(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, max_batch_size=BATCH_ONE, daemon_auto_apply=True)
+    specs_list = specs(COUNT_HUNDRED)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys, limit=str(COUNT_HUNDRED))
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, prepared["campaign_id"])
+        assert canary.verified == BATCH_ONE
+        _authorize_drain(env, store, prepared["campaign_id"])
+        canary_id = specs_list[0].shoko_id
+        env.stubs.ed2k_overrides.update(
+            {
+                item.shoko_id: hf.hex32(item.shoko_id + 1)
+                for item in specs_list
+                if item.shoko_id != canary_id
+            }
+        )
+
+        cycle = _daemon_cycle(env, store, prepared["campaign_id"], "identity-batch-one")
+
+        assert cycle.campaign is not None
+        assert cycle.campaign.quarantined == BATCH_ONE
+        assert cycle.campaign.submitted == 0
+        assert len(env.stubs.posts) == BATCH_ONE
+        quarantine_count = sum(
+            1
+            for record in store.campaign_files(prepared["campaign_id"])
+            if record.state is FileState.BLOCKED_SAFETY
+            and record.state_detail.startswith("campaign_quarantine:")
+        )
+        assert quarantine_count == BATCH_ONE
+    finally:
+        store.close()
+
+
+def test_campaign_batch_size_counts_new_quarantines_and_send_attempts(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, max_batch_size=COUNT_FIVE)
+    specs_list = specs(COUNT_FIVE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    victim = specs_list[0]
+    env.stubs.ed2k_overrides[victim.shoko_id] = hf.hex32(victim.shoko_id + 1)
+
+    result = apply(env, capsys, batch=str(COUNT_FIVE))
+
+    assert result["exit"] == EXIT_OK
+    payload = result["payload"]
+    assert payload["processed"] == COUNT_FIVE
+    assert payload["quarantined"] == 1
+    assert payload["submitted"] == COUNT_FIVE - 1
+    assert victim.shoko_id not in env.stubs.posted_files
+    assert len(env.stubs.posts) == COUNT_FIVE - 1
+
+
+def test_previously_quarantined_candidate_does_not_consume_batch_allowance(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, max_batch_size=BATCH_ONE)
+    specs_list = specs(COUNT_THREE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    victim = specs_list[0]
+    env.stubs.ed2k_overrides[victim.shoko_id] = hf.hex32(victim.shoko_id + 1)
+
+    first = apply(env, capsys, batch=str(BATCH_ONE))
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["quarantined"] == BATCH_ONE
+    assert first["payload"]["submitted"] == 0
+    assert env.stubs.posts == []
+
+    second = apply(env, capsys, batch=str(BATCH_ONE))
+
+    assert second["exit"] == EXIT_OK
+    assert second["payload"]["submitted"] == BATCH_ONE
+    assert victim.shoko_id not in env.stubs.posted_files
+    assert specs_list[1].shoko_id in env.stubs.posted_files
+    assert len(env.stubs.posts) == BATCH_ONE
+
+
 def test_repeated_ed2k_campaign_quarantine_is_deferred_and_counts_as_zero_progress(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:

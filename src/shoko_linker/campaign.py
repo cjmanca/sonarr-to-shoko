@@ -880,6 +880,23 @@ def _fold_tally(counters: _CampaignCounters, tally: _SendTally, reasons: list[st
     reasons.extend(tally.reasons)
 
 
+def _campaign_budget_cycle_key(
+    store: StateStore,
+    campaign_id: str,
+    now_iso: str,
+    *,
+    daemon_drain: bool,
+    budget_cycle_key: str | None,
+) -> str:
+    """Use the outer daemon key for automatic work; allocate one for each manual batch."""
+    if daemon_drain:
+        if budget_cycle_key is None or not budget_cycle_key.strip():
+            raise CampaignError("campaign daemon drain requires the outer daemon cycle key")
+        return budget_cycle_key
+    # F9: every manual invocation gets its own fresh durable budget key.
+    return store.begin_cycle(f"campaign-{_short(campaign_id)}", now_iso)
+
+
 def apply_campaign(
     deps: DaemonDeps,
     settings: Settings,
@@ -890,6 +907,7 @@ def apply_campaign(
     batch_size: int | None = None,
     lock_held: bool = False,
     daemon_drain: bool = False,
+    budget_cycle_key: str | None = None,
     fresh_campaign_quarantines: frozenset[int] = frozenset(),
 ) -> CampaignApplyReport:
     """One bounded batch of the approved campaign through the full guarded path.
@@ -912,9 +930,10 @@ def apply_campaign(
     lock, so the acquire/release pair is skipped (a same-process re-acquire self-contends).
     Every other guard runs unchanged. The CLI ``campaign apply`` path keeps ``lock_held=False``
     and its own lock-first acquire/release. ``daemon_drain=True`` (the daemon's
-    :func:`~shoko_linker.daemon._drain_campaign` only) reconsults the F10 drain authorization
-    before **every** submission, so a mid-batch ``campaign revoke-drain`` stops the running
-    batch; manual ``campaign apply`` never requires the authorization.
+    :func:`~shoko_linker.daemon._drain_campaign` only) uses the outer daemon cycle's durable
+    budget key and reconsults the F10 drain authorization before **every** submission, so a
+    mid-batch ``campaign revoke-drain`` stops the running batch. Manual ``campaign apply``
+    allocates its own durable budget key and never requires the drain authorization.
     """
     plan, digest = read_plan_file(plan_path)
     campaign = _require_campaign(store, plan.campaign_id)
@@ -958,9 +977,13 @@ def apply_campaign(
         active = _apply_mapping(deps, sweep)
         counters = _CampaignCounters(sent_running=campaign.total_sent)
         queue = _campaign_queue_snapshot(deps, active, now_iso)
-        # F9: a fresh durable budget-window key for this batch (unique across restarts), so the
-        # per-cycle submission cap is per batch — never a constant key that accumulates forever.
-        batch_cycle_key = store.begin_cycle(f"campaign-{_short(campaign.campaign_id)}", now_iso)
+        batch_cycle_key = _campaign_budget_cycle_key(
+            store,
+            campaign.campaign_id,
+            now_iso,
+            daemon_drain=daemon_drain,
+            budget_cycle_key=budget_cycle_key,
+        )
         context = _ApplyContext(
             deps=deps,
             settings=settings,
@@ -975,13 +998,13 @@ def apply_campaign(
             preexisting_quarantines=preexisting_quarantines,
             fresh_campaign_quarantines=fresh_campaign_quarantines,
         )
-        # F9-1: bounded batch loop. The per-cycle cap resets each batch (F9), but the batch
-        # itself must stay O(size) network reads: the batch-limit guard keys on scan ATTEMPTS
-        # (not successes — a pending-target resolution and a send both count), a wall-time cap
-        # mirrors the daemon cycle bound, and a campaign-wide budget refusal stops the batch.
+        # F9/F29: bounded batch loop. The per-cycle cap resets each manual batch, while daemon
+        # drains use their outer key. The batch guard counts meaningful processing attempts
+        # directly (resolution, send, and new quarantine decisions); a wall-time cap mirrors
+        # the daemon cycle bound, and a campaign-wide budget refusal stops the batch.
         # Deferred/remaining files are never quarantined — they stay queueable for later batches.
         for index, entry in enumerate(plan.files):
-            if counters.attempts - counters.quarantined >= size:
+            if counters.attempts >= size:
                 _defer_remaining(plan.files[index:], counters, reasons, "batch_limit")
                 break
             if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
@@ -1181,15 +1204,25 @@ def _require_campaign_window(store: StateStore, campaign: CampaignRecord, now_is
 
 
 def _apply_sweep(
-    deps: DaemonDeps, campaign_id: str, now_iso: str, reasons: list[str]
+    deps: DaemonDeps,
+    campaign_id: str,
+    now_iso: str,
+    reasons: list[str],
+    *,
+    campaign_quarantine_limit: int = 0,
 ) -> CycleReport:
-    """The dry-run reconciliation sweep (zero POSTs) whose frozen plans are the apply input."""
+    """The dry-run reconciliation sweep whose frozen plans feed the bounded apply loop.
+
+    Campaign source-identity quarantines are deferred to that loop so the batch allowance
+    accounts for them alongside resolution and send attempts.
+    """
     sweep = run_cycle(
         deps,
         now_iso=now_iso,
         mode=CycleMode.DRY_RUN,
         policy=RunPolicy.BACKLOG,
         cycle_key=f"campaign-{_short(campaign_id)}-apply",
+        campaign_quarantine_limit=campaign_quarantine_limit,
     )
     reasons.extend(sweep.reasons)
     reasons.extend(f"historical_mapping_drift:{item}" for item in sweep.existing_link_drift)
@@ -1367,13 +1400,16 @@ def _prepare_candidate(
     candidate = context.sweep.plans.get(file_id)
     if candidate is None:
         mapping_skip = _campaign_mapping_resolution_skip(context.sweep, file_id)
+        identity_drift = context.sweep.campaign_identity_drift_details.get(file_id)
         if mapping_skip is not None:
             _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
-        reason = (
-            _campaign_mapping_drift_detail(entry, context.active, mapping_skip)
-            if mapping_skip is not None
-            else "plan_no_longer_frozen"
-        )
+        if mapping_skip is not None:
+            reason = _campaign_mapping_drift_detail(entry, context.active, mapping_skip)
+        elif identity_drift is not None:
+            code, detail = identity_drift
+            reason = f"{code}: {detail}"
+        else:
+            reason = "plan_no_longer_frozen"
         if mapping_skip is not None:
             _campaign_quarantine_with_generation_guard(context, file_id, reason, counters, reasons)
         else:
@@ -1582,6 +1618,7 @@ def _campaign_quarantine(
     reasons: list[str],
 ) -> None:
     _quarantine(store, file_id, reason, iso)
+    counters.attempts += 1
     counters.processed += 1
     counters.quarantined += 1
     reasons.append(f"campaign_quarantine:{file_id}:{reason}")

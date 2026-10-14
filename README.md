@@ -311,7 +311,9 @@ Rules that the apply path enforces, with persisted evidence:
 ## Configuration budgets (M7-a/M7-b)
 
 `sync` carries the cycle/budget knobs (defaults shown in `config.example.yaml`):
-`max_new_per_cycle` (default 20; also bounds pending file requests), `rolling_new_limit`
+`max_new_per_cycle` (default 20; aggregate submissions by new-arrival and automatic-campaign
+processing in one daemon cycle; each manual `campaign apply` gets its own cycle budget; also
+bounds pending file requests), `rolling_new_limit`
 (200), `rolling_window_hours` (168), `max_pending_episode_jobs` (10),
 `max_cycle_seconds` (300), `max_recovery_rows_per_cycle` (100),
 `verification_timeout_seconds` (3600), `apply_lock_lease_seconds` (3600),

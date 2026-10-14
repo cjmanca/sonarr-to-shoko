@@ -21,8 +21,8 @@
 | --- | --- | --- |
 | Adopt approved baseline and design | complete | User approved plan digest above and recommended design, including the F29 `--batch-size 1` sweep-quarantine acceptance check. |
 | F26/F27 — Mapping source provenance and recovery | complete | Active authorization and persisted refresh state are now bound to the normalized full source URL. Source transitions immediately clear validators/schedule and remain non-authorizing through failures/backoff until a successful fetch activates that source. Invalid active generations trigger immediate recovery; failed recovery honors persisted backoff across restart. Sequential read-only review found no remaining mapping-provenance/recovery issue. |
-| F28 — Shared daemon-cycle budget | pending | |
-| F29 — Bounded campaign processing | pending | Must include sweep mutations and candidate-loop work in the same bound. |
+| F28 — Shared daemon-cycle budget | complete | Automatic campaign sends now reserve against the daemon's existing durable cycle key; manual apply still allocates a unique batch key. An integration test proved five completed arrival sends leave zero pending slots but still prevent five more campaign submissions in the same cycle; the deferred campaign uses the next cycle's fresh cap. |
+| F29 — Bounded campaign processing | complete | Direct work-attempt accounting replaces subtraction. Reconciliation defers campaign identity quarantines to the bounded candidate loop in both manual and automatic apply paths. A 100-file `--batch-size 1` canary quarantines one file; a 100-file all-mapping-drift batch of five quarantines five. Mixed sends/quarantines and preexisting quarantine cases pass. |
 | F30 — Streamed mapping download | pending | |
 | Final checks and read-only review | pending | |
 
@@ -43,6 +43,36 @@
 - Local F26/F27 implementation commit: `b2b920d` (`fix: bind mapping cache to configured source`).
 - All service requests were mocked/offline; no live Sonarr/Shoko call or write occurred.
 
+## F28 — Shared daemon-cycle submission budget (complete)
+
+- Confirmed the intended scope in `PROJECT.md` §3: new-arrival and authorized automatic-campaign work use the same per-cycle ceiling. Clarified the `README.md` budget description: manual `campaign apply` invocations receive their own bounded cycle budget.
+- Automatic drain now receives the unique budget key allocated for its enclosing daemon cycle and passes it to `apply_campaign()`. Manual campaign invocations continue calling `StateStore.begin_cycle()` for a new unique key; SQLite remains authoritative, with no parallel counter.
+- The F28 regression completes verification for five new arrivals before the campaign drain. It proves the released pending slots do not reset `cycle_new_submissions`, the same-cycle campaign sends zero, the candidates remain eligible after the recoverable cooldown, and the next outer cycle submits within a fresh cap. It also checks rolling totals, zero outstanding jobs, and no duplicate file sends.
+- Sequential read-only review confirmed the outer CLI allocates restart-unique keys, only `_drain_campaign` uses the shared-key path, manual batches still allocate independently, and existing rolling/pending reservation/release funnels were not changed. No unresolved F28 issue.
+
+### F28 verification evidence
+
+- Pre-fix `test_daemon_arrivals_and_campaign_share_one_cycle_submission_budget` reproduced **10 total requests** with a configured cap of 5.
+- Focused F9/manual/restart plus F28 integration checks → **5 passed**.
+- `uv run --offline --group dev pytest -o addopts="" -q tests/test_campaign.py tests/test_f_campaign_e2e.py` → **149 passed**.
+- Focused `ruff check` and `ruff format --check` → passed; `uv run --offline --group dev mypy` → passed (**47 source files**); scoped `git diff --check` → no whitespace errors.
+- All service requests were mocked/offline; no live Sonarr/Shoko call or write occurred.
+
+## F29 — Bounded campaign processing (complete)
+
+- Replaced `attempts - quarantined` with a direct meaningful-work count: pending-target resolution attempts, send attempts, and every new campaign quarantine decision count; already verified or previously quarantined rows do not consume new-work allowance.
+- The reconciliation sweep preceding campaign apply no longer mutates campaign identity-drift quarantines outside the candidate loop. It carries the drift details into the frozen sweep result so the candidate loop can apply the same fail-closed quarantine with full provenance and count it once. Automatic daemon cycles also defer outer-sweep identity quarantines to their bounded campaign loop.
+- A read-only path audit found `_quarantine_source_identity_drift` as the daemon reconciliation quarantine path and `_campaign_quarantine` as the apply-loop quarantine funnel; both are now covered by the bounded path. Protected Shoko associations and send-recovery states remain guarded.
+- Regression cases cover 100 frozen-identity drifts with `--batch-size 1` (the pre-fix run made **100** quarantines), 100 mapping-target drifts with batch size five, mixed quarantine/send work, a previously quarantined head followed by an eligible candidate, an already-verified canary at the plan head, pending-target bounds, restart, and automatic-daemon outer+inner sweeps.
+- Sequential read-only review found no remaining acceptance-blocking finding. All Sonarr/Shoko requests were mocked; no live write occurred.
+
+### F29 verification evidence
+
+- Focused F29 regression matrix → **12 passed**.
+- `uv run --offline --group dev pytest -o addopts="" -q tests/test_campaign.py tests/test_f_campaign_e2e.py tests/test_daemon.py` → **234 passed**.
+- `uv run --offline --group dev ruff check .` → passed; `uv run --offline --group dev ruff format --check .` → **51 files already formatted**.
+- `uv run --offline --group dev mypy` → passed (**47 source files**); `git diff --check` → no whitespace errors (Windows CRLF/LF working-copy warning only).
+
 ## Next action
 
-Add a regression that combines new-arrival and automatic-campaign sends under one daemon-cycle key, including verification that releases pending slots do not reset the shared per-cycle count.
+Add an incremental streaming-response regression for F30 covering the cap boundary, early stop on overflow, and response closure.

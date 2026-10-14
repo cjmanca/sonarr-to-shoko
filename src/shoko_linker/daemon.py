@@ -294,7 +294,9 @@ class CycleReport:
     new-arrival/campaign eligibility and write activity fields distinguish both mutation
     paths; ``writes_suppressed`` means every cycle mutation path was gated. ``campaign`` is
     the bounded campaign-batch summary (:class:`~shoko_linker.campaign.CampaignApplyReport`)
-    drained in this cycle under the cycle's own apply lock (F7), or ``None`` when no batch ran.
+    drained in this cycle under the cycle's own apply lock and budget key (F7), or ``None`` when
+    no batch ran. ``campaign_identity_drift_details`` is an internal handoff for campaign apply
+    when reconciliation defers a quarantine to respect the batch allowance.
     """
 
     mode: CycleMode
@@ -319,6 +321,9 @@ class CycleReport:
     campaign: Any | None = None
     mapping_snapshot: tuple[int, str, str, str, bool] | None = field(
         default=None, repr=False, compare=False
+    )
+    campaign_identity_drift_details: Mapping[int, tuple[str, str]] = field(
+        default_factory=lambda: MappingProxyType({}), repr=False, compare=False
     )
     new_arrival_apply_eligible: bool = False
     campaign_drain_selected: bool = False
@@ -846,6 +851,7 @@ class _ReconcileResult:
     plans: Mapping[int, LinkPlan]
     skip_reasons: Mapping[int, str]
     fresh_campaign_quarantines: frozenset[int]
+    campaign_identity_drift_details: Mapping[int, tuple[str, str]]
 
 
 _SEND_RECOVERY_STATES: Final[frozenset[FileState]] = frozenset(
@@ -974,9 +980,16 @@ def _advance(deps: DaemonDeps, file_id: int, target: FileState, detail: str, iso
 
 
 def _quarantine_source_identity_drift(
-    deps: DaemonDeps, file_id: int, reason: str, detail: str, now_iso: str
+    deps: DaemonDeps,
+    file_id: int,
+    reason: str,
+    detail: str,
+    now_iso: str,
+    *,
+    allow_campaign_quarantine: bool = True,
+    deferred_campaign_details: dict[int, tuple[str, str]] | None = None,
 ) -> bool:
-    """Quarantine identity drift and report a newly blocked campaign queue row."""
+    """Quarantine identity drift unless a campaign batch must account for it itself."""
     record = deps.store.get_file(file_id)
     if record is None or record.state in _SEND_RECOVERY_STATES:
         return False
@@ -984,6 +997,10 @@ def _quarantine_source_identity_drift(
         CAMPAIGN_QUEUE_STATES | {FileState.MATCHED, FileState.WAITING}
     )
     if campaign_pending:
+        if not allow_campaign_quarantine:
+            if deferred_campaign_details is not None:
+                deferred_campaign_details[file_id] = (reason, detail)
+            return False
         detail = (
             f"campaign_quarantine:{reason}{CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER} {detail}"
         )
@@ -1120,6 +1137,7 @@ def _reconcile(
     now_iso: str,
     *,
     policy: RunPolicy = RunPolicy.NEW_ARRIVAL,
+    campaign_quarantine_limit: int | None = None,
 ) -> _ReconcileResult:
     series_tvdb = {
         item.series.id: item.series.tvdb_id
@@ -1134,6 +1152,7 @@ def _reconcile(
     plans: dict[int, LinkPlan] = {}
     skip_reasons: dict[int, str] = {}
     fresh_campaign_quarantines: set[int] = set()
+    deferred_campaign_identity_details: dict[int, tuple[str, str]] = {}
     mapped_ids: list[int] = []
     planned_ids: list[int] = []
     pending = 0
@@ -1143,7 +1162,19 @@ def _reconcile(
         if identity_drift is not None:
             reason, detail = identity_drift
             skip_reasons[file_id] = reason
-            if _quarantine_source_identity_drift(deps, file_id, reason, detail, now_iso):
+            campaign_quarantine_available = (
+                campaign_quarantine_limit is None
+                or len(fresh_campaign_quarantines) < campaign_quarantine_limit
+            )
+            if _quarantine_source_identity_drift(
+                deps,
+                file_id,
+                reason,
+                detail,
+                now_iso,
+                allow_campaign_quarantine=campaign_quarantine_available,
+                deferred_campaign_details=deferred_campaign_identity_details,
+            ):
                 fresh_campaign_quarantines.add(file_id)
             continue
         tvdb_series = series_tvdb.get(match.sonarr_file.series_id)
@@ -1193,6 +1224,7 @@ def _reconcile(
         plans=plans,
         skip_reasons=skip_reasons,
         fresh_campaign_quarantines=frozenset(fresh_campaign_quarantines),
+        campaign_identity_drift_details=MappingProxyType(deferred_campaign_identity_details),
     )
 
 
@@ -2040,13 +2072,16 @@ def _drain_campaign(
     now_iso: str,
     reasons: list[str],
     *,
+    cycle_key: str,
     fresh_campaign_quarantines: frozenset[int],
 ) -> _CampaignDrainOutcome:
     """Drain **one** bounded batch of the oldest approved campaign (F7), under this cycle's lock.
 
     Runs entirely through :func:`shoko_linker.campaign.apply_campaign` with
-    ``lock_held=True`` (the daemon cycle already owns the OS apply lock), so the FULL
-    guard chain applies unchanged: plan digest, status/deadline/max-submissions, write gate,
+    ``lock_held=True`` and this cycle's existing ``cycle_key`` (the daemon cycle already owns
+    the OS apply lock), so arrival and campaign reservations share one durable per-cycle ceiling.
+    The full guard chain applies unchanged: plan digest, status/deadline/max-submissions,
+    write gate,
     campaign-scope attestation (an expiring lease pauses writes and stops the batch, zero
     POSTs, the daemon stays alive read-only), queue snapshot fail-closed, mapping/drift
     revalidation, eligibility, binding quarantine, preflight → prepare_send → mark_sent →
@@ -2097,6 +2132,7 @@ def _drain_campaign(
             now_iso,
             lock_held=True,
             daemon_drain=True,
+            budget_cycle_key=cycle_key,
             fresh_campaign_quarantines=fresh_campaign_quarantines,
         )
     except CampaignPlanInvalidError as exc:
@@ -2257,6 +2293,7 @@ def run_cycle(
     policy: RunPolicy,
     cycle_key: str,
     full: bool = True,
+    campaign_quarantine_limit: int | None = None,
 ) -> CycleReport:
     """Run one reconciliation cycle. See module docstring for the safety contract.
 
@@ -2282,7 +2319,22 @@ def run_cycle(
     no longer wedge it. A non-owner release (the lease was stolen after a crash)
     raises ``LockHeldError``; it is caught in the ``finally`` only, reported, never
     propagated and never wedging the next cycle.
+
+    ``campaign_quarantine_limit`` bounds new campaign identity quarantines created by this
+    reconciliation. Automatic drains default it to zero so their bounded campaign loop owns
+    those decisions; campaign apply's inner sweep uses the same deferral to avoid pre-loop
+    quarantine work escaping its batch size.
     """
+    if campaign_quarantine_limit is not None and campaign_quarantine_limit < 0:
+        raise ValueError("campaign_quarantine_limit must be non-negative")
+    if (
+        campaign_quarantine_limit is None
+        and mode is CycleMode.APPLY
+        and deps.settings.campaign.daemon_auto_apply
+    ):
+        # Campaign quarantine mutations from the outer reconciliation belong to the same
+        # bounded automatic-drain invocation; leave them for its candidate loop to count.
+        campaign_quarantine_limit = 0
     lock_reason, writes_suppressed, lock_acquired = _lock_preflight(deps, mode, now_iso)
     if writes_suppressed:
         return _read_only_report(mode, cycle_key, "writes_disabled", None)
@@ -2290,7 +2342,13 @@ def run_cycle(
         return _read_only_report(mode, cycle_key, lock_reason, None)
     try:
         return _run_cycle_body(
-            deps, now_iso=now_iso, mode=mode, cycle_key=cycle_key, policy=policy, full=full
+            deps,
+            now_iso=now_iso,
+            mode=mode,
+            cycle_key=cycle_key,
+            policy=policy,
+            full=full,
+            campaign_quarantine_limit=campaign_quarantine_limit,
         )
     finally:
         if lock_acquired:
@@ -2316,6 +2374,7 @@ def _run_cycle_body(
     cycle_key: str,
     policy: RunPolicy,
     full: bool,
+    campaign_quarantine_limit: int | None,
 ) -> CycleReport:
     """The cycle body — runs with the apply lock held (APPLY) under the caller's
     ``try/finally`` that guarantees the release (P2-1). ``full=False`` is the M7-b light
@@ -2401,7 +2460,15 @@ def _run_cycle_body(
     # run with the halved cap).
     reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono, full=full))
 
-    reconcile = _reconcile(deps, inventory, discovery, active, now_iso, policy=policy)
+    reconcile = _reconcile(
+        deps,
+        inventory,
+        discovery,
+        active,
+        now_iso,
+        policy=policy,
+        campaign_quarantine_limit=campaign_quarantine_limit,
+    )
     for file_id, skip_reason in sorted(reconcile.skip_reasons.items()):
         reasons.append(f"skip:{file_id}:{skip_reason}")
 
@@ -2436,7 +2503,8 @@ def _run_cycle_body(
     )
 
     # F7: drain ONE bounded batch of the oldest approved backlog campaign through the full
-    # campaign guard chain, under this same cycle's apply lock (lock_held). Only in APPLY mode
+    # campaign guard chain, under this cycle's apply lock and durable budget key (lock_held).
+    # Only in APPLY mode
     # on a reconciliation-ready cycle, and only when the operator opted in
     # (campaign.daemon_auto_apply). F8: this gate does NOT require the daemon's own apply
     # eligibility — an authorized campaign drains even when the daemon lease is invalid (the
@@ -2454,6 +2522,7 @@ def _run_cycle_body(
             deps,
             now_iso,
             reasons,
+            cycle_key=cycle_key,
             fresh_campaign_quarantines=reconcile.fresh_campaign_quarantines,
         )
 
@@ -2509,6 +2578,7 @@ def _run_cycle_body(
             active.structure_digest,
             active.overrides_applied,
         ),
+        campaign_identity_drift_details=reconcile.campaign_identity_drift_details,
     )
 
 
