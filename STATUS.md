@@ -24,7 +24,7 @@
 | F28 — Shared daemon-cycle budget | complete | Automatic campaign sends now reserve against the daemon's existing durable cycle key; manual apply still allocates a unique batch key. An integration test proved five completed arrival sends leave zero pending slots but still prevent five more campaign submissions in the same cycle; the deferred campaign uses the next cycle's fresh cap. |
 | F29 — Bounded campaign processing | complete | Direct work-attempt accounting replaces subtraction. Reconciliation defers campaign identity quarantines to the bounded candidate loop in both manual and automatic apply paths. A 100-file `--batch-size 1` canary quarantines one file; a 100-file all-mapping-drift batch of five quarantines five. Mixed sends/quarantines and preexisting quarantine cases pass. |
 | F30 — Streamed mapping download | complete | Mapping refresh uses HTTPX streaming, reads capped raw chunks into one bytearray without a second body-sized copy, and closes responses on success, overflow, errors, 304, and interruption. Focused streaming tests and related source-wiring tests pass. |
-| Final checks and read-only review | in progress | Full configured tests, quality checks, Docker build/smoke, and final read-only review have passed. F30 local commit and final SHA/status audit remain. |
+| Final checks and read-only review | complete | Full configured tests, quality checks, Docker build/smoke, and sequential read-only review passed. Approved PLAN.md digest rechecked; all implementation slices committed locally on main. |
 
 ## F26/F27 — Mapping source provenance and recovery (complete)
 
@@ -87,11 +87,8 @@
 - `uv run --offline --group dev pytest -o addopts="" -q tests/test_mapping_store.py tests/test_http.py` → **75 passed**.
 - Related source-wiring checks: daemon **80 passed**; CLI/attestation **62 passed**; end-to-end **28 passed** and F campaign e2e **22 passed**.
 - Full Ruff check/format → passed (**51 files already formatted**); `uv run --offline --group dev mypy` → passed (**47 source files**); `git diff --check` → no whitespace errors (Windows CRLF/LF working-copy warnings only).
+- Local F30 implementation commit: `84e4752` (`fix: stream and cap mapping downloads`).
 - All requests remained mocked/offline; no live Sonarr/Shoko requests or writes occurred.
-
-## Next action
-
-Commit the validated F30 changes locally on `main`, record its SHA below, then verify the final clean diff apart from the pre-existing immutable `PLAN.md` change and recheck its approved digest.
 
 ## Final verification and handoff
 
@@ -101,5 +98,9 @@ Commit the validated F30 changes locally on `main`, record its SHA below, then v
 - Final sequential read-only review across mapping provenance/recovery, combined budget reservations/restarts, reconciliation plus candidate-loop batch bounds/protected associations, streaming byte limits/response closure, and no-replay behavior found no unresolved P0/P1 or acceptance-blocking P2 issue.
 - Live Sonarr/Shoko integration, production writes, GitHub Actions/GHCR, and deployment remain **EXTERNAL/UNVERIFIED**; none were performed.
 - Approved `PLAN.md` SHA-256 rechecked as `CE5993C0E5F1DF5E2F33F18344E2A96C35E88B9817C9F554CA395B6E913CD272`. It remains an uncommitted pre-existing user change and is excluded from implementation commits.
-- Local commits so far: `b2b920d` (F26/F27 implementation), `c6a408b` (F26/F27 evidence), `053bdaa` (F28/F29 implementation), `d6f7901` (F28/F29 evidence). F30 commit pending.
+- Local commits: `b2b920d` (F26/F27 implementation), `c6a408b` (F26/F27 evidence), `053bdaa` (F28/F29 implementation), `d6f7901` (F28/F29 evidence), and `84e4752` (F30 implementation).
 - Changed implementation/test/documentation files: `README.md`, `src/shoko_linker/campaign.py`, `src/shoko_linker/daemon.py`, `src/shoko_linker/http.py`, `src/shoko_linker/mapping_store.py`, `src/shoko_linker/mappings.py`, `tests/e2e_harness.py`, `tests/test_attestation.py`, `tests/test_audit.py`, `tests/test_campaign.py`, `tests/test_cli_m7.py`, `tests/test_daemon.py`, `tests/test_f_campaign_e2e.py`, `tests/test_http.py`, and `tests/test_mapping_store.py`.
+
+## Next action
+
+No implementation work remains. Live integration and deployment checks are external operator work and remain unverified.
