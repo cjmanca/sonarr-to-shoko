@@ -72,6 +72,7 @@
 - `uv run --offline --group dev pytest -o addopts="" -q tests/test_campaign.py tests/test_f_campaign_e2e.py tests/test_daemon.py` → **234 passed**.
 - `uv run --offline --group dev ruff check .` → passed; `uv run --offline --group dev ruff format --check .` → **51 files already formatted**.
 - `uv run --offline --group dev mypy` → passed (**47 source files**); `git diff --check` → no whitespace errors (Windows CRLF/LF working-copy warning only).
+- Local combined F28/F29 implementation commit: `053bdaa` (`fix: enforce campaign cycle and batch limits`).
 
 ## Next action
 
