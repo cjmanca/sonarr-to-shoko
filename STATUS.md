@@ -20,7 +20,7 @@
 | F23 — GHCR workflow planning and latest gate | complete | Shared offline-tested planner; safe per-SHA publication/rechecks; branch-tip backfill; strict provenance/media validation; latest gated on verified current main head. Independent spec and code-quality review accepted after fixes/adjudication. Local implementation commit: `22ecaff86266c88152a2f7b45cb01745098a1870`. |
 | F21 — Frozen Shoko file identity | complete | ED2K is bound to link plans, fingerprints, durable campaign approval, discovery continuity, preflight, and async verification. Legacy campaign plans require re-prepare/re-approval. Campaign drift quarantine accounting is persisted and counts once. Independent sequential review accepted after two P2 fixes. Local implementation commit: `5eff64ee6bdaf89faad05993d62da005fc7010c4`. |
 | F22 — Incomplete reconciliation handling | complete | Manual apply and the daemon's inner campaign sweep now require `reconciliation_ready` before campaign drift decisions. Incomplete snapshots defer with stable source reason codes, zero POSTs, unchanged approvals/progress, and no zero-progress breaker update. Sequential read-only review accepted. Local implementation commit: `70628e8f4229540afc5335f7d7e13a6dc8924bea`. |
-| F24 — Candidate-level mapping drift | pending |  |
+| F24 — Candidate-level mapping drift | complete | Candidate-level mapping continuity, generation freshness, origin-bound pause handling, and durable ambiguity provenance. Sequential adversarial review findings fixed. Local implementation commit: `9ebf445`. |
 | F25 — Cross-scope write reporting | pending |  |
 | Final checks and adversarial review | pending |  |
 
@@ -82,6 +82,27 @@
 - `git diff --check` → passed (no whitespace errors).
 - Sequential read-only F22 review found no remaining findings. Local implementation commit: `70628e8f4229540afc5335f7d7e13a6dc8924bea`. `PLAN.md` SHA-256 remains `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`.
 
+## F24 — Preserve approved targets across unrelated mapping updates (complete)
+
+- Campaign mapping authorization is now compared against each approved file's immutable AniDB target identities. Unrelated Anime-Lists generation changes no longer invalidate or expand an approved file set; genuine target drift is quarantined per candidate with approved/current identities, mapping provenance, and revision context. Historical verified-link drift is reported without modifying existing XRefs.
+- Campaign batches bind to the exact mapping snapshot from their reconciliation sweep, recheck freshness after the Shoko queue read and before drift quarantines, and retain only a compact generation key in cycle history. A regression covers mapping-generation changes during pending-target resolution and Shoko episode-ID drift.
+- Daemon-origin mapping-churn pauses can defer new-arrival writes while an authorized campaign continues through per-candidate target checks. Pause origin is atomically installed, operator pauses cannot be relabeled for campaign bypass, and attestation recovery uses an atomic expected-reason/origin compare-and-clear so a concurrent operator pause remains in effect.
+- Mapping ambiguity reasons now compact/group candidate provenance within the durable detail limit and explicitly count omitted candidates. Regressions cover 32 competing candidates and persistence of provenance in the campaign quarantine detail.
+- Tests use mocked/offline Sonarr and Shoko services; no production calls or writes occurred. Sequential read-only adversarial review found and fixed: P1 concurrent operator-pause clearing; P2 stale Shoko-ID-drift quarantine after a mapping-generation swap; and provenance clipping in durable campaign details. No unresolved F24 blocking findings remain.
+
+### F24 verification evidence
+
+- `uv run --offline --group dev pytest -o addopts="" -q` → **1125 passed** (2026-10-14).
+- Focused regressions for bounded ambiguity provenance, persisted candidate provenance, mapping-generation deferral on Shoko-ID drift, and attestation recovery preserving an operator pause → **4 passed**.
+- `uv run --offline --group dev ruff check .` → passed.
+- `uv run --offline --group dev ruff format --check .` → passed (51 files already formatted).
+- `uv run --offline --group dev mypy` → passed (47 source files).
+- `git diff --check` → passed (only expected Windows CRLF-to-LF warnings from Git).
+- `docker build -t shoko-sonarr-linker:review .` → passed; built image runs as UID/GID `1000:1000`.
+- Docker smoke: `validate --offline config.example.yaml` passed with zero Sonarr/Shoko requests; `once --apply config.example.yaml` refused with exit **3** under the default-deny config and reported zero remote writes.
+- Adopted `PLAN.md` SHA-256 rechecked as `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`; the pre-existing plan modification remains uncommitted and unchanged.
+- Local F24 implementation commit: `9ebf445` (`fix: preserve campaign approval across mapping updates`). Live Sonarr/Shoko integration remains unverified; F24 push-triggered CI/GHCR status will be recorded after push.
+
 ## Next action
 
-Begin Phase 4 (F24): preserve approved AniDB episode identities while allowing unrelated Anime-Lists updates, and quarantine only candidates whose effective mappings genuinely changed.
+Begin Phase 5 (F25): make health and cycle reports distinguish new-arrival and campaign eligibility, submissions, and actual Shoko write activity.
