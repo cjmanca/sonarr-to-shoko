@@ -22,7 +22,7 @@
 | F22 — Incomplete reconciliation handling | complete | Manual apply and the daemon's inner campaign sweep now require `reconciliation_ready` before campaign drift decisions. Incomplete snapshots defer with stable source reason codes, zero POSTs, unchanged approvals/progress, and no zero-progress breaker update. Sequential read-only review accepted. Local implementation commit: `70628e8f4229540afc5335f7d7e13a6dc8924bea`. |
 | F24 — Candidate-level mapping drift | complete | Candidate-level mapping continuity, generation freshness, origin-bound pause handling, and durable ambiguity provenance. Sequential adversarial review findings fixed. Local implementation commit: `9ebf445`. |
 | F25 — Cross-scope write reporting | complete | Cycle/health/report output now separates new-arrival and campaign eligibility, submissions, total link requests, and path/all-path suppression. Sequential read-only review found no remaining findings. Local implementation commit: `b0bfe47`. |
-| Final checks and adversarial review | pending |  |
+| Final checks and adversarial review | complete | Full offline suite, static checks, Docker/default-deny smoke, final read-only review, pushed CI and GHCR verification all passed for the implementation/evidence head `e42780581280adc77e437fad06bcc0182ee92aca`. The only worktree modification remains the pre-existing `PLAN.md` change. |
 
 ## F23 — Restore automated publication (complete)
 
@@ -101,7 +101,7 @@
 - `docker build -t shoko-sonarr-linker:review .` → passed; built image runs as UID/GID `1000:1000`.
 - Docker smoke: `validate --offline config.example.yaml` passed with zero Sonarr/Shoko requests; `once --apply config.example.yaml` refused with exit **3** under the default-deny config and reported zero remote writes.
 - Adopted `PLAN.md` SHA-256 rechecked as `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`; the pre-existing plan modification remains uncommitted and unchanged.
-- Local F24 implementation commit: `9ebf445` (`fix: preserve campaign approval across mapping updates`). Live Sonarr/Shoko integration remains unverified; F24 push-triggered CI/GHCR status will be recorded after push.
+- Local F24 implementation commit: `9ebf445` (`fix: preserve campaign approval across mapping updates`). Live Sonarr/Shoko integration remains unverified; F24 push-triggered CI/GHCR results are included in the final acceptance record below.
 
 ## F25 — Report cross-scope write activity accurately (complete)
 
@@ -121,8 +121,17 @@
 - `docker build -t shoko-sonarr-linker:review .` → passed; runtime user verified as UID/GID `1000:1000`.
 - Docker smoke: CLI help passed; `validate --offline config.example.yaml` passed with no Sonarr/Shoko requests; `once --apply config.example.yaml` refused with exit **3** under default-deny configuration and reported no remote writes.
 - `PLAN.md` SHA-256 rechecked as `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`; the pre-existing plan modification remains uncommitted and unchanged.
-- Local F25 implementation commit: `b0bfe47` (`fix: report campaign and arrival writes separately`). Live Sonarr/Shoko behavior and push-triggered CI/GHCR for the new commits remain unverified pending push.
+- Local F25 implementation commit: `b0bfe47` (`fix: report campaign and arrival writes separately`). Live Sonarr/Shoko behavior remains unverified; push-triggered CI/GHCR results are included below.
+
+## Final acceptance gate (complete)
+
+- Final sequential read-only review covered the combined F24/F25 implementation and evidence changes; no unresolved P0/P1 or acceptance-blocking P2 finding remains.
+- The F24/F25 implementation-and-evidence push advanced `main` to `e42780581280adc77e437fad06bcc0182ee92aca`. The four commits were F24 implementation `9ebf4454986ca2df8da572c6164af3af760a8a3f`, F24 evidence `4039f295f7c27f2d792ff9423e299258cce801cd`, F25 implementation `b0bfe47a6f1c67868d21fd80dbcef108fd3a4844`, and F25 evidence `e42780581280adc77e437fad06bcc0182ee92aca`.
+- GitHub Actions CI succeeded for head `e42780581280adc77e437fad06bcc0182ee92aca`: [run 38522668978](https://github.com/cjmanca/sonarr-to-shoko/actions/runs/38522668978). Docker build, shared quality checks, CLI help, offline validation, and default-deny smoke all passed.
+- GHCR publishing succeeded for run [38522668956](https://github.com/cjmanca/sonarr-to-shoko/actions/runs/38522668956). All four pushed commit SHAs were built/published by the matrix; immutable-SHA provenance and current-main checks passed, and `latest` promotion succeeded.
+- The adopted `PLAN.md` SHA-256 remains `A77D0FF4410ACFFDC73083878F3629727661CBEB99347BAB173E045A3E3DD028`. The pre-existing modified `PLAN.md` remains uncommitted and was not included in any push.
+- No production Sonarr/Shoko calls or writes, Unraid deployment, or other production deployment occurred. Those live integration/deployment gates remain **EXTERNAL/UNVERIFIED**.
 
 ## Next action
 
-Push the authorized F24/F25 commits to `main`, verify the triggered CI/GHCR workflows, record their outcomes, and complete the overall PLAN.md acceptance audit.
+No additional implementation action remains for this plan. Live Sonarr/Shoko integration and deployment remain external operator work.
