@@ -315,6 +315,16 @@ def test_first_run_seven_k_backlog_zero_posts_cohort_split(
     assert counts["backlog"] == BACKLOG_FILES
     assert counts["new_arrival"] == 0
     assert counts["submitted"] == 0
+    assert report.new_arrival_apply_eligible is True
+    assert report.new_arrival_submitted == 0
+    assert report.campaign_submitted == 0
+    assert report.total_link_requests_attempted == 0
+    assert report.new_arrival_writes_suppressed is False
+    assert report.campaign_writes_suppressed is True
+    assert report.writes_suppressed is False
+    assert payload["new_arrival_apply_eligible"] is True
+    assert payload["new_arrival_submitted"] == 0
+    assert payload["total_link_requests_attempted"] == 0
     cov = cast("dict[str, Any]", coverage["coverage"])
     assert cov["files_tracked_in_state"] == BACKLOG_FILES
     assert cov["files_verified"] == 0

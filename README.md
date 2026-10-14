@@ -46,8 +46,8 @@ uv run python -m pytest -q
 | `config [path] [--check]` | Resolved config path; `--check` loads and validates | none |
 | `once [--dry-run] [--apply] [--policy P] [--max-links N] [--json]` | One reconciliation cycle. Dry-run by default. `--max-links N` caps **POST submissions** (not enumerated files); default `sync.max_new_per_cycle`. `--apply` requires the write gate **and** a valid attestation lease | Sonarr/Shoko reads; writes only through the gated path |
 | `daemon [--cycles N] [--once-signal] [--policy P] [--json]` | The polling loop: interval/backoff/jitter from config, apply only when the gate **and** lease open, SIGINT/SIGTERM stop after the current cycle (an idle daemon wakes from the **interruptible** sleep immediately; a signal during a cycle is honoured once that cycle completes, never mid-write). Cycle metadata persists after every cycle, so health/cadence stay fresh. `--cycles N` (and `--once-signal`) bound the loop for tests/CI. Full/light cadence: light cycles poll the same inventories with halved recovery/apply work budgets; `full_reconcile_interval_hours` forces a full reconcile. **F7 + F10:** with `campaign.daemon_auto_apply: true` (default) it drains an **approved** backlog campaign automatically — one bounded batch per apply cycle — only after the operator's manual canary **and** the explicit `campaign authorize-drain` confirmation bound to the plan digest; a changed plan fingerprint set invalidates the authorization, and `campaign revoke-drain` stops the drain | apply gated |
-| `report [--json]` | Read-only rollup: state counts by state/cohort, detail roll-up, mapping generation + affected candidates, safety fields (attestation verdict, pause, writes-disabled), campaign summaries, outstanding jobs, coverage % with explicit denominators ("based on last cycle inventory"), liveness / reconciliation-ready / apply-eligible levels | none |
-| `health [--json]` | Cheap liveness: `alive`, `last_cycle_iso`, `cycle_ok`, `mapping_age_hours`, counts (state/meta + cache only) | none |
+| `report [--json]` | Read-only rollup: state counts by state/cohort, detail roll-up, mapping generation + affected candidates, safety fields, campaign summaries, outstanding jobs, coverage denominators, liveness/reconciliation levels, and persisted per-path write activity | none |
+| `health [--json]` | Cheap liveness plus last-cycle per-path eligibility, submissions, total link-request attempts, and suppression state (state/meta + cache only) | none |
 | `mappings status [--json]` | Active generation: revision/content/effective/structure digests, age, last attempted/success + outcome, next due, source availability, mapping-affected candidate counts from the state DB. An absent generation is reported with exit 0 (informational) | none |
 | `mappings refresh [--force] [--json]` | Due-gated conditional GET of the Anime-Lists source only. Exit 0 for `activated`/`unchanged` (304)/`not_due`; exit 4 on failure (the last-known-good generation stays active) | mapping source only |
 | `attestation status [--scope S] [--json]` | Evaluate the configured safety lease **offline** (no network): `valid`/`absent`/`invalid`/`expired`/`stale_version`, the record fields, digest, seconds-to-expiry and the warn-lead flag. Scope is `daemon` (default) or `campaign:<id>` | none |
@@ -69,6 +69,16 @@ uv run python -m pytest -q
 | `steal-apply-lock --note TEXT --confirm [--json]` | Take over a **dead** owner's apply lease: it requires the OS advisory lock (`apply.lock`) to be **free**, so a live owner (kernel-held lock) refuses and names the holder. An expired meta lease with a free OS lock is audit-recorded and the OS lock is released | none |
 | `resume-writes --note TEXT --confirm [--json]` | Clear the stopped-writes marker and the write pause | none |
 | `pause-writes --reason TEXT [--hours H] --note TEXT --confirm [--json]` | Persist a write pause with a reason | none |
+
+Cycle payloads report `new_arrival_apply_eligible`, `campaign_drain_selected` (an
+authorized campaign was selected for this cycle), and `campaign_apply_eligible` (the
+selected campaign passed its batch-level guards) separately. `new_arrival_submitted` and `campaign_submitted`
+are actual link-request attempts for their respective paths; `total_link_requests_attempted`
+is their sum, including rejected or indeterminate POST outcomes. The legacy `apply_eligible`
+and `counts.submitted` fields remain scoped to new arrivals. `writes_suppressed` (also
+reported as `all_writes_suppressed`) is true only when both mutation paths were gated; an
+eligible cycle with no candidate request has `total_link_requests_attempted: 0` but is not
+misreported as globally suppressed.
 
 Operator commands mutate durable state, so they require `--confirm` plus a `--note`;
 they refuse (exit `5`) while state writes are stopped, except `resume-writes`.

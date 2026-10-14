@@ -269,7 +269,7 @@ class DaemonDeps:
 
 @dataclass(frozen=True)
 class CycleCounts:
-    """Per-cycle tallies reported at the observability boundary."""
+    """Per-cycle new-arrival tallies; campaign sends are reported on CycleReport separately."""
 
     discovered: int = 0
     matched: int = 0
@@ -290,9 +290,11 @@ class CycleReport:
 
     ``alive`` means the cycle ran; ``reconciliation_ready`` means both inventories
     were complete and an active mapping generation is present;
-    ``apply_eligible`` is the composed eligibility verdict. ``campaign`` is the bounded
-    campaign-batch summary (:class:`~shoko_linker.campaign.CampaignApplyReport`) drained in
-    this cycle under the cycle's own apply lock (F7), or ``None`` when no batch ran.
+    ``apply_eligible`` is retained as the new-arrival eligibility alias. Explicit
+    new-arrival/campaign eligibility and write activity fields distinguish both mutation
+    paths; ``writes_suppressed`` means every cycle mutation path was gated. ``campaign`` is
+    the bounded campaign-batch summary (:class:`~shoko_linker.campaign.CampaignApplyReport`)
+    drained in this cycle under the cycle's own apply lock (F7), or ``None`` when no batch ran.
     """
 
     mode: CycleMode
@@ -318,6 +320,23 @@ class CycleReport:
     mapping_snapshot: tuple[int, str, str, str, bool] | None = field(
         default=None, repr=False, compare=False
     )
+    new_arrival_apply_eligible: bool = False
+    campaign_drain_selected: bool = False
+    campaign_apply_eligible: bool = False
+    new_arrival_submitted: int = 0
+    campaign_submitted: int = 0
+    total_link_requests_attempted: int = 0
+    new_arrival_writes_suppressed: bool = True
+    campaign_writes_suppressed: bool = True
+
+
+@dataclass(frozen=True)
+class _CampaignDrainOutcome:
+    """Campaign drain selection and eligibility, kept separate from its submission count."""
+
+    selected: bool = False
+    apply_eligible: bool = False
+    report: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -2021,7 +2040,7 @@ def _drain_campaign(
     reasons: list[str],
     *,
     fresh_campaign_quarantines: frozenset[int],
-) -> Any | None:
+) -> _CampaignDrainOutcome:
     """Drain **one** bounded batch of the oldest approved campaign (F7), under this cycle's lock.
 
     Runs entirely through :func:`shoko_linker.campaign.apply_campaign` with
@@ -2043,8 +2062,8 @@ def _drain_campaign(
     stall cooldown (Finding 1: no more ``retry == now`` no-op, so a stalled head yields the
     queue and auto-resumes) — it stays APPROVED, is skipped while the retry is in the future,
     and resumes automatically in a later cycle (the old ``no_budget_progress`` permanent pause
-    is gone; only genuinely-unexpected stalls keep the 3-cycle breaker). Returns the bounded
-    :class:`~shoko_linker.campaign.CampaignApplyReport`, or ``None``.
+    is gone; only genuinely-unexpected stalls keep the 3-cycle breaker). The result separately
+    reports drain authorization, campaign eligibility, and the bounded batch summary.
     """
     from .campaign import (
         CampaignDeferredError,
@@ -2062,11 +2081,11 @@ def _drain_campaign(
     if campaign is None:
         # F18: surface the deferral (id + retry time) of a campaign skipped for the cooldown.
         reasons.extend(campaign_deferral_reasons(deps.store, now_iso))
-        return None
+        return _CampaignDrainOutcome()
     if campaign.plan_path is None:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}:plan_path_missing")
         _pause_deferred_campaign(deps, campaign.campaign_id, "plan_path_missing", now_iso)
-        return None
+        return _CampaignDrainOutcome(selected=True)
     campaign_deps = _campaign_scoped_deps(deps, campaign.campaign_id)
     try:
         report = apply_campaign(
@@ -2087,12 +2106,12 @@ def _drain_campaign(
             campaign.campaign_id,
             exc,
         )
-        return None
+        return _CampaignDrainOutcome(selected=True)
     except CampaignDeferredError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}:{exc.reason_code}")
         reasons.extend(exc.reason_codes)
         log.warning("campaign %s drain deferred: %s", campaign.campaign_id, exc)
-        return None
+        return _CampaignDrainOutcome(selected=True)
     except CampaignError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}")
         log.warning("campaign %s drain deferred: %s", campaign.campaign_id, exc)
@@ -2111,7 +2130,7 @@ def _drain_campaign(
         ):
             retry = _rolling_cooldown_retry_iso(deps, now_iso, ())
             _defer_campaign_drain(deps, campaign.campaign_id, retry, reasons, "budget_cooldown")
-        return None
+        return _CampaignDrainOutcome(selected=True)
     reasons.extend(_aggregate_campaign_reasons(report.reasons))
     key = f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign.campaign_id}"
     # P2: the breaker keys on REAL progress (submissions/verifications/quarantines), not the
@@ -2137,7 +2156,7 @@ def _drain_campaign(
         with contextlib.suppress(WriteDisabledError, StateError):
             deps.store.set_meta(key, "0")
             deps.store.clear_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign.campaign_id}")
-    return report
+    return _CampaignDrainOutcome(selected=True, apply_eligible=True, report=report)
 
 
 def _lock_preflight(
@@ -2424,13 +2443,13 @@ def _run_cycle_body(
     # F24: a mapping-churn pause still suppresses new-arrival writes, while an approved campaign
     # revalidates each candidate against immutable AniDB target identities before any POST.
     # Manual CLI campaign apply stays fully available.
-    campaign_report: Any | None = None
+    campaign_drain = _CampaignDrainOutcome()
     if (
         mode is CycleMode.APPLY
         and reconciliation_ready
         and deps.settings.campaign.daemon_auto_apply
     ):
-        campaign_report = _drain_campaign(
+        campaign_drain = _drain_campaign(
             deps,
             now_iso,
             reasons,
@@ -2453,7 +2472,7 @@ def _run_cycle_body(
         alive=True,
         reconciliation_ready=reconciliation_ready,
         apply_eligible=cycle_eligible,
-        writes_suppressed=not apply_running,
+        writes_suppressed=(not apply_running and not campaign_drain.apply_eligible),
         mapping_outcome=phase.outcome,
         mapping_revision=active.revision,
         counts=counts,
@@ -2467,7 +2486,21 @@ def _run_cycle_body(
         full=full,
         plans=reconcile.plans,
         folders=discovery.folders,
-        campaign=campaign_report,
+        campaign=campaign_drain.report,
+        new_arrival_apply_eligible=cycle_eligible,
+        campaign_drain_selected=campaign_drain.selected,
+        campaign_apply_eligible=campaign_drain.apply_eligible,
+        new_arrival_submitted=submitted,
+        campaign_submitted=(
+            campaign_drain.report.submitted if campaign_drain.report is not None else 0
+        ),
+        total_link_requests_attempted=(
+            submitted + campaign_drain.report.submitted
+            if campaign_drain.report is not None
+            else submitted
+        ),
+        new_arrival_writes_suppressed=not apply_running,
+        campaign_writes_suppressed=not campaign_drain.apply_eligible,
         mapping_snapshot=(
             active.revision,
             active.content_sha256,

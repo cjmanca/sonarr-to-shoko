@@ -121,15 +121,23 @@ from .mapping_store import (
 from .policies import PolicyRequest, RunPolicy, parse_policy
 from .reporting import (
     META_CYCLE_ALIVE,
+    META_CYCLE_ALL_WRITES_SUPPRESSED,
     META_CYCLE_APPLY_ELIGIBLE,
+    META_CYCLE_CAMPAIGN_ELIGIBLE,
     META_CYCLE_CAMPAIGN_ID,
     META_CYCLE_CAMPAIGN_REMAINING,
+    META_CYCLE_CAMPAIGN_SELECTED,
     META_CYCLE_CAMPAIGN_SUBMITTED,
+    META_CYCLE_CAMPAIGN_SUPPRESSED,
     META_CYCLE_FAILED,
     META_CYCLE_KEY,
     META_CYCLE_MODE,
+    META_CYCLE_NEW_ARRIVAL_ELIGIBLE,
+    META_CYCLE_NEW_ARRIVAL_SUBMITTED,
+    META_CYCLE_NEW_ARRIVAL_SUPPRESSED,
     META_CYCLE_RECONCILIATION_READY,
     META_CYCLE_SUBMITTED,
+    META_CYCLE_TOTAL_LINK_REQUESTS,
     META_OPERATOR_ACTIONS,
     REFRESH_SUCCESS_OUTCOMES,
     audit_payload,
@@ -543,8 +551,25 @@ def persist_cycle_meta(
         store.set_meta(META_CYCLE_ALIVE, "1" if report.alive else "0")
         store.set_meta(META_CYCLE_RECONCILIATION_READY, "1" if report.reconciliation_ready else "0")
         store.set_meta(META_CYCLE_APPLY_ELIGIBLE, "1" if report.apply_eligible else "0")
+        store.set_meta(
+            META_CYCLE_NEW_ARRIVAL_ELIGIBLE,
+            "1" if report.new_arrival_apply_eligible else "0",
+        )
+        store.set_meta(META_CYCLE_CAMPAIGN_SELECTED, "1" if report.campaign_drain_selected else "0")
+        store.set_meta(META_CYCLE_CAMPAIGN_ELIGIBLE, "1" if report.campaign_apply_eligible else "0")
         store.set_meta(META_CYCLE_FAILED, "1" if report.failed else "0")
-        store.set_meta(META_CYCLE_SUBMITTED, str(report.counts.submitted))
+        store.set_meta(META_CYCLE_SUBMITTED, str(report.new_arrival_submitted))
+        store.set_meta(META_CYCLE_NEW_ARRIVAL_SUBMITTED, str(report.new_arrival_submitted))
+        store.set_meta(META_CYCLE_TOTAL_LINK_REQUESTS, str(report.total_link_requests_attempted))
+        store.set_meta(
+            META_CYCLE_NEW_ARRIVAL_SUPPRESSED,
+            "1" if report.new_arrival_writes_suppressed else "0",
+        )
+        store.set_meta(
+            META_CYCLE_CAMPAIGN_SUPPRESSED,
+            "1" if report.campaign_writes_suppressed else "0",
+        )
+        store.set_meta(META_CYCLE_ALL_WRITES_SUPPRESSED, "1" if report.writes_suppressed else "0")
         _set_cycle_campaign_meta(store, report)
         store.set_meta(META_LAST_CYCLE_START_ISO, started_iso)
         store.set_meta(META_LAST_CYCLE_END_ISO, ended_iso)
@@ -782,10 +807,10 @@ def _run_daemon(args: argparse.Namespace) -> int:
                 full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
             )
             logging.getLogger(__name__).info(
-                "cycle %s complete: mode=%s submitted=%d full=%s failed=%s",
+                "cycle %s complete: mode=%s new_arrival_submitted=%d full=%s failed=%s",
                 report.cycle_key,
                 report.mode.value,
-                report.counts.submitted,
+                report.new_arrival_submitted,
                 report.full,
                 report.failed,
             )
@@ -934,7 +959,20 @@ def _print_report(payload: Mapping[str, Any]) -> None:
         print(
             f"levels: alive={levels['alive']} "
             f"reconciliation_ready={levels['reconciliation_ready']} "
-            f"apply_eligible={levels['apply_eligible']}"
+            f"new_arrival_apply_eligible={levels['apply_eligible']}"
+        )
+        activity = levels["write_activity"]
+        print(
+            "last-cycle writes: "
+            f"new_arrival(eligible={activity['new_arrival_apply_eligible']}, "
+            f"submitted={activity['new_arrival_submitted']}, "
+            f"suppressed={activity['new_arrival_writes_suppressed']}) "
+            f"campaign(selected={activity['campaign_drain_selected']}, "
+            f"eligible={activity['campaign_apply_eligible']}, "
+            f"submitted={activity['campaign_submitted']}, "
+            f"suppressed={activity['campaign_writes_suppressed']}) "
+            f"total_link_requests_attempted={activity['total_link_requests_attempted']} "
+            f"all_writes_suppressed={activity['all_writes_suppressed']}"
         )
         for item in payload["detail_rollup"][:10]:
             print(f"  detail x{item['count']}: {item['detail']}")

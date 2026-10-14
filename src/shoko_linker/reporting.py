@@ -57,6 +57,14 @@ META_CYCLE_SUBMITTED: Final[str] = "last_cycle_submitted"
 META_CYCLE_CAMPAIGN_ID: Final[str] = "last_cycle_campaign_id"
 META_CYCLE_CAMPAIGN_SUBMITTED: Final[str] = "last_cycle_campaign_submitted"
 META_CYCLE_CAMPAIGN_REMAINING: Final[str] = "last_cycle_campaign_remaining"
+META_CYCLE_NEW_ARRIVAL_ELIGIBLE: Final[str] = "last_cycle_new_arrival_apply_eligible"
+META_CYCLE_CAMPAIGN_SELECTED: Final[str] = "last_cycle_campaign_drain_selected"
+META_CYCLE_CAMPAIGN_ELIGIBLE: Final[str] = "last_cycle_campaign_apply_eligible"
+META_CYCLE_NEW_ARRIVAL_SUBMITTED: Final[str] = "last_cycle_new_arrival_submitted"
+META_CYCLE_TOTAL_LINK_REQUESTS: Final[str] = "last_cycle_total_link_requests_attempted"
+META_CYCLE_NEW_ARRIVAL_SUPPRESSED: Final[str] = "last_cycle_new_arrival_writes_suppressed"
+META_CYCLE_CAMPAIGN_SUPPRESSED: Final[str] = "last_cycle_campaign_writes_suppressed"
+META_CYCLE_ALL_WRITES_SUPPRESSED: Final[str] = "last_cycle_all_writes_suppressed"
 META_OPERATOR_ACTIONS: Final[str] = "operator_actions"
 
 CYCLE_META_KEYS: Final[tuple[str, ...]] = (
@@ -70,6 +78,14 @@ CYCLE_META_KEYS: Final[tuple[str, ...]] = (
     META_CYCLE_CAMPAIGN_ID,
     META_CYCLE_CAMPAIGN_SUBMITTED,
     META_CYCLE_CAMPAIGN_REMAINING,
+    META_CYCLE_NEW_ARRIVAL_ELIGIBLE,
+    META_CYCLE_CAMPAIGN_SELECTED,
+    META_CYCLE_CAMPAIGN_ELIGIBLE,
+    META_CYCLE_NEW_ARRIVAL_SUBMITTED,
+    META_CYCLE_TOTAL_LINK_REQUESTS,
+    META_CYCLE_NEW_ARRIVAL_SUPPRESSED,
+    META_CYCLE_CAMPAIGN_SUPPRESSED,
+    META_CYCLE_ALL_WRITES_SUPPRESSED,
     META_LAST_CYCLE_START_ISO,
     META_LAST_CYCLE_END_ISO,
     META_NEXT_CYCLE_DUE_ISO,
@@ -157,6 +173,35 @@ def _campaign_cycle_summary(report: Any | None) -> dict[str, Any] | None:
     }
 
 
+def _cycle_write_activity(meta: Mapping[str, Any]) -> dict[str, bool | int | None]:
+    """Explicit per-path eligibility and actual request attempts from the last cycle."""
+
+    def flag(key: str) -> bool | None:
+        raw = meta.get(key)
+        return None if raw is None else raw == INDICATOR_TRUE
+
+    def count(key: str) -> int | None:
+        raw = meta.get(key)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "new_arrival_apply_eligible": flag(META_CYCLE_NEW_ARRIVAL_ELIGIBLE),
+        "campaign_drain_selected": flag(META_CYCLE_CAMPAIGN_SELECTED),
+        "campaign_apply_eligible": flag(META_CYCLE_CAMPAIGN_ELIGIBLE),
+        "new_arrival_submitted": count(META_CYCLE_NEW_ARRIVAL_SUBMITTED),
+        "campaign_submitted": count(META_CYCLE_CAMPAIGN_SUBMITTED),
+        "total_link_requests_attempted": count(META_CYCLE_TOTAL_LINK_REQUESTS),
+        "new_arrival_writes_suppressed": flag(META_CYCLE_NEW_ARRIVAL_SUPPRESSED),
+        "campaign_writes_suppressed": flag(META_CYCLE_CAMPAIGN_SUPPRESSED),
+        "all_writes_suppressed": flag(META_CYCLE_ALL_WRITES_SUPPRESSED),
+    }
+
+
 def cycle_report_payload(
     report: CycleReport,
     *,
@@ -171,7 +216,15 @@ def cycle_report_payload(
         "alive": report.alive,
         "reconciliation_ready": report.reconciliation_ready,
         "apply_eligible": report.apply_eligible,
+        "new_arrival_apply_eligible": report.new_arrival_apply_eligible,
+        "campaign_drain_selected": report.campaign_drain_selected,
+        "campaign_apply_eligible": report.campaign_apply_eligible,
         "writes_suppressed": report.writes_suppressed,
+        "new_arrival_writes_suppressed": report.new_arrival_writes_suppressed,
+        "campaign_writes_suppressed": report.campaign_writes_suppressed,
+        "new_arrival_submitted": report.new_arrival_submitted,
+        "campaign_submitted": report.campaign_submitted,
+        "total_link_requests_attempted": report.total_link_requests_attempted,
         "mapping_outcome": report.mapping_outcome.value if report.mapping_outcome else None,
         "mapping_revision": report.mapping_revision,
         "counts": asdict(report.counts),
@@ -239,14 +292,21 @@ def cycle_summary_line(report: CycleReport) -> str:
     return (
         f"cycle {report.cycle_key} [{report.mode.value}]: "
         f"discovered={counts.discovered} matched={counts.matched} mapped={counts.mapped} "
-        f"planned={counts.planned} submitted={counts.submitted} verified={counts.verified} "
+        f"planned={counts.planned} new_arrival_submitted={report.new_arrival_submitted} "
+        f"verified={counts.verified} "
         f"pending={counts.pending} indeterminate={counts.indeterminate} blocked={counts.blocked} "
         f"backlog={counts.backlog} new_arrival={counts.new_arrival} | "
         f"mapping={report.mapping_outcome.value if report.mapping_outcome else 'none'}"
         f" rev={report.mapping_revision} deferred={report.deferred_planned}"
         f" recovery_deferred={recovery_deferred(report.reasons)}"
         f" live_held(sends={report.live_held_sends}, slots={report.live_held_slots})"
-        f" apply_eligible={report.apply_eligible}"
+        f" new_arrival_eligible={report.new_arrival_apply_eligible}"
+        f" campaign_drain_selected={report.campaign_drain_selected}"
+        f" campaign_apply_eligible={report.campaign_apply_eligible}"
+        f" campaign_submitted={report.campaign_submitted}"
+        f" total_link_requests_attempted={report.total_link_requests_attempted}"
+        f" writes_suppressed(new_arrival={report.new_arrival_writes_suppressed},"
+        f" campaign={report.campaign_writes_suppressed}, all={report.writes_suppressed})"
         f" reconciliation_ready={report.reconciliation_ready}"
         f"{_campaign_cycle_segment(report.campaign)}"
         f"{' FAILED' if report.failed else ''}"
@@ -555,6 +615,7 @@ def report_payload(
                 "reconciliation_ready": False,
                 "apply_eligible": False,
                 "last_cycle": {},
+                "write_activity": _cycle_write_activity({}),
                 "eligibility_inputs": {
                     "apply_gate": apply_gate_status(settings).describe(),
                     "attestation": attestation_status,
@@ -613,6 +674,15 @@ def report_payload(
                     META_CYCLE_MODE,
                     META_CYCLE_FAILED,
                     META_CYCLE_SUBMITTED,
+                    META_CYCLE_NEW_ARRIVAL_ELIGIBLE,
+                    META_CYCLE_CAMPAIGN_SELECTED,
+                    META_CYCLE_CAMPAIGN_ELIGIBLE,
+                    META_CYCLE_CAMPAIGN_SUBMITTED,
+                    META_CYCLE_NEW_ARRIVAL_SUBMITTED,
+                    META_CYCLE_TOTAL_LINK_REQUESTS,
+                    META_CYCLE_NEW_ARRIVAL_SUPPRESSED,
+                    META_CYCLE_CAMPAIGN_SUPPRESSED,
+                    META_CYCLE_ALL_WRITES_SUPPRESSED,
                     META_LAST_CYCLE_START_ISO,
                     META_LAST_CYCLE_END_ISO,
                     META_NEXT_CYCLE_DUE_ISO,
@@ -620,6 +690,7 @@ def report_payload(
                     META_NEXT_FULL_RECONCILE_ISO,
                 )
             },
+            "write_activity": _cycle_write_activity(meta),
             "eligibility_inputs": _eligibility_inputs(
                 store, settings, mapping_status.active_present, attestation_status, _iso(now)
             ),
@@ -647,6 +718,7 @@ def health_payload(
             "mapping_generation_active": mapping_status.active_present,
             "state_present": False,
             "counts": {},
+            "write_activity": _cycle_write_activity({}),
         }
     by_state = _state_counts(store)
     return {
@@ -656,6 +728,9 @@ def health_payload(
         "mapping_age_hours": age_hours,
         "mapping_generation_active": mapping_status.active_present,
         "state_present": True,
+        "write_activity": _cycle_write_activity(
+            {key: store.get_meta(key) for key in CYCLE_META_KEYS}
+        ),
         "counts": {
             "tracked": sum(by_state.values()),
             "verified": by_state[FileState.VERIFIED.value],

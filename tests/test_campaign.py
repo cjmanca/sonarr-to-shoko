@@ -3610,6 +3610,43 @@ def test_both_leases_valid_campaign_drains_and_daemon_submits(
         assert cycle.campaign is not None
         assert cycle.campaign.submitted == 1  # backlog 501 drained
         assert cycle.counts.submitted == COUNT_FIVE - 2  # new arrivals 502,503,504
+        assert cycle.new_arrival_apply_eligible is True
+        assert cycle.campaign_drain_selected is True
+        assert cycle.campaign_apply_eligible is True
+        assert cycle.new_arrival_submitted == COUNT_FIVE - 2
+        assert cycle.campaign_submitted == 1
+        assert cycle.total_link_requests_attempted == COUNT_FIVE - 1
+        assert cycle.new_arrival_writes_suppressed is False
+        assert cycle.campaign_writes_suppressed is False
+        assert cycle.writes_suppressed is False
+        cli.persist_cycle_meta(
+            store,
+            cycle,
+            started_iso=env.now_iso,
+            ended_iso=env.now_iso,
+            interval_seconds=300.0,
+            full_reconcile_hours=24.0,
+        )
+        capsys.readouterr()
+        health_code = main(["health", str(env.config_path), "--json"])
+        health = json.loads(capsys.readouterr().out)
+        assert health_code == EXIT_OK
+        expected_activity = {
+            "new_arrival_apply_eligible": True,
+            "campaign_drain_selected": True,
+            "campaign_apply_eligible": True,
+            "new_arrival_submitted": COUNT_FIVE - 2,
+            "campaign_submitted": 1,
+            "total_link_requests_attempted": COUNT_FIVE - 1,
+            "new_arrival_writes_suppressed": False,
+            "campaign_writes_suppressed": False,
+            "all_writes_suppressed": False,
+        }
+        assert health["write_activity"] == expected_activity
+        report_code = main(["report", str(env.config_path), "--json"])
+        report_payload = json.loads(capsys.readouterr().out)
+        assert report_code == EXIT_OK
+        assert report_payload["levels"]["write_activity"] == expected_activity
         campaign = store.get_campaign(campaign_id)
         assert campaign is not None
         assert campaign.total_sent == 2
@@ -3640,7 +3677,16 @@ def test_daemon_lease_expired_campaign_still_drains(
         cycle = env.daemon_cycle(store, "daemon-expired")
         assert cycle.alive is True
         assert cycle.apply_eligible is False
+        assert cycle.new_arrival_apply_eligible is False
+        assert cycle.campaign_drain_selected is True
+        assert cycle.campaign_apply_eligible is True
         assert cycle.counts.submitted == 0
+        assert cycle.new_arrival_submitted == 0
+        assert cycle.campaign_submitted == 1
+        assert cycle.total_link_requests_attempted == 1
+        assert cycle.new_arrival_writes_suppressed is True
+        assert cycle.campaign_writes_suppressed is False
+        assert cycle.writes_suppressed is False
         assert store.budget_view().paused_reason == ATTESTATION_PAUSE_REASON
         assert store.get_meta("attestation_gate") == "paused"
         # ...and the authorized campaign still drains (backlog 501):
@@ -3648,6 +3694,66 @@ def test_daemon_lease_expired_campaign_still_drains(
         assert cycle.campaign.submitted == 1
         assert len(env.stubs.posts) == posts_before + 1
         assert 501 in env.stubs.posted_files
+    finally:
+        store.close()
+
+
+def test_both_expired_leases_suppress_every_cycle_write_path(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)
+        env.write_daemon_lease(hours=0.5)
+        env.write_campaign_lease(campaign_id, hours=0.5)
+        env.now_iso = _iso_plus(env.now_iso, 3600.0 + 60.0)
+        posts_before = len(env.stubs.posts)
+
+        cycle = env.daemon_cycle(store, "both-leases-expired")
+
+        assert cycle.new_arrival_apply_eligible is False
+        assert cycle.campaign_drain_selected is True
+        assert cycle.campaign_apply_eligible is False
+        assert cycle.new_arrival_submitted == 0
+        assert cycle.campaign_submitted == 0
+        assert cycle.total_link_requests_attempted == 0
+        assert cycle.new_arrival_writes_suppressed is True
+        assert cycle.campaign_writes_suppressed is True
+        assert cycle.writes_suppressed is True
+        assert len(env.stubs.posts) == posts_before
+    finally:
+        store.close()
+
+
+def test_operator_global_write_pause_suppresses_both_cycle_scopes(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    store = env.open_store()
+    try:
+        _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, env.now_iso, note=AUTH_NOTE)
+        store.pause("operator_review", env.now_iso)
+        posts_before = len(env.stubs.posts)
+
+        cycle = env.daemon_cycle(store, "operator-global-pause")
+
+        assert cycle.new_arrival_apply_eligible is False
+        assert cycle.campaign_drain_selected is True
+        assert cycle.campaign_apply_eligible is False
+        assert cycle.new_arrival_submitted == 0
+        assert cycle.campaign_submitted == 0
+        assert cycle.total_link_requests_attempted == 0
+        assert cycle.new_arrival_writes_suppressed is True
+        assert cycle.campaign_writes_suppressed is True
+        assert cycle.writes_suppressed is True
+        assert len(env.stubs.posts) == posts_before
     finally:
         store.close()
 
@@ -3672,7 +3778,16 @@ def test_campaign_lease_absent_daemon_still_submits(
         cycle = env.daemon_cycle(store, "campaign-absent")
         assert cycle.alive is True
         assert cycle.apply_eligible is True
+        assert cycle.new_arrival_apply_eligible is True
+        assert cycle.campaign_drain_selected is True
+        assert cycle.campaign_apply_eligible is False
         assert cycle.counts.submitted == COUNT_FIVE - 2
+        assert cycle.new_arrival_submitted == COUNT_FIVE - 2
+        assert cycle.campaign_submitted == 0
+        assert cycle.total_link_requests_attempted == COUNT_FIVE - 2
+        assert cycle.new_arrival_writes_suppressed is False
+        assert cycle.campaign_writes_suppressed is True
+        assert cycle.writes_suppressed is False
         assert any(reason.startswith("campaign_deferred:") for reason in cycle.reasons)
         assert store.get_meta(f"campaign_attestation_gate:{campaign_id}") == "paused"
         campaign = store.get_campaign(campaign_id)
