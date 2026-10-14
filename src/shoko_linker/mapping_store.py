@@ -98,6 +98,7 @@ _STATE_FIELDS: Final[frozenset[str]] = frozenset(
         "revision",
         "consecutive_failures",
         "source_url",
+        "source_change_pending",
         "last_outcome",
     }
 )
@@ -159,6 +160,18 @@ def parse_source_url(url: str) -> SourceLocation:
     return SourceLocation(origin=origin, path=parts.path)
 
 
+def _normalized_source_url(url: str) -> str:
+    location = parse_source_url(url)
+    return location.origin + location.path
+
+
+def _source_url_matches(store: MappingStore, source_url: str) -> bool:
+    try:
+        return _normalized_source_url(source_url) == store.source_url
+    except (ConfigError, ValueError):
+        return False
+
+
 @dataclass
 class _State:
     """Validated view of ``state.json``; a corrupt file loads as the empty state."""
@@ -174,6 +187,7 @@ class _State:
     revision: int = 0
     consecutive_failures: int = 0
     source_url: str = DEFAULT_MAPPING_SOURCE_URL
+    source_change_pending: bool = False
     last_outcome: str | None = None
 
 
@@ -289,11 +303,13 @@ def _state_from_document(document: dict[str, Any]) -> _State:
     accept_encoding = document.get("accept_encoding", ACCEPT_ENCODING)
     if not isinstance(accept_encoding, str) or not accept_encoding:
         raise ValueError("accept_encoding must be a string")
-    source_url = document.get("source_url", DEFAULT_MAPPING_SOURCE_URL)
-    parse_source_url(source_url)
+    source_url = _normalized_source_url(document.get("source_url", DEFAULT_MAPPING_SOURCE_URL))
     last_outcome = document.get("last_outcome")
     if last_outcome is not None and not isinstance(last_outcome, str):
         raise ValueError("last_outcome must be a string")
+    source_change_pending = document.get("source_change_pending", False)
+    if not isinstance(source_change_pending, bool):
+        raise ValueError("source_change_pending must be a boolean")
     for name in ("content_sha256", "targets_digest", "structure_digest"):
         value = document.get(name)
         if value is not None and not _is_hex64(value):
@@ -310,6 +326,7 @@ def _state_from_document(document: dict[str, Any]) -> _State:
         revision=revision,
         consecutive_failures=failures,
         source_url=source_url,
+        source_change_pending=source_change_pending,
         last_outcome=last_outcome,
     )
 
@@ -333,9 +350,10 @@ def _meta_from_document(document: dict[str, Any]) -> _Meta:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a non-negative whole number")
         counts[name] = value
-    source_url = document.get("source_url")
-    if not isinstance(source_url, str):
+    raw_source_url = document.get("source_url")
+    if not isinstance(raw_source_url, str):
         raise ValueError("source_url must be a string")
+    source_url = _normalized_source_url(raw_source_url)
     return _Meta(
         content_sha256=cast(str, document["content_sha256"]),
         targets_digest=cast(str, document["targets_digest"]),
@@ -422,11 +440,17 @@ class MappingStore:
         """Headers for source requests: ``Accept-Encoding: identity`` plus the stored ETag.
 
         The ETag is sent only with the encoding it was recorded under (``Vary:
-        Accept-Encoding``): reusing it cross-encoding yields 200, not 304.
+        Accept-Encoding``), the configured source, and a verified active generation. A
+        validator without its matching bytes or provenance cannot recover a cache on 304.
         """
         headers = {"Accept-Encoding": ACCEPT_ENCODING}
         state = self._load_state()
-        if state.etag is not None and state.accept_encoding == ACCEPT_ENCODING:
+        if (
+            _source_url_matches(self, state.source_url)
+            and self._state_matches_active(state)
+            and state.etag is not None
+            and state.accept_encoding == ACCEPT_ENCODING
+        ):
             headers["If-None-Match"] = state.etag
         return headers
 
@@ -469,10 +493,35 @@ class MappingStore:
 
     def _active_verified(self) -> bool:
         meta = self._load_meta()
+        state = self._load_state()
         body = self._read_active_bytes()
-        if meta is None or body is None:
+        if (
+            meta is None
+            or body is None
+            or not _source_url_matches(self, meta.source_url)
+            or not _source_url_matches(self, state.source_url)
+            or state.source_change_pending
+            or content_digest(body) != meta.content_sha256
+        ):
             return False
-        return content_digest(body) == meta.content_sha256
+        try:
+            parse_anime_lists(body)
+        except (MappingError, ConfigError):
+            return False
+        return True
+
+    def _state_matches_active(self, state: _State) -> bool:
+        meta = self._load_meta()
+        return (
+            meta is not None
+            and _source_url_matches(self, state.source_url)
+            and _source_url_matches(self, meta.source_url)
+            and self._active_verified()
+            and state.content_sha256 == meta.content_sha256
+            and state.targets_digest == meta.targets_digest
+            and state.structure_digest == meta.structure_digest
+            and state.revision == meta.revision
+        )
 
 
 def make_source_endpoint(
@@ -518,6 +567,24 @@ def _is_due(state: _State, now: datetime) -> bool:
     return now >= next_due
 
 
+def _state_for_source(store: MappingStore, state: _State) -> tuple[_State, bool]:
+    """Return source-specific scheduler state, resetting all inherited validators/timing."""
+    if _source_url_matches(store, state.source_url):
+        return state, False
+    return _State(source_url=store.source_url, source_change_pending=True), True
+
+
+def _recovery_backoff_active(state: _State, now: datetime) -> bool:
+    """Honor the persisted failure retry time when no usable active generation exists."""
+    if state.consecutive_failures <= 0:
+        return False
+    try:
+        next_due = _parse_iso(state.next_due_iso)
+    except ValueError:
+        return False
+    return next_due is not None and now < next_due
+
+
 def _backoff_hours(consecutive_failures: int) -> float:
     return min(MAX_BACKOFF_HOURS, 2.0 ** (consecutive_failures - 1))
 
@@ -552,6 +619,8 @@ def _record_success(
     etag = response.headers.get("etag")
     state.etag = etag
     state.accept_encoding = ACCEPT_ENCODING
+    state.source_url = store.source_url
+    state.source_change_pending = False
     state.content_sha256 = content_sha256
     state.targets_digest = targets
     state.structure_digest = structure
@@ -617,6 +686,8 @@ def _accept_content(
         meta = store._load_meta()
         if (
             meta is not None
+            and _source_url_matches(store, meta.source_url)
+            and store._active_verified()
             and targets == meta.targets_digest
             and structure == meta.structure_digest
         ):
@@ -677,8 +748,23 @@ def refresh(
     if max_bytes <= 0:
         raise ConfigError("max_bytes must be greater than 0")
     now_utc = _as_utc(now)
-    state = store._load_state()
-    if not force and not _is_due(state, now_utc):
+    state, source_changed = _state_for_source(store, store._load_state())
+    if source_changed:
+        # Persist the source switch before any request so a crash cannot keep the old
+        # validator or weekly schedule attached to the new URL.
+        store._save_state(state)
+    cache_overrides: Overrides | None = None
+    overrides_valid = True
+    if overrides_text is not None:
+        try:
+            cache_overrides = load_overrides(overrides_text)
+        except ConfigError:
+            overrides_valid = False
+    active_valid = overrides_valid and load_active(store, cache_overrides) is not None
+    if not active_valid and state.etag is not None:
+        state.etag = None
+        store._save_state(state)
+    if not force and not due(store, now_utc, cache_overrides if overrides_valid else None):
         return RefreshOutcome.NOT_DUE
     _require_source_endpoint(store, endpoint)
     state.last_attempted_iso = _iso(now_utc)
@@ -704,7 +790,7 @@ def _dispatch(
     """Turn one source response into an outcome; the cache moves only on ACTIVATED."""
     if response.status_code == _NOT_MODIFIED:
         response.close()
-        return _handle_not_modified(store, state, now_utc, response, refresh_hours)
+        return _handle_not_modified(store, state, now_utc, response, refresh_hours, overrides_text)
     if response.status_code != _OK:
         response.close()
         return _record_failure(store, state, now_utc, RefreshOutcome.FAILED_TRANSPORT)
@@ -737,8 +823,20 @@ def _handle_not_modified(
     now_utc: datetime,
     response: httpx.Response,
     refresh_hours: float,
+    overrides_text: str | None,
 ) -> RefreshOutcome:
-    if not store._active_verified():
+    overrides: Overrides | None = None
+    overrides_valid = True
+    if overrides_text is not None:
+        try:
+            overrides = load_overrides(overrides_text)
+        except ConfigError:
+            overrides_valid = False
+    if (
+        not overrides_valid
+        or load_active(store, overrides) is None
+        or not store._state_matches_active(state)
+    ):
         # The validator is alive but our cache is not (deleted/tampered):
         # drop the ETag so the next attempt performs a full fetch, and fail
         # this one — 304 yields no content to activate.
@@ -758,9 +856,19 @@ def _handle_not_modified(
     )
 
 
-def due(store: MappingStore, now: datetime) -> bool:
-    """True when a refresh should run at ``now`` (no schedule recorded means due)."""
-    return _is_due(store._load_state(), _as_utc(now))
+def due(store: MappingStore, now: datetime, overrides: Overrides | None = None) -> bool:
+    """True when refresh is due or the active generation needs recovery.
+
+    A source change always triggers a fresh request. Missing/unusable active data also
+    triggers recovery immediately, except while a persisted failed-recovery backoff is open.
+    """
+    now_utc = _as_utc(now)
+    state = store._load_state()
+    if not _source_url_matches(store, state.source_url):
+        return True
+    if load_active(store, overrides) is None:
+        return not _recovery_backoff_active(state, now_utc)
+    return _is_due(state, now_utc)
 
 
 def next_refresh_due(store: MappingStore, now: datetime, refresh_hours: float) -> datetime:
@@ -768,7 +876,13 @@ def next_refresh_due(store: MappingStore, now: datetime, refresh_hours: float) -
     if refresh_hours <= 0:
         raise ConfigError("refresh_hours must be greater than 0")
     now_utc = _as_utc(now)
-    state = store._load_state()
+    state, source_changed = _state_for_source(store, store._load_state())
+    if source_changed:
+        return now_utc
+    if not store._active_verified():
+        if _recovery_backoff_active(state, now_utc):
+            return _parse_iso(state.next_due_iso) or now_utc
+        return now_utc
     try:
         scheduled = _parse_iso(state.next_due_iso)
     except ValueError:
@@ -781,11 +895,13 @@ def next_refresh_due(store: MappingStore, now: datetime, refresh_hours: float) -
 def status(store: MappingStore, now: datetime) -> MappingStatus:
     """Read-only disk view of the cache and schedule (no network, no index parse)."""
     now_utc = _as_utc(now)
-    state = store._load_state()
+    state, source_changed = _state_for_source(store, store._load_state())
     meta = store._load_meta()
-    active_present = (
-        meta is not None and store._read_active_bytes() is not None and store._active_verified()
-    )
+    active_present = not source_changed and store._state_matches_active(state)
+    if source_changed or not store._active_verified():
+        meta = None
+    if not active_present and not _recovery_backoff_active(state, now_utc):
+        state.next_due_iso = _iso(now_utc)
     age_seconds: float | None = None
     if meta is not None:
         activated = _parse_iso(meta.activated_iso)
@@ -832,7 +948,10 @@ def load_active(
     """
     meta = store._load_meta()
     body = None if meta is None else store._read_active_bytes()
-    if meta is None or body is None:
+    if meta is None or body is None or not _source_url_matches(store, meta.source_url):
+        return None
+    state = store._load_state()
+    if not _source_url_matches(store, state.source_url) or state.source_change_pending:
         return None
     if content_digest(body) != meta.content_sha256:
         return None

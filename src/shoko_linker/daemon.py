@@ -510,13 +510,14 @@ class _MappingPhase:
 
 def _mapping_phase(deps: DaemonDeps, now_iso: str) -> _MappingPhase:
     """Run the scheduler, then classify the generation change (activation/churn)."""
-    old = load_active(deps.mapping_store, _load_overrides(deps))
+    overrides = _load_overrides(deps)
+    old = load_active(deps.mapping_store, overrides)
     outcome: RefreshOutcome | None = None
-    if mapping_due(deps.mapping_store, _parse_iso(now_iso)):
+    if mapping_due(deps.mapping_store, _parse_iso(now_iso), overrides):
         outcome = run_mapping_check(deps, now_iso)
     else:
         outcome = RefreshOutcome.NOT_DUE
-    active = load_active(deps.mapping_store, _load_overrides(deps))
+    active = load_active(deps.mapping_store, overrides)
     reactivated = False
     churned: frozenset[int] = frozenset()
     churn_paused = False

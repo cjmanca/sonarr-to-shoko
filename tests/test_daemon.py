@@ -50,7 +50,13 @@ from shoko_linker.daemon import (
 )
 from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.linking import EpisodeIdResolver, SendOutcome, VerificationVerdict
-from shoko_linker.mapping_store import ActiveMappings, MappingStore, RefreshOutcome, refresh
+from shoko_linker.mapping_store import (
+    ActiveMappings,
+    MappingStore,
+    RefreshOutcome,
+    load_active,
+    refresh,
+)
 from shoko_linker.mappings import (
     EpisodeType,
     MappingTarget,
@@ -1485,6 +1491,51 @@ def test_restart_does_not_disable_refresh_or_tight_loop(
 
     assert due(store2, _parse(T1)) is False
     assert due(store2, _parse(T0) + _days(7)) is True
+
+
+def test_daemon_recovers_missing_active_cache_before_weekly_due_time(
+    tmp_path: Path,
+) -> None:
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    mapping_store = MappingStore(tmp_path / "mappings", source_url=SOURCE_URL)
+    mapping_store.active_path.unlink()
+    requests: list[str] = []
+
+    def recover(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={"ETag": '"recovered"'},
+            content=mapping_xml().encode(),
+            request=request,
+        )
+
+    state_store = open_tmp_store(tmp_path)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=state_store,
+            sonarr_files=[file],
+            shoko_files=[file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+        )
+        deps = _swap_source(deps, recover)
+        report = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="recovery",
+        )
+        assert len(requests) == 1
+        assert report.mapping_outcome in (RefreshOutcome.ACTIVATED, RefreshOutcome.UNCHANGED)
+        assert load_active(mapping_store) is not None
+    finally:
+        state_store.close()
+        deps.mapping_source.client.close()
 
 
 def _days(n: float) -> timedelta:

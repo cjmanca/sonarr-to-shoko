@@ -435,6 +435,143 @@ def test_restart_persistence_sees_state_validators_and_schedule(tmp_path: Path) 
     assert revived_source.requests[0].headers["If-None-Match"] == ETAG_A
 
 
+def test_source_change_on_same_host_requires_fresh_activation(tmp_path: Path) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/mirror/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(ok_response(SMALL_XML, ETAG_B))
+    endpoint_b = endpoint_for(source_b, store_b)
+    try:
+        # The active XML and weekly schedule belong to source A, even though the host matches.
+        assert load_active(store_b) is None
+        assert status(store_b, LATER).active_present is False
+        assert due(store_b, LATER) is True
+        assert store_b.request_headers() == {"Accept-Encoding": ACCEPT_ENCODING}
+
+        outcome = refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS)
+    finally:
+        endpoint_b.client.close()
+
+    assert outcome is RefreshOutcome.ACTIVATED
+    request = source_b.requests[0]
+    assert str(request.url) == source_b_url
+    assert "If-None-Match" not in request.headers
+    active_b = load_active(store_b)
+    assert active_b is not None
+    assert active_b.source_url == source_b_url
+    assert active_b.revision == REVISION_TWO
+    assert load_active(store_a) is None
+    state = read_json(store_b.state_path)
+    assert state["source_url"] == source_b_url
+    assert state["etag"] == ETAG_B
+    assert state["source_change_pending"] is False
+
+
+def test_failed_source_change_keeps_old_bytes_but_never_authorizes_them(
+    tmp_path: Path,
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    old_xml = store_a.active_path.read_bytes()
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/alternate/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    endpoint_b = endpoint_for(source_b, store_b)
+    try:
+        outcome = refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS)
+        assert outcome is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+        assert source_b.requests[0].headers.get("If-None-Match") is None
+    finally:
+        endpoint_b.client.close()
+
+    assert store_b.active_path.read_bytes() == old_xml
+    assert load_active(store_b) is None
+    state = read_json(store_b.state_path)
+    assert state["source_url"] == source_b_url
+    assert state["etag"] is None
+    assert state["source_change_pending"] is True
+    assert state["next_due_iso"] == iso(LATER + timedelta(hours=FIRST_BACKOFF_HOURS))
+    assert due(store_b, LATER + timedelta(minutes=30)) is False
+    assert due(store_b, LATER + timedelta(hours=FIRST_BACKOFF_HOURS)) is True
+    reopened_b = MappingStore(store_b.directory, source_url=source_b_url)
+    assert due(reopened_b, LATER + timedelta(minutes=30)) is False
+    assert reopened_b.request_headers() == {"Accept-Encoding": ACCEPT_ENCODING}
+
+    store_a_again = MappingStore(store_b.directory, source_url=SOURCE_URL)
+    assert load_active(store_a_again) is None
+    source_a_again = ScriptedSource()
+    source_a_again.queue(ok_response(SMALL_XML, ETAG_A))
+    endpoint_a_again = endpoint_for(source_a_again, store_a_again)
+    try:
+        outcome = refresh(store_a_again, endpoint_a_again, now=LATER, refresh_hours=HOURS)
+    finally:
+        endpoint_a_again.client.close()
+    assert outcome is RefreshOutcome.ACTIVATED
+    assert load_active(store_a_again) is not None
+    assert source_a_again.requests[0].headers.get("If-None-Match") is None
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["delete_active", "corrupt_active", "delete_meta", "corrupt_meta", "tamper_active"],
+)
+def test_invalid_active_cache_overrides_future_schedule_and_drops_etag(
+    tmp_path: Path, corruption: str
+) -> None:
+    store, _, _ = activated_store(tmp_path)
+    if corruption == "delete_active":
+        store.active_path.unlink()
+    elif corruption == "corrupt_active":
+        store.active_path.write_bytes(b"<anime-list><anime")
+    elif corruption == "delete_meta":
+        store.meta_path.unlink()
+    elif corruption == "corrupt_meta":
+        store.meta_path.write_text("{invalid", encoding="utf-8")
+    else:
+        store.active_path.write_bytes(EXTENDED_XML)
+
+    assert load_active(store) is None
+    assert due(store, LATER) is True
+    assert store.request_headers() == {"Accept-Encoding": ACCEPT_ENCODING}
+
+
+def test_missing_active_cache_recovers_before_weekly_due_time(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    store.active_path.unlink()
+    source.queue(ok_response(SMALL_XML, ETAG_B))
+
+    assert due(store, LATER) is True
+    assert "If-None-Match" not in store.request_headers()
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS)
+
+    assert outcome in (RefreshOutcome.ACTIVATED, RefreshOutcome.UNCHANGED)
+    active = load_active(store)
+    assert active is not None
+    assert store.active_path.read_bytes() == SMALL_XML
+    assert source.requests[-1].headers.get("If-None-Match") is None
+
+
+def test_failed_missing_cache_recovery_obeys_persisted_backoff(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    store.active_path.unlink()
+    source.queue(status_response(503))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS)
+
+    assert outcome is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    assert due(store, LATER + timedelta(minutes=30)) is False
+    assert due(store, LATER + timedelta(hours=FIRST_BACKOFF_HOURS)) is True
+    request_count = len(source.requests)
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    assert due(reopened, LATER + timedelta(minutes=30)) is False
+    assert (
+        refresh(reopened, endpoint, now=LATER + timedelta(minutes=30), refresh_hours=HOURS)
+        is RefreshOutcome.NOT_DUE
+    )
+    assert len(source.requests) == request_count
+
+
 def test_corrupt_state_file_is_treated_as_empty_not_crash(tmp_path: Path) -> None:
     store, source, endpoint = activated_store(tmp_path)
     store.state_path.write_text("{not json", encoding="utf-8")
