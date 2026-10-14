@@ -40,6 +40,7 @@
 - Focused `ruff check` → passed; focused `ruff format --check` → **4 files already formatted**.
 - `uv run --offline --group dev mypy` → passed (**47 source files**).
 - Focused `git diff --check` → no whitespace errors (Git emitted the existing Windows CRLF/LF working-copy warning for `tests/test_daemon.py`).
+- Local F26/F27 implementation commit: `b2b920d` (`fix: bind mapping cache to configured source`).
 - All service requests were mocked/offline; no live Sonarr/Shoko call or write occurred.
 
 ## Next action
