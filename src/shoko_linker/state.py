@@ -732,6 +732,8 @@ CAMPAIGN_DRAIN_REVOKED_REASON: Final[str] = "operator_revoked"
 CAMPAIGN_DRAIN_FINGERPRINT_REASON: Final[str] = "plan_fingerprint_set_changed"
 CAMPAIGN_STATUS_PAUSED: Final[str] = "paused"
 CAMPAIGN_STATUS_REVOKED: Final[str] = "revoked"
+CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER: Final[str] = ":campaign_progress_pending:"
+CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER: Final[str] = ":campaign_progress_recorded:"
 CAMPAIGN_STATUSES: Final[frozenset[str]] = frozenset(
     {CAMPAIGN_STATUS_APPROVED, CAMPAIGN_STATUS_PAUSED, CAMPAIGN_STATUS_REVOKED}
 )
@@ -3397,6 +3399,30 @@ class StateStore:
         progress["total_sent"] = 0 if campaign is None else campaign.total_sent
         progress["approved_files"] = 0 if campaign is None else len(campaign.bindings)
         return progress
+
+    @_mutation
+    def claim_campaign_quarantine_progress(self, shoko_file_id: int, campaign_id: str) -> bool:
+        """Atomically claim one persisted campaign quarantine as newly reported progress.
+
+        Reconciliation can quarantine a bound campaign file in a cycle that does not drain the
+        campaign. The marker lives in ``state_detail`` so a later apply (including after restart)
+        can count it once without treating every repeated observation as new progress.
+        """
+        with self._transaction():
+            changed = self._conn.execute(
+                "UPDATE files SET state_detail = REPLACE(state_detail, ?, ?)"
+                " WHERE shoko_file_id = ? AND campaign_id = ? AND state = ?"
+                " AND instr(state_detail, ?) > 0",
+                (
+                    CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
+                    CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER,
+                    shoko_file_id,
+                    campaign_id,
+                    FileState.BLOCKED_SAFETY.value,
+                    CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
+                ),
+            ).rowcount
+        return changed == 1
 
     @_mutation
     def unbind_campaign_files(self, campaign_id: str, reason: str, *, iso: str) -> int:

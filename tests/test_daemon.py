@@ -167,6 +167,7 @@ class ShokoStub:
         self.post_status: int | None = None
         self.on_post: Callable[[], None] | None = None
         self.unmaterialized: set[int] = set()  # AniDB episode ids whose Shoko metadata is not ready
+        self.ed2k_overrides: dict[int, str] = {}
         #: P2-1: fired on every GET with the request path — simulates a slow preflight network
         #: phase (authorization state flips mid-call, before the POST).
         self.on_get: Callable[[str], None] | None = None
@@ -276,13 +277,15 @@ class ShokoStub:
 
     def _file_row(self, shoko_id: int, xrefs: list[dict[str, Any]]) -> dict[str, Any]:
         file = self.files[shoko_id]
+        hashes = hf.ed2k_hashes(shoko_id, FILE_SIZE, f"{shoko_id}.mkv")
+        hashes["ED2K"] = self.ed2k_overrides.get(shoko_id, hashes["ED2K"])
         return {
             "ID": shoko_id,
             "Size": FILE_SIZE,
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
-            "Hashes": hf.ed2k_hashes(shoko_id, FILE_SIZE, f"{shoko_id}.mkv"),
+            "Hashes": hashes,
             "Locations": [self._location(file)],
             "SeriesIDs": xrefs,
         }
@@ -728,6 +731,196 @@ def test_new_arrival_submits_exactly_one_and_verifies(
     assert record is not None
     assert record.state is FileState.VERIFIED
     assert report.counts.verified == 1
+
+
+def test_restart_preserves_original_ed2k_and_rejects_reused_shoko_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=100)
+    activate_mapping(tmp_path, mapping_xml())
+    path = tmp_path / "state.sqlite3"
+    first_store = StateStore(path, budget_limits=WIDE_LIMITS)
+    seed_baseline(first_store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    try:
+        first_deps = build_deps(
+            tmp_path,
+            store=first_store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        first_report = run_cycle(
+            first_deps,
+            now_iso=T0,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="identity-first-scan",
+        )
+        original = first_store.get_file(candidate.shoko_id)
+        assert original is not None
+        original_identity = original.identity
+        assert original_identity is not None
+        original_ed2k = original_identity.ed2k
+        assert original_ed2k == hf.hex32(candidate.shoko_id)
+        assert candidate.shoko_id in first_report.plans
+    finally:
+        first_store.close()
+
+    # A database restore can make a different file reuse the same Shoko ID. Reopen the
+    # durable state and report a new valid ED2K at that ID; the first snapshot must win.
+    shoko.ed2k_overrides[candidate.shoko_id] = hf.hex32(candidate.shoko_id + 1)
+    reopened = StateStore(path, budget_limits=WIDE_LIMITS)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=reopened,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        report = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="identity-after-restore",
+        )
+        record = reopened.get_file(candidate.shoko_id)
+        assert record is not None
+        identity = record.identity
+        assert identity is not None
+        assert identity.ed2k == original_ed2k
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert "ED2K identity drift" in record.state_detail
+    finally:
+        reopened.close()
+
+    assert report.counts.submitted == 0
+    assert shoko.posts_count() == 0
+    assert any("source_hash_identity_drift" in reason for reason in report.reasons)
+
+
+def test_inline_verification_holds_when_posted_file_ed2k_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=101)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    shoko.on_post = lambda: shoko.ed2k_overrides.__setitem__(
+        candidate.shoko_id, hf.hex32(candidate.shoko_id + 1)
+    )
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
+        )
+        record = store.get_file(candidate.shoko_id)
+        view = store.budget_view()
+    finally:
+        store.close()
+
+    assert shoko.posts_count() == 1
+    assert report.counts.verified == 0
+    assert record is not None
+    assert record.state is FileState.VERIFYING
+    assert view.pending_file_requests == 1
+
+
+def test_restart_ed2k_drift_keeps_materialized_async_send_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=102)
+    activate_mapping(tmp_path, mapping_xml())
+    path = tmp_path / "state.sqlite3"
+    first_store = StateStore(path, budget_limits=WIDE_LIMITS)
+    seed_baseline(first_store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    shoko.link_on_post = False  # Accepted job has not materialized its XRefs yet.
+    try:
+        first_deps = build_deps(
+            tmp_path,
+            store=first_store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        first_report = run_cycle(
+            first_deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="c1",
+        )
+        first_record = first_store.get_file(candidate.shoko_id)
+        assert first_record is not None
+        assert first_record.state is FileState.VERIFYING
+        assert first_report.live_held_sends == 1
+    finally:
+        first_store.close()
+
+    # The async job materializes the original targets after the restart, but this is now a
+    # different file reusing the same Shoko ID/path/size.
+    shoko.materialize(candidate.shoko_id)
+    shoko.ed2k_overrides[candidate.shoko_id] = hf.hex32(candidate.shoko_id + 1)
+    reopened = StateStore(path, budget_limits=WIDE_LIMITS)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=reopened,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        report = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="c2",
+        )
+        record = reopened.get_file(candidate.shoko_id)
+        recovery = reopened.recover_after_restart()
+    finally:
+        reopened.close()
+
+    assert shoko.posts_count() == 1
+    assert report.counts.submitted == 0
+    assert candidate.shoko_id not in report.plans
+    assert any("source_hash_identity_drift" in reason for reason in report.reasons)
+    assert record is not None
+    assert record.state is FileState.VERIFYING
+    assert record.identity is not None
+    assert record.identity.ed2k == hf.hex32(candidate.shoko_id)
+    assert [row.shoko_file_id for row in recovery.continue_polling] == [candidate.shoko_id]
+    assert report.live_held_sends == 1
+    assert report.live_held_slots == 1
 
 
 def test_new_arrival_marks_sent_before_post(
@@ -2759,8 +2952,9 @@ def _seed_verifying_rows(store: StateStore, count: int) -> None:
         conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
             "INSERT INTO files (shoko_file_id, sonarr_series_id, sonarr_file_id, sonarr_path,"
-            " sonarr_size, state, cohort, state_detail, updated_iso, first_seen_iso)"
-            " VALUES (?, ?, ?, ?, ?, 'verifying', 'new_arrival', 'verify', ?, ?)",
+            " sonarr_size, state, cohort, state_detail, updated_iso, first_seen_iso,"
+            " identity_hash_json)"
+            " VALUES (?, ?, ?, ?, ?, 'verifying', 'new_arrival', 'verify', ?, ?, ?)",
             [
                 (
                     file_id,
@@ -2770,6 +2964,15 @@ def _seed_verifying_rows(store: StateStore, count: int) -> None:
                     1000 + file_id,
                     T0,
                     T0,
+                    json.dumps(
+                        {
+                            "ed2k": hf.hex32(file_id),
+                            "sha1": None,
+                            "md5": None,
+                            "crc32": None,
+                            "paths": [],
+                        }
+                    ),
                 )
                 for file_id in range(1, count + 1)
             ],

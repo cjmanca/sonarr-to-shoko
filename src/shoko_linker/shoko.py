@@ -1231,6 +1231,19 @@ def has_available_hashes(item: ShokoFile) -> bool:
     return _hashes_settled(item.hashes)
 
 
+def canonical_ed2k(value: str | int | None) -> str | None:
+    """Return a raw 32-hex ED2K in comparison form, or None when it is malformed.
+
+    F21 treats ED2K as Shoko's frozen file-content identity. The raw spelling stays
+    untouched in diagnostic/snapshot records; only this comparison value is lowercased.
+    Unlike the broader candidacy check, this requires the actual wire value to be exactly
+    32 hexadecimal characters, without trimming or accepting numeric substitutes.
+    """
+    if not isinstance(value, str) or not _ED2K_HEX_RE.fullmatch(value):
+        return None
+    return value.lower()
+
+
 def _hashes_settled(hashes: ShokoHashes) -> bool:
     """Single source of truth for "hashing settled" (snapshot and preflight gates)."""
     if not _valid_ed2k(hashes.ed2k):

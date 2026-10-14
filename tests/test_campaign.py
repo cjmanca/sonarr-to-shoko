@@ -56,9 +56,10 @@ from shoko_linker.campaign import (
 )
 from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
 from shoko_linker.config import load_settings
-from shoko_linker.daemon import CycleMode, run_cycle
+from shoko_linker.daemon import CycleMode, DaemonDeps, run_cycle
 from shoko_linker.http import ApiEndpoint
-from shoko_linker.mapping_store import MappingStore
+from shoko_linker.linking import EpisodeIdResolver, LinkPlan
+from shoko_linker.mapping_store import MappingStore, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
 from shoko_linker.state import (
@@ -68,6 +69,7 @@ from shoko_linker.state import (
     CAMPAIGN_STATUS_REVOKED,
     BaselineFile,
     BudgetRefusal,
+    CampaignBinding,
     CampaignRecord,
     Cohort,
     FileState,
@@ -134,6 +136,7 @@ class Stubs:
     posts: list[dict[str, Any]] = field(default_factory=list)
     posted_files: list[int] = field(default_factory=list)
     linked: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    ed2k_overrides: dict[int, str] = field(default_factory=dict)
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     shoko_requests: list[httpx.Request] = field(default_factory=list)
     post_hook: Callable[[int], None] | None = None
@@ -166,13 +169,15 @@ class Stubs:
         }
 
     def file_row(self, spec: SpecFile) -> dict[str, Any]:
+        hashes = hf.ed2k_hashes(spec.shoko_id, self.size(spec), f"{spec.shoko_id}.mkv")
+        hashes["ED2K"] = self.ed2k_overrides.get(spec.shoko_id, hashes["ED2K"])
         return {
             "ID": spec.shoko_id,
             "Size": self.size(spec),
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
-            "Hashes": hf.ed2k_hashes(spec.shoko_id, self.size(spec), f"{spec.shoko_id}.mkv"),
+            "Hashes": hashes,
             "Locations": [
                 {
                     "ID": spec.shoko_id * 10,
@@ -586,6 +591,12 @@ def test_prepare_approve_apply_three_batches_with_one_approval(
     prepared = prepare(env, capsys)
     assert prepared["files"] == COUNT_FIVE
     assert len(prepared["approval_digest"]) == DIGEST_HEX
+    plan_document = json.loads((env.tmp_path / "plan.json").read_bytes())
+    assert plan_document["schema"] == "shoko-linker-campaign-plan/2"
+    assert all(
+        entry["shoko_ed2k"] == hf.hex32(entry["shoko_file_id"]).lower()
+        for entry in plan_document["files"]
+    )
     assert env.stubs.posts == []
 
     approved = approve(env, capsys, prepared["approval_digest"])
@@ -712,6 +723,300 @@ def test_candidate_size_change_after_approval_is_quarantined_not_replaced(
     assert result2["exit"] == EXIT_OK
     assert result2["payload"]["submitted"] == 0
     assert any("not_queueable" in reason for reason in result2["payload"]["reasons"])
+
+
+def test_approved_campaign_quarantines_changed_ed2k_before_post(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    specs_list = specs(COUNT_TWO)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    changed = specs_list[0]
+    env.stubs.ed2k_overrides[changed.shoko_id] = hf.hex32(changed.shoko_id + 1)
+
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["processed"] == COUNT_TWO
+    assert result["payload"]["quarantined"] == 1
+    assert any("source_hash_identity_drift" in reason for reason in result["payload"]["reasons"])
+    assert any(
+        reason.startswith(f"campaign_quarantine:{changed.shoko_id}:")
+        for reason in result["payload"]["reasons"]
+    )
+    assert changed.shoko_id not in env.stubs.posted_files
+    assert len(env.stubs.posts) == COUNT_TWO - 1
+    store = env.open_store()
+    try:
+        record = store.get_file(changed.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith("campaign_quarantine:")
+        assert "source_hash_identity_drift" in record.state_detail
+        assert "ED2K identity drift" in record.state_detail
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 1
+    finally:
+        store.close()
+
+
+def test_repeated_ed2k_campaign_quarantine_is_deferred_and_counts_as_zero_progress(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    specs_list = specs(COUNT_TWO)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    changed = specs_list[0]
+    env.stubs.ed2k_overrides[changed.shoko_id] = hf.hex32(changed.shoko_id + 1)
+
+    first = apply(env, capsys)
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["quarantined"] == 1
+    assert changed.shoko_id not in env.stubs.posted_files
+    posts_after_first_apply = len(env.stubs.posts)
+    assert posts_after_first_apply == COUNT_TWO - 1
+
+    repeated = apply(env, capsys)
+    assert repeated["exit"] == EXIT_OK
+    assert repeated["payload"]["quarantined"] == 0
+    assert repeated["payload"]["progress"] == 0
+    assert repeated["payload"]["deferred"] >= 1
+    assert any("already_quarantined" in reason for reason in repeated["payload"]["reasons"])
+    assert changed.shoko_id not in env.stubs.posted_files
+    assert len(env.stubs.posts) == posts_after_first_apply
+
+    store = env.open_store()
+    try:
+        record = store.get_file(changed.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith("campaign_quarantine:")
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 1
+
+        _authorize_drain(env, store, prepared["campaign_id"])
+        for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
+            cycle = _daemon_cycle(env, store, prepared["campaign_id"], key)
+            assert cycle.campaign is not None
+            assert cycle.campaign.quarantined == 0
+            assert cycle.campaign.progress == 0
+            assert len(env.stubs.posts) == posts_after_first_apply
+            if index < len(ZERO_PROGRESS_CYCLE_KEYS) - 1:
+                assert store.get_meta(f"campaign_zero_progress:{prepared['campaign_id']}") == str(
+                    index + 1
+                )
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "no_queueable_candidates"
+        quarantined = store.get_file(changed.shoko_id)
+        assert quarantined is not None
+        assert quarantined.state is FileState.BLOCKED_SAFETY
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 1
+    finally:
+        store.close()
+
+
+def test_daemon_first_ed2k_quarantine_counts_fresh_progress_once_then_breaks_on_repeats(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, daemon_auto_apply=True)
+    specs_list = specs(COUNT_TWO)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    changed = specs_list[1]
+
+    store = env.open_store()
+    try:
+        canary = _canary(env, store, prepared["campaign_id"])
+        assert canary.verified == COUNT_ONE
+        _authorize_drain(env, store, prepared["campaign_id"])
+        canary_posts = len(env.stubs.posts)
+        assert env.stubs.posted_files == [specs_list[0].shoko_id]
+
+        store.advance(changed.shoko_id, FileState.WAITING, "rejected send", iso=env.now_iso)
+        env.stubs.ed2k_overrides[changed.shoko_id] = hf.hex32(changed.shoko_id + 1)
+        dry_run = run_cycle(
+            _campaign_deps(env, store, prepared["campaign_id"]),
+            now_iso=env.now_iso,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="dry-run-first-ed2k-quarantine",
+        )
+        assert dry_run.campaign is None
+        dry_run_quarantine = store.get_file(changed.shoko_id)
+        assert dry_run_quarantine is not None
+        assert dry_run_quarantine.state is FileState.BLOCKED_SAFETY
+        store.close()
+        store = env.open_store()
+
+        first = _daemon_cycle(env, store, prepared["campaign_id"], "daemon-first-ed2k-quarantine")
+
+        assert first.campaign is not None
+        assert first.campaign.quarantined == COUNT_ONE
+        assert first.campaign.progress == COUNT_ONE
+        assert first.campaign.submitted == 0
+        assert changed.shoko_id not in env.stubs.posted_files
+        assert len(env.stubs.posts) == canary_posts
+
+        quarantined = store.get_file(changed.shoko_id)
+        assert quarantined is not None
+        assert quarantined.state is FileState.BLOCKED_SAFETY
+        assert quarantined.state_detail.startswith("campaign_quarantine:")
+
+        for index, key in enumerate(ZERO_PROGRESS_CYCLE_KEYS):
+            repeated = _daemon_cycle(env, store, prepared["campaign_id"], key)
+            assert repeated.campaign is not None
+            assert repeated.campaign.quarantined == 0
+            assert repeated.campaign.progress == 0
+            assert changed.shoko_id not in env.stubs.posted_files
+            assert len(env.stubs.posts) == canary_posts
+            if index < len(ZERO_PROGRESS_CYCLE_KEYS) - 1:
+                assert store.get_meta(f"campaign_zero_progress:{prepared['campaign_id']}") == str(
+                    index + 1
+                )
+
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "no_queueable_candidates"
+    finally:
+        store.close()
+
+
+def test_pending_campaign_candidate_quarantines_ed2k_drift_before_target_resolution(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs_list = specs(COUNT_TWO)
+    pending = specs_list[1]
+    env.stubs.pending.add(pending.shoko_id)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    plan, _digest = read_plan_file(env.tmp_path / "plan.json")
+    entry = next(item for item in plan.files if item.shoko_file_id == pending.shoko_id)
+    assert entry.shoko_episode_ids == ()
+    assert entry.shoko_ed2k == hf.hex32(pending.shoko_id).lower()
+
+    store = env.open_store()
+    deps: DaemonDeps | None = None
+    try:
+        deps = _campaign_deps(env, store, plan.campaign_id)
+        assert deps is not None
+        sweep = run_cycle(
+            deps,
+            now_iso=env.now_iso,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="pending-ed2k-probe",
+        )
+        candidate = sweep.plans[pending.shoko_id]
+        assert candidate.status.value == "pending_targets"
+        changed_candidate = replace(candidate, shoko_ed2k=hf.hex32(pending.shoko_id + 1))
+        record = store.get_file(pending.shoko_id)
+        assert record is not None
+        campaign = store.get_campaign(plan.campaign_id)
+        assert campaign is not None
+        active = load_active(deps.mapping_store, campaign_mod._load_overrides(deps))
+        assert active is not None
+
+        pending_branch_calls: list[int] = []
+
+        def pending_branch(*_args: Any) -> LinkPlan:
+            pending_branch_calls.append(pending.shoko_id)
+            return changed_candidate
+
+        monkeypatch.setattr(
+            campaign_mod,
+            "_pending_plan",
+            pending_branch,
+        )
+        counters = campaign_mod._CampaignCounters()
+        reasons: list[str] = []
+        context = campaign_mod._ApplyContext(
+            deps=deps,
+            settings=load_settings(env.config_path),
+            store=store,
+            campaign=campaign,
+            sweep=sweep,
+            active=active,
+            resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
+            queue=None,
+            now_iso=env.now_iso,
+            cycle_key="pending-ed2k-probe",
+        )
+
+        result = campaign_mod._candidate_plan(
+            context,
+            entry,
+            record,
+            changed_candidate,
+            counters,
+            reasons,
+        )
+
+        assert result is None
+        assert pending_branch_calls == []
+        assert counters.quarantined == 1
+        assert any(f"campaign_quarantine:{pending.shoko_id}:ed2k_drift" in r for r in reasons)
+        quarantined = store.get_file(pending.shoko_id)
+        assert quarantined is not None
+        assert quarantined.state is FileState.BLOCKED_SAFETY
+    finally:
+        if deps is not None:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+        store.close()
+
+
+def test_legacy_campaign_approval_requires_reprepare_and_reapproval(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    plan_path = env.tmp_path / "plan.json"
+    document = json.loads(plan_path.read_bytes())
+    document["schema"] = "shoko-linker-campaign-plan/1"
+    for entry in document["files"]:
+        entry.pop("shoko_ed2k", None)
+    raw = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    plan_path.write_bytes(raw)
+    legacy_digest = hashlib.sha256(raw).hexdigest()
+    bindings = tuple(
+        CampaignBinding(
+            shoko_file_id=entry["shoko_file_id"],
+            plan_fingerprint=entry["plan_fingerprint"],
+            request_fingerprint=entry["request_fingerprint"],
+        )
+        for entry in document["files"]
+    )
+    store = env.open_store()
+    try:
+        store.create_campaign(
+            document["campaign_id"],
+            legacy_digest,
+            max_submissions=document["totals"]["max_submissions"],
+            deadline_iso=document["deadline_iso"],
+            attestation_scope=f"campaign:{document['campaign_id']}",
+            approval_iso=T0,
+            iso=T0,
+            bindings=bindings,
+            plan_path=str(plan_path.resolve()),
+        )
+        store.bind_campaign_files(document["campaign_id"], T0)
+    finally:
+        store.close()
+    env.write_campaign_lease(prepared["campaign_id"])
+
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_CONFIG_INVALID
+    assert "re-prepare and re-approve" in str(result["payload"])
+    assert env.stubs.posts == []
 
 
 # ------------------------------------------------------------------ pending targets

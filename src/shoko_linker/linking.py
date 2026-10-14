@@ -64,6 +64,7 @@ from .shoko import (
     ImportFolder,
     ShokoFile,
     ShokoLocation,
+    canonical_ed2k,
     has_available_hashes,
     join_location_path,
     parse_file_entries,
@@ -77,7 +78,7 @@ MAX_SUCCESS_STATUS: Final[int] = 300
 NOT_FOUND_STATUS: Final[int] = 404
 CLIENT_ERROR_MIN: Final[int] = 400
 CLIENT_ERROR_MAX: Final[int] = 500
-PLAN_VERSION: Final[str] = "1"
+PLAN_VERSION: Final[str] = "2"
 FILE_INCLUDE_FLAGS: Final[str] = "XRefs,AbsolutePaths"
 VERIFY_INCLUDE_FLAGS: Final[str] = "XRefs"
 DEFAULT_RESOLVE_TTL_SECONDS: Final[float] = 300.0
@@ -240,6 +241,7 @@ class LinkPlan:
     sonarr_size: int
     shoko_file_id: int
     shoko_size: int
+    shoko_ed2k: str
     shoko_paths: tuple[str, ...]
     episodes: tuple[SonarrEpisodeIdentity, ...]
     targets: tuple[LinkTarget, ...]
@@ -527,6 +529,12 @@ def freeze_plan(
     """
     _require_digest(targets_digest, "targets_digest")
     _require_digest(structure_digest, "structure_digest")
+    if canonical_ed2k(match.hashes.ed2k) is None:
+        return PlanSkip(
+            "invalid_ed2k",
+            f"Shoko file {match.shoko_file_id} has missing or malformed raw ED2K; "
+            "a file-content identity is required before freezing a link plan",
+        )
     validated = _validate_resolution_set(match, resolutions)
     if isinstance(validated, PlanSkip):
         return validated
@@ -559,6 +567,7 @@ def freeze_plan(
         sonarr_size=match.sonarr_file.size,
         shoko_file_id=match.shoko_file_id,
         shoko_size=match.sonarr_file.size,
+        shoko_ed2k=cast(str, match.hashes.ed2k),
         shoko_paths=shoko,
         episodes=episodes,
         targets=tuple(sorted(targets, key=_target_key)),
@@ -581,7 +590,7 @@ def plan_fingerprint(plan: LinkPlan) -> str:
         f"p|{plan.policy}",
         f"sn|{plan.sonarr_series_id}|{plan.sonarr_episode_file_id}|{plan.sonarr_path}"
         f"|{plan.sonarr_size}",
-        f"sh|{plan.shoko_file_id}|{plan.shoko_size}",
+        f"sh|{plan.shoko_file_id}|{plan.shoko_size}|{plan.shoko_ed2k.lower()}",
         *(f"shp|{path}" for path in plan.shoko_paths),
         *(
             f"ep|{item.episode_id}|{_fmt(item.tvdb_episode_id)}|{item.season_number}"
@@ -908,6 +917,7 @@ def _preflight_file(
         add(
             PreflightReason.IDENTITY_CHANGED, f"file size changed {plan.sonarr_size} -> {item.size}"
         )
+    _preflight_ed2k(item, plan, add)
     fresh_paths = tuple(sorted({_safe_path(loc.absolute_path) for loc in item.locations}))
     if fresh_paths != plan.shoko_paths:
         add(
@@ -916,6 +926,16 @@ def _preflight_file(
             "(added/removed/moved locations)",
         )
     _preflight_ownership(item, plan, settings, folders, add)
+
+
+def _preflight_ed2k(item: ShokoFile, plan: LinkPlan, add: AddReason) -> None:
+    """Refuse fresh content identity drift, comparing ED2K only (optional hashes are metadata)."""
+    if canonical_ed2k(item.hashes.ed2k) != plan.shoko_ed2k.lower():
+        add(
+            PreflightReason.IDENTITY_CHANGED,
+            f"Shoko ED2K changed {plan.shoko_ed2k!r} -> {item.hashes.ed2k!r}; "
+            "file-content identity drift, no POST",
+        )
 
 
 def _preflight_ownership(

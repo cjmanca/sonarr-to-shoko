@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -276,7 +276,11 @@ EPISODE_101 = episode_json(101, 1, 1)
 EPISODE_102 = episode_json(102, 2, 2)
 
 
-def build_match(episodes: tuple[SonarrEpisode, ...] = (EPISODE_101, EPISODE_102)) -> FileMatch:
+def build_match(
+    episodes: tuple[SonarrEpisode, ...] = (EPISODE_101, EPISODE_102),
+    *,
+    hashes: ShokoHashes | None = None,
+) -> FileMatch:
     sonarr_file = SonarrFile(
         series_id=7,
         episode_file_id=40,
@@ -288,7 +292,7 @@ def build_match(episodes: tuple[SonarrEpisode, ...] = (EPISODE_101, EPISODE_102)
         shoko_file_id=SHOKO_FILE_ID,
         sonarr_file=sonarr_file,
         shoko_paths=(SONARR_FILE_PATH,),
-        hashes=ShokoHashes(None, None, None, None),
+        hashes=hashes or ShokoHashes(hf.hex32(SHOKO_FILE_ID), None, None, None),
     )
 
 
@@ -315,7 +319,12 @@ def res(
     )
 
 
-def freeze(resolutions: list[EpisodeTargetResolution], **kwargs: Any) -> LinkPlan | PlanSkip:
+def freeze(
+    resolutions: list[EpisodeTargetResolution],
+    *,
+    match: FileMatch | None = None,
+    **kwargs: Any,
+) -> LinkPlan | PlanSkip:
     options: dict[str, Any] = {
         "policy": RunPolicy.BACKLOG,
         "targets_digest": TARGETS_DIGEST,
@@ -323,7 +332,7 @@ def freeze(resolutions: list[EpisodeTargetResolution], **kwargs: Any) -> LinkPla
         "shoko_paths": [SHOKO_FILE_PATH],
     }
     options.update(kwargs)
-    return freeze_plan(build_match(), resolutions, **options)
+    return freeze_plan(match or build_match(), resolutions, **options)
 
 
 def must_plan(result: LinkPlan | PlanSkip) -> LinkPlan:
@@ -653,6 +662,65 @@ def test_preflight_size_change_is_identity_changed(
     verdict = run_preflight(stub, plan, settings)
     assert not verdict.ok
     assert verdict.reasons == (PreflightReason.IDENTITY_CHANGED,)
+
+
+def test_preflight_refuses_changed_ed2k_for_same_file_identity_before_post(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = base_settings(base_document, write_document)
+    ed2k_a = hf.hex32(100)
+    ed2k_b = hf.hex32(101)
+    original = build_match(hashes=ShokoHashes(ed2k_a, None, None, None))
+    original = replace(
+        original,
+        shoko_file_id=100,
+        sonarr_file=replace(original.sonarr_file, size=1_000_000),
+    )
+    plan = must_plan(
+        freeze(
+            [res(EPISODE_101, EPISODE_A), res(EPISODE_102, EPISODE_B)],
+            match=original,
+        )
+    )
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", "/api/v3/File/100")] = file_json(
+        id_=100,
+        size=1_000_000,
+        hashes=hf.ed2k_hashes(100, 1_000_000) | {"ED2K": ed2k_b},
+    )
+    stub.routes[("GET", "/api/v3/Episode/AniDB/5501/Episode")] = shoko_episode(777, 5501)
+    stub.routes[("GET", "/api/v3/Episode/AniDB/5502/Episode")] = shoko_episode(778, 5502)
+
+    result = reconcile(stub, plan, settings, dry_run=False)
+
+    assert result.stage is ReconcileStage.PREFLIGHT_BLOCKED
+    assert result.preflight is not None
+    assert result.preflight.reasons == (PreflightReason.IDENTITY_CHANGED,)
+    assert any(ed2k_a in detail and ed2k_b in detail for detail in result.preflight.details)
+    assert stub.posts() == []
+
+
+def test_optional_hash_changes_do_not_change_frozen_ed2k_identity(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(
+        hashes={
+            "ED2K": hf.hex32(SHOKO_FILE_ID),
+            "SHA1": hf.hex40(SHOKO_FILE_ID + 1),
+            "MD5": hf.hex32(SHOKO_FILE_ID + 1),
+            "CRC32": hf.hex8(SHOKO_FILE_ID + 1),
+        }
+    )
+
+    verdict = run_preflight(stub, plan, settings)
+
+    assert verdict.ok
+    assert PreflightReason.IDENTITY_CHANGED not in verdict.reasons
 
 
 def test_preflight_missing_file_blocks(
@@ -1043,6 +1111,29 @@ def test_fingerprint_is_stable_across_permuted_inputs_and_clocks() -> None:
     rebuilt = linkable_plan(mapping_revision="rev-1")
     assert plan_fingerprint(rebuilt) == plan_fingerprint(first_plan)
     assert plan_fingerprint(rebuilt) != plan_fingerprint(linkable_plan())
+
+
+def test_fingerprint_binds_ed2k_and_normalizes_case() -> None:
+    plan = linkable_plan()
+    changed = replace(plan, shoko_ed2k=hf.hex32(SHOKO_FILE_ID + 1))
+    lowercase = replace(plan, shoko_ed2k=str(plan.shoko_ed2k).lower())
+
+    assert plan_fingerprint(changed) != plan_fingerprint(plan)
+    assert plan_fingerprint(lowercase) == plan_fingerprint(plan)
+    assert plan.shoko_ed2k == hf.hex32(SHOKO_FILE_ID)
+
+
+@pytest.mark.parametrize("ed2k", [None, 123, "invalid", "a" * 31, "z" * 32])
+def test_freeze_plan_rejects_missing_or_malformed_ed2k(ed2k: Any) -> None:
+    match = build_match(hashes=ShokoHashes(ed2k, None, None, None))
+
+    plan = freeze(
+        [res(EPISODE_101, EPISODE_A), res(EPISODE_102, EPISODE_B)],
+        match=match,
+    )
+
+    assert isinstance(plan, PlanSkip)
+    assert plan.reason == "invalid_ed2k"
 
 
 def test_fingerprint_excludes_timestamp_and_queue_fields() -> None:

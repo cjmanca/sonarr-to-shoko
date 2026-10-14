@@ -120,10 +120,18 @@ from .mapping_store import (
 from .mappings import MappingIndex, ResolutionStatus, TargetIdentity, effective_targets
 from .mappings import resolve as resolve_mapping
 from .policies import RunPolicy
-from .shoko import ImportFolder, ShokoDiscovery, collect_shoko_discovery, match_shoko_files
+from .shoko import (
+    ImportFolder,
+    ShokoDiscovery,
+    canonical_ed2k,
+    collect_shoko_discovery,
+    match_shoko_files,
+)
 from .sonarr import SonarrFile, SonarrInventory, collect_sonarr_inventory
 from .state import (
     ATTESTATION_PAUSE_REASON,
+    CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
+    CAMPAIGN_QUEUE_STATES,
     CAMPAIGN_STATUS_PAUSED,
     META_ATTESTATION_GATE,
     META_CAMPAIGN_ATTESTATION_GATE,
@@ -793,6 +801,17 @@ class _ReconcileResult:
     pending: int
     plans: Mapping[int, LinkPlan]
     skip_reasons: Mapping[int, str]
+    fresh_campaign_quarantines: frozenset[int]
+
+
+_SEND_RECOVERY_STATES: Final[frozenset[FileState]] = frozenset(
+    {
+        FileState.REQUEST_MAY_HAVE_BEEN_SENT,
+        FileState.VERIFYING,
+        FileState.INDETERMINATE_WRITE,
+        FileState.PARTIAL,
+    }
+)
 
 
 def _cohort_counts(rows: Sequence[tuple[int, Cohort]]) -> tuple[int, int]:
@@ -805,13 +824,16 @@ def _record_and_match(
     deps: DaemonDeps,
     matches: Sequence[Any],
     now_iso: str,
-) -> tuple[dict[int, Cohort], int]:
+) -> tuple[dict[int, Cohort], int, dict[int, tuple[str, str]]]:
     known = _tracked_file_ids(deps.store)
     cohorts: dict[int, Cohort] = {}
     seeds: list[FileSeed] = []
+    identity_drifts: dict[int, tuple[str, str]] = {}
     for match in matches:
         record = deps.store.get_file(match.shoko_file_id)
+        identity: FileIdentitySnapshot | None
         if record is None:
+            identity = _identity_snapshot(match)
             cohort = deps.store.classify_new(
                 match.shoko_file_id,
                 sonarr_series_id=match.sonarr_file.series_id,
@@ -827,20 +849,24 @@ def _record_and_match(
                     sonarr_size=match.sonarr_file.size,
                     cohort=cohort,
                     iso=now_iso,
-                    identity=_identity_snapshot(match),
+                    identity=identity,
                 )
             )
             known = known | {match.shoko_file_id}
             cohorts[match.shoko_file_id] = cohort
         else:
+            identity = record.identity
             cohorts[match.shoko_file_id] = record.cohort
+        identity_drift = _source_hash_identity_drift(identity, match)
+        if identity_drift is not None:
+            identity_drifts[match.shoko_file_id] = identity_drift
     # P3b: bulk one-transaction ingest + bulk validated advance for first-scan
     # (7k backlog wall-time target; identical per-edge semantics, illegal edges skipped).
     deps.store.record_files(seeds)
     deps.store.advance_bulk(
         [match.shoko_file_id for match in matches], FileState.MATCHED, "matched", iso=now_iso
     )
-    return cohorts, len(seeds)
+    return cohorts, len(seeds), identity_drifts
 
 
 def _tracked_file_ids(store: StateStore) -> frozenset[int]:
@@ -860,6 +886,36 @@ def _identity_snapshot(match: Any) -> FileIdentitySnapshot:
     )
 
 
+def _source_hash_identity_drift(
+    snapshot: FileIdentitySnapshot | None, match: Any
+) -> tuple[str, str] | None:
+    """Compare only the immutable first-seen ED2K with the current discovery identity."""
+    original_raw = None if snapshot is None else snapshot.ed2k
+    original = canonical_ed2k(original_raw)
+    current_raw = match.hashes.ed2k
+    current = canonical_ed2k(current_raw)
+    if original is None:
+        return (
+            "source_hash_identity_missing",
+            f"file {match.shoko_file_id} has no valid persisted original ED2K "
+            f"(stored {original_raw!r}); refusing to re-freeze source identity",
+        )
+    if current is None:
+        return (
+            "source_hash_identity_unavailable",
+            f"file {match.shoko_file_id} current discovery ED2K is missing or malformed "
+            f"({current_raw!r}); refusing to re-freeze source identity",
+        )
+    if original != current:
+        return (
+            "source_hash_identity_drift",
+            f"file {match.shoko_file_id} source ED2K identity drift: persisted original "
+            f"{original_raw!r}, current discovery {current_raw!r}; Shoko ID reuse/content "
+            "change requires operator review; no link plan will be frozen",
+        )
+    return None
+
+
 def _advance(deps: DaemonDeps, file_id: int, target: FileState, detail: str, iso: str) -> None:
     record = deps.store.get_file(file_id)
     if record is None:
@@ -871,6 +927,31 @@ def _advance(deps: DaemonDeps, file_id: int, target: FileState, detail: str, iso
     except Exception:
         # A state already past this point (e.g. verifying a sent file) is left alone.
         return
+
+
+def _quarantine_source_identity_drift(
+    deps: DaemonDeps, file_id: int, reason: str, detail: str, now_iso: str
+) -> bool:
+    """Quarantine identity drift and report a newly blocked campaign queue row."""
+    record = deps.store.get_file(file_id)
+    if record is None or record.state in _SEND_RECOVERY_STATES:
+        return False
+    campaign_pending = record.campaign_id is not None and record.state in (
+        CAMPAIGN_QUEUE_STATES | {FileState.MATCHED, FileState.WAITING}
+    )
+    if campaign_pending:
+        detail = (
+            f"campaign_quarantine:{reason}{CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER} {detail}"
+        )
+    _advance(deps, file_id, FileState.BLOCKED_SAFETY, detail, now_iso)
+    if not campaign_pending:
+        return False
+    updated = deps.store.get_file(file_id)
+    return (
+        updated is not None
+        and updated.state is FileState.BLOCKED_SAFETY
+        and updated.state_detail.startswith("campaign_quarantine:")
+    )
 
 
 def _resolve_shoko_paths(discovery: ShokoDiscovery, file_id: int) -> tuple[str, ...]:
@@ -943,15 +1024,23 @@ def _reconcile(
     match_result = match_shoko_files(
         discovery, inventory.files, inventory.verdict.complete, deps.settings
     )
-    cohorts, inserted = _record_and_match(deps, match_result.matches, now_iso)
+    cohorts, inserted, identity_drifts = _record_and_match(deps, match_result.matches, now_iso)
     resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic)
     plans: dict[int, LinkPlan] = {}
     skip_reasons: dict[int, str] = {}
+    fresh_campaign_quarantines: set[int] = set()
     mapped_ids: list[int] = []
     planned_ids: list[int] = []
     pending = 0
     for match in sorted(match_result.matches, key=lambda m: m.shoko_file_id):
         file_id = match.shoko_file_id
+        identity_drift = identity_drifts.get(file_id)
+        if identity_drift is not None:
+            reason, detail = identity_drift
+            skip_reasons[file_id] = reason
+            if _quarantine_source_identity_drift(deps, file_id, reason, detail, now_iso):
+                fresh_campaign_quarantines.add(file_id)
+            continue
         tvdb_series = series_tvdb.get(match.sonarr_file.series_id)
         if tvdb_series is None:
             skip_reasons[file_id] = "no_tvdb_series"
@@ -998,6 +1087,7 @@ def _reconcile(
         pending=pending,
         plans=plans,
         skip_reasons=skip_reasons,
+        fresh_campaign_quarantines=frozenset(fresh_campaign_quarantines),
     )
 
 
@@ -1060,8 +1150,14 @@ def _apply_generation_change(
 # ------------------------------------------------------------------ apply loop
 
 
-def _xref_fetcher(endpoint: ApiEndpoint, file_id: int) -> Callable[[], ShokoFileXRefs | None]:
-    """Build the verification poll: ``GET File/{id}?include=XRefs`` (read-only)."""
+def _xref_fetcher(
+    endpoint: ApiEndpoint, file_id: int, *, expected_ed2k: str | None = None
+) -> Callable[[], ShokoFileXRefs | None]:
+    """Build the verification poll: ``GET File/{id}?include=XRefs`` (read-only).
+
+    When an expected ED2K is supplied, the same File response must still identify the
+    frozen file before its XRefs can be used as verification evidence.
+    """
 
     def fetch() -> ShokoFileXRefs | None:
         try:
@@ -1079,6 +1175,15 @@ def _xref_fetcher(endpoint: ApiEndpoint, file_id: int) -> Callable[[], ShokoFile
                 return None
         finally:
             response.close()
+        if expected_ed2k is not None:
+            expected = canonical_ed2k(expected_ed2k)
+            entry = payload if isinstance(payload, Mapping) else None
+            hashes = entry.get("Hashes") if entry is not None else None
+            current_ed2k = (
+                canonical_ed2k(hashes.get("ED2K")) if isinstance(hashes, Mapping) else None
+            )
+            if expected is None or current_ed2k != expected:
+                return None
         return parse_file_xrefs(payload)
 
     return fetch
@@ -1097,14 +1202,19 @@ def _verify_and_close(
 ) -> str:
     """Poll the XRef set to the exact planned set and close the loop (slot released on VERIFIED)."""
     deadline = deps.monotonic() + deps.verification_timeout_seconds
-    verification = verify_link(
-        _xref_fetcher(deps.shoko, file_id),
-        plan,
-        clock=deps.monotonic,
-        deadline=deadline,
-        poll_interval=deps.poll_interval_seconds,
-        advance=deps.advance,
-        max_polls=deps.max_verify_polls,
+    expected_ed2k = canonical_ed2k(plan.shoko_ed2k)
+    verification = (
+        VerificationVerdict.UNKNOWN
+        if expected_ed2k is None
+        else verify_link(
+            _xref_fetcher(deps.shoko, file_id, expected_ed2k=expected_ed2k),
+            plan,
+            clock=deps.monotonic,
+            deadline=deadline,
+            poll_interval=deps.poll_interval_seconds,
+            advance=deps.advance,
+            max_polls=deps.max_verify_polls,
+        )
     )
     deps.store.record_verification(file_id, verification, iso=now_iso)
     if verification is VerificationVerdict.VERIFIED:
@@ -1129,7 +1239,13 @@ def inspect_send_state(deps: DaemonDeps, file_id: int) -> ShokoFileXRefs | None:
 
     Never a POST, never a DELETE — the hold branches verify, they do not repair.
     """
-    return _xref_fetcher(deps.shoko, file_id)()
+    record = deps.store.get_file(file_id)
+    if record is None or record.identity is None:
+        return None
+    expected_ed2k = canonical_ed2k(record.identity.ed2k)
+    if expected_ed2k is None:
+        return None
+    return _xref_fetcher(deps.shoko, file_id, expected_ed2k=expected_ed2k)()
 
 
 def _xref_triples(observed: ShokoFileXRefs) -> frozenset[tuple[int, int, int | None]]:
@@ -1814,7 +1930,13 @@ def _record_zero_progress(deps: DaemonDeps, campaign_id: str, now_iso: str, reas
     return False
 
 
-def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any | None:
+def _drain_campaign(
+    deps: DaemonDeps,
+    now_iso: str,
+    reasons: list[str],
+    *,
+    fresh_campaign_quarantines: frozenset[int],
+) -> Any | None:
     """Drain **one** bounded batch of the oldest approved campaign (F7), under this cycle's lock.
 
     Runs entirely through :func:`shoko_linker.campaign.apply_campaign` with
@@ -1869,6 +1991,7 @@ def _drain_campaign(deps: DaemonDeps, now_iso: str, reasons: list[str]) -> Any |
             now_iso,
             lock_held=True,
             daemon_drain=True,
+            fresh_campaign_quarantines=fresh_campaign_quarantines,
         )
     except CampaignPlanInvalidError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}:plan_unreadable")
@@ -2190,7 +2313,12 @@ def _run_cycle_body(
         and not phase.churn_paused
         and deps.settings.campaign.daemon_auto_apply
     ):
-        campaign_report = _drain_campaign(deps, now_iso, reasons)
+        campaign_report = _drain_campaign(
+            deps,
+            now_iso,
+            reasons,
+            fresh_campaign_quarantines=reconcile.fresh_campaign_quarantines,
+        )
 
     counts = _final_counts(
         deps,

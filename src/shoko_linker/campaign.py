@@ -78,9 +78,11 @@ from .linking import (
 )
 from .mapping_store import ActiveMappings, load_active
 from .policies import RunPolicy
-from .shoko import ImportFolder
+from .shoko import ImportFolder, canonical_ed2k
 from .state import (
     CAMPAIGN_DRAIN_REVOKED_REASON,
+    CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
+    CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER,
     CAMPAIGN_STATUS_APPROVED,
     CAMPAIGN_STATUS_REVOKED,
     META_CAMPAIGN_ATTESTATION_GATE,
@@ -105,7 +107,7 @@ from .state import (
     release_apply_lock,
 )
 
-PLAN_SCHEMA: Final[str] = "shoko-linker-campaign-plan/1"
+PLAN_SCHEMA: Final[str] = "shoko-linker-campaign-plan/2"
 DIGEST_HEX_CHARS: Final[int] = 64
 ANIDB_IDENTITY_FIELDS: Final[int] = 4
 MAX_DETAIL_CHARS: Final[int] = 1000
@@ -240,6 +242,7 @@ class CampaignFile:
     sonarr_file_id: int
     path: str
     size: int
+    shoko_ed2k: str
     plan_fingerprint: str
     request_fingerprint: str
     mapping_targets_digest: str
@@ -283,6 +286,7 @@ def _canonical_bytes(plan: CampaignPlan) -> bytes:
                 "sonarr_file_id": item.sonarr_file_id,
                 "path": item.path,
                 "size": item.size,
+                "shoko_ed2k": item.shoko_ed2k,
                 "plan_fingerprint": item.plan_fingerprint,
                 "request_fingerprint": item.request_fingerprint,
                 "mapping_targets_digest": item.mapping_targets_digest,
@@ -347,6 +351,11 @@ def _plan_from_document(raw: Any) -> CampaignPlan:
     document = cast("dict[str, Any]", raw)
     _require_plan_fields(document)
     if document["schema"] != PLAN_SCHEMA:
+        if document["schema"] == "shoko-linker-campaign-plan/1":
+            raise CampaignError(
+                "plan file uses legacy schema 'shoko-linker-campaign-plan/1', which does not "
+                "freeze Shoko ED2K file-content identity; re-prepare and re-approve the campaign"
+            )
         raise CampaignError(f"plan file: schema must be {PLAN_SCHEMA!r}")
     campaign_id = document["campaign_id"]
     if not isinstance(campaign_id, str) or not campaign_id.strip():
@@ -451,6 +460,7 @@ def _campaign_file(item: Any, index: int) -> CampaignFile:
         "sonarr_file_id",
         "path",
         "size",
+        "shoko_ed2k",
         "plan_fingerprint",
         "request_fingerprint",
         "mapping_targets_digest",
@@ -499,6 +509,9 @@ def _campaign_file(item: Any, index: int) -> CampaignFile:
     path = entry["path"]
     if not isinstance(path, str) or not path.startswith("/"):
         raise CampaignError(f"{field}: path must be a POSIX path string")
+    ed2k = canonical_ed2k(entry["shoko_ed2k"])
+    if ed2k is None:
+        raise CampaignError(f"{field}: shoko_ed2k must be a raw 32-hex ED2K value")
     for key in ("plan_fingerprint", "request_fingerprint", "mapping_targets_digest"):
         _require_hex64(entry[key], f"{field}: {key}")
     return CampaignFile(
@@ -507,6 +520,7 @@ def _campaign_file(item: Any, index: int) -> CampaignFile:
         sonarr_file_id=whole("sonarr_file_id"),
         path=path,
         size=whole("size"),
+        shoko_ed2k=ed2k,
         plan_fingerprint=str(entry["plan_fingerprint"]),
         request_fingerprint=str(entry["request_fingerprint"]),
         mapping_targets_digest=str(entry["mapping_targets_digest"]),
@@ -561,6 +575,7 @@ def _plan_entry(plan: LinkPlan, mapping_targets_digest: str) -> CampaignFile:
         sonarr_file_id=plan.sonarr_episode_file_id,
         path=plan.sonarr_path,
         size=plan.sonarr_size,
+        shoko_ed2k=plan.shoko_ed2k.lower(),
         plan_fingerprint=plan.fingerprint,
         request_fingerprint=request_fingerprint(plan),
         mapping_targets_digest=mapping_targets_digest,
@@ -729,8 +744,10 @@ class CampaignApplyReport:
     ``processed`` is a **scan** counter (files the batch examined: submissions, per-file budget
     deferrals and pending-target resolutions) — never submission progress.
     ``progress`` is the real progress the batch produced: submissions + verifications +
-    quarantines. The zero-progress breaker keys off ``progress`` (zero real progress → pause),
-    and ``stopped = "plan_complete"`` reflects **persisted** campaign progress, never a scan count.
+    newly-created quarantines. Repeated observations of an existing quarantine are deferred and
+    do not count as fresh progress. The zero-progress breaker keys off ``progress`` (zero real
+    progress → pause), and ``stopped = "plan_complete"`` reflects **persisted** campaign progress,
+    never a scan count.
     """
 
     campaign_id: str
@@ -843,6 +860,7 @@ def apply_campaign(
     batch_size: int | None = None,
     lock_held: bool = False,
     daemon_drain: bool = False,
+    fresh_campaign_quarantines: frozenset[int] = frozenset(),
 ) -> CampaignApplyReport:
     """One bounded batch of the approved campaign through the full guarded path.
 
@@ -900,6 +918,12 @@ def apply_campaign(
         # the whole cycle (sweep + apply) respects ``max_cycle_seconds`` (daemon ``_apply`` parity).
         cycle_start_mono = deps.monotonic()
         _apply_guards(deps, settings, store, campaign, digest, now_iso, reasons)
+        preexisting_quarantines = frozenset(
+            record.shoko_file_id
+            for record in store.campaign_files(campaign.campaign_id)
+            if record.state is FileState.BLOCKED_SAFETY
+            and record.state_detail.startswith("campaign_quarantine:")
+        )
         sweep = _apply_sweep(deps, campaign.campaign_id, now_iso, reasons)
         active = _apply_mapping(deps, store, plan, campaign.campaign_id, now_iso)
         counters = _CampaignCounters(sent_running=campaign.total_sent)
@@ -917,6 +941,8 @@ def apply_campaign(
             queue=fetch_queue(deps.shoko),
             now_iso=now_iso,
             cycle_key=batch_cycle_key,
+            preexisting_quarantines=preexisting_quarantines,
+            fresh_campaign_quarantines=fresh_campaign_quarantines,
         )
         # F9-1: bounded batch loop. The per-cycle cap resets each batch (F9), but the batch
         # itself must stay O(size) network reads: the batch-limit guard keys on scan ATTEMPTS
@@ -1019,6 +1045,8 @@ class _ApplyContext:
     queue: QueueSnapshot | None
     now_iso: str
     cycle_key: str
+    preexisting_quarantines: frozenset[int] = frozenset()
+    fresh_campaign_quarantines: frozenset[int] = frozenset()
 
 
 def _batch_size(settings: Settings, batch_size: int | None) -> int:
@@ -1157,6 +1185,26 @@ def _entry_gate(
         counters.deferred += 1
         reasons.append(f"unbound:{file_id}")
         return None
+    if record.state is FileState.BLOCKED_SAFETY and record.state_detail.startswith(
+        "campaign_quarantine:"
+    ):
+        counters.processed += 1
+        detail = record.state_detail.removeprefix("campaign_quarantine:")
+        newly_reported = store.claim_campaign_quarantine_progress(file_id, campaign.campaign_id)
+        if not newly_reported and (
+            file_id not in context.fresh_campaign_quarantines
+            and file_id in context.preexisting_quarantines
+        ):
+            counters.deferred += 1
+            reasons.append(
+                f"not_queueable:{file_id}:{record.state.value}:already_quarantined:{detail}"
+            )
+        else:
+            counters.quarantined += 1
+            detail = detail.replace(CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER, "")
+            detail = detail.replace(CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER, "")
+            reasons.append(f"campaign_quarantine:{file_id}:{detail}")
+        return None
     if record.state not in _CAMPAIGN_QUEUE_STATES:
         counters.deferred += 1
         reasons.append(f"not_queueable:{file_id}:{record.state.value}")
@@ -1196,6 +1244,9 @@ def _candidate_plan(
 ) -> LinkPlan | None:
     """Approved-plan identity rules: pending targets, materialization, fingerprint drift."""
     store, now_iso, file_id = context.store, context.now_iso, entry.shoko_file_id
+    if canonical_ed2k(candidate.shoko_ed2k) != entry.shoko_ed2k:
+        _campaign_quarantine(store, file_id, "ed2k_drift", now_iso, counters, reasons)
+        return None
     if entry.shoko_episode_ids == ():
         return _pending_plan(context, entry, record, candidate, counters, reasons)
     if candidate.status is not PlanStatus.LINKABLE:
