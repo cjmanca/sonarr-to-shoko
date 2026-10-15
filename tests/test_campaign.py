@@ -68,6 +68,8 @@ from shoko_linker.shoko import collect_shoko_discovery
 from shoko_linker.state import (
     ATTESTATION_PAUSE_REASON,
     CAMPAIGN_DRAIN_FINGERPRINT_REASON,
+    CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
+    CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER,
     CAMPAIGN_STATUS_APPROVED,
     CAMPAIGN_STATUS_REVOKED,
     BaselineFile,
@@ -870,6 +872,211 @@ def test_one_file_canary_bounds_reconciliation_sweep_quarantines(
         assert "source_hash_identity_drift" in quarantines[0].state_detail
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("already_recorded", [False, True])
+def test_batch_one_bounds_attribution_of_preexisting_quarantine_markers(
+    env: Env, capsys: pytest.CaptureFixture[str], already_recorded: bool
+) -> None:
+    _set_campaign(env, max_batch_size=BATCH_ONE)
+    specs_list = specs(COUNT_HUNDRED)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys, limit=str(COUNT_HUNDRED))
+    approve(env, capsys, prepared["approval_digest"])
+    env.stubs.ed2k_overrides.update(
+        {item.shoko_id: hf.hex32(item.shoko_id + 1) for item in specs_list}
+    )
+
+    store = env.open_store()
+    deps: DaemonDeps | None = None
+    total_sent_before = 0
+    rolling_before = 0
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        assert deps is not None
+        run_cycle(
+            deps,
+            now_iso=env.now_iso,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="preexisting-quarantine-progress",
+        )
+        preexisting = store.campaign_files(prepared["campaign_id"])
+        assert len(preexisting) == COUNT_HUNDRED
+        assert all(
+            record.state is FileState.BLOCKED_SAFETY
+            and CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER in record.state_detail
+            for record in preexisting
+        )
+        if already_recorded:
+            assert all(
+                store.claim_campaign_quarantine_progress(
+                    record.shoko_file_id, prepared["campaign_id"]
+                )
+                for record in preexisting
+            )
+        campaign_before = store.get_campaign(prepared["campaign_id"])
+        assert campaign_before is not None
+        total_sent_before = campaign_before.total_sent
+        rolling_before = store.budget_view().rolling_new_submissions
+    finally:
+        if deps is not None:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+        store.close()
+
+    result = apply(env, capsys, batch=str(BATCH_ONE))
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["processed"] == (COUNT_HUNDRED if already_recorded else BATCH_ONE)
+    assert result["payload"]["quarantined"] == (0 if already_recorded else BATCH_ONE)
+    assert result["payload"]["submitted"] == 0
+    assert env.stubs.posts == []
+    reopened = env.open_store()
+    try:
+        records = reopened.campaign_files(prepared["campaign_id"])
+        recorded = sum(
+            CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER in record.state_detail
+            for record in records
+        )
+        pending = sum(
+            CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER in record.state_detail for record in records
+        )
+        assert recorded == (COUNT_HUNDRED if already_recorded else BATCH_ONE)
+        assert pending == (0 if already_recorded else COUNT_HUNDRED - BATCH_ONE)
+        campaign_after = reopened.get_campaign(prepared["campaign_id"])
+        assert campaign_after is not None
+        assert campaign_after.total_sent == total_sent_before
+        assert reopened.budget_view().rolling_new_submissions == rolling_before
+    finally:
+        reopened.close()
+
+
+def test_batch_one_skips_accounted_quarantine_before_valid_candidate_and_pending_marker(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, max_batch_size=BATCH_ONE)
+    specs_list = specs(COUNT_THREE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    first_quarantine, valid_candidate, pending_quarantine = specs_list
+    env.stubs.ed2k_overrides[first_quarantine.shoko_id] = hf.hex32(first_quarantine.shoko_id + 1)
+    env.stubs.ed2k_overrides[pending_quarantine.shoko_id] = hf.hex32(
+        pending_quarantine.shoko_id + 1
+    )
+
+    store = env.open_store()
+    deps: DaemonDeps | None = None
+    campaign_before: CampaignRecord | None = None
+    rolling_before = 0
+    try:
+        deps = _campaign_deps(env, store, prepared["campaign_id"])
+        assert deps is not None
+        run_cycle(
+            deps,
+            now_iso=env.now_iso,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="mixed-quarantine-progress",
+        )
+        assert store.claim_campaign_quarantine_progress(
+            first_quarantine.shoko_id, prepared["campaign_id"]
+        )
+        campaign_before = store.get_campaign(prepared["campaign_id"])
+        assert campaign_before is not None
+        rolling_before = store.budget_view().rolling_new_submissions
+    finally:
+        if deps is not None:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+        store.close()
+
+    result = apply(env, capsys, batch=str(BATCH_ONE))
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == BATCH_ONE
+    assert result["payload"]["quarantined"] == 0
+    assert env.stubs.posted_files == [valid_candidate.shoko_id]
+    after = env.open_store()
+    try:
+        first = after.get_file(first_quarantine.shoko_id)
+        pending = after.get_file(pending_quarantine.shoko_id)
+        assert first is not None
+        assert pending is not None
+        assert CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER in first.state_detail
+        assert CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER in pending.state_detail
+        campaign_after = after.get_campaign(prepared["campaign_id"])
+        assert campaign_after is not None
+        assert campaign_before is not None
+        assert campaign_after.total_sent == campaign_before.total_sent + BATCH_ONE
+        assert after.budget_view().rolling_new_submissions == rolling_before + BATCH_ONE
+    finally:
+        after.close()
+
+
+def test_pending_quarantine_attribution_completes_across_bounded_batches(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_campaign(env, max_batch_size=BATCH_ONE)
+    specs_list = specs(COUNT_THREE)
+    env.seed(specs_list)
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    env.stubs.ed2k_overrides.update(
+        {item.shoko_id: hf.hex32(item.shoko_id + 1) for item in specs_list}
+    )
+
+    store = env.open_store()
+    deps = _campaign_deps(env, store, prepared["campaign_id"])
+    assert deps is not None
+    rolling_before = store.budget_view().rolling_new_submissions
+    try:
+        run_cycle(
+            deps,
+            now_iso=env.now_iso,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="bounded-quarantine-claims",
+        )
+    finally:
+        deps.sonarr.client.close()
+        deps.shoko.client.close()
+        deps.mapping_source.client.close()
+        store.close()
+
+    for expected_claims in range(1, COUNT_THREE + 1):
+        result = apply(env, capsys, batch=str(BATCH_ONE))
+        assert result["exit"] == EXIT_OK
+        assert result["payload"]["processed"] == expected_claims
+        assert result["payload"]["quarantined"] == BATCH_ONE
+        assert result["payload"]["submitted"] == 0
+        reopened = env.open_store()
+        try:
+            records = reopened.campaign_files(prepared["campaign_id"])
+            assert (
+                sum(
+                    CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER in record.state_detail
+                    for record in records
+                )
+                == expected_claims
+            )
+            assert (
+                sum(
+                    CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER in record.state_detail
+                    for record in records
+                )
+                == COUNT_THREE - expected_claims
+            )
+            campaign = reopened.get_campaign(prepared["campaign_id"])
+            assert campaign is not None
+            assert campaign.total_sent == 0
+            assert reopened.budget_view().rolling_new_submissions == rolling_before
+        finally:
+            reopened.close()
+    assert env.stubs.posts == []
 
 
 def test_daemon_one_file_batch_bounds_outer_and_inner_identity_sweeps(

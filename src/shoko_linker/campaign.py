@@ -1363,20 +1363,27 @@ def _entry_gate(
     ):
         counters.processed += 1
         detail = record.state_detail.removeprefix("campaign_quarantine:")
-        newly_reported = store.claim_campaign_quarantine_progress(file_id, campaign.campaign_id)
-        if not newly_reported and (
-            file_id not in context.fresh_campaign_quarantines
-            and file_id in context.preexisting_quarantines
-        ):
-            counters.deferred += 1
-            reasons.append(
-                f"not_queueable:{file_id}:{record.state.value}:already_quarantined:{detail}"
-            )
-        else:
+        has_pending_progress = CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER in detail
+        newly_reported = has_pending_progress and store.claim_campaign_quarantine_progress(
+            file_id, campaign.campaign_id
+        )
+        if newly_reported:
+            counters.attempts += 1
             counters.quarantined += 1
             detail = detail.replace(CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER, "")
             detail = detail.replace(CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER, "")
             reasons.append(f"campaign_quarantine:{file_id}:{detail}")
+        else:
+            counters.deferred += 1
+            duplicate_reason = (
+                "already_quarantined"
+                if file_id in context.preexisting_quarantines
+                and file_id not in context.fresh_campaign_quarantines
+                else "already_accounted"
+            )
+            reasons.append(
+                f"not_queueable:{file_id}:{record.state.value}:{duplicate_reason}:{detail}"
+            )
         return None
     if record.state not in _CAMPAIGN_QUEUE_STATES:
         counters.deferred += 1
