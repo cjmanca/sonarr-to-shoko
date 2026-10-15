@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>shoko-sonarr-linker</Name>
+  <Repository>ghcr.io/cjmanca/shoko-sonarr-linker:latest</Repository>
+  <Registry>https://github.com/cjmanca/sonarr-to-shoko/pkgs/container/shoko-sonarr-linker</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/cjmanca/sonarr-to-shoko/issues</Support>
+  <Project>https://github.com/cjmanca/sonarr-to-shoko</Project>
+  <Overview>Automatically links verified Sonarr anime episodes to unrecognized Shoko files. Enter Sonarr and Shoko connection details; the service starts read-only and enables linking only after safe setup is complete.</Overview>
+  <WebUI>http://[IP]:[PORT:8080]</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/cjmanca/sonarr-to-shoko/main/unraid.xml</TemplateURL>
+  <Icon>/plugins/dynamix.docker.manager/images/question.png</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <PostArgs />
+  <DonateText />
+  <DonateLink />
+  <Config Name="Application Data" Target="/data" Default="/mnt/user/appdata/shoko-sonarr-linker/data" Mode="rw" Description="Persistent SQLite state and mapping cache; keep on local or cache-backed storage." Type="Path" Display="always" Required="true" Mask="false" />
+  <Config Name="Sonarr URL" Target="SONARR_URL" Default="http://sonarr:8989" Mode="" Description="Sonarr base URL reachable from this container; use a host/IP if Docker DNS is not shared." Type="Variable" Display="always" Required="true" Mask="false" />
+  <Config Name="Sonarr API Key" Target="SONARR_API_KEY" Default="" Mode="" Description="Sonarr API key. Stored only in the container environment." Type="Variable" Display="always" Required="true" Mask="true" />
+  <Config Name="Shoko URL" Target="SHOKO_URL" Default="http://shoko:8111" Mode="" Description="Shoko base URL reachable from this container; use a host/IP if Docker DNS is not shared." Type="Variable" Display="always" Required="true" Mask="false" />
+  <Config Name="Shoko API Key" Target="SHOKO_API_KEY" Default="" Mode="" Description="Shoko API key. Stored only in the container environment." Type="Variable" Display="always" Required="true" Mask="true" />
+  <Config Name="Dashboard Port (optional)" Target="8080" Default="" Mode="tcp" Description="Optional host port mapping for the private dashboard. Leave empty to publish no dashboard port; if enabled, keep it on a trusted local network." Type="Port" Display="always" Required="false" Mask="false" />
+  <Config Name="Advanced YAML Config (optional)" Target="/config" Default="/mnt/user/appdata/shoko-sonarr-linker/config" Mode="ro" Description="Optional read-only config directory for advanced CLI use. Normal service startup does not require a YAML file." Type="Path" Display="advanced" Required="false" Mask="false" />
+</Container>

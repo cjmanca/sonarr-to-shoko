@@ -5,7 +5,7 @@
 # ONLY the /data volume; it never mounts media libraries (and Shoko's side
 # effects — quality filter, renamer, plugins — are why that stays true).
 #
-# API keys live in the environment only (env-file / host env), never in this file.
+# Connection settings live in the environment only (env-file / host env), never in this file.
 
 services:
   shoko-sonarr-linker:
@@ -13,16 +13,9 @@ services:
     # Published GHCR image (publishing milestone): ghcr.io/<owner>/shoko-sonarr-linker:sha-<sha>
     image: shoko-sonarr-linker:local
     init: true              # PID-1 signal handling for graceful SIGTERM
-    # The daemon is the real reconcile loop (it shipped with M6 and the M7
-    # wiring): it runs the schedule, holds the OS advisory apply-ownership lock
-    # (`apply.lock`, a sibling of the state DB) for the whole apply operation, and
-    # exits on SIGTERM/SIGINT (graceful) or a stop condition. `restart:
-    # unless-stopped` keeps the long-running loop up across host reboots and
-    # crashes (the loop is restart-idempotent: the kernel frees the apply lock
-    # on exit and the durable state DB recovers a crashed batch on the next
-    # cycle — a live owner is never fenced out by the lease timer). A
-    # one-shot `once`/campaign run is a CLI invocation, not this long-lived
-    # service, so it does not need a restart policy.
+    # The ordinary service starts without a YAML config or explicit CLI command.
+    # It begins read-only; the automatic linker remains paused until discovery
+    # and one-time safety/scope setup are complete.
     restart: unless-stopped
     # F6 shutdown grace: Docker's default 10s stop window is far shorter than one daemon
     # cycle. The interruptible inter-cycle sleep wakes the daemon within a second of SIGTERM
@@ -33,19 +26,18 @@ services:
     # SIGKILL — that outcome is recoverable by design (durable submission state; the
     # recovery phase never blindly resubmits).
     stop_grace_period: 360s
-    command: ["daemon", "/config/config.yaml"]
+    command: ["service"]
     environment:
+      SONARR_URL: "${SONARR_URL}"
       SONARR_API_KEY: "${SONARR_API_KEY}"
+      SHOKO_URL: "${SHOKO_URL}"
       SHOKO_API_KEY: "${SHOKO_API_KEY}"
-      # Live writes additionally require SHOKO_LINKER_ALLOW_APPLY=1 here AND
-      # sync.apply_changes: true in the config. Dry-run is the default.
     volumes:
-      - /mnt/user/appdata/shoko-sonarr-linker/config:/config:ro
       - shoko-sonarr-linker-data:/data
       # Unraid bind mounts: the container writes as UID/GID 1000. Set the share
       # owner accordingly (e.g. `chown 1000:1000` on the appdata path) so /data
       # is writable without running the container as root.
-    # No ports are exposed. The service is a network client only.
+    # No dashboard host port is published by default.
     # Sonarr and Shoko are existing services; join their Docker network
     # (name is deployment-specific) so configured URLs resolve:
     networks:

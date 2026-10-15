@@ -69,6 +69,7 @@ from .attestation import (
     write_attestation,
 )
 from .audit import collect_audit_inputs, run_audit
+from .bootstrap import load_bootstrap_settings
 from .campaign import (
     DRAIN_AUTHORIZATION_RULE,
     CampaignDigestMismatchError,
@@ -155,6 +156,7 @@ from .reporting import (
     refresh_payload,
     report_payload,
 )
+from .service import bootstrap_endpoints, run_service
 from .state import (
     ATTESTATION_PAUSE_REASON,
     META_LAST_CYCLE_END_ISO,
@@ -863,6 +865,34 @@ def _run_daemon(args: argparse.Namespace) -> int:
             print(cycle_summary_line(report))
         print(exit_line)
     return EXIT_RUNTIME if last is not None and last.failed else EXIT_OK
+
+
+def _run_service(_args: argparse.Namespace) -> int:
+    """Start the normal connection monitor without requiring a YAML configuration."""
+    settings = load_bootstrap_settings()
+    configure_logging(logging.DEBUG if cast(bool, _args.verbose) else logging.INFO)
+    state = StopState()
+    _SHUTDOWN_WAKE.clear()
+    installed = make_signal_handlers(state)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "service started in read-only setup mode; automatic linking remains paused "
+        "until scope and safety setup are complete"
+    )
+    if installed:
+        logger.debug("signal handlers installed: %s", ", ".join(_signal_name(n) for n in installed))
+    sonarr, shoko = bootstrap_endpoints(settings)
+    try:
+        run_service(
+            sonarr,
+            shoko,
+            stop_requested=state.should_stop,
+            wait=interruptible_sleep,
+        )
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+    return EXIT_OK
 
 
 def _daemon_cycle_key(index: int) -> str:
@@ -1924,6 +1954,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug-level logging")
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    _add_service(subparsers)
     _add_validate(subparsers)
     _add_once(subparsers)
     _add_daemon(subparsers)
@@ -1940,6 +1971,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_campaign(subparsers)
     _add_audit(subparsers)
     return parser
+
+
+def _add_service(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "service",
+        help=(
+            "Start the automatic service (read-only connection monitoring until setup "
+            "completes)."
+        ),
+    )
+    parser.set_defaults(handler=_run_service)
 
 
 def _add_validate(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -2495,6 +2537,7 @@ def _run_config(args: argparse.Namespace) -> int:
 
 
 _COMMAND_HANDLERS: Final[dict[str, CommandHandler]] = {
+    "service": _run_service,
     "validate": _run_validate,
     "once": _run_once,
     "daemon": _run_daemon,

@@ -21,6 +21,7 @@
 | `src/shoko_linker/sonarr.py` | Parse verified Sonarr `seriesType`, root folders, status/version as needed; fetch child inventory only after scope is explicit. |
 | `src/shoko_linker/shoko.py` | Reuse strict import-folder/file discovery; expose read-only compatibility/safety facts only from verified supported API shapes. |
 | `src/shoko_linker/onboarding.py` (new) | Persist selected scope, one-time physical-safety/automatic-linking consent, readiness, pause state, and invalidation identity. |
+| `src/shoko_linker/service.py` (new) | Read-only startup readiness probes and the long-lived service lifecycle; later milestones attach discovery, onboarding, and the guarded worker. |
 | `src/shoko_linker/state.py` | Add forward-only SQLite migration and transactional methods for onboarding, authentication metadata, and adaptive rate state; do not rewrite historical rows. |
 | `src/shoko_linker/daemon.py` | Add an explicitly authorized automatic backlog+arrival policy and adaptive bounded batch selection; preserve preflight, immutable targets, sends, verification, and recovery. |
 | `src/shoko_linker/rate_control.py` (new) | Deterministic persisted ramp-up/backoff decisions based on queue/jobs, verification, transport outcomes, and anomalies. |
@@ -29,6 +30,7 @@
 | `Dockerfile`, `compose.example.yaml`, `unraid.xml` (new) | Start the service by default; keep non-root and persistent `/data`; provide Unraid fields for URLs/keys and an optional private dashboard port; no media mount, socket, or privileged mode. |
 | `README.md`, `docs/advanced.md` (new), `docs/deployment.md` | Consumer-first quick start, migration, practical Unraid example, and relocated operator detail. |
 | `tests/test_bootstrap.py` (new) | Environment parsing, missing/invalid settings, no secret leakage, and legacy YAML selection. |
+| `tests/test_service.py` (new) | Read-only connection probes, safe plain-language failures, service loop cadence, and graceful shutdown. |
 | `tests/test_setup.py` (new) | Anime filtering, root choice, path-evidence inference, API compatibility, and fail-closed ambiguous discovery. |
 | `tests/test_onboarding.py` (new) | Safety inspection, one-time consent binding/invalidation, pause/resume, and additive migration. |
 | `tests/test_rate_control.py` (new) | Persisted cautious ramp-up, capacity ceilings, recovery after restart, and immediate slowdown/stop signals. |
@@ -83,6 +85,7 @@ Do not add a dependency or invent API fields. Consult `docs/compatibility.md`, t
 **Files:** Modify `src/shoko_linker/cli.py`, `src/shoko_linker/__init__.py` only if needed, `Dockerfile`, `compose.example.yaml`; add focused CLI tests.
 
 - [ ] Add a normal `service` command that reads bootstrap settings, starts the long-running service path, and routes expected setup/network failures to plain-language messages without tracebacks or secrets.
+- [ ] Until M2/M3 readiness is attached, startup only probes Sonarr status and Shoko import-folder availability with GET requests, then stays alive in an explicitly read-only setup-pending state. Do not build an empty/fake scope, scan all files, or submit links.
 - [ ] Preserve explicit `daemon <config>` and all advanced handlers unchanged in behavior.
 - [ ] Change the image default command to `service`; prove an explicit `CMD`/CLI command still overrides it.
 - [ ] Keep the runtime non-root, `/data` persistent, and the image without media mounts, exposed host port, Docker socket, or privileged mode.

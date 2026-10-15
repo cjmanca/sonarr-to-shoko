@@ -64,4 +64,4 @@ RUN mkdir -p /data && chown -R 1000:1000 /data && chmod 0755 /data
 USER 1000:1000
 
 ENTRYPOINT ["shoko-sonarr-linker"]
-CMD ["--help"]
+CMD ["service"]

@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from shoko_linker import cli
@@ -19,9 +20,65 @@ from shoko_linker.cli import (
     EXIT_RUNTIME,
     main,
 )
+from shoko_linker.http import ApiEndpoint
 
 EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
+
+
+def test_service_command_requires_no_yaml_path() -> None:
+    try:
+        args = cli.build_parser().parse_args(["service"])
+    except SystemExit as exc:
+        pytest.fail(f"service must be a normal command with no required config path: {exc}")
+    assert args.command == "service"
+
+
+def test_service_reports_missing_connection_setting_without_secret_values(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SONARR_URL", raising=False)
+    monkeypatch.setenv("SONARR_API_KEY", "sonarr-test-key-never-a-real-secret")
+    monkeypatch.setenv("SHOKO_URL", "http://shoko:8111")
+    monkeypatch.setenv("SHOKO_API_KEY", "shoko-test-key-never-a-real-secret")
+
+    code = main(["service"])
+    captured = capsys.readouterr()
+
+    assert code == EXIT_CONFIG_INVALID
+    assert "SONARR_URL" in captured.err
+    assert "sonarr-test-key-never-a-real-secret" not in captured.err
+    assert "shoko-test-key-never-a-real-secret" not in captured.err
+
+
+def test_service_command_starts_monitor_from_environment_without_config_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SONARR_URL", "http://sonarr:8989")
+    monkeypatch.setenv("SONARR_API_KEY", "sonarr-test-key-never-a-real-secret")
+    monkeypatch.setenv("SHOKO_URL", "http://shoko:8111")
+    monkeypatch.setenv("SHOKO_API_KEY", "shoko-test-key-never-a-real-secret")
+    sonarr = ApiEndpoint(httpx.Client(), lambda: {})
+    shoko = ApiEndpoint(httpx.Client(), lambda: {})
+    invoked: list[tuple[ApiEndpoint, ApiEndpoint]] = []
+    monkeypatch.setattr(
+        cli, "bootstrap_endpoints", lambda _settings: (sonarr, shoko), raising=False
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_service",
+        lambda sonarr_arg, shoko_arg, **_kwargs: invoked.append((sonarr_arg, shoko_arg)),
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "make_signal_handlers", lambda _state: ())
+
+    try:
+        assert main(["service"]) == EXIT_OK
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+    assert invoked == [(sonarr, shoko)]
 
 
 def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
