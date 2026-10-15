@@ -396,10 +396,18 @@ def _known_keys(section: Mapping[Any, Any], allowed: Iterable[str], field_name: 
 def _service(section: Mapping[str, Any], name: str) -> ServiceSettings:
     _known_keys(section, _SERVICE_KEYS, name)
     return ServiceSettings(
-        url=_base_url(section.get("url"), f"{name}.url"),
+        url=validate_base_url(section.get("url"), f"{name}.url"),
         api_key=_secret_ref(section, name),
         allowed_roots=_allowed_roots(section, name),
     )
+
+
+def validate_base_url(raw: Any, field_name: str) -> str:
+    """Validate an HTTP(S) service URL without echoing credentials or malformed input."""
+    try:
+        return _base_url(raw, field_name)
+    except ValueError:
+        raise ConfigError(f"{field_name}: must be a valid HTTP(S) URL") from None
 
 
 def _base_url(raw: Any, field_name: str) -> str:
@@ -412,6 +420,12 @@ def _base_url(raw: Any, field_name: str) -> str:
         raise ConfigError(f"{field_name}: scheme must be http or https (got {parts.scheme!r})")
     if not parts.hostname:
         raise ConfigError(f"{field_name}: must include a host")
+    try:
+        port = parts.port
+    except ValueError:
+        raise ConfigError(f"{field_name}: must contain a valid port") from None
+    if port == 0:
+        raise ConfigError(f"{field_name}: port must be greater than zero")
     if parts.username or parts.password:
         raise ConfigError(
             f"{field_name}: must not embed credentials (API keys come from the environment)"
