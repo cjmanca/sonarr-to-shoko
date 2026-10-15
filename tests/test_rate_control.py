@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
@@ -77,7 +78,7 @@ def test_unhealthy_signal_reduces_cap_and_resets_success_streak(
     )
     next_state = advance_rate(
         state,
-        replace(signals, **{field: value}),
+        replace(signals, **cast(Any, {field: value})),
         now_iso=T1,
         hard_cycle_cap=20,
     )

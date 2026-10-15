@@ -90,9 +90,12 @@ def _create_v2_database(path: Path) -> dict[str, list[tuple[object, ...]]]:
 def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     before = _create_v2_database(path)
+    assert before["campaigns"]
+    assert before["campaigns"][0][7] == "approved"
 
     with open_state(path) as store:
         assert store.schema_version() == 4
+        # Prior campaign approval survives, but does not populate normal-service consent.
         assert store.get_onboarding_json() is None
         assert store.get_service_pause() == (False, "")
         assert store.get_dashboard_account() is None

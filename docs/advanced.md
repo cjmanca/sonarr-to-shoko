@@ -1,0 +1,521 @@
+# Advanced CLI and recovery reference
+
+This guide retains the operator CLI, SQLite recovery, campaign, mapping, and
+attestation details for existing deployments and troubleshooting. For the normal
+four-variable service installation, start with [README](../README.md) and
+[deployment](deployment.md). For live-only side-effect preflight guidance, see
+[advanced deployment and safety](advanced-deployment.md).
+
+The commands below are advanced compatibility surfaces. They do not authorize the
+normal service; old YAML apply flags, leases, campaign approvals, and digests never
+become normal-service consent.
+
+## Install
+
+```powershell
+uv sync            # creates/syncs .venv with runtime and dev dependencies
+```
+
+## Run
+
+```powershell
+$env:SONARR_API_KEY = "<key>"   # API key values live only in the environment
+$env:SHOKO_API_KEY  = "<key>"   # the config file stores only the variable NAMES
+uv run shoko-sonarr-linker validate config.example.yaml
+uv run shoko-sonarr-linker config config.example.yaml --check
+uv run shoko-sonarr-linker mappings status config.example.yaml --json
+uv run shoko-sonarr-linker mappings refresh --force config.example.yaml
+uv run shoko-sonarr-linker attestation status config.example.yaml --json
+uv run shoko-sonarr-linker once --dry-run config.example.yaml --max-links 20
+uv run shoko-sonarr-linker daemon --cycles 1 config.example.yaml
+uv run shoko-sonarr-linker audit config.example.yaml --limit 25 --json
+uv run shoko-sonarr-linker report config.example.yaml --json
+uv run shoko-sonarr-linker health config.example.yaml
+uv run python -m pytest -q
+```
+
+## Commands
+
+| Command | What it does | Network |
+| --- | --- | --- |
+| `validate` | Offline config validation (`--live-read-only` is not implemented in this build) | none |
+| `config [path] [--check]` | Resolved config path; `--check` loads and validates | none |
+| `once [--dry-run] [--apply] [--policy P] [--max-links N] [--json]` | One reconciliation cycle. Dry-run by default. `--max-links N` caps **POST submissions** (not enumerated files); default `sync.max_new_per_cycle`. `--apply` requires the write gate **and** a valid attestation lease | Sonarr/Shoko reads; writes only through the gated path |
+| `daemon [--cycles N] [--once-signal] [--policy P] [--json]` | The polling loop: interval/backoff/jitter from config, apply only when the gate **and** lease open, SIGINT/SIGTERM stop after the current cycle (an idle daemon wakes from the **interruptible** sleep immediately; a signal during a cycle is honoured once that cycle completes, never mid-write). Cycle metadata persists after every cycle, so health/cadence stay fresh. `--cycles N` (and `--once-signal`) bound the loop for tests/CI. Full/light cadence: light cycles poll the same inventories with halved recovery/apply work budgets; `full_reconcile_interval_hours` forces a full reconcile. **F7 + F10:** with `campaign.daemon_auto_apply: true` (default) it drains an **approved** backlog campaign automatically — one bounded batch per apply cycle — only after the operator's manual canary **and** the explicit `campaign authorize-drain` confirmation bound to the plan digest; a changed plan fingerprint set invalidates the authorization, and `campaign revoke-drain` stops the drain | apply gated |
+| `report [--json]` | Read-only rollup: state counts by state/cohort, detail roll-up, mapping generation + affected candidates, safety fields, campaign summaries, outstanding jobs, coverage denominators, liveness/reconciliation levels, and persisted per-path write activity | none |
+| `health [--json]` | Cheap liveness plus last-cycle per-path eligibility, submissions, total link-request attempts, and suppression state (state/meta + cache only) | none |
+| `mappings status [--json]` | Active generation: revision/content/effective/structure digests, age, last attempted/success + outcome, next due, source availability, mapping-affected candidate counts from the state DB. An absent generation is reported with exit 0 (informational) | none |
+| `mappings refresh [--force] [--json]` | Due-gated conditional GET of the Anime-Lists source only. Exit 0 for `activated`/`unchanged` (304)/`not_due`; exit 4 on failure (the last-known-good generation stays active) | mapping source only |
+| `attestation status [--scope S] [--json]` | Evaluate the configured safety lease **offline** (no network): `valid`/`absent`/`invalid`/`expired`/`stale_version`, the record fields, digest, seconds-to-expiry and the warn-lead flag. Scope is `daemon` (default) or `campaign:<id>` | none |
+| `attestation record --endpoint URL --version VER --mounts ITEMS --settings FLAGS [--hours H] [--scope S] --note TEXT --confirm [--json]` | Operator builds the lease from the facts **they physically inspected** (read-only mounts, Shoko version, safety settings flags). Expiry is capped by `safety.attestation_validity_hours`; 0600 is attempted where the platform supports it | none |
+| `attestation invalidate [--scope S] --note TEXT --confirm [--json]` | Move the lease for the requested scope (`daemon` default, `campaign:<id>`) to `…​.revoked` (the audit trail is never overwritten) and record the action; a campaign-scope invalidate never touches the daemon lease. Applies stay closed in that scope until a new lease is recorded | none |
+| `campaign prepare [--limit N] [--deadline-hours H] --out FILE [--json]` | Full **dry-run** reconciliation (zero writes) → canonical plan file of backlog candidates with resolved mappings. Prints the **approval digest** (canonical SHA-256 of the plan file) | Sonarr/Shoko reads only |
+| `campaign approve --plan FILE --digest HEX [--json]` | Approve the campaign by supplying the digest **separately from the file**; a mismatch refuses (exit 2) and prints both digests. Persists the approved campaign row + per-file bindings | none |
+| `campaign apply --plan FILE [--batch-size N] [--json]` | One bounded batch (default/cap `campaign.max_batch_size`) of **approved** candidates through the guarded path. Repeated invocations consume the one approval. Campaign-state refusals (not-approved/revoked/paused/deadline/max-submissions/plan drift/attestation/gate/eligibility) exit 3 with zero POSTs; a malformed plan file exits 2. A queue blocked beyond `sync.queue_blocked_tolerance` **defers** every candidate (zero POSTs, no quarantine) | guarded path for approved files only |
+| `campaign verify --campaign-id ID [--json]` | Re-poll verification of campaign sends (read-only cycle; zero POSTs) | XRef GETs only |
+| `campaign report --campaign-id ID [--plan FILE] [--json]` | Progress (sent/verified/quarantined/remaining), digests, deadline, pause reason, and the **drain-authorization state** (`drain_selection`: `authorized` / `drain_not_authorized` / `drain_revoked` / `drain_digest_stale` / `status_*`, plus `drain_authorized_iso`/`drain_authorized_digest`/`drain_invalidated_reason`) so the operator sees why the daemon is skipping a campaign; `--plan` also re-checks the plan file digest. `remaining` = plan files with **no** persisted send progress: any file with send progress counts as consumed, including sends that ended in `conflict` (operator-review rows are never counted as "still to send") | none |
+| `campaign pause --campaign-id ID [--reason TEXT] --note TEXT --confirm [--json]` | Persist a campaign pause with a reason | none |
+| `campaign resume --campaign-id ID --note TEXT --confirm [--json]` | Resume after re-checking the attestation lease (campaign scope) **and** the write gate | none |
+| `campaign revoke --campaign-id ID --note TEXT --confirm [--json]` | Revoke: queued planned/mapped rows return to `waiting` with a reason; rows past `planned` are never rewound; future applies refuse | none |
+| `campaign authorize-drain --campaign-id ID --note TEXT --confirm [--json]` | **F10 drain authorization.** The operator's explicit confirmation that the canary passed: requires an APPROVED campaign whose canary is SETTLED (≥1 submitted file and EVERY submitted campaign file `verified` — a `request_may_have_been_sent`/`verifying`/`partial`/`indeterminate_write`/`conflict` row refuses). The grant binds the campaign's current approval digest and persists across restarts; only the automatic daemon drain consumes it — manual `campaign apply` never requires it. Without this authorization the daemon drains NOTHING | none |
+| `campaign revoke-drain --campaign-id ID --note TEXT --confirm [--json]` | Withdraw the drain authorization: the daemon skips the campaign (`drain_revoked`) **and a running drain batch stops at its next submission** — zero further campaign POSTs, the remainder stays queueable; the campaign status is untouched, so manual `campaign apply` stays available. A re-grant after a fresh review is the operator's decision | none |
+| `audit [--series-anidb N] [--limit N] [--max-requests N] [--json]` | Bounded **read-only** existing-link audit (GETs only, zero writes): classifies already-linked Shoko files against the verified mapping as `linked_consistent` (exact identity-set equality only), `partial_link`, `existing_link_mismatch`, `wrong_first_episode`, `ambiguous_match`, plus `no_sonarr_counterpart`/`audit_incomplete` buckets | Shoko/Sonarr GETs within the request budget |
+| `resolve-send --file-id N --fingerprint FP (--release\|--block) --note TEXT --confirm [--json]` | Operator close of a live terminal-review send (releases the budget slot). Refuses verified/closed rows. A closed send authorizes only a **fresh** re-plan fingerprint | none |
+| `clear-requires-rebaseline --note TEXT --confirm [--json]` | Operator clear of the persisted source-discontinuity flag | none |
+| `steal-apply-lock --note TEXT --confirm [--json]` | Take over a **dead** owner's apply lease: it requires the OS advisory lock (`apply.lock`) to be **free**, so a live owner (kernel-held lock) refuses and names the holder. An expired meta lease with a free OS lock is audit-recorded and the OS lock is released | none |
+| `resume-writes --note TEXT --confirm [--json]` | Clear the stopped-writes marker and the write pause | none |
+| `pause-writes --reason TEXT [--hours H] --note TEXT --confirm [--json]` | Persist a write pause with a reason | none |
+
+Cycle payloads report `new_arrival_apply_eligible`, `campaign_drain_selected` (an
+authorized campaign was selected for this cycle), and `campaign_apply_eligible` (the
+selected campaign passed its batch-level guards) separately. `new_arrival_submitted` and `campaign_submitted`
+are actual link-request attempts for their respective paths; `total_link_requests_attempted`
+is their sum, including rejected or indeterminate POST outcomes. The legacy `apply_eligible`
+and `counts.submitted` fields remain scoped to new arrivals. `writes_suppressed` (also
+reported as `all_writes_suppressed`) is true only when both mutation paths were gated; an
+eligible cycle with no candidate request has `total_link_requests_attempted: 0` but is not
+misreported as globally suppressed.
+
+Operator commands mutate durable state, so they require `--confirm` plus a `--note`;
+they refuse (exit `5`) while state writes are stopped, except `resume-writes`.
+`--json` output is nonsecret everywhere: reports carry API-key environment-variable
+**names**, never values, and never raw Shoko settings dumps. In `--json` mode stdout is
+**exactly one JSON document**: the human config summary and the `daemon` startup preamble
+are suppressed, so `json.loads(stdout)` parses cleanly (diagnostics go to the log stream).
+
+Configuration is YAML (`config.example.yaml` is the full example; every accepted
+field is documented there).
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success — completed cycle, mapping `activated`/`unchanged` (304)/`not_due`, informational `mappings status`/`report`/`health`/`audit` (an absent generation/state is reported, not an error), a confirmed operator action, a clean `daemon` exit, a campaign `prepare`/`approve`/`apply`/`verify`/`report`/`pause`/`resume`/`revoke`/`authorize-drain`/`revoke-drain` that completed |
+| `2` | Configuration/request invalid (unknown policy, unconfirmed operator command, bad flags, a malformed plan file — on **any** campaign command including `apply`, plan-file parse/digest-format errors are invalid input —, an `approve` digest mismatch — the refusal prints **both** digests; the message names the failed field, never a secret) |
+| `3` | Apply-gate refusal (`--apply`/campaign `apply` with the default-deny gate shut) **and** campaign-state apply refusals: campaign not approved, revocation, campaign pause, deadline, max-submissions, plan drift, attestation, eligibility |
+| `4` | Runtime/network failure (mapping-source fetch failure, transport-failed cycle, an audit whose Shoko listing failed, `validate --live-read-only` not implemented in this build) |
+| `5` | State error (the state store refused: illegal transition, held apply lock, stopped writes, record/budget refusals) |
+
+## Write safety: gate **and** attestation
+
+Live Shoko writes require **all** of:
+
+1. `sync.apply_changes: true` in the config, **and**
+2. the operator environment variable `SHOKO_LINKER_ALLOW_APPLY=1`, **and**
+3. a **valid safety attestation lease** (`safety.attestation_file`) whose endpoint
+   identity matches the configured Shoko URL, whose scope matches the caller
+   (`daemon` for `once --apply`/`daemon`, `campaign:<id>` for a campaign apply),
+   that has not expired, and that matches the configured version hint when one
+   is supplied.
+
+No command-line flag opens the gate by itself.
+
+### Safety attestation lease (lifecycle)
+
+The lease is an **operator-created** YAML/JSON record (`attestation record … --confirm`)
+of the physical facts the software cannot observe: the Shoko endpoint identity, the
+inspected Shoko version, read-only-mount summaries, and the four safety settings
+flags (`FileQualityFilterEnabled`, `RenameOnImport`, `MoveOnImport`, `MyListAddFiles`
+— recorded values only, never a raw settings dump). Its integrity is a canonical
+SHA-256 digest: **the trust anchor is the operator**, so the digest is tamper
+*evidence*, not a security boundary. Keep the file readable only by the operator
+(0600 where the platform supports it; the tool attempts it and warns when it cannot).
+
+Two **independent** leases gate writes, each evaluated by scope:
+
+- The **daemon lease** lives at `safety.attestation_file` (scope `daemon`) and gates
+  `once --apply` and the daemon's own new-arrival/backlog apply.
+- Each **campaign lease** lives at the sibling `<stem>.campaign-<id>.yaml` in the same
+  directory (scope `campaign:<id>`, e.g. `attestation.campaign-<id>.yaml` for
+  `attestation.yaml`) and gates that campaign's batches — both a manual `campaign apply`
+  and the daemon's automatic drain of the same campaign.
+
+`attestation record|status|invalidate` all take `--scope` (default `daemon`); recording a
+campaign lease never clobbers the daemon lease, and a campaign-scope `invalidate` never
+touches the daemon lease. Each lease expires and pauses **only its own scope**, and both
+survive a restart: a campaign can drain under a valid campaign lease even when the daemon
+lease is invalid, and vice versa.
+
+Lifecycle:
+
+1. Inspect the deployment (see [Deployment safety](#deployment-safety)), then
+   `attestation record --endpoint … --version … --mounts … --settings … --hours N --scope daemon --note … --confirm`.
+   `--hours` may not exceed `safety.attestation_validity_hours` (default 168). When
+   `safety.attested_shoko_version` is configured, the lease's `--version` must equal it
+   (a Shoko upgrade therefore requires re-inspection + a new lease, never an inherited one).
+2. `attestation status [--scope S]` evaluates the lease offline; a valid lease expiring within
+   `safety.attestation_warn_seconds` (default 3600) reports `warn_before_expiry` and
+   the daemon logs a warning — apply still proceeds.
+3. When the daemon lease is absent/invalid/expired/scope-mismatched/stale-version, the daemon
+   suppresses its own applies, persists exactly one write pause (`attestation_expired`) per
+   valid→invalid transition, warns, and **stays alive reporting read-only** (never a restart
+   loop); a re-recorded lease clears only a pause whose reason is `attestation_expired`. A
+   campaign-scope lease transition pauses only that campaign (never a global write pause).
+4. `attestation invalidate --scope S --confirm` moves that scope's lease to `…​.revoked`
+   (audit trail preserved) and records the operator action; applies stay closed in that scope.
+
+**Documented tradeoff (PLAN M7):** a completely unattended *indefinite* writable
+daemon is incompatible with an expiring physical-safety attestation. The daemon
+therefore degrades to read-only reporting after expiry; writes resume only when a
+human re-attests. Unattended campaign apply has the same bound: a campaign
+apply needs a lease scoped `campaign:<id>`.
+
+### Existing-link audit
+
+`audit` is bounded and read-only (`--limit` linked files, `--max-requests` Shoko GETs,
+default 100 each; zero POSTs by construction). It **includes already-recognized
+files** (the discovery path deliberately excludes them) and classifies observed
+AniDB cross-references against the verified mapping generation. `linked_consistent`
+fires **only on exact identity-set equality** — the existence of a link never marks
+a link correct. Findings are informational (exit 0); only a transport
+failure exits 4. The audit never unlinks, never repairs, consumes no state DB and no
+budget slots.
+
+### Backlog campaign walkthrough
+
+One approval, many bounded batches (all mutating writes flow through the same
+M5 guarded path and the M6 durability machine):
+
+```powershell
+# 1. Dry-run reconciliation → canonical plan + approval digest (zero writes)
+uv run shoko-sonarr-linker campaign prepare config.yaml --limit 500 --out plan.json --json
+
+# 2. Canary review of the plan file (dry-run only, zero writes): inspect plan.json —
+#    the exact file list, paths/sizes, AniDB identities, and the approval digest.
+#    There is no canary `campaign apply` at this point: nothing is approved yet, so
+#    apply would refuse (the campaign is not in the state DB).
+
+# 3. Approve with the digest supplied SEPARATELY from the plan file
+uv run shoko-sonarr-linker campaign approve --plan plan.json --digest <approval-digest> --json
+
+# 4. Record the campaign-scope lease, then run the bounded canary batch (one file)
+uv run shoko-sonarr-linker attestation record --endpoint http://shoko:8111 --version 5.3.3 `
+  --mounts "/anime read-only (host-inspected)" `
+  --settings "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false" `
+  --hours 24 --scope "campaign:<campaign-id>" --note "canary window" --confirm
+uv run shoko-sonarr-linker campaign apply --plan plan.json --batch-size 1 --json
+
+# 5. Verification + progress for the canary batch (read-only, zero POSTs)
+uv run shoko-sonarr-linker campaign verify --campaign-id <campaign-id> --json
+uv run shoko-sonarr-linker campaign report --campaign-id <campaign-id> --plan plan.json --json
+
+# 6. Remaining bounded batches — automatic (daemon) or manual (CLI, both remain available)
+#    After the canary above is verified, the operator inspects the physical-media side effects
+#    (renames, deletions, MyList writes Shoko jobs can cause) and authorizes the automatic drain:
+uv run shoko-sonarr-linker campaign authorize-drain --campaign-id <campaign-id> `
+  --note "canary inspected: side effects reviewed" --confirm
+#    Then start the daemon: with campaign.daemon_auto_apply: true (default) it drains the approved
+#    campaign ONE bounded batch per apply cycle, under the full guard chain, with zero further
+#    manual invocations. Without the authorization it drains NOTHING. The one-batch CLI command
+#    stays for manual operation (it never requires the authorization):
+uv run shoko-sonarr-linker campaign apply --plan plan.json --json   # ≤ campaign.max_batch_size files
+```
+
+**Campaign deadline planning.** `campaign prepare` reports a warning when the configured rolling
+submission limit makes the requested deadline too short, but it leaves both the deadline and
+submission limit unchanged. The optimistic minimum wait for the last budget window is
+`(ceil(files / rolling_new_limit) - 1) × rolling_window_hours`; for 7,000 files at 200 per 168-hour
+window, that is about 5,712 hours (238 days) before the last window can start. Prepare a large
+campaign with a deadline that allows for that wait, for example:
+
+```powershell
+uv run shoko-sonarr-linker campaign prepare config.yaml --deadline-hours 6000 --out plan.json --json
+```
+
+Transient failures, pending Shoko jobs, and verification delays can take longer than this optimistic
+estimate. A zero `rolling_new_limit` means no campaign submissions can complete. The campaign
+safety-attestation lease expires independently of the campaign deadline; inspect the physical
+safety conditions again and renew that lease as needed. Increasing the campaign deadline does not
+extend the lease or change the configured submission limits.
+
+**Daemon auto-drain (F7 + F10).** The unattended objective: an approved 7,000-file backlog must not
+need hundreds of manual `campaign apply` invocations. Once the campaign is approved, the operator's
+canary batch has completed **settled** (≥1 submitted file, every submitted file `verified`
+— `verifying`/`partial`/`indeterminate_write`/`conflict` rows refuse the grant), **and** the operator
+has run `campaign authorize-drain --confirm`, the daemon drains subsequent batches automatically:
+one bounded batch (≤ `campaign.max_batch_size`) per apply cycle, oldest approved campaign first,
+through the exact same guarded path as `campaign apply` (the daemon's own
+apply lock is reused, so a daemon batch and a concurrent CLI `campaign apply` contend for the
+single lock — one apply writer). It never approves a campaign, never expands an approved set, and
+never opens the write gate; pause/resume/revoke, plan drift, mapping drift, deadline, budgets,
+queue, and an expiring campaign lease all stop the drain with persisted state and zero POSTs.
+The authorization binds the plan approval digest: a plan-fingerprint change invalidates it
+(`drain_digest_stale` in `campaign report`), and `campaign revoke-drain` withdraws it
+(`drain_revoked`) — in both cases the operator re-reviews and re-grants. Set
+`campaign.daemon_auto_apply: false` to keep campaigns manual-only.
+
+Rules that the apply path enforces, with persisted evidence:
+
+- **Plan drift** (the plan file's digest no longer equals the stored approval
+  digest) → campaign paused (`plan_drift`), **zero POSTs**.
+- **Candidate drift** (path/size/fingerprint changed) → the file is **quarantined**
+  (`campaign_quarantine` reason; row goes to `blocked_safety`/`waiting`) —
+  never silently replaced, never auto-approved.
+- **Pending targets**: a file approved with an empty `shoko_episode_ids`
+  list and preapproved AniDB identities resolves its Shoko IDs at apply time; the
+  resolved set must equal the preapproved set **exactly** (mismatch → quarantine
+  `target_drift`, zero POSTs for it). The approved set **never expands**: a file the
+  plan file does not name is never processed, and a newly resolvable mapping for a
+  non-approved file never enters the campaign.
+- Deadline passed / `max_submissions` reached → refuse (the budget one auto-pauses).
+- Global churn, mapping drift, writes-disabled, source discontinuity, lease expiry →
+  campaign pause persisted + report.
+- Pause/resume/revoke are operator commands: revoke returns queued planned/mapped
+  rows to `waiting` with a reason and refuses future applies.
+- **Drain authorization (F10):** the daemon's automatic drain runs only with the operator's
+  explicit `campaign authorize-drain` confirmation of a SETTLED canary (every submitted
+  campaign file `verified`); it binds the approval digest, survives restarts, is invalidated by
+  a plan-fingerprint change, and is withdrawn by `campaign revoke-drain`. Manual `campaign apply`
+  never requires it. `campaign report` shows `drain_selection` so the skip reason is visible.
+- `campaign report`'s `remaining` counts plan files with **no** persisted send progress,
+  so every file with any send progress is excluded — including `conflict`-state sends
+  (operator-review rows are never re-counted as still-to-send).
+
+## Safety defaults
+
+- **Dry-run is the default.** `once`/`daemon`/`campaign prepare` run the full read
+  cycle and persist local state, and make no remote change; Shoko writes happen only
+  in apply mode, only through `linking.submit_link`, only after `preflight` and the
+  durable `prepare_send` → `mark_sent` ordering.
+- **Live writes are default-deny** and open only through `shoko_linker.config.apply_gate`:
+  both `sync.apply_changes: true` in the config **and** the operator environment variable
+  `SHOKO_LINKER_ALLOW_APPLY=1`, **and** a valid in-scope attestation lease. `once --apply`
+  refuses with exit `3` otherwise; no CLI flag enables writes by itself.
+- **Secrets are environment-only.** Config holds the variable name; values are read at
+  access time, never stored in settings, reports, `repr`, and scrubbed from logs by a
+  redaction filter **and** a redacting formatter (tracebacks included) registered at
+  client creation. Redaction is literal-substring scrubbing of registered values:
+  values shorter than 8 characters are not registered (scrubbing them would erase
+  ordinary words) — client creation logs a warning naming only the length — real
+  Sonarr/Shoko keys are long, and request logging must keep keys out of URLs entirely.
+- **Scope fails closed.** `sonarr.allowed_roots`, `shoko.allowed_roots` and
+  `paths.mappings` must be non-empty. Root matching is path-component-aware
+  (`/anime` never matches `/anime-old`), paths are compared case-sensitively, and nested
+  or conflicting mappings are rejected at load time.
+- **No automatic retries.** Clients are built with `follow_redirects=False`,
+  `retries=0`, and explicit timeouts. Redirects are followed only by
+  `http.resolve_and_send`, which caps hops, and drops auth headers when a redirect
+  target's origin differs. Non-idempotent requests are never replayed (HTTP 303 after a
+  POST is refused).
+- **No media file access.** This tool never opens, renames, moves, or deletes media.
+- **A blocked Shoko queue suppresses apply.** Every apply consults the read-only
+  `GET /Queue` snapshot: `BlockedCount` above `sync.queue_blocked_tolerance`
+  (default **0** — any blocked work) refuses all submissions (`queue_blocked`, zero
+  POSTs, reported per cycle; campaign candidates are **deferred**, never quarantined),
+  and a queue read failure refuses apply too (`queue_unknown`). Delivery of the
+  async `ManualLinkJob` chain cannot be trusted on a blocked queue.
+  **Freshness bound:** the snapshot is taken once per daemon apply **cycle** and once
+  per campaign apply **batch** (plus each send's inline verification window), so a queue
+  that becomes blocked *after* the snapshot is not seen until the next cycle/batch —
+  the guard bounds the exposure window, it is not a race-free guarantee (documented M5
+  design limit).
+- **New files get a grace window before their first submit.** In apply cycles (`once --apply`
+  and `daemon` apply) a `new_arrival`-cohort file is deferred with the `grace_period` reason
+  while `now − first_seen_iso < sync.new_file_grace_period_seconds` (default **300**; `0`
+  disables the window). The row stays `planned`, consumes **no** budget slot, and is
+  never quarantined; the first cycle that starts after the window closes submits it.
+  Shoko's own post-arrival import/XRef state settles during the window, so submitting in
+  the arrival cycle is not attempted. Backlog and campaign files are **not** grace-gated: the
+  daemon never submits them as new arrivals. An **approved** backlog campaign drains
+  automatically on the F7 path (one bounded batch per apply cycle, after the canary) when
+  `campaign.daemon_auto_apply: true`; the daemon never auto-approves a campaign, so an unapproved
+  backlog is never mass-submitted by a daemon started with `apply_changes=true`.
+
+## Configuration budgets (M7-a/M7-b)
+
+`sync` carries the cycle/budget knobs (defaults shown in `config.example.yaml`):
+`max_new_per_cycle` (default 20; aggregate submissions by new-arrival and automatic-campaign
+processing in one daemon cycle; each manual `campaign apply` gets its own cycle budget; also
+bounds pending file requests), `rolling_new_limit`
+(200), `rolling_window_hours` (168), `max_pending_episode_jobs` (10),
+`max_cycle_seconds` (300), `max_recovery_rows_per_cycle` (100),
+`verification_timeout_seconds` (3600), `apply_lock_lease_seconds` (3600),
+`jitter_ratio` (0.1, max 0.5), `mapping_churn_limit` (500),
+`new_file_grace_period_seconds` (300 — daemon-apply grace window for `new_arrival`
+files; deferrals are reason `grace_period`, no budget consumed; `0` disables it, see
+[Safety defaults](#safety-defaults)) and
+`queue_blocked_tolerance` (0 — fail-closed Shoko queue guard, see below).
+
+`safety` carries the attestation lease: `attestation_file` (null = no lease → every
+apply refused `attestation_invalid`), `attestation_validity_hours` (168, the hard
+lease-lifetime cap), `attestation_warn_seconds` (3600, the pre-expiry warning lead) and
+`attested_shoko_version` (null = no version pin; when set, a lease recorded for a
+different Shoko version evaluates `stale_version` and every apply is suppressed until
+re-inspection).
+`campaign` carries `max_campaign_files` (7000, the plan bound and default
+`prepare --limit`) and `max_batch_size` (10, the per-invocation apply cap). These
+ceilings never bypass the write gate, the lease, the state budgets, or the plan
+approval digest.
+
+Out-of-range values (NaN/inf, negatives where nonsense, zero where > 0, non-whole
+numbers) are refused at load time with exit `2`.
+
+`apply_lock_lease_seconds` is an **audit/visibility** window only, never a lock timeout:
+exclusive apply ownership is fenced by an OS advisory lock file (`apply.lock`, a sibling
+of the state DB) that is held for the whole apply operation and freed by the kernel
+when the owning process exits. A live apply operation therefore **never** loses ownership
+because a fixed lease elapsed — a second live process (a restart race, an operator
+campaign) is refused, and `steal-apply-lock` refuses too. The supported deployment is
+one container on a local (or cache-backed) volume state directory; like the SQLite caveat,
+`flock`/byte-range locks are unreliable on SMB/NFS.
+
+`report` coverage percentages are computed from **state-DB inventory counts**
+(files tracked vs verified, with explicit denominators) and note that they reflect the
+last cycle inventory.
+
+## Deployment runbook
+
+The live-only operator procedure is in
+[advanced deployment runbook](advanced-deployment.md): read-only preflight, Shoko safety
+inspection, attestation lease, one-file canary, campaign canary, backup,
+rollback, and live acceptance checks. The mocked M9 end-to-end suite is offline
+evidence only; live validation remains operator work.
+
+## Deployment safety
+
+The daemon never mounts media, and that stays true for a reason: **Shoko's
+`ManualLinkJob` chain runs server-side after an accepted link** and can trigger
+file-quality-filter deletions, renames/moves, plugin reactions, and AniDB MyList
+writes (docs §2). Before recording any attestation lease, inspect the **Shoko
+container's own mounts on the host**:
+
+```powershell
+docker inspect --format "{{json .Mounts}}" <shoko-container>   # verify media mounts are :ro
+```
+
+Checklist the lease records (operator-inspected, human-verified):
+
+- Shoko's import-folder media mounts are **read-only** on the host; the Shoko-side
+  `ImportFolder` list has no drop folders (`DropFolderType: None` for Sonarr-owned
+  paths).
+- Shoko settings: `FileQualityFilterEnabled=false` (quality filter deletes
+  non-linked files), `Plugins.Renamer.RenameOnImport=false`,
+  `Plugins.Renamer.MoveOnImport=false` (rename/move physically relocates files),
+  `AniDb.MyList_AddFiles=false` (every link writes to AniDB MyList upstream).
+  Record the values you inspected — never a raw settings dump.
+- Sonarr is read-only: the Sonarr API key used here has read scope only.
+- `/data` persistence: the SQLite state DB and the Anime-Lists cache live in the
+  `/data` volume. Keep it on a **local** disk/cache mount (SQLite locking is
+  unreliable on SMB/NFS; Unraid: use an appdata/local-cache path, not a network share).
+- UID/GID: the image runs as a non-root user and writes `/data` as UID/GID 1000 —
+  set the share owner (`chown 1000:1000 <appdata path>`) instead of running as root.
+- Networks: join the existing Sonarr/Shoko Docker network so the configured URLs
+resolve (see [compose.example.yaml](../compose.example.yaml)); no ports are exposed.
+
+### Backup and restore
+
+Back up with the tool stopped (`daemon`/`once` closed): copy
+`/data/state.sqlite3*` (include the `-wal`/`-shm` siblings when present) and the
+derived `mappings/` directory. Restoring to a fresh volume is just the copy back —
+the schedule, budgets, campaign rows, and last-known-good generation all live in
+those files. Never edit the SQLite file by hand.
+
+### Rollback
+
+Writes are reversible in *state* only — Shoko-side links are never unlinked by
+this tool (out of scope): `pause-writes --reason "<why>" --note "<audit note>" --confirm` (stops all apply),
+`attestation invalidate [--scope "campaign:<id>"] --note "<audit note>" --confirm` (applies closed),
+`campaign revoke --campaign-id <id> --note "<audit note>" --confirm`
+(queued approved rows return to `waiting`), `resume-writes --note "<audit note>" --confirm` to re-open.
+A sent-but-unverified file is verified/held, never resubmitted; close it with
+`resolve-send --file-id <id> --fingerprint "<fingerprint>" --release --note "<audit note>" --confirm` after inspection.
+
+## Images (GHCR)
+
+Publishing is defined by [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
+and the publishing policy in PROJECT.md §6: an immutable **SHA-tagged image for every
+pushed commit** (including commits inside multi-commit pushes), `latest` only for the
+newest successfully built default-branch revision, never from untrusted pull requests,
+least-privilege `GITHUB_TOKEN`.
+
+> **EXTERNAL/UNVERIFIED:** the workflow code is implemented and covered by offline
+> enumeration tests, YAML structural tests, and permission-gate checks. It has not been
+> validated by a live GitHub Actions run or GHCR publication.
+
+**Publishing semantics.** The `plan` job runs `scripts/enumerate_introduced.py`
+over the push event (`before..after`; first-push from the first-buildable boundary
+`aa6b85e` inclusive, older history skipped; force-push/non-ancestor falls back to the
+merge-base; branch pushes enumerate from `merge-base(main, head)` so shared history
+is never re-tagged). Each enumerated SHA becomes one matrix leg: checkout that SHA,
+**re-run the checks available for that commit**: `scripts/ci_checks.sh` when present,
+or the trusted uploaded `scripts/validate_historical.py` for older commits. No cached
+pass is substituted for per-commit validation. Then build & push
+`ghcr.io/<owner>/shoko-sonarr-linker:sha-<full-sha>` (provenance on, labels point at
+the commit, registry cache scoped per SHA so builds can't contaminate each other).
+After acquiring its exact-SHA lock, each leg re-queries registry provenance: a
+matching existing image is skipped, a proven-absent tag may be published, and unknown
+state fails closed. Any failed leg fails the publish job and blocks `latest`, even
+though `fail-fast: false` lets sibling legs finish and report their outcomes. A later
+bounded backfill re-reads registry state and can safely retry an absent SHA; it skips
+an already-verified immutable tag and blocks on unknown provenance. PR events run the
+read-only test job only — publish/promote jobs are gated to push/schedule/dispatch
+and fork PRs get a read-only token, so untrusted code can never publish.
+
+There is no workflow-level concurrency group because GitHub may replace a pending
+workflow run when another push arrives. Publisher legs instead serialize **per exact
+SHA** (`concurrency: publish-sha-<sha>`, `cancel-in-progress: false`) and recheck
+registry provenance after acquiring that lock, so duplicate plans do not overwrite an
+existing tag from another run of this workflow. GHCR does not provide a conditional
+tag update in this workflow, so an out-of-band writer could still race after the
+preflight; SHA-tag immutability is enforced only among these workflow publisher legs.
+`latest` is promoted only for a
+push, schedule, or backfill whose selected ref is `main`, by `promote-latest` under
+its own serialized group (`concurrency: latest-promotion`, `cancel-in-progress: false`).
+Promotion requires successful tests and plan, all publish legs successful (or an
+empty matrix), exact-SHA provenance, and a final check that the run SHA is still
+the current `main` head immediately before the latest push.
+
+**Shell-injection hygiene & trust boundary.** No `${{ }}` expression is expanded inside
+a `run:` script body — `github.*`/`inputs.*` values reach the shell only through job/step
+`env:` indirection, and dispatch `from_sha`/`to_sha` inputs are validated as 40-char
+lowercase hex before use. Dispatch trust boundary: `workflow_dispatch` requires repository
+**write access**, and write access is already a code-execution trust boundary (anyone who can
+dispatch can run code here), so the dispatch gates are defense-in-depth, not a secret
+boundary. Dispatch accepts only a selected `refs/heads/*` ref, fetches that exact branch,
+defaults an empty `to_sha` to its fetched head, and requires any explicit `to_sha` to be
+a full lowercase SHA that is an ancestor of that head. A supplied `from_sha` must also
+be an ancestor of `to_sha`; reversed or unrelated ranges fail before enumeration. A
+feature-branch backfill can publish immutable SHA tags but cannot promote `latest`.
+A non-positive `max_shas` fails closed.
+
+**Action pins.** Every `uses:` ref in `publish.yml`/`ci.yml` is pinned to a full commit
+SHA with its release tag in a trailing comment (SHAs fetched from the GitHub refs API,
+2026-10-09, newest patch of each major). The Dockerfile base image is pinned by digest
+and installs strictly from `uv.lock` (`uv sync --frozen --no-dev`, which fails if the
+lock is stale, with `uv pip check` verifying the environment).
+
+**Auth.** Only `secrets.GITHUB_TOKEN` with `contents: read` + `packages: write` on the
+publish/promote jobs — no repository secrets, no Sonarr/Shoko keys exist in CI.
+
+**Event gap.** GitHub does **not** fire `push` workflows for commits created by
+workflows using `GITHUB_TOKEN` (merge queues, auto-commits). The weekly schedule scans
+the default branch. For a capped or unmerged topic branch, manually dispatch a backfill
+against that in-repository branch with `--ref <branch>`; each run is capped (10 by
+default; `max_shas` is clamped to 10 and must be positive), oldest-first, with overflow
+reported for a later run rather than dropped. `to_sha` defaults to the fetched branch
+head; explicit `to_sha` and `from_sha` values are checked as ancestors of the selected
+branch head and of `to_sha`, respectively:
+
+```sh
+gh workflow run publish.yml --ref <branch> -f backfill=true
+gh workflow run publish.yml --ref <branch> -f backfill=true -f from_sha=<exclusive-start-sha> -f to_sha=<end-sha>
+gh workflow run publish.yml -f backfill=true   # whole-history tag-gap scan
+```
+
+Pin deployments to the SHA tag (and record the image digest) — `latest` is a moving
+label, not a safety boundary:
+
+```yaml
+image: ghcr.io/<owner>/shoko-sonarr-linker:sha-<full-sha>   # + record the repo digest
+# strongest: pin the digest directly, immune to tag movement:
+image: ghcr.io/<owner>/shoko-sonarr-linker@sha256:<digest>
+```
+
+## Not implemented in this build
+
+- `validate --live-read-only` refuses immediately with exit `4` and makes no network call.
+- Delta-fetching **light** cycles: light cycles poll the same inventories with reduced
+  work budgets (halved recovery-row cap and submission cap); true Sonarr/Shoko delta
+  endpoints are not invented and remain the M9 optimization.
+- GHCR publishing runs in GitHub Actions — publication has not yet been exercised
+  live (EXTERNAL/UNVERIFIED); build locally with `docker build -t shoko-sonarr-linker:local .`.

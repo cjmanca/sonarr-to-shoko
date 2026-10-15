@@ -37,7 +37,11 @@ services:
       # Unraid bind mounts: the container writes as UID/GID 1000. Set the share
       # owner accordingly (e.g. `chown 1000:1000` on the appdata path) so /data
       # is writable without running the container as root.
-    # No dashboard host port is published by default.
+    # Dashboard listens on container port 8080, but no host port is published by
+    # default. To expose it only on the Docker host, opt in explicitly:
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+    # Dashboard authentication is required after first-use account creation.
     # Sonarr and Shoko are existing services; join their Docker network
     # (name is deployment-specific) so configured URLs resolve:
     networks:

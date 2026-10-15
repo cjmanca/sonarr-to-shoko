@@ -1359,7 +1359,9 @@ def test_steal_apply_lock_refused_while_live_holder_holds_the_os_lock(
 
 
 def test_readme_documents_every_cli_command_and_flags() -> None:
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    readme = (Path(__file__).resolve().parents[1] / "docs" / "advanced.md").read_text(
+        encoding="utf-8"
+    )
     commands = set(cli._COMMAND_HANDLERS)
     assert {"validate", "once", "daemon", "report", "mappings", "health", "config"} <= commands
     for command in sorted(commands):
@@ -1370,3 +1372,17 @@ def test_readme_documents_every_cli_command_and_flags() -> None:
         assert flag in readme
     for marker in ("exit codes", "state error", "apply-gate refusal"):
         assert marker in readme.lower()
+
+
+def test_readme_quick_start_is_consumer_first_and_avoids_operator_jargon() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    lowered = readme.lower()
+    normalized = " ".join(lowered.split())
+    for setting in ("sonarr_url", "sonarr_api_key", "shoko_url", "shoko_api_key"):
+        assert setting in lowered
+    for step in ("1. Install", "2. Enter", "3. Start", "4. Open the dashboard"):
+        assert step.lower() in lowered
+    for jargon in ("campaign", "attestation", "approval digest", "reconciliation"):
+        assert jargon not in lowered
+    assert "unraid.xml" in lowered
+    assert "does not publish a dashboard port" in normalized
