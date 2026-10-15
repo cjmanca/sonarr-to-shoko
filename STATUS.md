@@ -21,7 +21,7 @@
 | F31 — Mapping crash consistency | complete | Immutable digest-identified generation files are selected by an atomic pointer. Source-transition and scheduler snapshots, epoch/attempt fencing, verified legacy migration, and lock-fenced reads/cleanup preserve last-known-good data across interrupted activation and state loss. |
 | F32 — Campaign quarantine accounting | complete | First-time pending progress claims consume the batch allowance; previously recorded claims are skipped without recounting. Mocked tests cover 100-file DRY_RUN quarantine staging, `--batch-size 1`, restart before attribution, no extra POSTs, and unchanged submission/rolling-budget counters. |
 | F33 — Operational deadline guidance | complete | Preparation warns from the approved file count and configured rolling limits; it leaves deadlines, limits, and safety leases unchanged. README and deployment guidance explain the optimistic horizon and separate lease renewal. |
-| Final validation and independent review | pending | Full project checks, Docker build/smoke checks, and final safety-critical review remain. |
+| Final validation and independent review | complete | Full configured tests, Ruff, format, mypy, diff check, Docker build, and offline container smoke checks passed. Final sequential read-only review found no unresolved findings; PLAN.md digest remains unchanged. |
 
 ## F31 — Mapping crash consistency (complete)
 
@@ -77,6 +77,20 @@
 - Local F33 implementation commit: `a500c03` (`feat: warn about campaign deadline limits`).
 - No live Sonarr/Shoko requests or writes occurred; no push, publish, or deployment was performed.
 
+## Final validation and review (complete)
+
+- Full suite: `uv run pytest -q` → passed through **100%** (mocked/offline project tests).
+- `uv run ruff check .` → passed.
+- `uv run ruff format --check .` → **51 files already formatted**.
+- `uv run mypy` → passed (**47 source files**).
+- `git diff --check` and `git diff --check 4ef92355fdc03b41499731e0180a18821d6b9d51..HEAD` → no whitespace errors. Git emitted the working-copy CRLF/LF normalization warning for `tests/test_campaign.py`.
+- `docker build -t shoko-sonarr-linker:review .` → passed; image built from the repository Dockerfile and pinned runtime/build dependencies.
+- Container smoke checks passed: `docker run --rm shoko-sonarr-linker:review --help` displayed CLI usage; importing the installed package through `docker run --rm --entrypoint python shoko-sonarr-linker:review -c "import os, shoko_linker; print(f'uid={os.getuid()} gid={os.getgid()}')"` reported `uid=1000 gid=1000`; image inspection confirmed user `1000:1000`, entrypoint `shoko-sonarr-linker`, and default `--help` command.
+- Final sequential read-only audit covered the mapping crash-consistency/source-provenance/last-known-good gates, F32 quarantine batch accounting and budgets/no-extra-POSTs, F33 deadline/lease behavior, the full F26–F30 regression suite, and changed paths against `PLAN.md` and `PROJECT.md`. No unresolved P0/P1/P2/P3 findings. A separate reviewer was unavailable; this was a distinct second-pass audit.
+- `PLAN.md` SHA-256 verified as `0C543E28DD12FA124E845110681F11F9281D4D7057A53CC9F22984A900C64AEB`, matching the approved frozen digest.
+- Local implementation commits: F31 `f31fc88`, F32 `ac157eb`, F33 `a500c03`; evidence commits: F31 `b56fbf3`, F32 `0287c73`, F33 `b220464`.
+- No live Sonarr/Shoko requests or writes, push, publish, or deployment occurred.
+
 ## Next action
 
-Run the full project validation from `PLAN.md`, including the repository-wide tests, Ruff, mypy, Docker build, Docker smoke checks, and final safety-critical review.
+No further implementation action remains for this handoff. The validated commits remain local and unpushed.
