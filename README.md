@@ -215,6 +215,23 @@ uv run shoko-sonarr-linker campaign authorize-drain --campaign-id <campaign-id> 
 uv run shoko-sonarr-linker campaign apply --plan plan.json --json   # ≤ campaign.max_batch_size files
 ```
 
+**Campaign deadline planning.** `campaign prepare` reports a warning when the configured rolling
+submission limit makes the requested deadline too short, but it leaves both the deadline and
+submission limit unchanged. The optimistic minimum wait for the last budget window is
+`(ceil(files / rolling_new_limit) - 1) × rolling_window_hours`; for 7,000 files at 200 per 168-hour
+window, that is about 5,712 hours (238 days) before the last window can start. Prepare a large
+campaign with a deadline that allows for that wait, for example:
+
+```powershell
+uv run shoko-sonarr-linker campaign prepare config.yaml --deadline-hours 6000 --out plan.json --json
+```
+
+Transient failures, pending Shoko jobs, and verification delays can take longer than this optimistic
+estimate. A zero `rolling_new_limit` means no campaign submissions can complete. The campaign
+safety-attestation lease expires independently of the campaign deadline; inspect the physical
+safety conditions again and renew that lease as needed. Increasing the campaign deadline does not
+extend the lease or change the configured submission limits.
+
 **Daemon auto-drain (F7 + F10).** The unattended objective: an approved 7,000-file backlog must not
 need hundreds of manual `campaign apply` invocations. Once the campaign is approved, the operator's
 canary batch has completed **settled** (≥1 submitted file, every submitted file `verified`

@@ -600,6 +600,100 @@ def approve(env: Env, capsys: pytest.CaptureFixture[str], digest: str) -> dict[s
     return cast("dict[str, Any]", json.loads(capsys.readouterr().out))
 
 
+@pytest.mark.parametrize(
+    ("file_count", "deadline_hours", "warn"),
+    [
+        (10, "168", False),
+        (200, "168", False),
+        (201, "168", True),
+        (7000, "168", True),
+        (201, "336", False),
+        (201, "0.01", True),
+    ],
+)
+def test_campaign_prepare_warns_for_implausible_deadline_without_changing_limits(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    file_count: int,
+    deadline_hours: str,
+    warn: bool,
+) -> None:
+    _set_sync(env, rolling_new_limit=200, rolling_window_hours=168.0)
+    env.seed(specs(file_count))
+
+    payload = prepare(
+        env,
+        capsys,
+        deadline_hours=deadline_hours,
+        limit=str(file_count),
+    )
+
+    warnings = payload["warnings"]
+    assert bool(warnings) is warn
+    if warn:
+        assert "optimistic" in warnings[0]
+        assert "rolling_new_limit=200" in warnings[0]
+        assert "transient failures" in warnings[0]
+        assert "safety-attestation" in warnings[0]
+        if file_count == 7000:
+            assert "5712 hours" in warnings[0]
+    plan, _ = read_plan_file(env.tmp_path / "plan.json")
+    assert len(plan.files) == file_count
+    assert plan.max_submissions == file_count
+    assert plan.rate_limits["rolling_new_limit"] == 200.0
+    assert plan.rate_limits["rolling_window_hours"] == 168.0
+    assert datetime.fromisoformat(plan.deadline_iso) - datetime.fromisoformat(
+        plan.created_iso
+    ) == timedelta(hours=float(deadline_hours))
+    assert env.stubs.posts == []
+
+
+def test_campaign_prepare_warns_when_rolling_submission_limit_is_zero(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_sync(env, rolling_new_limit=0, rolling_window_hours=168.0)
+    env.seed(specs(10))
+
+    payload = prepare(env, capsys, limit="10")
+
+    assert len(payload["warnings"]) == 1
+    assert "rolling_new_limit=0" in payload["warnings"][0]
+    assert "cannot complete" in payload["warnings"][0]
+    assert "safety-attestation lease expires separately" in payload["warnings"][0]
+    plan, _ = read_plan_file(env.tmp_path / "plan.json")
+    assert plan.max_submissions == 10
+    assert plan.rate_limits["rolling_new_limit"] == 0.0
+    assert env.stubs.posts == []
+
+
+def test_campaign_prepare_prints_deadline_warning_without_json(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_sync(env, rolling_new_limit=200, rolling_window_hours=168.0)
+    env.seed(specs(201))
+    seed_mapping(env)
+
+    code = main(
+        [
+            "campaign",
+            "prepare",
+            str(env.config_path),
+            "--limit",
+            "201",
+            "--deadline-hours",
+            "168",
+            "--out",
+            str(env.tmp_path / "plan.json"),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "warning: campaign deadline is shorter than the optimistic minimum wait" in output
+    assert "safety-attestation lease expires separately" in output
+    assert env.stubs.posts == []
+
+
 def apply(
     env: Env, capsys: pytest.CaptureFixture[str], *, batch: str | None = None
 ) -> dict[str, Any]:

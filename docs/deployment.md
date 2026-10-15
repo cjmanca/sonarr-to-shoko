@@ -348,6 +348,26 @@ writer runs. `campaign revoke-drain --confirm` withdraws the authorization later
 skips the campaign (`drain_revoked` in `campaign report`) with zero further automatic submissions,
 while manual applies stay available.
 
+### Campaign deadline and lease renewal
+
+`campaign prepare` warns when the configured rolling submission capacity makes the requested
+deadline implausible; it does not reject the plan or silently extend its deadline, the submission
+limit, or the safety-attestation lease. The optimistic minimum wait until the last rolling-budget
+window is `(ceil(files / rolling_new_limit) - 1) × rolling_window_hours`. With the defaults of 200
+submissions per 168-hour window, a 7,000-file campaign needs about 5,712 hours (238 days) before
+its final window can start. For example, explicitly choose a longer campaign deadline when preparing
+that backlog:
+
+```powershell
+uv run shoko-sonarr-linker campaign prepare config.yaml --deadline-hours 6000 --out plan.json --json
+```
+
+This is an optimistic lower bound: transient failures, pending Shoko jobs, and verification delays
+can extend completion time. A zero rolling submission limit makes completion impossible until the
+operator changes the configuration. Safety-attestation expiry is separate; a long campaign may
+require periodic physical-safety reinspection and lease renewal even when its campaign deadline is
+long enough. Raising `--deadline-hours` does not renew or extend that lease.
+
 Campaign drain rules the daemon enforces every batch (identical to `campaign apply`):
 
 - **Canary first, then authorization.** The daemon drains an approved campaign only after the

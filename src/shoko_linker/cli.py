@@ -77,6 +77,7 @@ from .campaign import (
     apply_campaign,
     approve_campaign,
     authorize_campaign_drain,
+    campaign_deadline_warning,
     campaign_drain_selection,
     campaign_pause,
     campaign_report,
@@ -1507,6 +1508,12 @@ def _run_campaign_prepare(args: argparse.Namespace) -> int:
             limit=limit,
             deadline_hours=cast(float, args.deadline_hours),
         )
+        warning = campaign_deadline_warning(
+            len(plan.files),
+            cast(float, args.deadline_hours),
+            settings.sync.rolling_new_limit,
+            settings.sync.rolling_window_hours,
+        )
         write_plan_file(cast(str, args.out), plan)
     finally:
         store.close()
@@ -1519,6 +1526,7 @@ def _run_campaign_prepare(args: argparse.Namespace) -> int:
         "max_submissions": plan.max_submissions,
         "deadline_iso": plan.deadline_iso,
         "mapping_revision": plan.mapping_revision,
+        "warnings": [] if warning is None else [warning],
         "note": (
             "review this file, run a canary, then approve with: campaign approve --plan "
             f"{cast(str, args.out)} --digest {digest} (the digest is supplied SEPARATELY)"
@@ -1527,6 +1535,8 @@ def _run_campaign_prepare(args: argparse.Namespace) -> int:
     if cast(bool, args.json):
         print(json_payload(payload))
         return EXIT_OK
+    for warning_text in cast(list[str], payload["warnings"]):
+        print(f"warning: {warning_text}")
     for key in ("campaign_id", "files", "pending_targets", "max_submissions", "deadline_iso"):
         print(f"{key}: {payload[key]}")
     print(f"plan file: {payload['plan_file']}")

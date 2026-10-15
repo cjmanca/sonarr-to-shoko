@@ -705,6 +705,33 @@ def prepare_campaign(
     return plan, plan_digest(plan)
 
 
+def campaign_deadline_warning(
+    file_count: int,
+    deadline_hours: float,
+    rolling_new_limit: int,
+    rolling_window_hours: float,
+) -> str | None:
+    """Warn when even the optimistic rolling-budget horizon reaches the deadline."""
+    if rolling_new_limit == 0:
+        return (
+            f"campaign has {file_count} files but rolling_new_limit=0, so it cannot complete "
+            "under the configured submission limit; the deadline was not changed. The "
+            "safety-attestation lease expires separately and must be renewed after reinspection"
+        )
+    required_windows = (file_count + rolling_new_limit - 1) // rolling_new_limit
+    minimum_wait_hours = max(0, required_windows - 1) * rolling_window_hours
+    if minimum_wait_hours < deadline_hours:
+        return None
+    return (
+        f"campaign deadline is shorter than the optimistic minimum wait of "
+        f"{minimum_wait_hours:g} hours for {file_count} files at "
+        f"rolling_new_limit={rolling_new_limit} per {rolling_window_hours:g}-hour window; "
+        "transient failures, pending Shoko jobs, and verification delays can extend completion. "
+        "The deadline was not changed, and the safety-attestation lease expires separately "
+        "and must be renewed after reinspection"
+    )
+
+
 def _load_overrides(deps: DaemonDeps) -> Any:
     from . import mappings as _mappings
 
