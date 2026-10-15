@@ -3,6 +3,7 @@
 **Run:** Implement F34 from `PLAN.md`.
 **Approved PLAN.md SHA-256:** `D43140F0DF399F09EDFE5B2D9A851F4266D7293BA6DD02D06605B7FE981A20AB`.
 **Baseline HEAD:** `7d848a30edf4518fe8af5d9528c5eefb86034399`.
+**Validated implementation commit:** `a387e0dbeb3ba73774217c9c6b25419608495961` (`fix: warn when campaign capacity is disabled`).
 **Branch:** `main` (user requested direct work without a worktree).
 **Execution mode:** Offline and mocked tests. No live Sonarr/Shoko requests or writes, deployment, or publishing.
 
@@ -28,4 +29,4 @@
 
 ## Next action
 
-Commit the validated F34 implementation and this run record on `main`, record the resulting implementation commit, then push the authorized commits to `origin`.
+Commit this post-commit status update, then push both authorized commits to `origin/main`.
