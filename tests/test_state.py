@@ -186,10 +186,10 @@ def test_open_state_applies_durability_pragmas_and_schema_version(tmp_path: Path
         assert store.journal_mode() == "wal"
         assert store.synchronous() == "full"
         assert store.foreign_keys_enabled() is True
-        assert store.schema_version() == 2
-        assert store.migrate() == 2
+        assert store.schema_version() == SCHEMA_VERSION
+        assert store.migrate() == SCHEMA_VERSION
         rows = second_view(path, "SELECT version, description FROM schema_version")
-        assert rows[0][0] == 2
+        assert rows[0][0] == SCHEMA_VERSION
 
 
 def test_schema_rejects_newer_version(tmp_path: Path) -> None:
@@ -215,11 +215,12 @@ def test_f17_probe_v1_database_opens_and_answers_campaign_queries(tmp_path: Path
 
 
 def test_f17_v1_migration_preserves_every_row_and_advances_version(tmp_path: Path) -> None:
-    """F17: v1→v2 upgrades in place — version advances, every durable row survives untouched."""
+    """Opening v1 upgrades in place through v3 without changing any historical row."""
     path = tmp_path / "state.sqlite3"
     before = v1fx.build_v1_database(path)
     with open_store(path) as store:
-        assert store.schema_version() == 2
+        assert store.schema_version() == SCHEMA_VERSION
+        assert store.get_onboarding_json() is None
     after = v1fx.snapshot_state(path)
     for table in ("meta", "baselines", "baseline_files", "files", "sends", "budgets"):
         assert after[table] == before[table]
@@ -227,12 +228,15 @@ def test_f17_v1_migration_preserves_every_row_and_advances_version(tmp_path: Pat
     # not-authorized defaults; no campaign row is rewritten.
     assert [row[:13] for row in after["campaigns"]] == [row[:13] for row in before["campaigns"]]
     assert all(row[13:] == (None, None, "") for row in after["campaigns"])
-    # schema_version audit history: the v1 row survives, exactly one v2 row is appended.
+    # schema_version audit history: the v1 row survives, and v2/v3 are appended.
     assert after["schema_version"][0] == before["schema_version"][0]
-    assert len(after["schema_version"]) == len(before["schema_version"]) + 1
-    assert after["schema_version"][-1][0] == 2
-    assert after["schema_version"][-1][2] == "migrated from 1"
-    assert second_view(path, "PRAGMA user_version") == [(2,)]
+    assert len(after["schema_version"]) == len(before["schema_version"]) + 2
+    assert after["schema_version"][-2][0:3:2] == (2, "migrated from 1")
+    assert after["schema_version"][-1][0:3:2] == (3, "migrated from 2")
+    assert second_view(path, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
+    assert second_view(
+        path, "SELECT name FROM sqlite_master WHERE type='table' AND name='onboarding'"
+    ) == [("onboarding",)]
 
 
 def test_f17_migrated_campaign_is_not_drain_authorized(tmp_path: Path) -> None:
@@ -292,15 +296,15 @@ def test_f17_budget_accounting_survives_migration(tmp_path: Path) -> None:
 
 
 def test_f17_reopen_does_not_repeat_migration(tmp_path: Path) -> None:
-    """F17: reopening a v2 database is a no-op — no ALTER, no extra audit row, same data."""
+    """Reopening the current database is a no-op — no extra audit row and same data."""
     path = tmp_path / "state.sqlite3"
     v1fx.build_v1_database(path)
     with open_store(path) as store:
-        assert store.schema_version() == 2
+        assert store.schema_version() == SCHEMA_VERSION
     first = v1fx.snapshot_state(path)
     with open_store(path) as store:
-        assert store.schema_version() == 2
-        assert store.migrate() == 2
+        assert store.schema_version() == SCHEMA_VERSION
+        assert store.migrate() == SCHEMA_VERSION
         assert store.get_campaign(v1fx.CAMPAIGN_ID) is not None
     assert v1fx.snapshot_state(path) == first
 
@@ -338,7 +342,7 @@ def test_f17_interim_v1_with_drain_columns_upgrades_cleanly(tmp_path: Path) -> N
     finally:
         conn.close()
     with open_store(path) as store:
-        assert store.schema_version() == 2
+        assert store.schema_version() == SCHEMA_VERSION
         campaign = store.get_campaign(v1fx.CAMPAIGN_ID)
         assert campaign is not None
         # an existing operator grant is data, not a migration casualty: it survives.
@@ -347,8 +351,8 @@ def test_f17_interim_v1_with_drain_columns_upgrades_cleanly(tmp_path: Path) -> N
         assert campaign_drain_selection(campaign) == "authorized"
     audit = second_view(path, "SELECT version, description FROM schema_version ORDER BY version")
     assert audit[0] == (1, "initial v1 schema")
-    assert audit[1][0] == 2
-    assert audit[1][1] == "migrated from 1"
+    assert audit[1] == (2, "migrated from 1")
+    assert audit[2] == (3, "migrated from 2")
 
 
 def test_f17_future_schema_version_is_refused_fail_closed(tmp_path: Path) -> None:
@@ -356,12 +360,12 @@ def test_f17_future_schema_version_is_refused_fail_closed(tmp_path: Path) -> Non
     path = tmp_path / "state.sqlite3"
     before = v1fx.build_v1_database(path)
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA user_version=3")
+    conn.execute("PRAGMA user_version=4")
     conn.commit()
     conn.close()
-    with pytest.raises(sqlite3.DatabaseError, match="newer than supported 2"), open_store(path):
+    with pytest.raises(sqlite3.DatabaseError, match="newer than supported 3"), open_store(path):
         pass
-    assert second_view(path, "PRAGMA user_version") == [(3,)]
+    assert second_view(path, "PRAGMA user_version") == [(4,)]
     assert v1fx.snapshot_state(path) == before
 
 
@@ -388,7 +392,7 @@ def test_f17_failed_migration_leaves_database_recoverable(
     assert v1fx.snapshot_state(path) == before
     monkeypatch.undo()
     with open_store(path) as store:
-        assert store.schema_version() == 2
+        assert store.schema_version() == SCHEMA_VERSION
         assert store.get_campaign(v1fx.CAMPAIGN_ID) is not None
     after = v1fx.snapshot_state(path)
     assert [row[:13] for row in after["campaigns"]] == [row[:13] for row in before["campaigns"]]

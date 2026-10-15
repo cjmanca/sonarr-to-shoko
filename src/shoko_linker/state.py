@@ -82,8 +82,8 @@ F7 (also schema v1, unshipped — no image shipped with v1 columns has ever been
 ``campaigns.plan_path`` records the canonical plan file path bound at approval, so the daemon
 drains an approved campaign against the same file the ``plan_drift`` digest gate re-verifies;
 it is appended to ``_SCHEMA_SQL`` (schema v1, unshipped). **F17 supersedes this framing:** the
-schema now ships at v2 and the registered ``1 → 2`` migration (below) upgrades any existing v1
-database in place — no database is rebuilt.
+schema shipped at v2 with a registered ``1 → 2`` migration. M3 adds only an onboarding table
+through a registered ``2 → 3`` migration; no prior state is rebuilt or discarded.
 
 **F17 (schema v2): the F10 drain-authorization columns ARE a schema change.** A database created
 by the previous implementation carries ``user_version = 1`` **without** those columns, so
@@ -94,9 +94,14 @@ re-inspects the canary and re-grants), using ``PRAGMA table_info`` so an interim
 already has the columns upgrades cleanly. The step, the ``PRAGMA user_version=2`` bump and the
 ``schema_version`` audit row commit in **one transaction**: a failing step rolls back whole, the
 store refuses to open with a recoverable :class:`StateError`, and the file stays usable at its
-original version with every history row intact. Fresh (empty) databases initialize directly at v2;
+original version with every history row intact. At F17, fresh databases initialized directly at
+v2; current fresh databases initialize at v3, and a v2 database upgrades in place. A
 ``user_version > SCHEMA_VERSION`` is refused (fail closed). Migrations never rewrite send, budget
 or campaign rows.
+
+**M3 (schema v3):** the `onboarding` table stores scope/version/safety digests, explicit
+operator confirmations, automatic-link consent, and pause state. The `2 → 3` migration adds
+the table without changing any existing row.
 
 F9 (also schema v1, unshipped — no released image exists): the per-cycle budget window_key is
 made durable-unique. :meth:`StateStore.begin_cycle` allocates ``<label>-<run_id>-<seq>`` window
@@ -166,12 +171,13 @@ else:
 
 _O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 3
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
 GLOBAL_BUDGET_KEY: Final[str] = "_global"
 MAX_DETAIL_CHARS: Final[int] = 1000
 DIGEST_HEX_CHARS: Final[int] = 64
 TARGET_TRIPLE_LEN: Final[int] = 3
+MAX_ONBOARDING_JSON_CHARS: Final[int] = 100_000
 
 # meta keys (documented contract for M6-b/M7; the scheduler fills the
 # cycle/timestamp keys when the daemon loop lands).
@@ -971,6 +977,13 @@ CREATE TABLE budgets (
     paused_reason TEXT,
     completed_submissions INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE onboarding (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    document_json TEXT,
+    paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+    pause_reason TEXT NOT NULL DEFAULT '',
+    updated_iso TEXT NOT NULL
+);
 CREATE INDEX idx_files_state ON files (state);
 CREATE INDEX idx_files_cohort ON files (cohort);
 CREATE INDEX idx_files_campaign ON files (campaign_id);
@@ -1004,11 +1017,36 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {column_ddl}")
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """M3: add durable onboarding state without rewriting existing files or sends."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS onboarding ("
+        "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+        "document_json TEXT, "
+        "paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)), "
+        "pause_reason TEXT NOT NULL DEFAULT '', "
+        "updated_iso TEXT NOT NULL)"
+    )
+    actual_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(onboarding)")}
+    expected_columns = {
+        "singleton",
+        "document_json",
+        "paused",
+        "pause_reason",
+        "updated_iso",
+    }
+    if actual_columns != expected_columns:
+        raise sqlite3.DatabaseError("onboarding table has an unexpected schema")
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
-# v2 is the current schema; the 1→2 entry (F17) upgrades existing v1 databases in place.
+# v3 is the current schema; 1→2 (F17) and 2→3 (M3) upgrade existing databases in place.
 # Future slices append entries here and bump SCHEMA_VERSION. Migrations never destroy
 # tables, never rewrite stored rows, and never run backwards.
-_MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {1: _migrate_v1_to_v2}
+_MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {
+    1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
+}
 
 
 def _parse_iso(raw: str) -> datetime:
@@ -1432,6 +1470,69 @@ class StateStore:
     def clear_meta(self, key: str) -> None:
         """Delete one meta key (bounded terminal-state bookkeeping cleanup; no-op if absent)."""
         self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+    # ---------------------------------------------------------- onboarding
+
+    def get_onboarding_json(self) -> str | None:
+        """Return the single sanitized onboarding document, if one is persisted."""
+        row = self._conn.execute(
+            "SELECT document_json FROM onboarding WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else _as_optional_str(row[0])
+
+    @_mutation
+    def save_onboarding_json(self, document_json: str, iso: str) -> None:
+        """Persist a JSON object containing onboarding facts, never API-key values."""
+        if not isinstance(document_json, str) or len(document_json) > MAX_ONBOARDING_JSON_CHARS:
+            raise StateError("onboarding document must be bounded JSON text")
+        _require_iso(iso, "onboarding.updated_iso")
+        try:
+            document = json.loads(document_json)
+        except (TypeError, ValueError):
+            raise StateError("onboarding document must be a JSON object") from None
+        if not isinstance(document, dict):
+            raise StateError("onboarding document must be a JSON object")
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO onboarding (singleton, document_json, updated_iso)"
+                " VALUES (1, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
+                " document_json = excluded.document_json, updated_iso = excluded.updated_iso",
+                (document_json, iso),
+            )
+
+    def get_service_pause(self) -> tuple[bool, str]:
+        """Return the durable normal-service pause flag and reason; absent state is unpaused."""
+        row = self._conn.execute(
+            "SELECT paused, pause_reason FROM onboarding WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return False, ""
+        paused = _as_int(row[0], "onboarding.paused")
+        if paused not in (0, 1):
+            raise StateError("onboarding.paused: persisted value is invalid")
+        return bool(paused), _as_str(row[1], "onboarding.pause_reason")
+
+    @_mutation
+    def set_service_pause(self, paused: bool, reason: str, iso: str) -> None:
+        """Persist Pause/Resume independently of automatic-linking authorization."""
+        if not isinstance(paused, bool):
+            raise StateError("onboarding.paused: expected a boolean")
+        if not isinstance(reason, str) or len(reason) > MAX_DETAIL_CHARS:
+            raise StateError("onboarding.pause_reason: invalid text")
+        if paused and not reason.strip():
+            raise StateError("onboarding.pause_reason: a paused service requires a reason")
+        if not paused and reason:
+            raise StateError("onboarding.pause_reason: a resumed service must clear the reason")
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO onboarding (singleton, document_json, paused, pause_reason,"
+                " updated_iso)"
+                " VALUES (1, NULL, ?, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
+                " paused = excluded.paused, pause_reason = excluded.pause_reason,"
+                " updated_iso = excluded.updated_iso",
+                (int(paused), _clip(reason), iso),
+            )
 
     @_mutation
     def disable_writes(self, reason: str) -> None:
