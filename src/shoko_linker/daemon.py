@@ -936,6 +936,8 @@ def _record_and_match(
     deps: DaemonDeps,
     matches: Sequence[Any],
     now_iso: str,
+    *,
+    preserve_unresolved: frozenset[int] = frozenset(),
 ) -> tuple[dict[int, Cohort], int, dict[int, tuple[str, str]]]:
     known = _tracked_file_ids(deps.store)
     cohorts: dict[int, Cohort] = {}
@@ -976,7 +978,14 @@ def _record_and_match(
     # (7k backlog wall-time target; identical per-edge semantics, illegal edges skipped).
     deps.store.record_files(seeds)
     deps.store.advance_bulk(
-        [match.shoko_file_id for match in matches], FileState.MATCHED, "matched", iso=now_iso
+        [
+            match.shoko_file_id
+            for match in matches
+            if match.shoko_file_id not in preserve_unresolved
+        ],
+        FileState.MATCHED,
+        "matched",
+        iso=now_iso,
     )
     return cohorts, len(seeds), identity_drifts
 
@@ -1191,6 +1200,27 @@ def _compact_mapping_candidate_provenance(candidates: Sequence[Any], *, max_char
     return f"[omitted={total}]"[:max_chars]
 
 
+def _preserve_unaffected_service_unresolved(
+    deps: DaemonDeps,
+    matches: Sequence[Any],
+    affected_sonarr_series: frozenset[int] | None,
+) -> frozenset[int]:
+    if not deps.service_mode:
+        return frozenset()
+    preserved: set[int] = set()
+    for match in matches:
+        record = deps.store.get_file(match.shoko_file_id)
+        if record is None:
+            continue
+        if record.state_detail.startswith("service_mapping_target_changed") or (
+            affected_sonarr_series is not None
+            and record.state in (FileState.AMBIGUOUS, FileState.CONFLICT)
+            and record.sonarr_series_id not in affected_sonarr_series
+        ):
+            preserved.add(match.shoko_file_id)
+    return frozenset(preserved)
+
+
 def _reconcile(
     deps: DaemonDeps,
     inventory: SonarrInventory,
@@ -1200,6 +1230,7 @@ def _reconcile(
     *,
     policy: RunPolicy = RunPolicy.NEW_ARRIVAL,
     campaign_quarantine_limit: int | None = None,
+    affected_sonarr_series: frozenset[int] | None = None,
 ) -> _ReconcileResult:
     series_tvdb = {
         item.series.id: item.series.tvdb_id
@@ -1209,7 +1240,15 @@ def _reconcile(
     match_result = match_shoko_files(
         discovery, inventory.files, inventory.verdict.complete, deps.settings
     )
-    cohorts, inserted, identity_drifts = _record_and_match(deps, match_result.matches, now_iso)
+    preserve_unresolved = _preserve_unaffected_service_unresolved(
+        deps, match_result.matches, affected_sonarr_series
+    )
+    cohorts, inserted, identity_drifts = _record_and_match(
+        deps,
+        match_result.matches,
+        now_iso,
+        preserve_unresolved=preserve_unresolved,
+    )
     resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic)
     plans: dict[int, LinkPlan] = {}
     skip_reasons: dict[int, str] = {}
@@ -1238,6 +1277,8 @@ def _reconcile(
                 deferred_campaign_details=deferred_campaign_identity_details,
             ):
                 fresh_campaign_quarantines.add(file_id)
+            continue
+        if file_id in preserve_unresolved:
             continue
         tvdb_series = series_tvdb.get(match.sonarr_file.series_id)
         if tvdb_series is None:
@@ -1301,10 +1342,68 @@ def _sonarr_to_tvdb(inventory: SonarrInventory) -> dict[int, int]:
     }
 
 
+def _reopen_generation_unresolved(
+    deps: DaemonDeps, now_iso: str, affected: frozenset[int]
+) -> list[str]:
+    """Re-open affected unresolved files and quarantine frozen service targets."""
+    drift: list[str] = []
+    for state, target, reason in (
+        (FileState.AMBIGUOUS, FileState.WAITING, "mapping_reactivated"),
+        (FileState.CONFLICT, FileState.WAITING, "mapping_reactivated"),
+    ):
+        for record in deps.store.files_in_state(state):
+            if record.sonarr_series_id not in affected:
+                continue
+            if deps.service_mode and (
+                record.campaign_id is not None or record.cohort is Cohort.CAMPAIGN
+            ):
+                continue
+            if (
+                deps.service_mode
+                and state is FileState.CONFLICT
+                and record.state_detail.startswith("service_mapping_target_changed")
+            ):
+                continue
+            with contextlib.suppress(TransitionError):
+                deps.store.advance(record.shoko_file_id, target, reason, iso=now_iso)
+    if deps.service_mode:
+        for record in deps.store.files_in_state(FileState.WAITING):
+            if (
+                record.sonarr_series_id in affected
+                and record.campaign_id is None
+                and record.cohort is not Cohort.CAMPAIGN
+                and record.state_detail in {"mapping_drift", "mapping_changed"}
+            ):
+                with contextlib.suppress(TransitionError):
+                    deps.store.advance(
+                        record.shoko_file_id,
+                        FileState.CONFLICT,
+                        "service_mapping_target_changed",
+                        iso=now_iso,
+                    )
+                    drift.append(
+                        f"mapping_changed: waiting file {record.shoko_file_id} quarantined"
+                    )
+    planned_target = FileState.CONFLICT if deps.service_mode else FileState.WAITING
+    planned_reason = "service_mapping_target_changed" if deps.service_mode else "mapping_changed"
+    for record in deps.store.files_in_state(FileState.PLANNED):
+        if record.sonarr_series_id not in affected:
+            continue
+        if deps.service_mode and (
+            record.campaign_id is not None or record.cohort is Cohort.CAMPAIGN
+        ):
+            continue
+        with contextlib.suppress(TransitionError):
+            deps.store.advance(record.shoko_file_id, planned_target, planned_reason, iso=now_iso)
+            drift.append(f"mapping_changed: file {record.shoko_file_id} quarantined from planned")
+    return drift
+
+
 def _apply_generation_change(
     deps: DaemonDeps,
     now_iso: str,
     affected: frozenset[int],
+    active: ActiveMappings,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Re-evaluate affected candidates on an ACTIVATED generation (PLAN M4/M6 semantics).
 
@@ -1313,32 +1412,33 @@ def _apply_generation_change(
     * files in ``ambiguous``/``conflict`` in an affected series → ``waiting`` (prompt
       re-evaluation this cycle);
     * ``planned`` (unlinked, in-flight approvals) in an affected series → ``waiting``
-      with a ``mapping_changed`` quarantine reason (their frozen digests no longer match);
-    * ``verified`` (already-linked) files in an affected series → drift **report only**,
-      never unlinked.
+      for advanced mode, or a durable service ``conflict`` quarantine until the changed target
+      is explicitly reviewed;
+    * ``verified`` (already-linked) service files in an affected series → a durable mapping-drift
+      review marker and report; never unlinked or relinked. Advanced mode retains report-only
+      behavior.
 
     The resolved-ID cache is per-cycle (a new generation is a new cycle), so no
     in-cycle cache invalidation is needed here.
     """
-    churned = affected
-    drift: list[str] = []
+    drift = _reopen_generation_unresolved(deps, now_iso, affected)
     existing_link: list[str] = []
-    for state, target, reason in (
-        (FileState.AMBIGUOUS, FileState.WAITING, "mapping_reactivated"),
-        (FileState.CONFLICT, FileState.WAITING, "mapping_reactivated"),
-        (FileState.PLANNED, FileState.WAITING, "mapping_changed"),
-    ):
-        for record in deps.store.files_in_state(state):
-            if record.sonarr_series_id not in churned:
-                continue
-            with contextlib.suppress(TransitionError):
-                deps.store.advance(record.shoko_file_id, target, reason, iso=now_iso)
-                if state is FileState.PLANNED:
-                    drift.append(
-                        f"mapping_changed: file {record.shoko_file_id} quarantined from planned"
-                    )
     for record in deps.store.files_in_state(FileState.VERIFIED):
-        if record.sonarr_series_id in churned:
+        if record.sonarr_series_id in affected:
+            if (
+                deps.service_mode
+                and record.campaign_id is None
+                and record.cohort is not Cohort.CAMPAIGN
+            ):
+                deps.store.record_service_mapping_drift(
+                    record.shoko_file_id,
+                    previous_targets_digest=record.mapping_targets_digest,
+                    active_targets_digest=active.targets_digest,
+                    previous_structure_digest=record.mapping_structure_digest,
+                    active_structure_digest=active.structure_digest,
+                    mapping_revision=str(active.revision),
+                    iso=now_iso,
+                )
             existing_link.append(
                 f"existing_link drift: verified file {record.shoko_file_id} in a "
                 "changed mapping series (never unlinked)"
@@ -2428,6 +2528,23 @@ def _establish_baseline(
     return ()
 
 
+def _reconcile_mapping_generation(
+    deps: DaemonDeps,
+    phase: _MappingPhase,
+    inventory: SonarrInventory,
+    active: ActiveMappings,
+    now_iso: str,
+) -> tuple[frozenset[int] | None, tuple[str, ...], tuple[str, ...]]:
+    if not phase.reactivated:
+        return None, (), ()
+    series_tvdb = _sonarr_to_tvdb(inventory)
+    affected = frozenset(
+        sonarr_id for sonarr_id, tvdb in series_tvdb.items() if tvdb in phase.churned
+    )
+    drift, existing = _apply_generation_change(deps, now_iso, affected, active)
+    return affected, drift, existing
+
+
 def _incomplete_reconciliation_reasons(
     source: str, complete: bool, reasons: Sequence[str]
 ) -> tuple[str, ...]:
@@ -2626,16 +2743,13 @@ def _run_cycle_body(
             deps, mode, cycle_key, phase, reasons, drift, now_iso
         )
 
-    if phase.reactivated:
-        series_tvdb = _sonarr_to_tvdb(inventory)
-        affected = frozenset(
-            sonarr_id for sonarr_id, tvdb in series_tvdb.items() if tvdb in phase.churned
-        )
-        gen_drift, gen_existing = _apply_generation_change(deps, now_iso, affected)
-        drift.extend(gen_drift)
-        existing_link.extend(gen_existing)
-        if phase.churn_paused:
-            reasons.append("mapping_churn")
+    affected_sonarr_series, gen_drift, gen_existing = _reconcile_mapping_generation(
+        deps, phase, inventory, active, now_iso
+    )
+    drift.extend(gen_drift)
+    existing_link.extend(gen_existing)
+    if phase.churn_paused:
+        reasons.append("mapping_churn")
 
     # P1-3: consume persisted recovery rows BEFORE processing new candidates (the
     # budget ceiling is enforced against the true in-flight count). P2-A: bounded by the
@@ -2651,6 +2765,7 @@ def _run_cycle_body(
         now_iso,
         policy=policy,
         campaign_quarantine_limit=campaign_quarantine_limit,
+        affected_sonarr_series=affected_sonarr_series,
     )
     for file_id, skip_reason in sorted(reconcile.skip_reasons.items()):
         reasons.append(f"skip:{file_id}:{skip_reason}")
@@ -2864,6 +2979,7 @@ def _update_service_rate_state(
         "onboarding_not_authorized",
         "service_authorization_changed",
         "service_canary_failed",
+        "existing_link drift",
         "preflight_blocked_safety",
         "unsafe_shoko_settings",
         "writes_disabled",

@@ -219,6 +219,8 @@ META_SERVICE_CANARY_FILE_ID: Final[str] = "service_canary_file_id"
 META_SERVICE_CANARY_STATUS: Final[str] = "service_canary_status"
 META_SERVICE_CANARY_UPDATED_ISO: Final[str] = "service_canary_updated_iso"
 META_SERVICE_RATE_STATE: Final[str] = "service_rate_state"
+META_SERVICE_MAPPING_DRIFT_PREFIX: Final[str] = "service_mapping_drift:"
+SERVICE_MAPPING_DRIFT_SCHEMA: Final[str] = "shoko-sonarr-linker/mapping-drift/1"
 META_ATTESTATION_GATE: Final[str] = "attestation_gate"
 #: Per-campaign attestation gate bookkeeping key prefix (F8: campaign-scope lease
 #: transitions are tracked per campaign, never as the global daemon write pause).
@@ -569,6 +571,19 @@ class FileRecord:
     def identity(self) -> FileIdentitySnapshot | None:
         """The stored identity snapshot (None when never recorded)."""
         return _parse_identity(self.identity_json)
+
+
+@dataclass(frozen=True)
+class ServiceMappingDrift:
+    """Persistent review marker for a verified Shoko file whose mapping generation changed."""
+
+    shoko_file_id: int
+    previous_targets_digest: str | None
+    active_targets_digest: str
+    previous_structure_digest: str | None
+    active_structure_digest: str
+    mapping_revision: str
+    detected_iso: str
 
 
 @dataclass(frozen=True)
@@ -1502,6 +1517,172 @@ class StateStore:
             raise StateError("service rate state timestamp does not match its persistence time")
         with self._transaction():
             self._set_meta_tx(META_SERVICE_RATE_STATE, document_json)
+
+    def get_service_mapping_drifts(self) -> tuple[ServiceMappingDrift, ...]:
+        """Return durable review markers for verified files with changed mapping generations."""
+        rows = self._conn.execute(
+            "SELECT key, value FROM meta WHERE key GLOB ? ORDER BY key",
+            (f"{META_SERVICE_MAPPING_DRIFT_PREFIX}*",),
+        ).fetchall()
+        result: list[ServiceMappingDrift] = []
+        for row in rows:
+            key = _as_str(row[0], "service_mapping_drift.key")
+            suffix = key.removeprefix(META_SERVICE_MAPPING_DRIFT_PREFIX)
+            try:
+                file_id = int(suffix)
+            except ValueError:
+                raise StateError("service mapping drift key is malformed") from None
+            if file_id < 1 or str(file_id) != suffix:
+                raise StateError("service mapping drift key is malformed")
+            encoded = _as_str(row[1], "service_mapping_drift.document")
+            result.append(self._decode_service_mapping_drift(file_id, encoded))
+        return tuple(result)
+
+    @_mutation
+    def record_service_mapping_drift(
+        self,
+        shoko_file_id: int,
+        *,
+        previous_targets_digest: str | None,
+        active_targets_digest: str,
+        previous_structure_digest: str | None,
+        active_structure_digest: str,
+        mapping_revision: str,
+        iso: str,
+    ) -> ServiceMappingDrift:
+        """Persist a verified file's changed mapping identity without changing its Shoko XRefs."""
+        if (
+            isinstance(shoko_file_id, bool)
+            or not isinstance(shoko_file_id, int)
+            or shoko_file_id < 1
+        ):
+            raise StateError("service mapping drift file id must be a positive integer")
+        for name, digest, optional in (
+            ("previous_targets_digest", previous_targets_digest, True),
+            ("active_targets_digest", active_targets_digest, False),
+            ("previous_structure_digest", previous_structure_digest, True),
+            ("active_structure_digest", active_structure_digest, False),
+        ):
+            if digest is None and optional:
+                continue
+            if (
+                not isinstance(digest, str)
+                or len(digest) != DIGEST_HEX_CHARS
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise StateError(f"service mapping drift {name} must be a SHA-256 digest")
+        if not isinstance(mapping_revision, str) or not mapping_revision.strip():
+            raise StateError("service mapping drift revision must be non-empty text")
+        if len(mapping_revision) > MAX_DETAIL_CHARS:
+            raise StateError("service mapping drift revision is too long")
+        _require_iso(iso, "service_mapping_drift.detected_iso")
+        key = f"{META_SERVICE_MAPPING_DRIFT_PREFIX}{shoko_file_id}"
+        with self._transaction():
+            file_row = self._conn.execute(
+                "SELECT state FROM files WHERE shoko_file_id = ?", (shoko_file_id,)
+            ).fetchone()
+            if file_row is None or _as_str(file_row[0], "files.state") != FileState.VERIFIED.value:
+                raise StateError("service mapping drift can only be recorded for a verified file")
+            existing_row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._decode_service_mapping_drift(
+                    shoko_file_id, _as_str(existing_row[0], "service_mapping_drift.document")
+                )
+                previous_targets_digest = existing.previous_targets_digest
+                previous_structure_digest = existing.previous_structure_digest
+            record = ServiceMappingDrift(
+                shoko_file_id=shoko_file_id,
+                previous_targets_digest=previous_targets_digest,
+                active_targets_digest=active_targets_digest,
+                previous_structure_digest=previous_structure_digest,
+                active_structure_digest=active_structure_digest,
+                mapping_revision=mapping_revision.strip(),
+                detected_iso=iso,
+            )
+            document = {
+                "schema": SERVICE_MAPPING_DRIFT_SCHEMA,
+                "shoko_file_id": record.shoko_file_id,
+                "previous_targets_digest": record.previous_targets_digest,
+                "active_targets_digest": record.active_targets_digest,
+                "previous_structure_digest": record.previous_structure_digest,
+                "active_structure_digest": record.active_structure_digest,
+                "mapping_revision": record.mapping_revision,
+                "detected_iso": record.detected_iso,
+            }
+            encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
+            if len(encoded) > MAX_DETAIL_CHARS:
+                raise StateError("service mapping drift record exceeds its size limit")
+            self._set_meta_tx(key, encoded)
+        return record
+
+    @staticmethod
+    def _decode_service_mapping_drift(file_id: int, encoded: str) -> ServiceMappingDrift:
+        if not isinstance(encoded, str) or len(encoded) > MAX_DETAIL_CHARS:
+            raise StateError("persisted service mapping drift exceeds its size limit")
+        try:
+            document = json.loads(encoded)
+        except (TypeError, ValueError):
+            raise StateError("persisted service mapping drift is malformed") from None
+        expected = {
+            "schema",
+            "shoko_file_id",
+            "previous_targets_digest",
+            "active_targets_digest",
+            "previous_structure_digest",
+            "active_structure_digest",
+            "mapping_revision",
+            "detected_iso",
+        }
+        if (
+            not isinstance(document, dict)
+            or set(document) != expected
+            or document["schema"] != SERVICE_MAPPING_DRIFT_SCHEMA
+            or isinstance(document["shoko_file_id"], bool)
+            or not isinstance(document["shoko_file_id"], int)
+            or document["shoko_file_id"] != file_id
+        ):
+            raise StateError("persisted service mapping drift has an unsupported shape")
+        try:
+            previous_targets = document["previous_targets_digest"]
+            previous_structure = document["previous_structure_digest"]
+            active_targets = document["active_targets_digest"]
+            active_structure = document["active_structure_digest"]
+            revision = document["mapping_revision"]
+            detected_iso = document["detected_iso"]
+            for name, digest, optional in (
+                ("previous_targets_digest", previous_targets, True),
+                ("active_targets_digest", active_targets, False),
+                ("previous_structure_digest", previous_structure, True),
+                ("active_structure_digest", active_structure, False),
+            ):
+                if digest is None and optional:
+                    continue
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != DIGEST_HEX_CHARS
+                    or any(char not in "0123456789abcdef" for char in digest)
+                ):
+                    raise ValueError(f"{name} is invalid")
+            if not isinstance(revision, str) or not revision or len(revision) > MAX_DETAIL_CHARS:
+                raise ValueError("mapping_revision is invalid")
+            if not isinstance(detected_iso, str):
+                raise ValueError("detected_iso is invalid")
+            _require_iso(detected_iso, "service_mapping_drift.detected_iso")
+            return ServiceMappingDrift(
+                shoko_file_id=file_id,
+                previous_targets_digest=previous_targets,
+                active_targets_digest=active_targets,
+                previous_structure_digest=previous_structure,
+                active_structure_digest=active_structure,
+                mapping_revision=revision,
+                detected_iso=detected_iso,
+            )
+        except (TypeError, ValueError, StateError) as exc:
+            raise StateError(
+                f"persisted service mapping drift contains invalid values: {exc}"
+            ) from None
 
     def get_service_canary(self) -> tuple[int, str] | None:
         """Return the durable first-send canary identity and its monotonic status."""

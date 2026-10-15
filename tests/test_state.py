@@ -289,6 +289,59 @@ def test_service_rate_state_is_persisted_as_bounded_json(tmp_path: Path) -> None
         assert reopened.get_service_rate_state_json() == rate_json
 
 
+def test_verified_service_mapping_drift_is_durable_and_tracks_latest_generation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    old_targets = "a" * 64
+    second_targets = "b" * 64
+    latest_targets = "c" * 64
+    old_structure = "d" * 64
+    second_structure = "e" * 64
+    latest_structure = "f" * 64
+    with open_store(path) as store:
+        seed_file(store, 500)
+        for target in WALK:
+            store.advance(500, target, f"to {target.value}", iso=T0)
+        with pytest.raises(StateError, match="verified file"):
+            store.record_service_mapping_drift(
+                501,
+                previous_targets_digest=old_targets,
+                active_targets_digest=second_targets,
+                previous_structure_digest=old_structure,
+                active_structure_digest=second_structure,
+                mapping_revision="2",
+                iso=T0,
+            )
+        store.record_service_mapping_drift(
+            500,
+            previous_targets_digest=old_targets,
+            active_targets_digest=second_targets,
+            previous_structure_digest=old_structure,
+            active_structure_digest=second_structure,
+            mapping_revision="2",
+            iso=T0,
+        )
+        store.record_service_mapping_drift(
+            500,
+            previous_targets_digest=second_targets,
+            active_targets_digest=latest_targets,
+            previous_structure_digest=second_structure,
+            active_structure_digest=latest_structure,
+            mapping_revision="3",
+            iso=T1,
+        )
+        drift = store.get_service_mapping_drifts()
+    with open_store(path) as reopened:
+        persisted = reopened.get_service_mapping_drifts()
+    assert drift == persisted
+    assert len(persisted) == 1
+    assert persisted[0].previous_targets_digest == old_targets
+    assert persisted[0].active_targets_digest == latest_targets
+    assert persisted[0].mapping_revision == "3"
+    assert persisted[0].detected_iso == T1
+
+
 def test_f17_pending_and_indeterminate_sends_are_not_replayed(tmp_path: Path) -> None:
     """F17: opening a v1 install must not auto-send anything — live rows stay held."""
     path = tmp_path / "state.sqlite3"

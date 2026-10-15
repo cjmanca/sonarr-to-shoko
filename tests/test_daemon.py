@@ -93,6 +93,9 @@ SOURCE_URL = SOURCE_BASE + SOURCE_PATH
 SONARR_ROOT = "/data/media/anime"
 SHOKO_ROOT = "/anime"
 ANIME_ID = 1234
+CHANGED_ANIME_ID = 5678
+CHANGED_ANIDB_EPISODE = 6501
+CHANGED_SHOKO_EPISODE = 778
 TVDB_SERIES = 267440
 ANIDB_EP = 5501
 SHOKO_EP = 777
@@ -368,6 +371,32 @@ class ShokoStub:
 
     def methods(self) -> list[str]:
         return [request.method for request in self.requests]
+
+
+class MappingChangeShokoStub(ShokoStub):
+    """Resolve both old and new Anime-Lists targets so quarantine is the only safe outcome."""
+
+    def _chain_first(self, request: httpx.Request) -> httpx.Response:
+        anime_id = int(request.url.path.split("/")[5])
+        episode = {
+            ANIME_ID: ANIDB_EP,
+            CHANGED_ANIME_ID: CHANGED_ANIDB_EPISODE,
+        }.get(anime_id)
+        rows = [] if episode is None else [self._anidb_episode(episode, anime_id, 1)]
+        return self._json(request, {"Total": len(rows), "List": rows})
+
+    def _chain_second(self, request: httpx.Request, path: str) -> httpx.Response:
+        episode = int(path.split("/")[5])
+        shoko_episode = {
+            ANIDB_EP: SHOKO_EP,
+            CHANGED_ANIDB_EPISODE: CHANGED_SHOKO_EPISODE,
+        }.get(episode)
+        if shoko_episode is None:
+            return httpx.Response(404, json={"title": "not materialized"}, request=request)
+        return self._json(
+            request,
+            {"IDs": {"ID": shoko_episode, "AniDB": episode, "TMDB": None}, "Type": "Episode"},
+        )
 
 
 # ------------------------------------------------------------------ Sonarr stub
@@ -1677,6 +1706,200 @@ def test_mapping_activated_reevaluates_backlog_without_posts(
     assert mapped_state.state is FileState.PLANNED
     assert shoko.posts_count() == 0
     assert report.counts.planned >= 1
+
+
+def test_service_mapping_activation_reconsiders_and_processes_unresolved_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    unresolved = SpecFile(series_id=2, file_id=20, shoko_id=600, tvdb_series=999, anime_id=1001)
+    unaffected = SpecFile(series_id=3, file_id=30, shoko_id=601, tvdb_series=998, anime_id=1002)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [unresolved, unaffected])
+    shoko = ShokoStub([unresolved, unaffected])
+    sleeper = Sleeper()
+    resolution_calls: list[int] = []
+    original_resolve = daemon_module._episode_resolutions
+
+    def count_resolution_calls(*args: Any, **kwargs: Any) -> Any:
+        match = args[1]
+        resolution_calls.append(match.sonarr_file.series_id)
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "_episode_resolutions", count_resolution_calls)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[unresolved, unaffected],
+            shoko_files=[unresolved, unaffected],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=sleeper.advance,
+            shoko=shoko,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True, max_submissions=20)
+        initial = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        initial_record = store.get_file(unresolved.shoko_id)
+        unaffected_initial = store.get_file(unaffected.shoko_id)
+        assert resolution_calls == [2, 3]
+        resolution_calls.clear()
+        new_xml = mapping_xml_mapped((999, 1001))
+        deps = replace(deps, mapping_source=source_endpoint(source_handler(new_xml)))
+        activated = run_cycle(
+            deps,
+            now_iso=_due_iso(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="svc-2",
+        )
+        final_record = store.get_file(unresolved.shoko_id)
+        unaffected_final = store.get_file(unaffected.shoko_id)
+    finally:
+        store.close()
+    assert initial_record is not None
+    assert initial_record.state is FileState.AMBIGUOUS
+    assert unaffected_initial is not None
+    assert unaffected_initial.state is FileState.AMBIGUOUS
+    assert initial.counts.submitted == 0
+    assert activated.mapping_outcome is RefreshOutcome.ACTIVATED
+    assert final_record is not None
+    assert final_record.state is FileState.VERIFIED
+    assert unaffected_final is not None
+    assert unaffected_final.state is FileState.AMBIGUOUS
+    assert resolution_calls == [2]
+    assert activated.counts.verified == 1
+    assert shoko.posts_count() == 1
+
+
+def test_service_quarantines_planned_file_when_mapping_target_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = MappingChangeShokoStub([candidate])
+    state_at_post: list[FileState | None] = []
+
+    def capture_state_at_post() -> None:
+        record = store.get_file(candidate.shoko_id)
+        state_at_post.append(None if record is None else record.state)
+
+    shoko.on_post = capture_state_at_post
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=0,
+        )
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        record_before = store.get_file(candidate.shoko_id)
+        new_xml = "<anime-list>" + _entry(TVDB_SERIES, CHANGED_ANIME_ID) + "</anime-list>"
+        deps = replace(deps, mapping_source=source_endpoint(source_handler(new_xml)))
+        deps = replace(deps, max_submissions=20)
+        updated = run_cycle(
+            deps,
+            now_iso=_due_iso(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="svc-2",
+        )
+        record_after = store.get_file(candidate.shoko_id)
+        deps = replace(deps, mapping_source=source_endpoint(source_handler(mapping_xml())))
+        retried = run_cycle(
+            deps,
+            now_iso=_due_iso(base=_due_iso()),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="svc-3",
+        )
+        record_after_retry = store.get_file(candidate.shoko_id)
+    finally:
+        store.close()
+    assert first.counts.submitted == 0
+    assert record_before is not None
+    assert record_before.state is FileState.PLANNED
+    assert updated.mapping_outcome is RefreshOutcome.ACTIVATED
+    assert retried.mapping_outcome is RefreshOutcome.ACTIVATED
+    assert record_after is not None
+    assert record_after.state is FileState.CONFLICT
+    assert state_at_post == []
+    assert shoko.posts_count() == 0
+    assert record_after.state_detail == "service_mapping_target_changed"
+    assert record_after_retry is not None
+    assert record_after_retry.state is FileState.CONFLICT
+    assert record_after_retry.state_detail == "service_mapping_target_changed"
+
+
+def test_verified_service_file_mapping_drift_is_persisted_without_link_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = MappingChangeShokoStub([candidate])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True, max_submissions=20)
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        before = store.get_file(candidate.shoko_id)
+        before_xrefs = list(shoko.linked[candidate.shoko_id])
+        old_mapping = before.mapping_targets_digest if before is not None else None
+        new_xml = "<anime-list>" + _entry(TVDB_SERIES, CHANGED_ANIME_ID) + "</anime-list>"
+        deps = replace(deps, mapping_source=source_endpoint(source_handler(new_xml)))
+        second = run_cycle(
+            deps,
+            now_iso=_due_iso(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="svc-2",
+        )
+        drift_records = store.get_service_mapping_drifts()
+        after = store.get_file(candidate.shoko_id)
+        after_xrefs = list(shoko.linked[candidate.shoko_id])
+    finally:
+        store.close()
+    assert first.counts.verified == 1
+    assert second.mapping_outcome is RefreshOutcome.ACTIVATED
+    assert after is not None
+    assert after.state is FileState.VERIFIED
+    assert after_xrefs == before_xrefs
+    assert shoko.posts_count() == 1
+    assert len(drift_records) == 1
+    assert drift_records[0].shoko_file_id == candidate.shoko_id
+    assert drift_records[0].previous_targets_digest == old_mapping
+    assert drift_records[0].active_targets_digest != old_mapping
 
 
 def _activate_new_generation(deps: DaemonDeps, xml: str, now_iso: str) -> None:
