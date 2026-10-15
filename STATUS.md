@@ -1,96 +1,31 @@
-# STATUS — Sixth Independent Review Remediation (F31–F33)
+# STATUS — F34 Campaign Capacity Warning
 
-**Run:** Implement the approved sixth independent review handoff in `PLAN.md`.
-**Approved PLAN.md SHA-256:** `0C543E28DD12FA124E845110681F11F9281D4D7057A53CC9F22984A900C64AEB`.
-**Reviewed baseline HEAD:** `4ef92355fdc03b41499731e0180a18821d6b9d51`.
-**Branch:** `main` (user selected the current checkout).
-**Execution mode:** Offline and mocked tests only. No push, deployment, production write, or live integration is authorized.
+**Run:** Implement F34 from `PLAN.md`.
+**Approved PLAN.md SHA-256:** `D43140F0DF399F09EDFE5B2D9A851F4266D7293BA6DD02D06605B7FE981A20AB`.
+**Baseline HEAD:** `7d848a30edf4518fe8af5d9528c5eefb86034399`.
+**Branch:** `main` (user requested direct work without a worktree).
+**Execution mode:** Offline and mocked tests. No live Sonarr/Shoko requests or writes, deployment, or publishing.
 
-## Baseline and recovery
+## Scope and implementation
 
-- `PLAN.md` matched the tracked file at baseline HEAD. `STATUS.md` was empty at task start, so the digest above establishes the frozen plan version for this run. `PLAN.md` remains unchanged.
-- Baseline `uv run pytest -q` completed through 100% and exited successfully.
-- F31 reproduction: `uv run pytest -q tests/test_mapping_store.py::test_interrupted_active_xml_replacement_recovers_previous_generation` failed as expected. Injecting an exception after replacing `active.xml` caused reopened `load_active()` to return `None` instead of recovering generation A.
-- Preserve the F26–F30 protections, especially source provenance, source-transition refusal, bounded recovery backoff, campaign accounting, and streamed-download behavior.
+- The current F34 `PLAN.md` was present in the working tree at task start and was adopted by the explicit user request. Its SHA-256 was recorded above; `PLAN.md` was not edited during implementation.
+- `campaign_deadline_warning()` now reports disabled capacity for `max_new_per_cycle=0` and `max_pending_episode_jobs=0`, includes all zero-valued limits when combined, and retains the existing rolling-only warning and positive-capacity rolling-window calculation.
+- Campaign preparation passes the configured limits to the warning helper. Warning generation does not change campaign plan fields, the requested deadline, the approval digest, configured limits, or remote-write behavior.
+- Regression tests cover all-positive limits, each disabled limit, combined disabled limits, rolling horizon warnings, large insufficient/sufficient deadlines, JSON and text output, unchanged plan/deadline/digest, and zero Shoko POSTs.
 
-## Milestone ledger
+## Verification and review
 
-| Milestone | Status | Evidence / notes |
-| --- | --- | --- |
-| Baseline and frozen plan | complete | Clean tracked baseline at `4ef9235`; plan SHA-256 recorded above. Full baseline pytest run passed. |
-| F31 — Mapping crash consistency | complete | Immutable digest-identified generation files are selected by an atomic pointer. Source-transition and scheduler snapshots, epoch/attempt fencing, verified legacy migration, and lock-fenced reads/cleanup preserve last-known-good data across interrupted activation and state loss. |
-| F32 — Campaign quarantine accounting | complete | First-time pending progress claims consume the batch allowance; previously recorded claims are skipped without recounting. Mocked tests cover 100-file DRY_RUN quarantine staging, `--batch-size 1`, restart before attribution, no extra POSTs, and unchanged submission/rolling-budget counters. |
-| F33 — Operational deadline guidance | complete | Preparation warns from the approved file count and configured rolling limits; it leaves deadlines, limits, and safety leases unchanged. README and deployment guidance explain the optimistic horizon and separate lease renewal. |
-| Final validation and independent review | complete | Full configured tests, Ruff, format, mypy, diff check, Docker build, and offline container smoke checks passed. Final sequential read-only review found no unresolved findings; PLAN.md digest remains unchanged. |
-
-## F31 — Mapping crash consistency (complete)
-
-- Replaced in-place XML/meta activation with immutable `generations/<id>/active.xml` + `active.meta.json`, selected by atomic `active.generation.json`. Candidate XML is parsed/indexed and staged metadata/content digests are checked before pointer publication; staged and migrated XML digest checks stream from disk.
-- Pointer snapshots preserve scheduler state. `source-transition.json` and pointer pending-state fences preserve source epochs and retry state, including source switchbacks, state loss, initial default-source failures, and legacy flat caches.
-- State transitions, activation, recovery, status snapshots, and active-generation reads share the generation lock. Attempt IDs prevent older responses from changing a newer refresh schedule. Daemon freshness identity checks are digest-only and include the source epoch; campaign quarantine uses the lock-held identity path.
-- Legacy migration validates upstream-derived counts and effective digests when applicable. Override-aware CLI status, report, health, and daemon generation views use the configured overrides.
-- Fault-injection regression coverage exercises XML staging, metadata staging, pointer publication, bookkeeping, and post-activation interruptions; additional tests cover source provenance, state/backoff recovery, formatting-only efficiency, lock contention, concurrent status/read cleanup, and stale refresh responses.
-
-### F31 verification evidence
-
-- `uv run pytest -q tests/test_campaign.py tests/test_mapping_store.py tests/test_daemon.py tests/test_cli_m7.py tests/test_e2e.py` → completed through **100%**, exit 0 (mocked/offline integrations only).
-- `uv run ruff check .` → passed.
-- `uv run ruff format --check .` → **51 files already formatted**.
-- `uv run mypy` → passed (**47 source files**).
-- `git diff --check` → no whitespace errors. Git reported the existing Windows CRLF/LF working-copy warning for `tests/test_campaign.py`.
-- Final sequential read-only review → no P0/P1/P2/P3 findings.
-- Local F31 implementation commit: `f31fc88` (`fix: make mapping activation crash-safe`).
-- No live Sonarr/Shoko requests or writes occurred; no push, publish, or deployment was performed.
-
-## F32 — Campaign quarantine accounting (complete)
-
-- `_entry_gate()` now claims only a pending progress marker. A successful first claim increments both `attempts` and `quarantined`, so the existing batch guard bounds persistent attribution work. Already-claimed or unmarked quarantines defer without consuming the allowance or adding quarantine progress.
-- Regression coverage creates 100 drift quarantines during ordinary DRY_RUN, closes the state/dependency handles, then applies with batch size one. It verifies exactly one marker is claimed, the other 99 remain pending, and no Shoko POST, campaign `total_sent`, or rolling submission budget changes. The parameterized case verifies all 100 already-recorded markers are not recounted. A mixed-case test confirms an already-counted quarantine does not starve a valid candidate; a repeated bounded-invocation test confirms remaining claims progress one per invocation.
-- Sequential read-only acceptance review of the gate, atomic state claim, candidate loop guard, test coverage, and diff found no P0/P1/P2/P3 findings. F29 new-quarantine behavior remains covered by the existing 100-file one-file-canary and related campaign regressions.
-
-### F32 verification evidence
-
-- `uv run pytest -q tests/test_campaign.py::test_batch_one_bounds_attribution_of_preexisting_quarantine_markers tests/test_campaign.py::test_batch_one_skips_accounted_quarantine_before_valid_candidate_and_pending_marker tests/test_campaign.py::test_pending_quarantine_attribution_completes_across_bounded_batches tests/test_campaign.py::test_one_file_canary_bounds_reconciliation_sweep_quarantines tests/test_campaign.py::test_previously_quarantined_candidate_does_not_consume_batch_allowance tests/test_campaign.py::test_repeated_ed2k_campaign_quarantine_is_deferred_and_counts_as_zero_progress` → passed (**7 cases**, including parameterized values).
-- `uv run pytest -q tests/test_campaign.py` → passed through **100%** (mocked/offline integrations only).
-- `uv run ruff check src/shoko_linker/campaign.py tests/test_campaign.py` → passed.
-- `uv run ruff format --check src/shoko_linker/campaign.py tests/test_campaign.py` → **2 files already formatted**.
-- `uv run mypy src/shoko_linker/campaign.py src/shoko_linker/state.py tests/test_campaign.py` → passed.
-- `git diff --check` → no whitespace errors (Git emitted the working-copy CRLF/LF normalization warning for `tests/test_campaign.py`).
-- Local F32 implementation commit: `ac157eb` (`fix: bound campaign quarantine attribution`).
-- No live Sonarr/Shoko requests or writes occurred; no push, publish, or deployment was performed.
-
-## F33 — Operational deadline guidance (complete)
-
-- Added `campaign_deadline_warning()` and wired it into `campaign prepare`. It estimates the optimistic wait until the final rolling-budget window as `max(0, ceil(files / rolling_new_limit) - 1) × rolling_window_hours`; it warns when that wait reaches or exceeds the requested deadline and explicitly warns that a zero submission limit makes completion impossible. The warning is returned in JSON `warnings` and printed in human-readable output.
-- Preparation does not change the requested deadline, approved submission count, configured rate limits, or attestation lease. The warning calls out transient failures, pending Shoko jobs, verification delays, and separate safety-attestation renewal.
-- `README.md` and `docs/deployment.md` explain the estimate, the 7,000-file example (5,712 hours / 238 days until the last window can begin), choosing `--deadline-hours`, and periodic safety reinspection/lease renewal.
-- Parameterized preparation tests cover 10, 200, 201, and 7,000 files at 200 submissions per 168-hour window, a deliberately short deadline, a sufficient deadline, and a zero submission limit. They verify warnings, unchanged plan deadline/rate limits, and zero Shoko POSTs. A text-mode test verifies the warning is visible without `--json`.
-- Sequential read-only review of horizon arithmetic, CLI output, plan mutation boundaries, tests, and documentation found no P0/P1/P2/P3 findings. Rate-limit enforcement and authorization behavior are unchanged.
-
-### F33 verification evidence
-
-- `uv run pytest -q tests/test_campaign.py tests/test_cli_m7.py` → passed through **100%** (mocked/offline integrations only).
-- `uv run ruff check src/shoko_linker/campaign.py src/shoko_linker/cli.py tests/test_campaign.py` → passed.
-- `uv run ruff format --check src/shoko_linker/campaign.py src/shoko_linker/cli.py tests/test_campaign.py` → **3 files already formatted**.
-- `uv run mypy src/shoko_linker/campaign.py src/shoko_linker/cli.py tests/test_campaign.py` → passed.
-- `git diff --check` → no whitespace errors (Git emitted the working-copy CRLF/LF normalization warning for `tests/test_campaign.py`).
-- Local F33 implementation commit: `a500c03` (`feat: warn about campaign deadline limits`).
-- No live Sonarr/Shoko requests or writes occurred; no push, publish, or deployment was performed.
-
-## Final validation and review (complete)
-
-- Full suite: `uv run pytest -q` → passed through **100%** (mocked/offline project tests).
-- `uv run ruff check .` → passed.
-- `uv run ruff format --check .` → **51 files already formatted**.
-- `uv run mypy` → passed (**47 source files**).
-- `git diff --check` and `git diff --check 4ef92355fdc03b41499731e0180a18821d6b9d51..HEAD` → no whitespace errors. Git emitted the working-copy CRLF/LF normalization warning for `tests/test_campaign.py`.
-- `docker build -t shoko-sonarr-linker:review .` → passed; image built from the repository Dockerfile and pinned runtime/build dependencies.
-- Container smoke checks passed: `docker run --rm shoko-sonarr-linker:review --help` displayed CLI usage; importing the installed package through `docker run --rm --entrypoint python shoko-sonarr-linker:review -c "import os, shoko_linker; print(f'uid={os.getuid()} gid={os.getgid()}')"` reported `uid=1000 gid=1000`; image inspection confirmed user `1000:1000`, entrypoint `shoko-sonarr-linker`, and default `--help` command.
-- Final sequential read-only audit covered the mapping crash-consistency/source-provenance/last-known-good gates, F32 quarantine batch accounting and budgets/no-extra-POSTs, F33 deadline/lease behavior, the full F26–F30 regression suite, and changed paths against `PLAN.md` and `PROJECT.md`. No unresolved P0/P1/P2/P3 findings. A separate reviewer was unavailable; this was a distinct second-pass audit.
-- `PLAN.md` SHA-256 verified as `0C543E28DD12FA124E845110681F11F9281D4D7057A53CC9F22984A900C64AEB`, matching the approved frozen digest.
-- Local implementation commits: F31 `f31fc88`, F32 `ac157eb`, F33 `a500c03`; evidence commits: F31 `b56fbf3`, F32 `0287c73`, F33 `b220464`.
-- No live Sonarr/Shoko requests or writes, push, publish, or deployment occurred.
+- New regression cases failed before implementation as expected for per-cycle and pending-job limits.
+- `uv run pytest -q tests/test_campaign.py` → passed through **100%** (mocked/offline).
+- `uv run pytest -q` → passed through **100%** (mocked/offline; run before the final docstring-only review correction).
+- After the review correction, focused campaign preparation tests → **14 passed**.
+- `uv run ruff check .` → passed; targeted Ruff check also passed after the review correction.
+- `uv run ruff format --check .` → **51 files already formatted**; targeted format check also passed after the review correction.
+- `uv run mypy` → passed (**47 source files**); targeted mypy also passed after the review correction.
+- `git diff --check` → no whitespace errors. Git emitted its Windows CRLF-to-LF working-copy warning for `tests/test_campaign.py`.
+- A sequential read-only review found no behavior issues and one P3 docstring accuracy issue; the docstring was corrected and focused tests/static checks rerun. The reviewer could not run tests in its separate environment; no reviewer test success is claimed.
+- No live Sonarr/Shoko requests or writes occurred.
 
 ## Next action
 
-No further implementation action remains for this handoff. The validated commits remain local and unpushed.
+Commit the validated F34 implementation and this run record on `main`, record the resulting implementation commit, then push the authorized commits to `origin`.

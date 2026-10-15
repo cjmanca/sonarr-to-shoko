@@ -1513,6 +1513,8 @@ def _run_campaign_prepare(args: argparse.Namespace) -> int:
             cast(float, args.deadline_hours),
             settings.sync.rolling_new_limit,
             settings.sync.rolling_window_hours,
+            max_new_per_cycle=settings.sync.max_new_per_cycle,
+            max_pending_episode_jobs=settings.sync.max_pending_episode_jobs,
         )
         write_plan_file(cast(str, args.out), plan)
     finally:

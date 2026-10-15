@@ -710,13 +710,30 @@ def campaign_deadline_warning(
     deadline_hours: float,
     rolling_new_limit: int,
     rolling_window_hours: float,
+    *,
+    max_new_per_cycle: int,
+    max_pending_episode_jobs: int,
 ) -> str | None:
-    """Warn when even the optimistic rolling-budget horizon reaches the deadline."""
+    """Warn when capacity is disabled or the rolling-budget horizon reaches the deadline."""
+    disabled_limits = []
+    if max_new_per_cycle == 0:
+        disabled_limits.append("max_new_per_cycle=0")
+    if max_pending_episode_jobs == 0:
+        disabled_limits.append("max_pending_episode_jobs=0")
     if rolling_new_limit == 0:
+        disabled_limits.append("rolling_new_limit=0")
+    if disabled_limits == ["rolling_new_limit=0"]:
         return (
             f"campaign has {file_count} files but rolling_new_limit=0, so it cannot complete "
             "under the configured submission limit; the deadline was not changed. The "
             "safety-attestation lease expires separately and must be renewed after reinspection"
+        )
+    if disabled_limits:
+        return (
+            f"campaign has {file_count} files but submission capacity is disabled by "
+            f"{', '.join(disabled_limits)}, so it cannot complete under the configured "
+            "submission limits; the deadline was not changed. The safety-attestation lease "
+            "expires separately and must be renewed after reinspection"
         )
     required_windows = (file_count + rolling_new_limit - 1) // rolling_new_limit
     minimum_wait_hours = max(0, required_windows - 1) * rolling_window_hours
