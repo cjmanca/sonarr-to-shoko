@@ -894,6 +894,7 @@ class _NormalServiceRuntime:
         self.shoko = shoko
         self.state = state
         self.logger = logging.getLogger(__name__)
+        self._latest_lock = threading.Lock()
         self.latest: dict[str, Any] = {
             "connection": None,
             "authorized": False,
@@ -903,8 +904,17 @@ class _NormalServiceRuntime:
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
 
+    def _update_latest(self, **changes: Any) -> None:
+        with self._latest_lock:
+            self.latest.update(changes)
+
+    def _latest_snapshot(self) -> dict[str, Any]:
+        with self._latest_lock:
+            return self.latest.copy()
+
     def status(self) -> DashboardStatus:
-        connection = self.latest["connection"]
+        latest = self._latest_snapshot()
+        connection = latest["connection"]
         message = (
             connection.messages[0]
             if connection is not None and connection.messages
@@ -914,7 +924,7 @@ class _NormalServiceRuntime:
         )
         path = Path(self.settings.database_path)
         if not path.exists():
-            return DashboardStatus(message, 0, 0, 0, False, self.latest["next_action"])
+            return DashboardStatus(message, 0, 0, 0, False, latest["next_action"])
         store = StateStore(path)
         try:
             paused, _reason = store.get_service_pause()
@@ -936,50 +946,43 @@ class _NormalServiceRuntime:
                 len(store.files_in_state(FileState.VERIFIED)),
                 waiting,
                 review,
-                bool(self.latest["authorized"]) and not paused,
-                cast(str, self.latest["next_action"]),
-                cast(tuple[str, ...], self.latest["diagnostics"]),
-                cast(str, self.latest["mapping_cache"]),
+                bool(latest["authorized"]) and not paused,
+                cast(str, latest["next_action"]),
+                cast(tuple[str, ...], latest["diagnostics"]),
+                cast(str, latest["mapping_cache"]),
             )
-        finally:
-            store.close()
-
-    def onboarding_context(self) -> tuple[Any, Any] | None:
-        path = Path(self.settings.database_path)
-        if not path.exists():
-            return None
-        store = StateStore(path)
-        try:
-            return self.setup.current_context(store)
         finally:
             store.close()
 
     def worker_tick(self) -> None:
         connection = probe_connections(self.sonarr, self.shoko)
-        self.latest["connection"] = connection
+        self._update_latest(connection=connection)
         if not connection.ready:
-            self.latest["authorized"] = False
-            self.latest["next_action"] = (
-                connection.messages[0]
-                if connection.messages
-                else "Check the Sonarr and Shoko connections."
+            self._update_latest(
+                authorized=False,
+                next_action=(
+                    connection.messages[0]
+                    if connection.messages
+                    else "Check the Sonarr and Shoko connections."
+                ),
             )
             return
         store = StateStore(Path(self.settings.database_path))
         try:
             context = self.setup.current_context(store)
             if context is None:
-                self.latest["authorized"] = False
-                self.latest["next_action"] = (
-                    "Complete or review scope and safety setup before automatic linking."
+                self._update_latest(
+                    authorized=False,
+                    next_action=(
+                        "Complete or review scope and safety setup before automatic linking."
+                    ),
                 )
                 return
             binding, assessment = context
             manager = OnboardingManager(store)
             decision = manager.evaluate(binding, assessment, iso=current_iso())
             if decision.status is not OnboardingStatus.AUTHORIZED:
-                self.latest["authorized"] = False
-                self.latest["next_action"] = decision.message
+                self._update_latest(authorized=False, next_action=decision.message)
                 return
             self._run_authorized_cycle(store, binding, manager)
         except (ConfigError, HttpPolicyError, StateError, OSError, ValueError):
@@ -1050,20 +1053,24 @@ class _NormalServiceRuntime:
                 interval_seconds=settings.sync.interval_seconds,
                 full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
             )
-            self.latest["diagnostics"] = report.reasons[:20]
-            self.latest["mapping_cache"] = (
-                "Available from the last service check."
-                if report.mapping_revision > 0
-                else "Not ready; linking will wait for verified episode mappings."
-            )
-            self.latest["next_action"] = (
-                "Automatic linking is processing eligible files."
-                if not report.failed
-                else "A service check needs attention; automatic linking will retry safely."
+            self._update_latest(
+                diagnostics=report.reasons[:20],
+                mapping_cache=(
+                    "Available from the last service check."
+                    if report.mapping_revision > 0
+                    else "Not ready; linking will wait for verified episode mappings."
+                ),
+                next_action=(
+                    "Automatic linking is processing eligible files."
+                    if not report.failed
+                    else "A service check needs attention; automatic linking will retry safely."
+                ),
             )
 
-        self.latest["authorized"] = True
-        self.latest["next_action"] = "Automatic linking is running for the confirmed scope."
+        self._update_latest(
+            authorized=True,
+            next_action="Automatic linking is running for the confirmed scope.",
+        )
         run_daemon(
             deps,
             cycle_key=lambda _index: cycle_key_value,
@@ -1079,12 +1086,14 @@ class _NormalServiceRuntime:
         )
 
     def _cycle_deferred(self) -> None:
-        self.latest["authorized"] = False
-        self.latest["next_action"] = "A service check needs attention; it will retry safely."
+        self._update_latest(
+            authorized=False,
+            next_action="A service check needs attention; it will retry safely.",
+        )
 
 
 def _run_service(_args: argparse.Namespace) -> int:
-    """Run the authenticated dashboard and guarded service worker on one serialized thread."""
+    """Run the authenticated dashboard with the guarded worker on its own thread."""
     settings = load_bootstrap_settings()
     configure_logging(logging.DEBUG if cast(bool, _args.verbose) else logging.INFO)
     state = StopState()
@@ -1104,15 +1113,31 @@ def _run_service(_args: argparse.Namespace) -> int:
         raise ConfigError("DASHBOARD_PORT must be an integer between 1 and 65535") from None
 
     runtime = _NormalServiceRuntime(settings, sonarr, shoko, state)
-    application = DashboardApplication(
-        settings.database_path,
-        status_provider=runtime.status,
-        onboarding_context=runtime.onboarding_context,
-        setup_provider=runtime.setup.view,
-        setup_action=runtime.setup.action,
-    )
     server = None
+    dashboard_endpoints: tuple[ApiEndpoint, ApiEndpoint] | None = None
     try:
+        dashboard_endpoints = bootstrap_endpoints(settings)
+        dashboard_setup = ServiceSetupController(
+            settings, *dashboard_endpoints, settings.database_path
+        )
+
+        def dashboard_onboarding_context() -> tuple[Any, Any] | None:
+            path = Path(settings.database_path)
+            if not path.exists():
+                return None
+            dashboard_store = StateStore(path)
+            try:
+                return dashboard_setup.current_context(dashboard_store)
+            finally:
+                dashboard_store.close()
+
+        application = DashboardApplication(
+            settings.database_path,
+            status_provider=runtime.status,
+            onboarding_context=dashboard_onboarding_context,
+            setup_provider=dashboard_setup.view,
+            setup_action=dashboard_setup.action,
+        )
         server = create_dashboard_server(DASHBOARD_BIND_HOST, dashboard_port, application)
         logger.info("service started; no dashboard host port is published by default")
         run_dashboard_worker(
@@ -1128,6 +1153,9 @@ def _run_service(_args: argparse.Namespace) -> int:
     finally:
         if server is not None:
             server.server_close()
+        if dashboard_endpoints is not None:
+            dashboard_endpoints[0].client.close()
+            dashboard_endpoints[1].client.close()
         sonarr.client.close()
         shoko.client.close()
     return EXIT_OK

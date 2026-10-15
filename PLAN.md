@@ -1,291 +1,270 @@
-# Sonarr-to-Shoko — User Experience Redesign
+# Sonarr-to-Shoko — Ninth Independent Review Handoff
 
 Repository: https://github.com/cjmanca/sonarr-to-shoko
 
-## Product direction
+Reviewed commit: `e78efc86dc8671dd75c401fc64c9d72aa35748b3`
 
-The application's current user experience is unacceptable for its intended audience.
+## Review summary
 
-It exposes approximately 27 CLI commands, complex YAML configuration, manual safety attestations, campaign preparation, approval digests, canary operations, and recovery procedures.
+The user-experience redesign is substantially implemented.
 
-This is an engineering/operator interface, not a consumer-facing application.
+Verified components include:
 
-**The new primary goal is a set-and-forget background service.**
+* Environment-based startup.
+* Sonarr anime-scope discovery.
+* Sonarr/Shoko path-mapping discovery.
+* Shoko safety inspection.
+* Persistent onboarding confirmation.
+* Automatic backlog processing.
+* Adaptive submission controls.
+* Authenticated dashboard.
+* Legacy CLI compatibility.
+* Updated beginner documentation.
 
-A typical user should be able to install the Docker container, provide Sonarr and Shoko connection details/API keys, and have the application automatically link eligible anime episodes without further routine interaction.
+The reviewed commit passed GitHub CI and GHCR publishing.
 
-The existing safety and recovery systems should become internal implementation details.
+Two issues remain.
 
-This is an intentional change to the product requirements. Update `PROJECT.md` to reflect the new user experience. Create a separate implementation plan for this redesign rather than modifying the previously frozen `PLAN.md`.
+## F35 — P1: Dashboard blocks during background processing
 
-Follow the existing `AGENTS.md` and `ORCHESTRATION.md` conventions.
+### Affected files
 
-## 1. Introduce a simplified default operating mode
+* `src/shoko_linker/service.py`
+* `src/shoko_linker/cli.py`
+* `src/shoko_linker/dashboard.py`
+* Related service/dashboard tests
 
-The normal installation should require only:
+### Root cause
 
-* Sonarr URL and API key.
-* Shoko URL and API key.
+`run_dashboard_worker()` runs the linking worker synchronously on the same thread responsible for accepting dashboard requests.
 
-Support configuration through Docker environment variables and provide an Unraid-friendly Docker template.
+Each iteration executes:
 
-Avoid requiring users to create or edit a large YAML configuration file.
+1. `worker_tick()`
+2. `server.handle_request()`
 
-Advanced configuration may remain available but must be optional.
+A long-running reconciliation or verification cycle prevents the dashboard from accepting new requests.
 
-The application should start its continuous background service automatically when the container starts.
+The normal service invokes the existing daemon machinery, which can perform lengthy API operations.
 
-The normal mode should handle both the existing unrecognized library and newly arriving episodes.
+This is incompatible with the intended always-available management interface.
 
-Do not expose campaigns, attestations, approval digests, or reconciliation terminology to normal users.
+### Required correction
 
-## 2. Automatically discover the environment
+Decouple dashboard request handling from the background linking worker.
 
-On startup, use the Sonarr and Shoko APIs to discover:
+Prefer a minimal implementation using existing Python standard-library facilities.
 
-* Sonarr anime series and their root folders.
-* Shoko import folders.
-* Candidate files present in both systems.
-* Differences between Sonarr and Shoko container paths.
-* Compatible API versions and available capabilities.
+A reasonable approach is:
 
-Automatically establish path mappings when sufficient evidence exists.
+* One background thread for the linking worker.
+* One thread for the HTTP server.
+* SQLite transactions for durable shared state.
+* A small, thread-safe status snapshot for dashboard display.
 
-Use exact file paths, relative path structure, file sizes, and other available identity information to validate inferred mappings.
+Alternatively, run the HTTP server on the main thread and the linking worker on a dedicated background thread.
 
-Never silently guess ambiguous path mappings.
+Avoid introducing Celery, Redis, a message broker, or another scheduling framework.
 
-Do not accidentally include live-action TV or Shoko's separately managed manual collection.
+### Safety requirements
 
-When automatic discovery cannot establish a safe scope, request one simple user decision.
+Preserve the existing single-writer guarantees.
 
-For example:
+The worker must remain the only component performing automatic Shoko link submissions.
 
-"Which Sonarr folder contains your anime?"
+Dashboard actions should modify durable control state rather than directly invoking linking operations.
 
-Do not require users to understand Docker path translation unless automatic discovery genuinely fails.
+The worker must recheck pause and authorization state before subsequent POST requests.
 
-## 3. Replace routine manual attestations with automatic safety checks
+Preserve:
 
-The current expiring safety-attestation workflow is incompatible with an unattended application.
+* OS apply locking.
+* SQLite transaction boundaries.
+* Durable submission fingerprints.
+* No-replay semantics.
+* Existing-link protection.
+* Per-submission authorization checks.
+* Safe startup and shutdown.
 
-Investigate which Shoko safety settings and capabilities can be reliably inspected through its supported API.
+### Threading requirements
 
-Automatically validate everything that can be verified.
+Avoid sharing a SQLite connection across threads.
 
-This includes the settings governing file deletion, renaming, movement, and other potentially destructive linking side effects.
+Each thread should obtain its own appropriately scoped state connection.
 
-**Do not automatically change Shoko's configuration without user consent.**
+Any in-memory status exchanged between threads must be synchronized or represented by an immutable snapshot.
 
-The application must preserve these existing protections:
+Network clients must not be shared unsafely.
 
-* Never overwrite existing Shoko episode associations.
-* Never submit an ambiguous episode mapping.
-* Never link an out-of-scope file.
-* Never blindly repeat an uncertain POST.
-* Never intentionally modify media files.
-* Stop linking when Shoko's behavior cannot be considered safe.
+The dashboard should remain responsive even when the linking worker is blocked on a slow API request.
 
-For facts that cannot be established programmatically, provide a straightforward one-time safety confirmation during setup.
+### Shutdown
 
-Do not require users to repeatedly execute CLI commands or recreate attestations every seven days.
+Ensure SIGTERM:
 
-Re-evaluate automatically observable safety conditions whenever appropriate, including after Shoko version changes.
+1. Stops accepting new linking work.
+2. Signals the background worker to stop.
+3. Allows the current protected operation to finish within the configured shutdown grace period when possible.
+4. Closes the HTTP listener.
+5. Releases resources safely.
 
-A new user should not need to learn what an attestation is.
+Do not forcibly terminate a thread while a Shoko submission is in flight.
 
-Importantly, do not bypass physical-media safety requirements by automatically generating fictitious operator attestations.
+### Regression tests
 
-## 4. Make backlog processing automatic
+Simulate:
 
-The existing campaign system can remain internally, but the user should not have to operate it.
+* A reconciliation cycle blocked on a network request.
+* A verification operation taking several minutes.
+* Dashboard status access during worker activity.
+* A pause request while a worker cycle is executing.
+* A resume request.
+* Dashboard account creation while the worker is idle.
+* Worker exceptions.
+* Graceful SIGTERM.
+* Repeated start/stop cycles.
 
-The application should automatically identify eligible unrecognized files and maintain a persistent work queue.
+Verify that:
 
-Reuse the existing:
+* Dashboard status requests remain responsive.
+* Pause requests can be accepted while the worker is busy.
+* The next submission observes the persisted pause.
+* No additional POST is started after the worker observes the pause.
+* Existing submissions remain recoverable.
+* No SQLite threading errors occur.
+* Shutdown does not corrupt durable state.
 
-* Frozen file identities.
-* Immutable mapping targets.
-* Durable SQLite submission records.
-* Protected-link preflight.
-* Queue and submission budgets.
-* Asynchronous verification.
-* Restart recovery.
-* Duplicate-submission prevention.
+**Acceptance:** A long-running linking operation cannot make the dashboard unavailable.
 
-Automatically process an initial small batch and verify the resulting Shoko associations before gradually increasing processing.
+---
 
-Only do this after the required environment safety checks have passed.
+## F36 — P2: Docker Compose quick-start requires an undocumented local build
 
-If physical-media safety cannot be established, do not automatically perform the initial write.
+### Affected files
 
-No manual campaign preparation, approval digest, canary verification, or drain authorization should be necessary in the normal verified-safe operating mode.
+* `compose.example.yaml`
+* `README.md`
+* Docker/installation tests
 
-The user should not have to calculate campaign deadlines.
+### Root cause
 
-Normal background work should not expire simply because it takes longer than seven days.
+The main Compose example currently contains:
 
-Handle mapping updates and temporary API failures automatically.
+```yaml
+image: shoko-sonarr-linker:local
+```
 
-Individual ambiguous or conflicting files should be skipped and reported without unnecessarily stopping other safely processable files.
+That image is not automatically available to ordinary users.
 
-## 5. Improve the default processing rate
+However, the README presents Docker Compose as a normal installation method.
 
-The existing default rolling budget of 200 submissions per week is far too conservative for a typical backlog of several thousand episodes.
+The Unraid template already references:
 
-Review the actual rate-limiting requirements.
+```text
+ghcr.io/cjmanca/shoko-sonarr-linker:latest
+```
 
-Use conservative but practical defaults that consider:
+The two installation methods are inconsistent.
 
-* Shoko's processing queue.
-* Outstanding asynchronous jobs.
-* Verification results.
-* API failures and throttling.
-* Detected anomalies.
+### Required correction
 
-Start cautiously and increase throughput only when Shoko is responding normally.
+Use the published GHCR image as the default Compose image.
 
-Slow down or stop automatically when the system encounters problems.
+Prefer a pinned version or immutable SHA for reproducible deployments.
 
-Do not remove the durable submission limits or uncertain-send protections.
+If `latest` is used for convenience, document the update implications and retain the option to pin a SHA.
 
-Users should not need to configure rate limits to obtain reasonable backlog processing.
+Keep local source builds as an explicitly documented developer option.
 
-## 6. Create a minimal user-facing interface
+Do not require normal users to install Git, Python, uv, or build the Docker image themselves.
 
-Provide a simple way to inspect operation without learning CLI commands.
+### Additional usability review
 
-A lightweight local web dashboard is preferable for ordinary Docker users.
+Check the installation instructions end to end from the perspective of someone with minimal Docker knowledge.
 
-It should show:
+Verify that:
 
-* Connection status.
-* Number of successfully linked files.
-* Number awaiting processing.
-* Number that could not be matched.
-* Whether automatic linking is running.
-* Any problem requiring user intervention.
+* All required environment variables are clearly identified.
+* Users can obtain the image without building it.
+* The persistent `/data` volume is configured.
+* The dashboard port can be deliberately exposed for local access.
+* The container starts the normal service automatically.
+* No YAML configuration file is required.
+* No advanced CLI commands are necessary for first-use setup.
 
-Provide simple Pause and Resume controls.
+Keep the dashboard private by default and explain how to expose it safely on a trusted local network.
 
-Use plain-language explanations.
+### Regression tests
 
-Examples:
+Validate the Compose structure and Unraid template.
 
-"Cannot connect to Sonarr. Check its address and API key."
+Verify:
 
-"Waiting for Shoko to finish processing files."
+* The default image resolves to the published GHCR repository.
+* Required environment variables are passed.
+* Persistent storage is configured.
+* No unnecessary media mounts exist.
+* No privileged mode or Docker socket mount is required.
+* The normal service is the default container command.
 
-"Some episodes could not be matched confidently. They were skipped."
+**Acceptance:** Users can install the published container using the documented Compose procedure without building source code.
 
-Avoid exposing internal exception classes, state-machine names, or campaign identifiers in the normal interface.
+---
 
-Technical details should remain accessible through an advanced diagnostics section.
+## Implementation sequence
 
-Keep the dashboard private by default. Do not introduce an unauthenticated Internet-facing management endpoint.
+### Phase 1 — Dashboard responsiveness
 
-Avoid a large frontend framework unless a lightweight implementation demonstrably cannot meet the requirements.
+Implement F35 first.
 
-## 7. Simplify the CLI
+This is the primary production-usability issue.
 
-Keep advanced commands for development, support, troubleshooting, and backward compatibility.
+Use the existing service and SQLite architecture rather than adding external infrastructure.
 
-The ordinary user should only encounter straightforward operations equivalent to:
+### Phase 2 — Installation experience
 
-* Start automatic linking.
-* Check status.
-* Pause linking.
-* Resume linking.
+Implement F36.
 
-The container should start automatically without an explicit CLI command.
+Make Docker Compose and Unraid installation instructions consistent with the actual published image.
 
-Move specialized operations into an advanced/help surface.
+### Phase 3 — Validation
 
-Do not delete existing functionality merely to reduce the command count.
+Run:
 
-## 8. Rewrite the documentation
+```bash
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+git diff --check
+docker build -t shoko-sonarr-linker:review .
+```
 
-The README should explain the product from the user's perspective.
+Conduct independent read-only review focused on:
 
-Its opening section should describe what the application does, not its internal implementation milestones.
+* Worker/dashboard concurrency.
+* SQLite connection ownership.
+* Persistent pause and resume controls.
+* Per-submission authorization.
+* Thread shutdown and resource cleanup.
+* Container startup.
+* Beginner installation documentation.
 
-The primary setup instructions should be short:
+Record results in `STATUS.md`.
 
-1. Install the container.
-2. Enter Sonarr and Shoko connection details.
-3. Start the container.
-4. Automatic linking begins when safety checks pass.
+Follow the repository's orchestration rules and keep the active implementation plan immutable.
 
-Document exceptional setup requirements separately.
+Do not perform production Shoko writes, deploy, or push without authorization.
 
-Move detailed material covering campaigns, attestation records, fingerprints, mapping generation, SQLite recovery, and command-line internals to advanced documentation.
+## Completion criteria
 
-Provide a practical Unraid installation example.
-
-## 9. Preserve compatibility
-
-Existing installations must retain their SQLite state, previous submissions, completed links, and unresolved-send history.
-
-Do not perform a destructive state reset.
-
-Existing advanced configurations should continue to function where possible.
-
-Provide a clear migration strategy if the simplified configuration or automatic-linking policy requires new persistent settings.
-
-Do not silently reinterpret old operator approvals as consent for broader automatic linking.
-
-## 10. Validation
-
-Prioritize end-to-end behavior rather than expanding the existing test infrastructure.
-
-The central acceptance test should simulate a fresh installation with only the required connection settings.
-
-Verify that the application can:
-
-* Connect to mocked Sonarr and Shoko services.
-* Identify anime files.
-* Determine safe file correspondence.
-* Download mappings.
-* Select eligible unrecognized files.
-* Process and verify links automatically when safety is established.
-* Continue processing after restart.
-* Skip ambiguous files without blocking unrelated work.
-* Refuse unsafe Shoko configurations.
-* Preserve previous links.
-* Avoid replaying uncertain requests.
-
-Also test the exceptional onboarding paths for ambiguous folders, invalid API keys, unsupported Shoko versions, and unverifiable safety settings.
-
-Run the project's existing configured checks and Docker smoke tests.
-
-Use proportional testing. Do not spend most of the milestone building another elaborate test framework.
-
-## 11. Implementation approach
-
-Implement this as an incremental product redesign.
-
-Reuse the established matching, mapping, SQLite, and guarded-linking implementation.
-
-Avoid rewriting the core engine.
-
-Prioritize the following milestones:
-
-**M1 — Zero-configuration startup:** Environment-based settings, automatic daemon startup, friendly errors, and Unraid installation support.
-
-**M2 — Automatic environment discovery:** Anime scope detection, path mapping, and compatibility checks.
-
-**M3 — Simplified safety model:** Automatic runtime checks and one-time human confirmation only when truly necessary.
-
-**M4 — Automatic backlog processing:** Internal queue/campaign management, automatic verification, and sensible throughput.
-
-**M5 — Simple status interface:** Lightweight dashboard, pause/resume controls, and actionable error reporting.
-
-**M6 — Documentation, migration, and final integration:** Beginner-focused README, backward compatibility, end-to-end testing, and independent review.
-
-The primary acceptance criterion is not the number of tests or CLI capabilities.
-
-**It is whether an ordinary user can install the application, enter their API keys, and have it work safely in the background without learning its internal architecture.**
-
-Do not request routine approval between implementation milestones.
-
-Do not perform live Sonarr/Shoko writes, production deployment, or GitHub pushes without authorization.
+1. Dashboard remains responsive during long worker operations.
+2. Pausing during a running cycle prevents further submissions once the pause is observed.
+3. SQLite state remains consistent across concurrent dashboard and worker activity.
+4. Worker shutdown preserves in-flight submission recovery guarantees.
+5. Docker Compose uses a published image by default.
+6. Installation requires no local source build.
+7. Existing authorization and linking safeguards remain intact.
+8. Targeted tests pass.
+9. Full configured checks pass.
+10. Independent review finds no unresolved P0/P1

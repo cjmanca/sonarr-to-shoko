@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from http.server import HTTPServer
@@ -190,17 +191,37 @@ def run_dashboard_worker(
     worker_interval_seconds: float,
     request_poll_seconds: float = 0.5,
 ) -> None:
-    """Serve one dashboard request or one worker tick at a time on the calling thread."""
+    """Keep the dashboard loop responsive while a dedicated thread runs worker ticks.
+
+    The caller owns the HTTP server loop. On shutdown the listener is closed before waiting
+    for the worker, while the worker thread is joined without force-termination so a protected
+    Shoko operation can finish and preserve its durable recovery state.
+    """
     if worker_interval_seconds <= 0 or request_poll_seconds <= 0:
         raise ValueError("service intervals must be positive")
-    next_worker_tick = monotonic()
-    while not stop_requested():
-        now = monotonic()
-        if now >= next_worker_tick:
-            worker_tick()
+    worker_stop = threading.Event()
+
+    def run_worker() -> None:
+        next_worker_tick = monotonic()
+        while not worker_stop.is_set() and not stop_requested():
+            remaining = next_worker_tick - monotonic()
+            if remaining > 0:
+                if worker_stop.wait(remaining):
+                    break
+                continue
+            try:
+                worker_tick()
+            except Exception:
+                _logger.exception("Service worker tick failed; it will be retried.")
             next_worker_tick = monotonic() + worker_interval_seconds
-        if stop_requested():
-            break
-        remaining = max(0.0, next_worker_tick - monotonic())
-        server.timeout = min(request_poll_seconds, remaining or request_poll_seconds)
-        server.handle_request()
+
+    worker = threading.Thread(target=run_worker, name="shoko-link-worker", daemon=False)
+    try:
+        worker.start()
+        while not stop_requested():
+            server.timeout = request_poll_seconds
+            server.handle_request()
+    finally:
+        worker_stop.set()
+        server.server_close()
+        worker.join()

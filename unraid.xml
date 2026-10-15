@@ -11,7 +11,7 @@
   <WebUI>http://[IP]:[PORT:8080]</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/cjmanca/sonarr-to-shoko/main/unraid.xml</TemplateURL>
   <Icon>/plugins/dynamix.docker.manager/images/question.png</Icon>
-  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <ExtraParams>--restart unless-stopped --stop-timeout=360</ExtraParams>
   <PostArgs />
   <DonateText />
   <DonateLink />

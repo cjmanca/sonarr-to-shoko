@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
+import signal
+import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from http.server import HTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import httpx
 import pytest
@@ -72,6 +74,26 @@ def _healthy_endpoints(
             header=shoko_headers,
         ),
     )
+
+
+def _create_dashboard_account_and_pause(base_url: str) -> None:
+    with httpx.Client(timeout=2, follow_redirects=False) as client:
+        created = client.post(
+            f"{base_url}/setup",
+            data={"username": "library-admin", "password": "a sufficiently long password"},
+            headers={"Origin": base_url},
+        )
+        assert created.status_code == 303
+        status = client.get(f"{base_url}/status")
+        assert status.status_code == 200
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', status.text)
+        assert csrf is not None
+        paused = client.post(
+            f"{base_url}/pause",
+            data={"csrf_token": csrf.group(1)},
+            headers={"Origin": base_url},
+        )
+        assert paused.status_code == 303
 
 
 def test_connection_probe_uses_read_only_verified_endpoints_and_redacts_keys() -> None:
@@ -143,42 +165,127 @@ def test_service_rechecks_connections_and_waits_interruptibly_between_cycles() -
     assert waits == [SERVICE_POLL_SECONDS]
 
 
-def test_managed_dashboard_and_worker_run_serially_on_one_loop() -> None:
+def test_dashboard_stays_responsive_and_pause_is_durable_while_worker_is_blocked(
+    tmp_path: Path,
+) -> None:
+    from shoko_linker.cli import _SHUTDOWN_WAKE, StopState, _stop_handler
+    from shoko_linker.dashboard import (
+        DashboardApplication,
+        DashboardStatus,
+        create_dashboard_server,
+    )
+    from shoko_linker.service import run_dashboard_worker
+    from shoko_linker.state import open_state
+
+    state_path = tmp_path / "state.sqlite3"
+    app = DashboardApplication(
+        state_path,
+        status_provider=lambda: DashboardStatus(
+            "Sonarr and Shoko are connected.", 0, 0, 0, True, "No action is needed."
+        ),
+    )
+    server = create_dashboard_server("127.0.0.1", 0, app)
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    stop_state = StopState()
+    stop_handler = _stop_handler(stop_state)
+    observed_pause: list[tuple[bool, str]] = []
+    runner: threading.Thread | None = None
+
+    def worker_tick() -> None:
+        worker_entered.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test worker was not released")
+        with open_state(state_path) as store:
+            observed_pause.append(store.get_service_pause())
+
+    try:
+        runner = threading.Thread(
+            target=run_dashboard_worker,
+            kwargs={
+                "server": server,
+                "worker_tick": worker_tick,
+                "stop_requested": stop_state.should_stop,
+                "monotonic": time.monotonic,
+                "worker_interval_seconds": 60.0,
+                "request_poll_seconds": 0.05,
+            },
+        )
+        runner.start()
+        assert worker_entered.wait(timeout=2)
+
+        _create_dashboard_account_and_pause(base_url)
+
+        with open_state(state_path) as store:
+            assert store.get_service_pause() == (True, "user_paused")
+
+        stop_handler(int(signal.SIGTERM), None)
+        deadline = time.monotonic() + 2
+        while server.fileno() != -1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.fileno() == -1  # stop accepting requests before joining the worker
+        assert runner.is_alive()  # the protected worker operation has not been killed
+    finally:
+        stop_handler(int(signal.SIGTERM), None)
+        release_worker.set()
+        if runner is not None:
+            runner.join(timeout=5)
+        server.server_close()
+        _SHUTDOWN_WAKE.clear()
+
+    assert runner is not None
+    assert not runner.is_alive()
+    assert observed_pause == [(True, "user_paused")]
+
+
+def test_worker_exception_is_retried_and_repeated_start_stop_closes_server(
+    tmp_path: Path,
+) -> None:
+    from shoko_linker.dashboard import DashboardApplication, create_dashboard_server
     from shoko_linker.service import run_dashboard_worker
 
-    @dataclass
-    class FakeState:
-        seconds: float = 0.0
-        stopped: bool = False
-        inside_tick: bool = False
+    for cycle in range(2):
+        server = create_dashboard_server(
+            "127.0.0.1", 0, DashboardApplication(tmp_path / f"state-{cycle}.sqlite3")
+        )
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        stop = threading.Event()
+        retried = threading.Event()
+        calls = 0
 
-    current = FakeState()
-    ticks: list[float] = []
+        def worker_tick(
+            current_cycle: int = cycle, retry_signal: threading.Event = retried
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if current_cycle == 0 and calls == 1:
+                raise RuntimeError("simulated worker failure")
+            retry_signal.set()
 
-    class FakeServer:
-        timeout = 0.0
-
-        def handle_request(self) -> None:
-            assert current.inside_tick is False
-            current.seconds += self.timeout
-            if current.seconds >= 3.2:
-                current.stopped = True
-
-    def tick() -> None:
-        assert current.inside_tick is False
-        current.inside_tick = True
-        ticks.append(current.seconds)
-        current.inside_tick = False
-
-    run_dashboard_worker(
-        cast(HTTPServer, FakeServer()),
-        worker_tick=tick,
-        stop_requested=lambda: current.stopped,
-        monotonic=lambda: current.seconds,
-        worker_interval_seconds=3.0,
-        request_poll_seconds=1.0,
-    )
-    assert ticks == [0.0, 3.0]
+        runner = threading.Thread(
+            target=run_dashboard_worker,
+            kwargs={
+                "server": server,
+                "worker_tick": worker_tick,
+                "stop_requested": stop.is_set,
+                "monotonic": time.monotonic,
+                "worker_interval_seconds": 0.05,
+                "request_poll_seconds": 0.01,
+            },
+        )
+        try:
+            runner.start()
+            assert retried.wait(timeout=2)
+            with httpx.Client(timeout=2) as client:
+                assert client.get(base_url).status_code == 200
+        finally:
+            stop.set()
+            runner.join(timeout=5)
+            server.server_close()
+        assert not runner.is_alive()
+        assert server.fileno() == -1
+        assert calls >= (2 if cycle == 0 else 1)
 
 
 def test_container_and_compose_start_service_without_yaml_or_published_port() -> None:
@@ -189,10 +296,14 @@ def test_container_and_compose_start_service_without_yaml_or_published_port() ->
 
     assert 'ENTRYPOINT ["shoko-sonarr-linker"]' in dockerfile
     assert 'CMD ["service"]' in dockerfile
+    assert service["image"] == "ghcr.io/cjmanca/shoko-sonarr-linker:latest"
     assert service["command"] == ["service"]
     assert {"SONARR_URL", "SONARR_API_KEY", "SHOKO_URL", "SHOKO_API_KEY"} <= set(environment)
     assert service["volumes"] == ["shoko-sonarr-linker-data:/data"]
     assert "ports" not in service
+    assert "build" not in service
+    assert not service.get("privileged", False)
+    assert not any("docker.sock" in mount for mount in service["volumes"])
 
 
 def test_service_settings_are_built_only_from_confirmed_scope_and_exact_mappings(

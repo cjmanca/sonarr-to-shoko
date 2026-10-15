@@ -7,25 +7,62 @@ review. It does not rename, move, or edit media files.
 
 ## Quick start
 
-1. Install the container using [Docker Compose](compose.example.yaml) or the
-   [Unraid template](unraid.xml). Connect it to the Docker network used by Sonarr
-   and Shoko, and provide a persistent `/data` volume.
-2. Enter the Sonarr URL/API key and Shoko URL/API key in the container settings.
-   These are the only required service settings; no YAML file or media-library
-   mount is required.
+1. Install the example Compose file. Download [`compose.example.yaml`](compose.example.yaml)
+   and save it in a new folder on the Docker host.
+
+2. Enter the four connection settings by creating a `.env` file beside the Compose
+   file and adding the values below. Use URLs and API keys that the container can
+   reach; the example URLs work only when the services share Docker DNS on the same
+   network.
 
    ```text
-   SONARR_URL
-   SONARR_API_KEY
-   SHOKO_URL
-   SHOKO_API_KEY
+   SONARR_URL=http://sonarr:8989
+   SONARR_API_KEY=replace-with-your-sonarr-api-key
+   SHOKO_URL=http://shoko:8111
+   SHOKO_API_KEY=replace-with-your-shoko-api-key
    ```
 
-3. Start the container. It begins with read-only discovery and does not publish a
-   dashboard port automatically.
-4. Open the dashboard on a port you deliberately map, create its username and
-   password, then review the anime scope and any safety facts the service cannot
+   These are the only required service settings. Keep `.env` private; do not commit
+   it or share the API keys.
+
+   In `compose.example.yaml`, set the `media.name` value to the existing Docker
+   network shared by Sonarr and Shoko; check the containers' network settings on
+   the Docker host to find its name. `media` is only an example. The Compose file
+   joins that existing network but does not create or reconfigure it. If you use
+   host/IP addresses instead of Docker service names, make sure those addresses
+   are reachable from the container.
+
+3. Start the published image from that folder:
+
+   ```text
+   docker compose -f compose.example.yaml pull
+   docker compose -f compose.example.yaml up -d
+   ```
+
+   Compose uses `ghcr.io/cjmanca/shoko-sonarr-linker:latest`; it does not build the
+   source. The named `/data` volume persists the SQLite state and mapping cache
+   across container upgrades. The container starts the normal background service
+   automatically, with no YAML configuration file or media-library mount.
+
+4. Open the dashboard after deliberately exposing its port. By default, Compose
+   does not publish a dashboard port. To open it on the Docker host, uncomment the
+   `ports` lines under the service in the Compose file, keeping the
+   `127.0.0.1:8080:8080` binding. Re-run the `up -d` command, then visit
+   `http://127.0.0.1:8080`. To access it from another trusted LAN device, bind the
+   host's LAN IP instead and restrict access with your network firewall; do not
+   expose the dashboard to the public Internet. Create the dashboard account on
+   first visit, then review the anime scope and any safety facts the service cannot
    verify itself. Automatic linking starts only after setup is confirmed.
+
+The [Unraid template](unraid.xml) uses the same published `latest` image, requires
+the same four connection settings, persists `/data`, and leaves dashboard port
+publishing optional.
+
+`latest` is a moving tag. To stay on the newest successful default-branch image,
+run `docker compose -f compose.example.yaml pull` before restarting after an update.
+For reproducible deployments, replace `latest` in the Compose `image` line with a
+published immutable `sha-<40-character-commit>` tag from the GHCR package versions.
+Unraid users can select the same SHA-tagged image in the template's repository field.
 
 If Sonarr has several anime roots, select the folders to include. If the service
 cannot prove how a Sonarr folder corresponds to a Shoko folder, it will ask you to
@@ -65,6 +102,11 @@ and [advanced deployment safety runbook](docs/advanced-deployment.md) when those
 tools are needed.
 
 ## Development checks
+
+Normal installation does not require Git, Python, `uv`, or a local image build.
+For development, clone the repository, build the local image with
+`docker build -t shoko-sonarr-linker:local .`, and use that tag in a local copy of
+the Compose file.
 
 ```powershell
 uv sync

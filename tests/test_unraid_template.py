@@ -21,7 +21,7 @@ def test_unraid_template_keeps_dashboard_private_and_state_persistent() -> None:
     assert root.attrib["version"] == "2"
     assert root.findtext("Privileged") == "false"
     assert root.findtext("Repository") == "ghcr.io/cjmanca/shoko-sonarr-linker:latest"
-    assert root.findtext("ExtraParams") == "--restart unless-stopped"
+    assert root.findtext("ExtraParams") == "--restart unless-stopped --stop-timeout=360"
     assert by_name["Application Data"].attrib["Target"] == "/data"
     assert by_name["Application Data"].attrib["Required"] == "true"
     assert by_name["Application Data"].attrib["Mode"] == "rw"

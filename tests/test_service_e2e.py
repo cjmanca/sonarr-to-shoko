@@ -25,6 +25,7 @@ from shoko_linker.bootstrap import (
 from shoko_linker.dashboard import DashboardApplication, DashboardResponse
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.paths import PathMapping
+from shoko_linker.service_setup import ServiceSetupController
 from shoko_linker.state import FileState, open_state
 
 SONARR_ROOT = eh.SONARR_ROOT
@@ -197,6 +198,17 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
     sonarr = _endpoint(world.sonarr.handler, eh.SONARR_BASE)
     shoko = _endpoint(world.shoko.handler, eh.SHOKO_BASE)
     runtime = cli._NormalServiceRuntime(bootstrap, sonarr, shoko, cli.StopState())
+    dashboard_sonarr = _endpoint(world.sonarr.handler, eh.SONARR_BASE)
+    dashboard_shoko = _endpoint(world.shoko.handler, eh.SHOKO_BASE)
+    dashboard_setup = ServiceSetupController(
+        bootstrap, dashboard_sonarr, dashboard_shoko, bootstrap.database_path
+    )
+
+    def dashboard_onboarding_context() -> tuple[Any, Any] | None:
+        if not bootstrap.database_path.exists():
+            return None
+        with open_state(bootstrap.database_path) as store:
+            return dashboard_setup.current_context(store)
 
     try:
         runtime.worker_tick()
@@ -204,9 +216,9 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         application = DashboardApplication(
             bootstrap.database_path,
             status_provider=runtime.status,
-            onboarding_context=runtime.onboarding_context,
-            setup_provider=runtime.setup.view,
-            setup_action=runtime.setup.action,
+            onboarding_context=dashboard_onboarding_context,
+            setup_provider=dashboard_setup.view,
+            setup_action=dashboard_setup.action,
         )
 
         first = _dashboard_request(application, "GET", "/")
@@ -235,7 +247,7 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
 
         confirm_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
         assert confirm_page.status == 200
-        setup_view = runtime.setup.view()
+        setup_view = dashboard_setup.view()
         assert setup_view is not None
         assert setup_view.confirmation_enabled
         confirm_form = {
@@ -255,7 +267,7 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         )
         assert confirmation.status == 200
         with open_state(bootstrap.database_path) as store:
-            saved = runtime.setup.onboarding(store).record()
+            saved = dashboard_setup.onboarding(store).record()
             assert saved is not None
             assert saved.binding.path_mappings == (PathMapping(SONARR_ROOT, SHOKO_ROOT),)
 
@@ -296,5 +308,7 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         restarted_sonarr.client.close()
         restarted_shoko.client.close()
     finally:
+        dashboard_sonarr.client.close()
+        dashboard_shoko.client.close()
         sonarr.client.close()
         shoko.client.close()

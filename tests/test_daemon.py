@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -19,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from urllib.parse import urlencode
 
 import hash_fixtures as hf
 import httpx
@@ -48,6 +51,7 @@ from shoko_linker.daemon import (
     run_daemon,
     run_mapping_check,
 )
+from shoko_linker.dashboard import DashboardApplication, DashboardStatus, create_dashboard_server
 from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.linking import EpisodeIdResolver, SendOutcome, VerificationVerdict
 from shoko_linker.mapping_store import (
@@ -71,6 +75,7 @@ from shoko_linker.reporting import (
     META_CYCLE_KEY,
     META_CYCLE_SUBMITTED,
 )
+from shoko_linker.service import run_dashboard_worker
 from shoko_linker.state import (
     MAX_DETAIL_CHARS,
     META_LAST_FULL_RECONCILE_ISO,
@@ -882,6 +887,167 @@ def test_service_rechecks_onboarding_after_preflight_before_post(
         store.close()
     assert shoko.posts_count() == 0
     assert any("service_authorization_changed" in reason for reason in report.reasons)
+
+
+@pytest.mark.parametrize("blocked_stage", ["preflight", "verification"])
+def test_dashboard_pause_during_slow_service_request_prevents_next_post(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_stage: str
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    next_file = SpecFile(series_id=2, file_id=20, shoko_id=501)
+    activate_mapping(tmp_path, mapping_xml())
+    seed_store = open_tmp_store(tmp_path)
+    seed_baseline(seed_store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    seed_store.close()
+    shoko = ShokoStub([new_file, next_file])
+    state_path = tmp_path / "state.sqlite3"
+    slow_request_started = threading.Event()
+    release_slow_request = threading.Event()
+
+    def block_slow_request(path: str) -> None:
+        expected_posts = 0 if blocked_stage == "preflight" else 1
+        if (
+            path.endswith("/File/500")
+            and shoko.posts_count() == expected_posts
+            and not slow_request_started.is_set()
+        ):
+            slow_request_started.set()
+            if not release_slow_request.wait(timeout=5):
+                raise TimeoutError("test Shoko request was not released")
+
+    shoko.on_get = block_slow_request
+
+    def currently_authorized() -> bool:
+        controls = StateStore(state_path)
+        try:
+            return not controls.get_service_pause()[0]
+        finally:
+            controls.close()
+
+    app = DashboardApplication(
+        state_path,
+        status_provider=lambda: DashboardStatus(
+            "Sonarr and Shoko are connected.", 0, 1, 0, True, "Automatic linking is running."
+        ),
+    )
+    server = create_dashboard_server("127.0.0.1", 0, app)
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    setup = app.handle(
+        "POST",
+        "/setup",
+        {
+            "origin": base_url,
+            "host": base_url.removeprefix("http://"),
+            "content-type": "application/x-www-form-urlencoded",
+        },
+        urlencode(
+            {"username": "library-admin", "password": "a sufficiently long password"}
+        ).encode(),
+    )
+    assert setup.status == 303
+    cookie = dict(setup.headers)["Set-Cookie"].split(";", 1)[0]
+    status_page = app.handle("GET", "/status", {"cookie": cookie})
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', status_page.body.decode())
+    assert csrf is not None
+    stop = threading.Event()
+    reports: list[Any] = []
+    failures: list[BaseException] = []
+
+    def worker_tick() -> None:
+        worker_store: StateStore | None = None
+        try:
+            worker_store = StateStore(state_path, budget_limits=WIDE_LIMITS)
+            deps = build_deps(
+                tmp_path,
+                store=worker_store,
+                sonarr_files=[new_file, next_file],
+                shoko_files=[new_file, next_file],
+                xml=mapping_xml(),
+                monotonic=Clock([MONO_ZERO]),
+                advance=Sleeper().advance,
+                shoko=shoko,
+                attestation=False,
+            )
+            deps = replace(deps, service_mode=True, service_authorized=currently_authorized)
+            reports.append(
+                run_cycle(
+                    deps,
+                    now_iso=T0,
+                    mode=CycleMode.APPLY,
+                    policy=RunPolicy.SERVICE,
+                    cycle_key="svc",
+                )
+            )
+            if blocked_stage == "verification":
+                reports.append(
+                    run_cycle(
+                        deps,
+                        now_iso=T1,
+                        mode=CycleMode.APPLY,
+                        policy=RunPolicy.SERVICE,
+                        cycle_key="svc-next",
+                    )
+                )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            if worker_store is not None:
+                worker_store.close()
+            stop.set()
+
+    runner = threading.Thread(
+        target=run_dashboard_worker,
+        kwargs={
+            "server": server,
+            "worker_tick": worker_tick,
+            "stop_requested": stop.is_set,
+            "monotonic": time.monotonic,
+            "worker_interval_seconds": 60.0,
+            "request_poll_seconds": 0.05,
+        },
+    )
+    try:
+        runner.start()
+        assert slow_request_started.wait(timeout=3)
+        with httpx.Client(timeout=2) as client:
+            status = client.get(f"{base_url}/status", headers={"Cookie": cookie})
+            assert status.status_code == 200
+            paused = client.post(
+                f"{base_url}/pause",
+                data={"csrf_token": csrf.group(1)},
+                headers={"Cookie": cookie, "Origin": base_url},
+            )
+            assert paused.status_code == 303
+        controls = StateStore(state_path)
+        try:
+            assert controls.get_service_pause() == (True, "user_paused")
+        finally:
+            controls.close()
+        release_slow_request.set()
+        runner.join(timeout=5)
+        assert not runner.is_alive()
+    finally:
+        stop.set()
+        release_slow_request.set()
+        runner.join(timeout=5)
+        server.server_close()
+
+    controls = StateStore(state_path)
+    try:
+        assert controls.get_service_pause() == (True, "user_paused")
+    finally:
+        controls.close()
+    assert not failures
+    assert reports
+    expected_posts = 0 if blocked_stage == "preflight" else 1
+    assert shoko.posts_count() == expected_posts
+    if blocked_stage == "preflight":
+        assert any("service_authorization_changed" in reason for reason in reports[0].reasons)
+    else:
+        assert reports[0].counts.verified == 1
+        assert len(reports) == 2
+        assert any("onboarding_not_authorized" in reason for reason in reports[1].reasons)
 
 
 def test_service_policy_processes_backlog_after_onboarding_consent(

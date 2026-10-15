@@ -9,9 +9,8 @@
 
 services:
   shoko-sonarr-linker:
-    # Local smoke build: docker build -t shoko-sonarr-linker:local .
-    # Published GHCR image (publishing milestone): ghcr.io/<owner>/shoko-sonarr-linker:sha-<sha>
-    image: shoko-sonarr-linker:local
+    # Convenience tag; use an immutable sha-<40-character-commit> tag to pin a release.
+    image: ghcr.io/cjmanca/shoko-sonarr-linker:latest
     init: true              # PID-1 signal handling for graceful SIGTERM
     # The ordinary service starts without a YAML config or explicit CLI command.
     # It begins read-only; the automatic linker remains paused until discovery
@@ -49,7 +48,8 @@ services:
 
 networks:
   media:
-    name: media            # example name; match the existing Sonarr/Shoko network
+    external: true
+    name: media            # set this to the existing network shared by Sonarr and Shoko
 
 volumes:
   shoko-sonarr-linker-data:
