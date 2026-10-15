@@ -1,4 +1,4 @@
-"""Run policies as data from the start: backlog, new_arrival, approved_campaign.
+"""Run policies as data: backlog, new_arrival, approved_campaign, and service.
 
 This module is representation and validation only. No scheduling, no selection logic,
 and no linking lives here — later milestones consume these values.
@@ -13,11 +13,12 @@ from .errors import PolicyError
 
 
 class RunPolicy(Enum):
-    """The three distinct ways this service is asked to run."""
+    """The distinct run paths; SERVICE is reserved for onboarding-authorized service mode."""
 
     BACKLOG = "backlog"
     NEW_ARRIVAL = "new_arrival"
     APPROVED_CAMPAIGN = "approved_campaign"
+    SERVICE = "service"
 
     @property
     def label(self) -> str:

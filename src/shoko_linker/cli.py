@@ -182,7 +182,9 @@ EXIT_APPLY_GATE_REFUSAL: Final[int] = 3
 EXIT_RUNTIME: Final[int] = 4
 EXIT_STATE: Final[int] = 5
 
-_POLICY_CHOICES: Final[list[str]] = [policy.value for policy in RunPolicy]
+_POLICY_CHOICES: Final[list[str]] = [
+    policy.value for policy in RunPolicy if policy is not RunPolicy.SERVICE
+]
 _NOT_IMPLEMENTED_LIVE_READ_ONLY: Final[str] = (
     "validate --live-read-only: not implemented — live read-only checks arrive in "
     "the M7-b slice; no network call was made"

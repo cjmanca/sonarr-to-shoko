@@ -7,11 +7,16 @@ import pytest
 from shoko_linker.errors import PolicyError
 from shoko_linker.policies import PolicyRequest, RunPolicy, parse_policy
 
-POLICY_COUNT = 3
+POLICY_COUNT = 4
 
 
-def test_all_three_policies_are_distinct() -> None:
-    assert {RunPolicy.BACKLOG, RunPolicy.NEW_ARRIVAL, RunPolicy.APPROVED_CAMPAIGN} == set(RunPolicy)
+def test_policies_are_distinct() -> None:
+    assert {
+        RunPolicy.BACKLOG,
+        RunPolicy.NEW_ARRIVAL,
+        RunPolicy.APPROVED_CAMPAIGN,
+        RunPolicy.SERVICE,
+    } == set(RunPolicy)
     assert len({policy.value for policy in RunPolicy}) == POLICY_COUNT
 
 
@@ -21,6 +26,7 @@ def test_all_three_policies_are_distinct() -> None:
         ("backlog", RunPolicy.BACKLOG),
         ("  New_Arrival ", RunPolicy.NEW_ARRIVAL),
         ("approved_campaign", RunPolicy.APPROVED_CAMPAIGN),
+        ("service", RunPolicy.SERVICE),
     ],
 )
 def test_parse_policy_accepts_known_names(raw: str, expected: RunPolicy) -> None:

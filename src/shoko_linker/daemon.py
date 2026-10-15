@@ -17,8 +17,10 @@ Hard safety properties this module enforces (PROJECT.md, docs/compatibility.md �
   :mod:`shoko_linker.state` documents. ``mark_sent`` (which commits
   ``request_may_have_been_sent``) is durably committed *before* any bytes are handed
   to HTTP; ``submit_link`` is called *after* it.
-* **Only the ``new_arrival`` cohort auto-applies in daemon cycles.** Backlog files are never
-   auto-submitted as new arrivals. An **approved** backlog campaign is drained by the daemon
+* **Advanced daemon cycles only auto-apply the ``new_arrival`` cohort.** Normal service mode
+   separately uses the explicit ``SERVICE`` policy to process backlog and arrivals after current
+   onboarding authorization; backlog is never auto-submitted under ``NEW_ARRIVAL``. An
+   **approved** advanced backlog campaign is drained by the daemon
    (F7, when ``campaign.daemon_auto_apply`` is set) as ONE bounded batch per apply cycle, after
    the operator's explicit approval + canary, through the full campaign guard chain under the
    cycle's apply lock — the plan's approval digest, campaign status, deadline, budgets,
@@ -37,9 +39,10 @@ Hard safety properties this module enforces (PROJECT.md, docs/compatibility.md �
   New arrivals inside ``sync.new_file_grace_period_seconds`` (default 300s, measured from
   the persisted ``first_seen_iso``) defer with ``grace_period`` — they stay ``planned``
   and consume no budget slot — so Shoko's post-arrival import state settles first.
-* **Apply requires the whole eligibility conjunction**: an open apply gate, a valid
-  safety attestation, budget headroom, an active mapping generation, source
-  continuity, a complete auto-apply-eligible baseline, and no pending rebaseline.
+* **Apply requires the whole eligibility conjunction**: advanced mode requires its open apply
+  gate and valid safety attestation; normal service mode requires current onboarding consent.
+  Both require budget headroom, an active mapping generation, source continuity, a complete
+  auto-apply-eligible baseline, and no pending rebaseline.
 * **A possibly-sent file is never resubmitted** (state transition table); the daemon
   verifies/holds it. Mapping churn and source discontinuity
   pause/suppress writes persistently.
@@ -1646,6 +1649,71 @@ def _close_send(
     return _ApplyOutcome(1, 0, (), (_verify_and_close(deps, plan, file_id, cycle_key, send_iso),))
 
 
+def _refresh_service_canary(deps: DaemonDeps, now_iso: str) -> tuple[int, str] | None:
+    """Advance the durable first-send canary from the file's durable ledger state."""
+    canary = deps.store.get_service_canary()
+    if not deps.service_mode or canary is None or canary[1] != "pending":
+        return canary
+    file_id, _status = canary
+    record = deps.store.get_file(file_id)
+    if record is not None and record.state is FileState.VERIFIED:
+        deps.store.set_service_canary_status("verified", now_iso)
+        return (file_id, "verified")
+    if record is not None and record.state in {
+        FileState.MAPPED,
+        FileState.PLANNED,
+        FileState.PREPARED_NOT_SENT,
+        FileState.REQUEST_MAY_HAVE_BEEN_SENT,
+        FileState.VERIFYING,
+    }:
+        return canary
+    deps.store.set_service_canary_status("failed", now_iso)
+    return (file_id, "failed")
+
+
+def _finish_service_candidate(
+    deps: DaemonDeps,
+    plan: LinkPlan,
+    file_id: int,
+    cycle_key: str,
+    send_iso: str,
+    send: Any,
+) -> _ApplyOutcome:
+    outcome = _close_send(deps, plan, file_id, cycle_key, send_iso, send)
+    canary = _refresh_service_canary(deps, send_iso)
+    if canary is not None and canary[1] == "failed":
+        return replace(outcome, reasons=(*outcome.reasons, "service_canary_failed"))
+    return outcome
+
+
+def _service_canary_candidates(
+    deps: DaemonDeps,
+    plans: Mapping[int, LinkPlan],
+    ordered: list[int],
+    now_iso: str,
+) -> tuple[list[int], str | None]:
+    if not deps.service_mode:
+        return ordered, None
+    canary = _refresh_service_canary(deps, now_iso)
+    if canary is None or canary[1] == "verified":
+        return ordered, None
+    if canary[1] == "failed":
+        return [], "service_canary_failed"
+    record = deps.store.get_file(canary[0])
+    if record is None or record.state is not FileState.PLANNED or canary[0] not in plans:
+        return [], "service_canary_pending"
+    return [canary[0]], None
+
+
+def _service_canary_hold_reason(deps: DaemonDeps) -> str | None:
+    if not deps.service_mode:
+        return None
+    canary = _refresh_service_canary(deps, deps.now())
+    if canary is None or canary[1] == "verified":
+        return None
+    return "service_canary_failed" if canary[1] == "failed" else "service_canary_pending"
+
+
 def _process_candidate(
     deps: DaemonDeps,
     plan: LinkPlan,
@@ -1655,6 +1723,8 @@ def _process_candidate(
     folders: Mapping[int, ImportFolder],
     queue: QueueSnapshot | None,
     cycle_key: str,
+    *,
+    service_backlog: bool = False,
 ) -> _ApplyOutcome:
     """One file's guarded send: fresh safety inputs → eligibility → preflight → prepare →
     mark_sent → submit → verify (F11: every submission timestamp comes from the fresh clock)."""
@@ -1677,6 +1747,7 @@ def _process_candidate(
         gate_open=gate_open,
         service_mode=deps.service_mode,
         service_authorized=service_authorized,
+        service_backlog=service_backlog,
         budgets_ok=flags.budgets_ok,
         mapping_stable=flags.mapping_stable,
         source_stable=flags.source_stable,
@@ -1732,6 +1803,8 @@ def _process_candidate(
     )
     if isinstance(prepared, BudgetRefusal):
         return _ApplyOutcome(0, 1, ("budget_refusal",), ())
+    if deps.service_mode:
+        deps.store.record_service_canary(file_id, send_iso)
     token: SendToken = prepared
     # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
     deps.store.mark_sent(token, iso=send_iso)
@@ -1739,7 +1812,7 @@ def _process_candidate(
     deps.store.record_send_outcome(
         token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
     )
-    return _close_send(deps, plan, file_id, cycle_key, send_iso, send)
+    return _finish_service_candidate(deps, plan, file_id, cycle_key, send_iso, send)
 
 
 def mapping_generation_identity(
@@ -1803,8 +1876,10 @@ def _apply(
     now_iso: str,
     cycle_start_mono: float,
     max_submissions: int,
+    *,
+    policy: RunPolicy,
 ) -> tuple[int, int, tuple[str, ...], tuple[str, ...]]:
-    """The apply path over eligible new-arrival candidates in deterministic order.
+    """Apply to deterministic arrivals and explicitly authorized service backlog candidates.
 
     ``max_submissions`` bounds **POSTs attempted**, not enumerated files; the rest stay
     ``planned`` (deferred). Returns ``(submitted, deferred, reasons, drift)``.
@@ -1812,22 +1887,26 @@ def _apply(
     New arrivals inside the ``sync.new_file_grace_period_seconds`` window defer
     with the ``grace_period`` reason: the row stays ``planned``, consumes **no** budget
     reservation (no ``prepare_send``), and is never quarantined — the next cycle that
-    starts after the window closes submits it. Backlog/campaign files are outside this
-    new-arrival loop (the daemon never submits them as new arrivals); approved backlog
-    campaigns drain on the separate F7 path (see :func:`_drain_campaign`), and the CLI
-    ``campaign apply`` is the operator's manual act on aged, plan-approved inventory.
+    starts after the window closes submits it. Backlog files require service mode plus the
+    explicit ``SERVICE`` policy; campaign files remain on the separate F7/CLI campaign paths.
     """
     submitted = 0
     deferred = 0
     reasons: list[str] = []
     drift: list[str] = []
     ordered = sorted(plans)
+    service_backlog = deps.service_mode and policy is RunPolicy.SERVICE
+    ordered, canary_gate_reason = _service_canary_candidates(deps, plans, ordered, now_iso)
+    if canary_gate_reason is not None:
+        return (0, len(plans), (canary_gate_reason,), ())
     for index, file_id in enumerate(ordered):
         record = deps.store.get_file(file_id)
         if record is None or record.state is not FileState.PLANNED:
             continue
-        if record.cohort is not Cohort.NEW_ARRIVAL:
-            continue  # backlog/campaign never auto-submitted by the daemon
+        if record.cohort is not Cohort.NEW_ARRIVAL and not (
+            service_backlog and record.cohort is Cohort.BACKLOG
+        ):
+            continue  # backlog requires the explicit onboarding-authorized SERVICE policy
         if submitted >= max_submissions:
             deferred += len(ordered) - index
             break
@@ -1845,12 +1924,25 @@ def _apply(
             reasons.append(GRACE_PERIOD_REASON)
             continue
         outcome = _process_candidate(
-            deps, plans[file_id], file_id, flags, active, folders, queue, cycle_key
+            deps,
+            plans[file_id],
+            file_id,
+            flags,
+            active,
+            folders,
+            queue,
+            cycle_key,
+            service_backlog=service_backlog,
         )
         submitted += outcome.submitted
         deferred += outcome.deferred
         reasons.extend(outcome.reasons)
         drift.extend(outcome.drift)
+        canary_hold_reason = _service_canary_hold_reason(deps)
+        if canary_hold_reason is not None:
+            reasons.append(canary_hold_reason)
+            deferred += max(0, len(ordered) - index - 1)
+            break
     return submitted, deferred, tuple(reasons), tuple(drift)
 
 
@@ -2322,14 +2414,15 @@ def run_cycle(
 ) -> CycleReport:
     """Run one reconciliation cycle. See module docstring for the safety contract.
 
-    Order: apply-lock preflight (APPLY only) → attestation gate (APPLY mutates the
-    persisted pause transition; dry-run only warns) → mapping scheduler → Sonarr
+    Order: apply-lock preflight (APPLY only) → legacy attestation gate (advanced mode only;
+    APPLY mutates its persisted pause transition, dry-run only warns) → mapping scheduler → Sonarr
     inventory → Shoko discovery → baseline establishment → source continuity →
     persisted recovery consumption → reconcile matches → (APPLY only) the ordered
-    send/verify loop. ``policy`` names the daemon's cohort policy (only ``NEW_ARRIVAL``
-    auto-applies in the new-arrival loop; an **approved** backlog campaign drains as one
-    bounded batch per apply cycle on the F7 path when ``campaign.daemon_auto_apply`` is set,
-    and the one-batch CLI ``campaign apply`` remains for manual runs).
+    send/verify loop. Advanced daemon policy ``NEW_ARRIVAL`` submits only new arrivals; an
+    **approved** backlog campaign drains as one bounded batch per apply cycle on the F7 path when
+    ``campaign.daemon_auto_apply`` is set. Explicitly authorized normal service mode uses
+    ``RunPolicy.SERVICE`` for backlog and arrivals without campaign preparation. The one-batch CLI
+    ``campaign apply`` remains for manual advanced runs.
 
     M7-b full/light cadence: ``full=True`` (the default — every explicit ``once`` and
     every due full-reconcile) runs the complete cycle. A **light** cycle (``full=False``)
@@ -2525,6 +2618,7 @@ def _run_cycle_body(
         apply_running,
         reasons,
         drift,
+        policy,
         full=full,
     )
 
@@ -2646,6 +2740,7 @@ def _run_apply(
     apply_running: bool,
     reasons: list[str],
     drift: list[str],
+    policy: RunPolicy,
     full: bool = True,
 ) -> tuple[int, int]:
     """Drive the apply loop and fold its reasons/drift into the cycle's lists."""
@@ -2653,6 +2748,8 @@ def _run_apply(
         return (0, 0)
     queue = fetch_queue(deps.shoko)
     max_submissions = deps.max_submissions if full else max(1, deps.max_submissions // 2)
+    if deps.service_mode:
+        max_submissions = min(max_submissions, 1)
     submitted, deferred, apply_reasons, apply_drift = _apply(
         deps,
         plans,
@@ -2664,6 +2761,7 @@ def _run_apply(
         now_iso,
         cycle_start_mono,
         max_submissions,
+        policy=policy,
     )
     reasons.extend(apply_reasons)
     drift.extend(apply_drift)

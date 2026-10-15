@@ -257,6 +257,21 @@ def test_f17_migrated_campaign_is_not_drain_authorized(tmp_path: Path) -> None:
         assert campaign_drain_selection(listed[0]) == "drain_not_authorized"
 
 
+def test_service_canary_is_a_single_durable_monotonic_record(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with open_store(path) as store:
+        assert store.get_service_canary() is None
+        assert store.record_service_canary(500, T0) == 500
+        assert store.get_service_canary() == (500, "pending")
+        assert store.record_service_canary(501, T1) == 500
+        store.set_service_canary_status("verified", T1)
+        assert store.get_service_canary() == (500, "verified")
+        with pytest.raises(StateError, match="cannot change terminal"):
+            store.set_service_canary_status("failed", T2)
+    with open_store(path) as reopened:
+        assert reopened.get_service_canary() == (500, "verified")
+
+
 def test_f17_pending_and_indeterminate_sends_are_not_replayed(tmp_path: Path) -> None:
     """F17: opening a v1 install must not auto-send anything — live rows stay held."""
     path = tmp_path / "state.sqlite3"

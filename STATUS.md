@@ -5,7 +5,7 @@
 **Historical approved PLAN.md SHA-256:** `D43140F0DF399F09EDFE5B2D9A851F4266D7293BA6DD02D06605B7FE981A20AB` (the previous F34 handoff).
 **Plan selection:** The current redesign handoff was already present in the working tree when `/goal` was invoked, and the user explicitly requested implementing that `PLAN.md` handoff. It is adopted for this run and remains unchanged; the old F34 digest does not describe the selected redesign.
 **Baseline HEAD:** `5f9d4a3` (`docs: add user experience redesign design`).
-**Latest accepted local commit:** `e6abc9b` (`feat: inspect Shoko linking safety`).
+**Latest accepted local commit:** `d3b8952` (`feat: gate service writes on onboarding`).
 **Branch/worktree:** `main`; one worktree at the repository root, as requested.
 **Mode:** Local/offline implementation only. No live Sonarr/Shoko requests or writes, production deployment, or GHCR publishing.
 
@@ -25,7 +25,9 @@
 - M1.3 — Unraid support: **accepted**. Added a version-2 XML template with required URL/key fields, masked key entries, persistent `/data`, optional advanced YAML mount, and an optional dashboard port that is unpublished by default. M1 is accepted in `baa3450`.
 - M2 — automatic environment discovery: **accepted** in `9362ee3`. M2.1 selects verified anime roots; M2.2 infers only unique exact path mappings from safe matching files; M2.3 verifies versions and provides a plain-language next setup action.
 - M3.1 — Shoko safety inspection: **accepted** in `e6abc9b`. The checker extracts only five verified side-effect booleans, refuses when any are unsafe, asks for one-time confirmation when values are unknown or API access is unavailable, and always records physical/plugin facts as operator-confirmation requirements.
-- M3.2 — durable onboarding state: **accepted, pending focused implementation commit**. Schema v3 adds an onboarding row and store methods; the `OnboardingManager` binds consent to endpoints, API versions, roots, mappings, capabilities, and sanitized safety digests without an arbitrary expiry.
+- M3.2 — durable onboarding state: **accepted** in `efd6ccf`. Schema v3 adds an onboarding row and store methods; the `OnboardingManager` binds consent to endpoints, API versions, roots, mappings, capabilities, and sanitized safety digests without an arbitrary expiry.
+- M3.3 — normal-service write authorization: **accepted** in `d3b8952`. `DaemonDeps` has a separate safe-closed service mode; it uses current onboarding authorization at cycle/candidate/pre-POST checks, bypasses no legacy state by inference, and does not synthesize or pass a fake attestation. Normal service mode also skips legacy campaign draining.
+- M4.1 — durable service backlog/canary path: **accepted, pending focused implementation commit**. Added an internal-only `SERVICE` policy (not exposed as a legacy CLI policy), allowing the onboarding-authorized service to process `BACKLOG` plus arrivals through the existing durable send and protected-preflight path. A monotonic SQLite canary record holds expansion until exact target verification; rejection/contradiction/failure permanently holds the queue until a later explicit recovery action. Service batches are capped at one submission pending M4.2 adaptive control.
 - Design-doc check: staged `git diff --cached --check` passed before commit; no runtime/code test was applicable to the design-only commit.
 - M0 verification: `git diff --check` and staged `git diff --cached --check` returned no whitespace errors; `PLAN.md` SHA-256 remained `587b920f90062092599c178ac3619ce830c66764f95fd71043158d2610dbc733`; the current plan version, `PROJECT.md`, `STATUS.md`, and separate implementation plan were committed as `8919789`.
 - M1.1 TDD: `uv run pytest -q tests/test_bootstrap.py` first failed on the missing bootstrap module as expected; a subsequent regression case for port `0` failed before its validator fix. `uv run pytest -q tests/test_bootstrap.py tests/test_config.py` then passed.
@@ -44,10 +46,16 @@
 - M3.1 TDD: `uv run pytest -q tests/test_safety_check.py` first failed because the module was absent; then passed unsafe flags, missing/malformed values, admin-only 403, secret redaction, and digest stability cases. Targeted Ruff check, format (2 files), mypy (2 files), and `git diff --check` passed; all settings responses were mocked.
 - M3.2 TDD: tests first failed on missing onboarding methods/schema migration; an unexpected v2 table-shape test also failed before migration validation was added. `uv run pytest -q tests/test_onboarding.py tests/test_state.py tests/test_attestation.py` passed v2→v3 history preservation, malformed-schema refusal, explicit scope/safety consent, endpoint/version/root/mapping/safety-digest invalidation, 30-day persistence, and durable pause/resume including user-pause preservation.
 - M3.2 static checks: targeted Ruff check, format, mypy, and `git diff --check` passed after the user-pause and migration-shape fixes.
+- M3.3 TDD: end-to-end mocked daemon tests first failed because `DaemonDeps` lacked the distinct service authorization input; they now prove current consent can authorize the service without legacy gates, legacy gates cannot authorize the service without consent, service consent cannot unlock advanced mode, and consent revoked during Shoko preflight prevents the POST.
+- M3.3 verification: focused daemon/campaign/state/onboarding/linking suites passed; Ruff check/format, mypy, and `git diff --check` passed. All Shoko traffic was mocked; no live write was attempted.
+- M4.1 TDD: policy tests first failed because the explicit `SERVICE` policy was absent; backlog tests then verified only that policy plus service authorization submits backlog, while `NEW_ARRIVAL` still leaves backlog planned. Canary persistence tests first failed on absent APIs; they now prove single identity, monotonic terminal state, async-verification hold across a state-store restart, and permanent hold after a rejected first send without replay or second-file submission.
+- M4.1 verification: `uv run pytest -q tests/test_daemon.py tests/test_state.py tests/test_linking.py tests/test_policies.py tests/test_campaign.py tests/test_f_campaign_e2e.py` passed; targeted Ruff check/format, mypy, and `git diff --check` passed. Requests used mocked HTTP only.
 - No product behavior or Docker/test verification has been claimed.
 
 ## Open risks / next action
 
 - The working plan-version mismatch is resolved for this run by the user's explicit `/goal` instruction selecting the current handoff; do not edit `PLAN.md`.
 - Shoko's safety settings may be unavailable to the supplied non-admin key. Automatic writes must remain paused until the user completes the physical-safety confirmation for facts that cannot be read.
-- **Next action:** inspect and commit the M3.2 migration/onboarding layer; then implement M3.3 service-only write gating while preserving all advanced apply gates.
+- M3.2 was committed as `efd6ccf` after re-running `uv run pytest -q tests/test_onboarding.py tests/test_state.py tests/test_attestation.py` (130 passed) and `git diff --cached --check` (clean).
+- M3.3 implementation was committed as `d3b8952` after the focused daemon/campaign/state/onboarding/linking suite, targeted Ruff/format/mypy, and diff checks passed. All external API requests in verification were mocked.
+- **Next action:** commit M4.1, then implement M4.2's persisted adaptive throughput controller and hard ceilings.

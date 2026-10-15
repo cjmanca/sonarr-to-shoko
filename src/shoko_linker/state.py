@@ -214,6 +214,9 @@ META_LAST_CYCLE_END_ISO: Final[str] = "last_cycle_end_iso"
 META_NEXT_CYCLE_DUE_ISO: Final[str] = "next_cycle_due_iso"
 META_LAST_FULL_RECONCILE_ISO: Final[str] = "last_full_reconcile_iso"
 META_NEXT_FULL_RECONCILE_ISO: Final[str] = "next_full_reconcile_iso"
+META_SERVICE_CANARY_FILE_ID: Final[str] = "service_canary_file_id"
+META_SERVICE_CANARY_STATUS: Final[str] = "service_canary_status"
+META_SERVICE_CANARY_UPDATED_ISO: Final[str] = "service_canary_updated_iso"
 META_ATTESTATION_GATE: Final[str] = "attestation_gate"
 #: Per-campaign attestation gate bookkeeping key prefix (F8: campaign-scope lease
 #: transitions are tracked per campaign, never as the global daemon write pause).
@@ -1473,6 +1476,85 @@ class StateStore:
 
     # ---------------------------------------------------------- onboarding
 
+    def get_service_canary(self) -> tuple[int, str] | None:
+        """Return the durable first-send canary identity and its monotonic status."""
+        raw_file_id = self.get_meta(META_SERVICE_CANARY_FILE_ID)
+        raw_status = self.get_meta(META_SERVICE_CANARY_STATUS)
+        if raw_file_id is None and raw_status is None:
+            return None
+        if raw_file_id is None or raw_status not in {"pending", "verified", "failed"}:
+            raise StateError("service canary metadata is incomplete or invalid")
+        try:
+            file_id = int(raw_file_id)
+        except ValueError:
+            raise StateError("service canary file id is invalid") from None
+        if file_id < 1:
+            raise StateError("service canary file id is invalid")
+        updated_iso = self.get_meta(META_SERVICE_CANARY_UPDATED_ISO)
+        if updated_iso is None:
+            raise StateError("service canary timestamp is missing")
+        _require_iso(updated_iso, "service_canary.updated_iso")
+        return file_id, raw_status
+
+    @_mutation
+    def record_service_canary(self, shoko_file_id: int, iso: str) -> int:
+        """Durably designate exactly one first service submission; never replace its identity."""
+        if (
+            isinstance(shoko_file_id, bool)
+            or not isinstance(shoko_file_id, int)
+            or shoko_file_id < 1
+        ):
+            raise StateError("service canary file id must be a positive integer")
+        _require_iso(iso, "service_canary.updated_iso")
+        with self._transaction():
+            existing = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (META_SERVICE_CANARY_FILE_ID,)
+            ).fetchone()
+            if existing is not None:
+                raw = _as_str(existing[0], "service_canary.file_id")
+                try:
+                    existing_file_id = int(raw)
+                except ValueError:
+                    raise StateError("service canary file id is invalid") from None
+                if existing_file_id < 1 or str(existing_file_id) != raw:
+                    raise StateError("service canary file id is invalid")
+                return existing_file_id
+            self._conn.executemany(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                (
+                    (META_SERVICE_CANARY_FILE_ID, str(shoko_file_id)),
+                    (META_SERVICE_CANARY_STATUS, "pending"),
+                    (META_SERVICE_CANARY_UPDATED_ISO, iso),
+                ),
+            )
+        return shoko_file_id
+
+    @_mutation
+    def set_service_canary_status(self, status: Literal["verified", "failed"], iso: str) -> None:
+        """Close the canary once as verified or failed; terminal results cannot be revised."""
+        if status not in {"verified", "failed"}:
+            raise StateError("service canary status must be verified or failed")
+        _require_iso(iso, "service_canary.updated_iso")
+        with self._transaction():
+            current = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (META_SERVICE_CANARY_STATUS,)
+            ).fetchone()
+            if current is None:
+                raise StateError("service canary has not been recorded")
+            current_status = _as_str(current[0], "service_canary.status")
+            if current_status == status:
+                return
+            if current_status != "pending":
+                raise StateError("service canary cannot change terminal status")
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = ?",
+                (status, META_SERVICE_CANARY_STATUS),
+            )
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = ?",
+                (iso, META_SERVICE_CANARY_UPDATED_ISO),
+            )
+
     def get_onboarding_json(self) -> str | None:
         """Return the single sanitized onboarding document, if one is persisted."""
         row = self._conn.execute(
@@ -1816,6 +1898,7 @@ class StateStore:
         source_stable: bool,
         service_mode: bool = False,
         service_authorized: bool | None = None,
+        service_backlog: bool = False,
     ) -> EligibilityVerdict:
         """Pure composition of durable facts + caller-supplied external facts.
 
@@ -1825,7 +1908,9 @@ class StateStore:
         onboarding authorization instead. Backlog/campaign files never use this auto-apply path.
         """
         _require_iso(now, "now")
-        reasons = self._eligibility_reasons(shoko_file_id, now)
+        reasons = self._eligibility_reasons(
+            shoko_file_id, now, allow_backlog=service_mode and service_backlog
+        )
         authorization_gates = (
             ((service_authorized is True, "onboarding_not_authorized"),)
             if service_mode
@@ -1843,7 +1928,9 @@ class StateStore:
         reasons.extend(label for open_flag, label in gates if not open_flag)
         return EligibilityVerdict(not reasons, tuple(reasons))
 
-    def _eligibility_reasons(self, shoko_file_id: int, now: str) -> list[str]:
+    def _eligibility_reasons(
+        self, shoko_file_id: int, now: str, *, allow_backlog: bool = False
+    ) -> list[str]:
         """Durable-side refusals: baseline state, cohort membership, discontinuity."""
         reasons: list[str] = []
         baseline = self.latest_baseline()
@@ -1859,6 +1946,8 @@ class StateStore:
         record = self.get_file(shoko_file_id)
         if record is None:
             reasons.append("file_unknown")
+        elif record.cohort is Cohort.BACKLOG and allow_backlog:
+            pass
         elif record.cohort is not Cohort.NEW_ARRIVAL:
             label = (
                 "backlog_not_auto_applied"

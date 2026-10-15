@@ -855,6 +855,197 @@ def test_service_rechecks_onboarding_after_preflight_before_post(
     assert any("service_authorization_changed" in reason for reason in report.reasons)
 
 
+def test_service_policy_processes_backlog_after_onboarding_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    backlog = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [backlog])
+    shoko = ShokoStub([backlog])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[backlog],
+            shoko_files=[backlog],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            attestation=False,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc"
+        )
+        record = store.get_file(backlog.shoko_id)
+        canary = store.get_service_canary()
+    finally:
+        store.close()
+    assert shoko.posts_count() == 1
+    assert record is not None
+    assert record.cohort is Cohort.BACKLOG
+    assert record.state is FileState.VERIFIED
+    assert report.counts.verified == 1
+    assert canary == (backlog.shoko_id, "verified")
+
+
+def test_new_arrival_policy_does_not_submit_backlog_even_in_service_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    backlog = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [backlog])
+    shoko = ShokoStub([backlog])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[backlog],
+            shoko_files=[backlog],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            attestation=False,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="legacy-policy",
+        )
+        record = store.get_file(backlog.shoko_id)
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert record is not None
+    assert record.cohort is Cohort.BACKLOG
+    assert record.state is FileState.PLANNED
+
+
+def test_service_canary_holds_expansion_until_async_verification_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    files = [
+        SpecFile(series_id=1, file_id=10, shoko_id=500),
+        SpecFile(series_id=1, file_id=11, shoko_id=501),
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    shoko.link_on_post = False
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+            verification_timeout_seconds=10_000,
+        )
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        store.close()
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+            verification_timeout_seconds=10_000,
+        )
+        second = run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
+        )
+        canary_id = store.get_service_canary()
+        second_file = store.get_file(501)
+    finally:
+        store.close()
+    assert shoko.posts_count() == 1
+    assert first.counts.submitted == 1
+    assert "service_canary_pending" in second.reasons
+    assert canary_id == (500, "pending")
+    assert second_file is not None
+    assert second_file.state is FileState.PLANNED
+
+
+def test_rejected_service_canary_stops_expansion_across_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    files = [
+        SpecFile(series_id=1, file_id=10, shoko_id=500),
+        SpecFile(series_id=1, file_id=11, shoko_id=501),
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    shoko.post_status = 400
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+        )
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        shoko.post_status = None
+        second = run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
+        )
+        canary = store.get_service_canary()
+    finally:
+        store.close()
+    assert first.counts.submitted == 1
+    assert "service_canary_failed" in first.reasons
+    assert second.counts.submitted == 0
+    assert "service_canary_failed" in second.reasons
+    assert shoko.posts_count() == 1
+    assert canary == (500, "failed")
+
+
 def test_restart_preserves_original_ed2k_and_rejects_reused_shoko_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
