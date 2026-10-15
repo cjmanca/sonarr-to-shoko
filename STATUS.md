@@ -5,7 +5,7 @@
 **Historical approved PLAN.md SHA-256:** `D43140F0DF399F09EDFE5B2D9A851F4266D7293BA6DD02D06605B7FE981A20AB` (the previous F34 handoff).
 **Plan selection:** The current redesign handoff was already present in the working tree when `/goal` was invoked, and the user explicitly requested implementing that `PLAN.md` handoff. It is adopted for this run and remains unchanged; the old F34 digest does not describe the selected redesign.
 **Baseline HEAD:** `5f9d4a3` (`docs: add user experience redesign design`).
-**Latest accepted local commit:** `6564187` (`feat: integrate authenticated service dashboard`).
+**Latest accepted implementation commit:** `7e985bc` (`feat: add service acceptance and user documentation`).
 **Branch/worktree:** `main`; one worktree at the repository root, as requested.
 **Mode:** Local/offline implementation only. No live Sonarr/Shoko requests or writes, production deployment, or GHCR publishing.
 
@@ -70,6 +70,8 @@
 - M6.4 configured checks: full `uv run pytest -q` reached 100% and exited successfully; `uv run ruff check .`, `uv run ruff format --check .` (70 files), `uv run mypy` (66 files), and `git diff --check` passed.
 - M6.4 Docker: `docker build -t shoko-sonarr-linker:local .` passed. A local smoke container started as UID/GID 1000 with only a named `/data` volume and no published ports; a marker survived container stop/start, and graceful `docker stop --timeout 10` exited 0. The smoke used `127.0.0.1:1` test URLs; no live Sonarr/Shoko operation occurred.
 - M6.4 read-only review: second-pass review covered scope/root boundaries, explicit mappings, secret/settings handling, durable consent and per-write freshness, Shoko side effects, uncertain-send/restart behavior, async verification, service budgets, dashboard authentication/CSRF, SQLite migration, and GHCR workflow policy. No P0/P1/blocking P2 findings remain. Live service integration, Unraid deployment, Shoko physical-safety inspection, and GHCR publishing remain external/unverified.
+- M6.4 delivery: implementation commits `6564187` and `7e985bc` are pushed; after `git fetch origin`, `HEAD` and `origin/main` both resolved to `7e985bc6d3ed42324d9134777324c36236ea4886`, and `git ls-remote origin refs/heads/main` returned the same SHA. The working tree was clean at that checkpoint.
+- M6 — **complete** for offline acceptance. Live Sonarr/Shoko behavior and safety inspection, Unraid installation, and GHCR publication remain external/unverified by design.
 
 ## Open risks / next action
 
