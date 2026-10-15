@@ -5,7 +5,7 @@
 **Historical approved PLAN.md SHA-256:** `D43140F0DF399F09EDFE5B2D9A851F4266D7293BA6DD02D06605B7FE981A20AB` (the previous F34 handoff).
 **Plan selection:** The current redesign handoff was already present in the working tree when `/goal` was invoked, and the user explicitly requested implementing that `PLAN.md` handoff. It is adopted for this run and remains unchanged; the old F34 digest does not describe the selected redesign.
 **Baseline HEAD:** `5f9d4a3` (`docs: add user experience redesign design`).
-**Latest accepted local commit:** `8fb9809` (`feat: quarantine service mapping drift`).
+**Latest accepted local commit:** `3e08a6c` (`feat: add authenticated dashboard account`).
 **Branch/worktree:** `main`; one worktree at the repository root, as requested.
 **Mode:** Local/offline implementation only. No live Sonarr/Shoko requests or writes, production deployment, or GHCR publishing.
 
@@ -30,7 +30,7 @@
 - M4.1 — durable service backlog/canary path: **accepted** in `fa88e06`. Added an internal-only `SERVICE` policy (not exposed as a legacy CLI policy), allowing the onboarding-authorized service to process `BACKLOG` plus arrivals through the existing durable send and protected-preflight path. A monotonic SQLite canary record holds expansion until exact target verification; rejection/contradiction/failure permanently holds the queue until a later explicit recovery action. Service batches are capped at one submission pending M4.2 adaptive control.
 - M4.2 — persisted adaptive service rate: **accepted** in `d9dd00e`. Service mode starts at one submission, persists verified-cycle streak/cap in bounded SQLite meta, ramps 1→2→4→8→16→20, and halves/resets on queue blockage, outstanding jobs/verification delay, transport/API failure, mapping/source instability, safety refusal, or anomalies. Effective durable limits are clamped to 20 pending files/submissions per cycle, 5,000 per 168-hour window, and 10 pending episode jobs; stricter config still applies.
 - M4.3 — mapping-refresh re-evaluation and target-drift quarantine: **accepted** in `8fb9809`. Service-mode refreshes only re-walk unresolved ambiguous/conflict files in affected Sonarr series, quarantines old planned/known mapping-drift targets, and records verified-link mapping drift persistently without changing XRefs. Repeated mapping activation cannot clear the service quarantine; campaign rows are not mutated by service mapping guards.
-- M5.1 — authenticated dashboard account/session surface: **accepted, pending focused implementation commit**. Schema v4 adds empty account and expiring session/CSRF tables; password uses salted scrypt, a separate random signing key signs HttpOnly/SameSite cookies, CSRF nonce rotates atomically, and POSIX database/sidecars are owner-only. Standard-library routes require authentication for status and controls; Resume rechecks onboarding.
+- M5.1 — authenticated dashboard account/session surface: **accepted** in `3e08a6c`. Schema v4 adds empty account and expiring session/CSRF tables; password uses salted scrypt, a separate random signing key signs HttpOnly/SameSite cookies, CSRF nonce rotates atomically, and POSIX database/sidecars are owner-only. Standard-library routes require authentication for status and controls; Resume rechecks onboarding.
 - Design-doc check: staged `git diff --cached --check` passed before commit; no runtime/code test was applicable to the design-only commit.
 - M0 verification: `git diff --check` and staged `git diff --cached --check` returned no whitespace errors; `PLAN.md` SHA-256 remained `587b920f90062092599c178ac3619ce830c66764f95fd71043158d2610dbc733`; the current plan version, `PROJECT.md`, `STATUS.md`, and separate implementation plan were committed as `8919789`.
 - M1.1 TDD: `uv run pytest -q tests/test_bootstrap.py` first failed on the missing bootstrap module as expected; a subsequent regression case for port `0` failed before its validator fix. `uv run pytest -q tests/test_bootstrap.py tests/test_config.py` then passed.
@@ -60,6 +60,7 @@
 - M4.3 was committed as `8fb9809`; selected `PLAN.md` digest remains unchanged.
 - M5.1 TDD: dashboard tests first failed because the module was absent and the state API tests first failed because account/session persistence was absent. Coverage now includes first-account atomic enrollment, salted scrypt verification, generic login refusal, protected status, expiry/tamper, replayed CSRF, onboarding-checked Resume, cross-origin/malformed/oversized inputs, and POSIX file permissions (permission-bit assertion skips on Windows).
 - M5.1 verification: `uv run pytest -q tests/test_dashboard.py tests/test_onboarding.py tests/test_state.py tests/test_daemon.py tests/test_cli.py` passed; targeted Ruff check/format, mypy, and `git diff --check` passed.
+- M5.1 was committed as `3e08a6c`; no service listener or worker was started in live mode.
 - No live product behavior, Docker build, or deployment has been verified.
 
 ## Open risks / next action
@@ -70,4 +71,4 @@
 - M3.2 was committed as `efd6ccf` after re-running `uv run pytest -q tests/test_onboarding.py tests/test_state.py tests/test_attestation.py` (130 passed) and `git diff --cached --check` (clean).
 - M3.3 implementation was committed as `d3b8952` after the focused daemon/campaign/state/onboarding/linking suite, targeted Ruff/format/mypy, and diff checks passed. All external API requests in verification were mocked.
 - M4.1 was committed as `fa88e06` after the focused daemon/state/linking/policy/campaign suites and targeted static checks passed. The selected `PLAN.md` hash is unchanged.
-- **Next action:** commit M5.1, then implement M5.2 managed worker/dashboard integration with serialized SQLite access and ordinary CLI controls.
+- **Next action:** implement M5.2 managed worker/dashboard integration with serialized SQLite access and ordinary CLI controls.
