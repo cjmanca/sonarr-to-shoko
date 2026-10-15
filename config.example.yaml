@@ -62,7 +62,7 @@ sync:
   # pending file requests (budget max_pending_files = max_new_per_cycle).
   max_new_per_cycle: 20
   # New submissions allowed in the rolling window (>= 0).
-  rolling_new_limit: 200
+  rolling_new_limit: 5000
   # Rolling-window length in hours (> 0).
   rolling_window_hours: 168
   # Ceiling on Shoko per-episode jobs currently pending (>= 0).

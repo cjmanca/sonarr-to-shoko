@@ -115,6 +115,10 @@ def test_defaults_are_applied_when_optional_values_are_omitted() -> None:
     assert settings.sync.interval_seconds == DEFAULT_INTERVAL_SECONDS
     assert settings.sync.full_reconcile_interval_hours == DEFAULT_FULL_RECONCILE_HOURS
     assert settings.sync.new_file_grace_period_seconds == DEFAULT_NEW_FILE_GRACE_SECONDS
+    assert DEFAULT_ROLLING_NEW_LIMIT == 5000
+    assert settings.sync.max_new_per_cycle == DEFAULT_MAX_NEW_PER_CYCLE == 20
+    assert settings.sync.rolling_new_limit == 5000
+    assert settings.sync.max_pending_episode_jobs == DEFAULT_MAX_PENDING_EPISODE_JOBS == 10
     assert settings.sync.apply_changes is False
     assert settings.sync.connect_timeout_seconds == DEFAULT_CONNECT_TIMEOUT_SECONDS
     assert settings.sync.read_timeout_seconds == DEFAULT_READ_TIMEOUT_SECONDS

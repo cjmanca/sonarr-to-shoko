@@ -120,6 +120,16 @@ from .mapping_store import (
 from .mappings import MappingIndex, ResolutionStatus, TargetIdentity, effective_targets
 from .mappings import resolve as resolve_mapping
 from .policies import RunPolicy
+from .rate_control import (
+    MAX_SERVICE_CYCLE_SUBMISSIONS,
+    RateSignals,
+    RateState,
+    advance_rate,
+    decode_rate_state,
+    effective_submission_cap,
+    encode_rate_state,
+    service_budget_limits,
+)
 from .shoko import (
     ImportFolder,
     ShokoDiscovery,
@@ -621,12 +631,49 @@ def _budget_headroom(deps: DaemonDeps, now_iso: str, *, campaign: bool = False) 
     if _global_pause_reason(deps, campaign=campaign) is not None:
         return False
     if limits is None:
-        return True
+        return not (deps.service_mode and not campaign)
+    if deps.service_mode and not campaign:
+        limits = service_budget_limits(limits)
     if view.pending_file_requests >= limits.max_pending_files:
         return False
     if view.pending_episode_jobs >= limits.max_pending_episode_jobs:
         return False
     return not rolling_budget_exhausted(view, limits, now_iso)
+
+
+def _service_candidate_budget_headroom(
+    deps: DaemonDeps, now_iso: str, expected_episode_jobs: int
+) -> bool:
+    """Recheck effective hard service budgets immediately before reserving a send."""
+    if not deps.service_mode:
+        return True
+    configured = deps.store.budget_limits
+    if configured is None:
+        return False
+    limits = service_budget_limits(configured)
+    view = deps.store.budget_view()
+    return not (
+        view.cycle_new_submissions >= limits.per_cycle_new
+        or view.pending_file_requests + 1 > limits.max_pending_files
+        or view.pending_episode_jobs + expected_episode_jobs > limits.max_pending_episode_jobs
+        or rolling_budget_exhausted(view, limits, now_iso)
+    )
+
+
+def _apply_service_budget_limits(deps: DaemonDeps) -> None:
+    """Make the existing durable reservation path enforce service hard ceilings verbatim."""
+    configured = deps.store.budget_limits
+    if deps.service_mode and configured is not None:
+        deps.store.budget_limits = service_budget_limits(configured)
+
+
+def _service_mapping_refresh_failed(
+    deps: DaemonDeps, outcome: RefreshOutcome | None, reasons: list[str]
+) -> bool:
+    failed = deps.service_mode and _is_transport_failure(outcome)
+    if failed:
+        reasons.append("mapping_source_transport_failure")
+    return failed
 
 
 def rolling_budget_exhausted(view: BudgetView, limits: BudgetLimits, now_iso: str) -> bool:
@@ -1347,6 +1394,7 @@ class _ApplyOutcome:
     deferred: int
     reasons: tuple[str, ...]
     drift: tuple[str, ...]
+    verified: bool = False
 
 
 def _verify_and_close(
@@ -1646,7 +1694,14 @@ def _close_send(
         )
     if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
         return _ApplyOutcome(1, 0, (), ())
-    return _ApplyOutcome(1, 0, (), (_verify_and_close(deps, plan, file_id, cycle_key, send_iso),))
+    verification = _verify_and_close(deps, plan, file_id, cycle_key, send_iso)
+    return _ApplyOutcome(
+        1,
+        0,
+        (),
+        (verification,),
+        verified=verification == "verification:verified",
+    )
 
 
 def _refresh_service_canary(deps: DaemonDeps, now_iso: str) -> tuple[int, str] | None:
@@ -1748,7 +1803,8 @@ def _process_candidate(
         service_mode=deps.service_mode,
         service_authorized=service_authorized,
         service_backlog=service_backlog,
-        budgets_ok=flags.budgets_ok,
+        budgets_ok=flags.budgets_ok
+        and _service_candidate_budget_headroom(deps, send_iso, len(plan.episode_ids)),
         mapping_stable=flags.mapping_stable,
         source_stable=flags.source_stable,
     )
@@ -1878,11 +1934,11 @@ def _apply(
     max_submissions: int,
     *,
     policy: RunPolicy,
-) -> tuple[int, int, tuple[str, ...], tuple[str, ...]]:
+) -> tuple[int, int, tuple[str, ...], tuple[str, ...], int]:
     """Apply to deterministic arrivals and explicitly authorized service backlog candidates.
 
     ``max_submissions`` bounds **POSTs attempted**, not enumerated files; the rest stay
-    ``planned`` (deferred). Returns ``(submitted, deferred, reasons, drift)``.
+    ``planned`` (deferred). Returns submissions, deferrals, reasons, drift, and verified count.
 
     New arrivals inside the ``sync.new_file_grace_period_seconds`` window defer
     with the ``grace_period`` reason: the row stays ``planned``, consumes **no** budget
@@ -1891,6 +1947,7 @@ def _apply(
     explicit ``SERVICE`` policy; campaign files remain on the separate F7/CLI campaign paths.
     """
     submitted = 0
+    verified = 0
     deferred = 0
     reasons: list[str] = []
     drift: list[str] = []
@@ -1898,7 +1955,7 @@ def _apply(
     service_backlog = deps.service_mode and policy is RunPolicy.SERVICE
     ordered, canary_gate_reason = _service_canary_candidates(deps, plans, ordered, now_iso)
     if canary_gate_reason is not None:
-        return (0, len(plans), (canary_gate_reason,), ())
+        return (0, len(plans), (canary_gate_reason,), (), 0)
     for index, file_id in enumerate(ordered):
         record = deps.store.get_file(file_id)
         if record is None or record.state is not FileState.PLANNED:
@@ -1935,6 +1992,7 @@ def _apply(
             service_backlog=service_backlog,
         )
         submitted += outcome.submitted
+        verified += int(outcome.verified)
         deferred += outcome.deferred
         reasons.extend(outcome.reasons)
         drift.extend(outcome.drift)
@@ -1943,7 +2001,7 @@ def _apply(
             reasons.append(canary_hold_reason)
             deferred += max(0, len(ordered) - index - 1)
             break
-    return submitted, deferred, tuple(reasons), tuple(drift)
+    return submitted, deferred, tuple(reasons), tuple(drift), verified
 
 
 # ------------------------------------------------------------------ cycle runner
@@ -2458,7 +2516,9 @@ def run_cycle(
         return _read_only_report(mode, cycle_key, "writes_disabled", None)
     if lock_reason is not None:
         return _read_only_report(mode, cycle_key, lock_reason, None)
+    original_budget_limits = deps.store.budget_limits
     try:
+        _apply_service_budget_limits(deps)
         return _run_cycle_body(
             deps,
             now_iso=now_iso,
@@ -2469,6 +2529,8 @@ def run_cycle(
             campaign_quarantine_limit=campaign_quarantine_limit,
         )
     finally:
+        if deps.service_mode:
+            deps.store.budget_limits = original_budget_limits
         if lock_acquired:
             try:
                 release_apply_lock(deps.store, deps.pid, now_iso)
@@ -2507,6 +2569,7 @@ def _run_cycle_body(
         reasons.extend(attestation_gate(deps, now_iso, mutate=mode is CycleMode.APPLY))
 
     phase = _mapping_phase(deps, now_iso)
+    service_mapping_refresh_failed = _service_mapping_refresh_failed(deps, phase.outcome, reasons)
     inventory = collect_sonarr_inventory(deps.sonarr, deps.settings)
     discovery = collect_shoko_discovery(deps.shoko)
     reconciliation_ready = (
@@ -2559,8 +2622,9 @@ def _run_cycle_body(
 
     active = phase.active
     if active is None:
-        reasons.append("mapping_unavailable")
-        return _unavailable_report(mode, cycle_key, phase, tuple(reasons), deps)
+        return _unavailable_service_mapping_report(
+            deps, mode, cycle_key, phase, reasons, drift, now_iso
+        )
 
     if phase.reactivated:
         series_tvdb = _sonarr_to_tvdb(inventory)
@@ -2605,6 +2669,7 @@ def _run_cycle_body(
         and cycle_eligible
         and reconciliation_ready
         and not phase.churn_paused
+        and not service_mapping_refresh_failed
     )
     submitted, deferred = _run_apply(
         deps,
@@ -2619,6 +2684,7 @@ def _run_cycle_body(
         reasons,
         drift,
         policy,
+        mode,
         full=full,
     )
 
@@ -2728,6 +2794,151 @@ def _unavailable_report(
     )
 
 
+def _unavailable_service_mapping_report(
+    deps: DaemonDeps,
+    mode: CycleMode,
+    cycle_key: str,
+    phase: _MappingPhase,
+    reasons: list[str],
+    drift: list[str],
+    now_iso: str,
+) -> CycleReport:
+    reasons.append("mapping_unavailable")
+    if deps.service_mode and mode is CycleMode.APPLY:
+        _observe_service_rate_hold(deps, now_iso, reasons, drift)
+    return _unavailable_report(mode, cycle_key, phase, tuple(reasons), deps)
+
+
+def _load_service_rate_state(deps: DaemonDeps, now_iso: str) -> RateState:
+    encoded = deps.store.get_service_rate_state_json()
+    if encoded is None:
+        state = RateState.initial(now_iso)
+        deps.store.save_service_rate_state_json(encode_rate_state(state), now_iso)
+        return state
+    try:
+        return decode_rate_state(encoded)
+    except (StateError, ValueError):
+        # Corrupt durable feedback can only restore the one-send cautious starting cap.
+        state = RateState.initial(now_iso)
+        deps.store.save_service_rate_state_json(encode_rate_state(state), now_iso)
+        return state
+
+
+def _update_service_rate_state(
+    deps: DaemonDeps,
+    state: RateState,
+    *,
+    now_iso: str,
+    queue: QueueSnapshot | None,
+    submitted: int,
+    verified: int,
+    reasons: Sequence[str],
+    drift: Sequence[str],
+) -> RateState:
+    if not deps.service_mode:
+        return state
+    configured = deps.store.budget_limits
+    limits = None if configured is None else service_budget_limits(configured)
+    budget_view = deps.store.budget_view()
+    all_reasons = tuple(reasons) + tuple(drift)
+    mapping_markers = (
+        "mapping_unstable",
+        "mapping_churn",
+        "mapping_generation_changed",
+        "mapping_changed",
+        "mapping_source_transport_failure",
+        "source_unstable",
+        "source_discontinuity",
+        "source_identity_drift",
+    )
+    failure_markers = (
+        "transport_failure",
+        "queue_unknown",
+        "api_failure",
+        "http_",
+        "throttl",
+    )
+    anomaly_markers = (
+        *mapping_markers,
+        "queue_blocked",
+        "onboarding_not_authorized",
+        "service_authorization_changed",
+        "service_canary_failed",
+        "preflight_blocked_safety",
+        "unsafe_shoko_settings",
+        "writes_disabled",
+        "recovery_poll",
+        "recovery_hold",
+        "verification:pending",
+        "verification:partial",
+        "verification:contradiction",
+        "verification:unknown",
+        "conflict",
+        "indeterminate",
+        "identity_drift",
+    )
+    canary = deps.store.get_service_canary()
+    signals = RateSignals(
+        queue_healthy=(
+            queue is not None and queue.blocked_count <= deps.settings.sync.queue_blocked_tolerance
+        ),
+        pending_episode_jobs=budget_view.pending_episode_jobs,
+        max_pending_episode_jobs=(0 if limits is None else limits.max_pending_episode_jobs),
+        submitted=submitted,
+        verified=verified,
+        api_healthy=not any(
+            marker in reason for reason in all_reasons for marker in failure_markers
+        ),
+        mapping_stable=not any(
+            marker in reason for reason in all_reasons for marker in mapping_markers
+        ),
+        authorization_valid=deps.service_authorized(),
+        anomaly_free=not any(
+            marker in reason for reason in all_reasons for marker in anomaly_markers
+        ),
+        canary_verified=canary is not None and canary[1] == "verified",
+    )
+    next_state = advance_rate(
+        state,
+        signals,
+        now_iso=now_iso,
+        hard_cycle_cap=min(
+            deps.settings.sync.max_new_per_cycle,
+            MAX_SERVICE_CYCLE_SUBMISSIONS,
+        ),
+    )
+    if next_state != state:
+        deps.store.save_service_rate_state_json(encode_rate_state(next_state), now_iso)
+    return next_state
+
+
+def _observe_service_rate_hold(
+    deps: DaemonDeps, now_iso: str, reasons: Sequence[str], drift: Sequence[str]
+) -> None:
+    state = _load_service_rate_state(deps, now_iso)
+    _update_service_rate_state(
+        deps,
+        state,
+        now_iso=now_iso,
+        queue=None,
+        submitted=0,
+        verified=0,
+        reasons=reasons,
+        drift=drift,
+    )
+
+
+def _apply_cycle_limit(deps: DaemonDeps, *, full: bool) -> int:
+    if deps.service_mode:
+        configured = min(
+            deps.max_submissions,
+            deps.settings.sync.max_new_per_cycle,
+            MAX_SERVICE_CYCLE_SUBMISSIONS,
+        )
+        return max(1, configured // 2) if not full and configured > 0 else configured
+    return deps.max_submissions if full else max(1, deps.max_submissions // 2)
+
+
 def _run_apply(
     deps: DaemonDeps,
     plans: Mapping[int, LinkPlan],
@@ -2741,16 +2952,23 @@ def _run_apply(
     reasons: list[str],
     drift: list[str],
     policy: RunPolicy,
+    mode: CycleMode,
     full: bool = True,
 ) -> tuple[int, int]:
     """Drive the apply loop and fold its reasons/drift into the cycle's lists."""
     if not apply_running:
+        if deps.service_mode and mode is CycleMode.APPLY:
+            _observe_service_rate_hold(deps, now_iso, reasons, drift)
         return (0, 0)
     queue = fetch_queue(deps.shoko)
-    max_submissions = deps.max_submissions if full else max(1, deps.max_submissions // 2)
-    if deps.service_mode:
-        max_submissions = min(max_submissions, 1)
-    submitted, deferred, apply_reasons, apply_drift = _apply(
+    configured_limit = _apply_cycle_limit(deps, full=full)
+    rate_state = _load_service_rate_state(deps, now_iso) if deps.service_mode else None
+    max_submissions = (
+        effective_submission_cap(rate_state, configured_limit)
+        if rate_state is not None
+        else configured_limit
+    )
+    submitted, deferred, apply_reasons, apply_drift, verified = _apply(
         deps,
         plans,
         flags,
@@ -2765,7 +2983,19 @@ def _run_apply(
     )
     reasons.extend(apply_reasons)
     drift.extend(apply_drift)
-    reasons.extend(queue_reasons(queue))
+    current_queue_reasons = queue_reasons(queue)
+    reasons.extend(current_queue_reasons)
+    if rate_state is not None:
+        _update_service_rate_state(
+            deps,
+            rate_state,
+            now_iso=deps.now(),
+            queue=queue,
+            submitted=submitted,
+            verified=verified,
+            reasons=reasons,
+            drift=drift,
+        )
     return (submitted, deferred)
 
 

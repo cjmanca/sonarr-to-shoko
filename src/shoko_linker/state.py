@@ -178,6 +178,7 @@ MAX_DETAIL_CHARS: Final[int] = 1000
 DIGEST_HEX_CHARS: Final[int] = 64
 TARGET_TRIPLE_LEN: Final[int] = 3
 MAX_ONBOARDING_JSON_CHARS: Final[int] = 100_000
+MAX_SERVICE_RATE_JSON_CHARS: Final[int] = 4096
 
 # meta keys (documented contract for M6-b/M7; the scheduler fills the
 # cycle/timestamp keys when the daemon loop lands).
@@ -217,6 +218,7 @@ META_NEXT_FULL_RECONCILE_ISO: Final[str] = "next_full_reconcile_iso"
 META_SERVICE_CANARY_FILE_ID: Final[str] = "service_canary_file_id"
 META_SERVICE_CANARY_STATUS: Final[str] = "service_canary_status"
 META_SERVICE_CANARY_UPDATED_ISO: Final[str] = "service_canary_updated_iso"
+META_SERVICE_RATE_STATE: Final[str] = "service_rate_state"
 META_ATTESTATION_GATE: Final[str] = "attestation_gate"
 #: Per-campaign attestation gate bookkeeping key prefix (F8: campaign-scope lease
 #: transitions are tracked per campaign, never as the global daemon write pause).
@@ -1475,6 +1477,31 @@ class StateStore:
         self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     # ---------------------------------------------------------- onboarding
+
+    def get_service_rate_state_json(self) -> str | None:
+        """Return the bounded adaptive-rate controller state, if initialized."""
+        encoded = self.get_meta(META_SERVICE_RATE_STATE)
+        if encoded is not None and len(encoded) > MAX_SERVICE_RATE_JSON_CHARS:
+            raise StateError("persisted service rate state exceeds its size limit")
+        return encoded
+
+    @_mutation
+    def save_service_rate_state_json(self, document_json: str, iso: str) -> None:
+        """Persist one validated, bounded, non-secret adaptive-rate state document."""
+        if not isinstance(document_json, str) or len(document_json) > MAX_SERVICE_RATE_JSON_CHARS:
+            raise StateError("service rate state must be bounded JSON text")
+        _require_iso(iso, "service_rate.updated_iso")
+        try:
+            document = json.loads(document_json)
+        except (TypeError, ValueError):
+            raise StateError("service rate state must be a JSON object") from None
+        expected = {"schema", "cap", "successful_streak", "updated_iso", "last_reason"}
+        if not isinstance(document, dict) or set(document) != expected:
+            raise StateError("service rate state must be a JSON object with the supported fields")
+        if document["updated_iso"] != iso:
+            raise StateError("service rate state timestamp does not match its persistence time")
+        with self._transaction():
+            self._set_meta_tx(META_SERVICE_RATE_STATE, document_json)
 
     def get_service_canary(self) -> tuple[int, str] | None:
         """Return the durable first-send canary identity and its monotonic status."""

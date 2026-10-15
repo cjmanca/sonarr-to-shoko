@@ -272,6 +272,23 @@ def test_service_canary_is_a_single_durable_monotonic_record(tmp_path: Path) -> 
         assert reopened.get_service_canary() == (500, "verified")
 
 
+def test_service_rate_state_is_persisted_as_bounded_json(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    rate_json = (
+        '{"schema":"shoko-sonarr-linker/service-rate/1","cap":4,'
+        '"successful_streak":2,"updated_iso":"2026-01-01T00:00:00+00:00",'
+        '"last_reason":"healthy"}'
+    )
+    with open_store(path) as store:
+        assert store.get_service_rate_state_json() is None
+        store.save_service_rate_state_json(rate_json, T0)
+        assert store.get_service_rate_state_json() == rate_json
+        with pytest.raises(StateError, match="JSON object"):
+            store.save_service_rate_state_json("[]", T1)
+    with open_store(path) as reopened:
+        assert reopened.get_service_rate_state_json() == rate_json
+
+
 def test_f17_pending_and_indeterminate_sends_are_not_replayed(tmp_path: Path) -> None:
     """F17: opening a v1 install must not auto-send anything — live rows stay held."""
     path = tmp_path / "state.sqlite3"

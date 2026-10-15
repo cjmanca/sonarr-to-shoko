@@ -1046,6 +1046,123 @@ def test_rejected_service_canary_stops_expansion_across_cycles(
     assert canary == (500, "failed")
 
 
+def test_service_rate_cap_ramps_and_survives_state_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    files = [SpecFile(series_id=1, file_id=index, shoko_id=500 + index) for index in range(10, 18)]
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+        )
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        rate_after_canary = store.get_service_rate_state_json()
+        store.close()
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+        )
+        second = run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
+        )
+        third = run_cycle(
+            deps,
+            now_iso="2026-01-01T00:20:00+00:00",
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="svc-3",
+        )
+        rate_after_third = store.get_service_rate_state_json()
+        limits_after_service_cycles = store.budget_limits
+    finally:
+        store.close()
+    assert first.counts.submitted == 1
+    assert second.counts.submitted == 2
+    assert third.counts.submitted == 4
+    assert shoko.posts_count() == 7
+    assert rate_after_canary is not None
+    assert rate_after_third is not None
+    assert limits_after_service_cycles == WIDE_LIMITS
+    assert json.loads(rate_after_canary)["cap"] == 2
+    assert json.loads(rate_after_third)["cap"] == 8
+
+
+def test_service_rate_immediately_drops_on_blocked_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    files = [SpecFile(series_id=1, file_id=index, shoko_id=500 + index) for index in range(10, 13)]
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+        )
+        canary = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        shoko.blocked_count = 1
+        blocked = run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
+        )
+        rate_json = store.get_service_rate_state_json()
+    finally:
+        store.close()
+    assert canary.counts.submitted == 1
+    assert blocked.counts.submitted == 0
+    assert any("preflight_queue_blocked" in reason for reason in blocked.reasons)
+    assert rate_json is not None
+    assert json.loads(rate_json)["cap"] == 1
+    assert shoko.posts_count() == 1
+
+
 def test_restart_preserves_original_ed2k_and_rejects_reused_shoko_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
