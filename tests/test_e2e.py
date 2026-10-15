@@ -849,14 +849,14 @@ def test_corrupt_mapping_source_keeps_last_known_good_with_backoff(
     eh.seed_backlog(world, N_TWO, N_TEN)
     store = eh.open_store(world)
     try:
-        active_bytes = (world.mapping_dir / "active.xml").read_bytes()
+        active_bytes = world.mapping_store().active_path.read_bytes()
         baseline_digest = hashlib.sha256(active_bytes).hexdigest()
         deps = eh.build_deps(world, store, clock, max_submissions=N_SERIES)
         world.source.corrupt = True
         clock.jump(7 * 24 * 3600.0)
         failed = _run_apply(deps, clock, "c1")
         status = mapping_status(world.mapping_store(), clock.now)
-        after_bytes = (world.mapping_dir / "active.xml").read_bytes()
+        after_bytes = world.mapping_store().active_path.read_bytes()
         reopened = world.mapping_store()
         due_time = eh.parse_iso(eh.iso_plus(clock.iso(), 3600))
         assert hashlib.sha256(after_bytes).hexdigest() == baseline_digest
@@ -912,7 +912,7 @@ def test_override_add_moves_ambiguous_file_to_planned_without_posts(
         )
         second = _run_apply(deps2, clock, "c2")
         record = store.get_file(AMBIG_FILE)
-        status = mapping_status(world.mapping_store(), clock.now)
+        status = mapping_status(world.mapping_store(), clock.now, overrides_text=OVERRIDE_YAML)
     finally:
         store.close()
     assert second.mapping_outcome is RefreshOutcome.ACTIVATED

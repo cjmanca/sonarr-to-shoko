@@ -3,13 +3,15 @@
 The stateful half of the M4 mapping pipeline (:mod:`shoko_linker.mappings` is the pure
 half). This module owns the on-disk cache under ``<database-dir>/mappings``:
 
-* ``active.xml`` — the last-known-good mapping bytes,
-* ``active.meta.json`` — digests/revision describing exactly those bytes,
-* ``state.json`` — schedule, opaque ETag validator, digests, revision, failure count.
+* ``active.generation.json`` — an atomic pointer and successful scheduler snapshot,
+* ``generations/<id>/active.xml`` and ``active.meta.json`` — immutable generation data,
+* ``state.json`` — schedule, opaque ETag validator, digests, revision, failure count,
+* ``source-transition.json`` — durable source-epoch fence across state loss or source switches.
 
-All JSON and cache writes are write-temp + ``os.replace``: a crash never leaves a
-half-written file, and a failed refresh never moves ``active.xml``, so the last-known-good
-mapping stays live.
+Generation files are staged before the pointer is atomically replaced. A crash before pointer
+publication leaves the previous generation selected; a crash afterwards selects a complete,
+verified generation whose scheduler snapshot can recover ``state.json``. Legacy flat cache
+files remain readable until the first successful generation activation.
 
 Policy (``docs/compatibility.md`` sections 1 and 3):
 
@@ -39,11 +41,14 @@ and send ``Accept-Encoding: identity`` (see :func:`make_source_endpoint`).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import time
+import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager, suppress
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -84,6 +89,7 @@ GENERATION_LOCK_REFRESH_WAIT_SECONDS: Final[float] = 1.0
 _OK: Final[int] = 200
 _NOT_MODIFIED: Final[int] = 304
 _HEX64: Final[int] = 64
+_HEX32: Final[int] = 32
 _MIN_SOURCE_PATH_CHARS: Final[int] = 2
 
 _STATE_FIELDS: Final[frozenset[str]] = frozenset(
@@ -99,9 +105,29 @@ _STATE_FIELDS: Final[frozenset[str]] = frozenset(
         "revision",
         "consecutive_failures",
         "source_url",
+        "source_epoch",
+        "refresh_attempt_id",
         "source_change_pending",
         "last_outcome",
     }
+)
+_REQUIRED_STATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "last_attempted_iso",
+        "last_success_iso",
+        "next_due_iso",
+        "etag",
+        "accept_encoding",
+        "content_sha256",
+        "targets_digest",
+        "structure_digest",
+        "revision",
+        "consecutive_failures",
+        "source_url",
+    }
+)
+_REQUIRED_SNAPSHOT_STATE_FIELDS: Final[frozenset[str]] = _REQUIRED_STATE_FIELDS | frozenset(
+    {"source_epoch", "refresh_attempt_id", "source_change_pending", "last_outcome"}
 )
 _META_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -111,10 +137,14 @@ _META_FIELDS: Final[frozenset[str]] = frozenset(
         "revision",
         "activated_iso",
         "source_url",
+        "source_epoch",
         "entries_indexed",
         "mapping_rules",
         "explicit_pairs",
     }
+)
+_TRANSITION_FIELDS: Final[frozenset[str]] = frozenset(
+    {"source_url", "source_epoch", "scheduler_state"}
 )
 
 
@@ -128,6 +158,7 @@ class RefreshOutcome(Enum):
     FAILED_INVALID = "failed_invalid"
     FAILED_SIZE = "failed_size"
     FAILED_LOCKED = "failed_locked"
+    FAILED_STALE = "failed_stale"
     NO_ACTIVE_BUT_FAILED = "no_active_but_failed"
 
 
@@ -188,8 +219,17 @@ class _State:
     revision: int = 0
     consecutive_failures: int = 0
     source_url: str = DEFAULT_MAPPING_SOURCE_URL
+    source_epoch: str | None = None
+    refresh_attempt_id: str | None = None
     source_change_pending: bool = False
     last_outcome: str | None = None
+
+
+@dataclass(frozen=True)
+class _SourceTransition:
+    source_url: str
+    source_epoch: str
+    scheduler_state: _State
 
 
 @dataclass(frozen=True)
@@ -202,6 +242,7 @@ class _Meta:
     revision: int
     activated_iso: str
     source_url: str
+    source_epoch: str | None
     entries_indexed: int
     mapping_rules: int
     explicit_pairs: int
@@ -218,12 +259,22 @@ class ActiveMappings:
     revision: int
     activated_iso: str
     source_url: str
+    source_epoch: str | None
     overrides_applied: bool
 
 
 @dataclass(frozen=True)
+class _VerifiedGeneration:
+    files: tuple[Path, Path, str | None]
+    meta: _Meta
+    index: MappingIndex
+    pointer_state: _State | None
+    source_fence_valid: bool
+
+
+@dataclass(frozen=True)
 class MappingStatus:
-    """Read-only disk view used for scheduling and reporting (no parsing, no I/O beyond reads)."""
+    """Snapshot; status retrieval may reconcile state and prune orphan generations."""
 
     source_url: str
     active_present: bool
@@ -288,6 +339,18 @@ def _is_hex64(raw: Any) -> bool:
     )
 
 
+def _is_hex32(raw: Any) -> bool:
+    return (
+        isinstance(raw, str)
+        and len(raw) == _HEX32
+        and all(char in "0123456789abcdef" for char in raw)
+    )
+
+
+def _generation_id(meta_bytes: bytes) -> str:
+    return hashlib.sha256(meta_bytes).hexdigest()
+
+
 def _state_from_document(document: dict[str, Any]) -> _State:
     if set(document) - _STATE_FIELDS:
         raise ValueError("unknown state fields")
@@ -300,6 +363,8 @@ def _state_from_document(document: dict[str, Any]) -> _State:
         raise ValueError("revision must be a non-negative whole number")
     if isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
         raise ValueError("consecutive_failures must be a non-negative whole number")
+    if failures > 0 and document.get("next_due_iso") is None:
+        raise ValueError("next_due_iso is required when consecutive_failures is positive")
     etag = document.get("etag")
     if etag is not None and not isinstance(etag, str):
         raise ValueError("etag must be a string")
@@ -307,6 +372,12 @@ def _state_from_document(document: dict[str, Any]) -> _State:
     if not isinstance(accept_encoding, str) or not accept_encoding:
         raise ValueError("accept_encoding must be a string")
     source_url = _normalized_source_url(document.get("source_url", DEFAULT_MAPPING_SOURCE_URL))
+    source_epoch = document.get("source_epoch")
+    if source_epoch is not None and not _is_hex32(source_epoch):
+        raise ValueError("source_epoch must be a lowercase 128-bit hex token")
+    refresh_attempt_id = document.get("refresh_attempt_id")
+    if refresh_attempt_id is not None and not _is_hex32(refresh_attempt_id):
+        raise ValueError("refresh_attempt_id must be a lowercase 128-bit hex token")
     last_outcome = document.get("last_outcome")
     if last_outcome is not None and not isinstance(last_outcome, str):
         raise ValueError("last_outcome must be a string")
@@ -329,6 +400,8 @@ def _state_from_document(document: dict[str, Any]) -> _State:
         revision=revision,
         consecutive_failures=failures,
         source_url=source_url,
+        source_epoch=source_epoch,
+        refresh_attempt_id=refresh_attempt_id,
         source_change_pending=source_change_pending,
         last_outcome=last_outcome,
     )
@@ -357,6 +430,9 @@ def _meta_from_document(document: dict[str, Any]) -> _Meta:
     if not isinstance(raw_source_url, str):
         raise ValueError("source_url must be a string")
     source_url = _normalized_source_url(raw_source_url)
+    source_epoch = document.get("source_epoch")
+    if source_epoch is not None and not _is_hex32(source_epoch):
+        raise ValueError("source_epoch must be a lowercase 128-bit hex token")
     return _Meta(
         content_sha256=cast(str, document["content_sha256"]),
         targets_digest=cast(str, document["targets_digest"]),
@@ -364,10 +440,35 @@ def _meta_from_document(document: dict[str, Any]) -> _Meta:
         revision=revision,
         activated_iso=activated,
         source_url=source_url,
+        source_epoch=source_epoch,
         entries_indexed=counts["entries_indexed"],
         mapping_rules=counts["mapping_rules"],
         explicit_pairs=counts["explicit_pairs"],
     )
+
+
+def _source_transition_from_document(document: Any) -> _SourceTransition | None:
+    if not isinstance(document, dict) or set(document) != _TRANSITION_FIELDS:
+        return None
+    raw_url = document.get("source_url")
+    epoch = document.get("source_epoch")
+    raw_state = document.get("scheduler_state")
+    if (
+        not isinstance(raw_url, str)
+        or not isinstance(epoch, str)
+        or not _is_hex32(epoch)
+        or not isinstance(raw_state, dict)
+        or not _REQUIRED_SNAPSHOT_STATE_FIELDS.issubset(raw_state)
+    ):
+        return None
+    try:
+        source_url = _normalized_source_url(raw_url)
+        scheduler_state = _state_from_document(cast("dict[str, Any]", raw_state))
+    except (ConfigError, ValueError):
+        return None
+    if scheduler_state.source_url != source_url or scheduler_state.source_epoch != epoch:
+        return None
+    return _SourceTransition(source_url, epoch, scheduler_state)
 
 
 class MappingStore:
@@ -401,16 +502,73 @@ class MappingStore:
         return self._source.path
 
     @property
-    def active_path(self) -> Path:
+    def generations_path(self) -> Path:
+        return self.directory / "generations"
+
+    @property
+    def active_generation_path(self) -> Path:
+        return self.directory / "active.generation.json"
+
+    @property
+    def _legacy_active_path(self) -> Path:
         return self.directory / "active.xml"
 
     @property
-    def meta_path(self) -> Path:
+    def _legacy_meta_path(self) -> Path:
         return self.directory / "active.meta.json"
+
+    def _load_active_pointer(self) -> tuple[str, _State] | None:
+        try:
+            document = json.loads(self.active_generation_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(document, dict) or set(document) != {"generation", "state"}:
+            return None
+        generation = document.get("generation")
+        raw_state = document.get("state")
+        if not isinstance(generation, str) or not _is_hex64(generation):
+            return None
+        if not isinstance(raw_state, dict) or not _REQUIRED_SNAPSHOT_STATE_FIELDS.issubset(
+            raw_state
+        ):
+            return None
+        try:
+            state = _state_from_document(cast("dict[str, Any]", raw_state))
+        except (ValueError, ConfigError):
+            return None
+        return generation, state
+
+    def _active_files(self) -> tuple[Path, Path, str | None] | None:
+        if self.active_generation_path.exists():
+            pointer = self._load_active_pointer()
+            if pointer is None:
+                return None
+            generation, _ = pointer
+            generation_dir = self.generations_path / generation
+            return (
+                generation_dir / "active.xml",
+                generation_dir / "active.meta.json",
+                generation,
+            )
+        return self._legacy_active_path, self._legacy_meta_path, None
+
+    @property
+    def active_path(self) -> Path:
+        files = self._active_files()
+        return self._legacy_active_path if files is None else files[0]
+
+    @property
+    def meta_path(self) -> Path:
+        files = self._active_files()
+        return self._legacy_meta_path if files is None else files[1]
 
     @property
     def state_path(self) -> Path:
         return self.directory / "state.json"
+
+    @property
+    def source_transition_path(self) -> Path:
+        return self.directory / "source-transition.json"
 
     @property
     def generation_lock_path(self) -> Path:
@@ -448,9 +606,17 @@ class MappingStore:
         """
         headers = {"Accept-Encoding": ACCEPT_ENCODING}
         state = self._load_state()
+        identity = self.active_identity()
         if (
             _source_url_matches(self, state.source_url)
-            and self._state_matches_active(state)
+            and identity
+            == (
+                state.revision,
+                state.content_sha256,
+                state.targets_digest,
+                state.structure_digest,
+                state.source_epoch,
+            )
             and state.etag is not None
             and state.accept_encoding == ACCEPT_ENCODING
         ):
@@ -462,23 +628,135 @@ class MappingStore:
         return self.request_headers
 
     def _load_state(self) -> _State:
+        return self._load_state_with_validity()[0]
+
+    def _load_state_with_validity(self) -> tuple[_State, bool]:
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return _State()
-        if not isinstance(payload, dict):
-            return _State()
+            return _State(), False
+        if not isinstance(payload, dict) or not _REQUIRED_STATE_FIELDS.issubset(payload):
+            return _State(), False
         try:
-            return _state_from_document(cast("dict[str, Any]", payload))
+            return _state_from_document(cast("dict[str, Any]", payload)), True
         except (ValueError, ConfigError):
-            return _State()
+            return _State(), False
 
     def _save_state(self, state: _State) -> None:
         _atomic_write(self.state_path, _json_bytes(asdict(state)))
 
-    def _load_meta(self) -> _Meta | None:
+    def _load_source_transition_with_validity(
+        self,
+    ) -> tuple[_SourceTransition | None, bool]:
         try:
-            payload = json.loads(self.meta_path.read_text(encoding="utf-8"))
+            document = json.loads(self.source_transition_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, True
+        except (OSError, ValueError):
+            return None, False
+        transition = _source_transition_from_document(document)
+        return transition, transition is not None
+
+    def _save_source_transition(self, state: _State) -> None:
+        if state.source_epoch is None:
+            raise ValueError("pending source transitions require a source epoch")
+        _atomic_write(
+            self.source_transition_path,
+            _json_bytes(
+                {
+                    "source_url": state.source_url,
+                    "source_epoch": state.source_epoch,
+                    "scheduler_state": asdict(state),
+                }
+            ),
+        )
+
+    def _save_pointer_transition(self, state: _State) -> None:
+        pointer = self._load_active_pointer()
+        if pointer is None:
+            return
+        _atomic_write(
+            self.active_generation_path,
+            _json_bytes({"generation": pointer[0], "state": asdict(state)}),
+        )
+
+    def _save_pointer_scheduler_state(self, state: _State) -> None:
+        pointer = self._load_active_pointer()
+        transition, transition_valid = self._load_source_transition_with_validity()
+        if not transition_valid:
+            return
+        if state.source_change_pending:
+            self._save_pending_scheduler_state(state, pointer, transition)
+            return
+        if pointer is None:
+            return
+        self._save_active_scheduler_state(state, pointer, transition)
+
+    def _save_pending_scheduler_state(
+        self,
+        state: _State,
+        pointer: tuple[str, _State] | None,
+        transition: _SourceTransition | None,
+    ) -> None:
+        if (
+            state.source_epoch is None
+            or transition is None
+            or transition.source_url != state.source_url
+            or transition.source_epoch != state.source_epoch
+        ):
+            return
+        if pointer is not None:
+            pointer_state = pointer[1]
+            if (
+                not pointer_state.source_change_pending
+                or pointer_state.source_url != state.source_url
+                or pointer_state.source_epoch != state.source_epoch
+            ):
+                return
+            _atomic_write(
+                self.active_generation_path,
+                _json_bytes({"generation": pointer[0], "state": asdict(state)}),
+            )
+        self._save_source_transition(state)
+
+    def _save_active_scheduler_state(
+        self,
+        state: _State,
+        pointer: tuple[str, _State],
+        transition: _SourceTransition | None,
+    ) -> None:
+        meta = self._load_meta()
+        if (
+            meta is None
+            or not self._active_verified()
+            or pointer[0] != _generation_id(_json_bytes(asdict(meta)))
+            or not _source_url_matches(self, state.source_url)
+            or state.source_change_pending
+            or state.source_epoch != meta.source_epoch
+            or state.content_sha256 != meta.content_sha256
+            or state.targets_digest != meta.targets_digest
+            or state.structure_digest != meta.structure_digest
+            or state.revision != meta.revision
+        ):
+            return
+        if transition is not None and (transition.source_url, transition.source_epoch) != (
+            meta.source_url,
+            meta.source_epoch,
+        ):
+            return
+        _atomic_write(
+            self.active_generation_path,
+            _json_bytes({"generation": pointer[0], "state": asdict(state)}),
+        )
+        if transition is not None:
+            self._save_source_transition(state)
+
+    def _load_meta(self) -> _Meta | None:
+        files = self._active_files()
+        if files is None:
+            return None
+        try:
+            payload = json.loads(files[1].read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         if not isinstance(payload, dict):
@@ -489,21 +767,302 @@ class MappingStore:
             return None
 
     def _read_active_bytes(self) -> bytes | None:
+        files = self._active_files()
+        if files is None:
+            return None
         try:
-            return self.active_path.read_bytes()
+            return files[0].read_bytes()
         except OSError:
             return None
+
+    def _pointer_matches_meta(self, meta: _Meta) -> bool:
+        files = self._active_files()
+        if files is None:
+            return False
+        generation = files[2]
+        if generation is None:
+            return True
+        pointer = self._load_active_pointer()
+        if pointer is None:
+            return False
+        pointer_generation, state = pointer
+        return (
+            generation == pointer_generation
+            and generation == _generation_id(_json_bytes(asdict(meta)))
+            and not state.source_change_pending
+            and state.source_url == meta.source_url
+            and state.source_epoch == meta.source_epoch
+            and state.content_sha256 == meta.content_sha256
+            and state.targets_digest == meta.targets_digest
+            and state.structure_digest == meta.structure_digest
+            and state.revision == meta.revision
+        )
+
+    def _verify_active_generation(self, overrides: Overrides | None) -> _VerifiedGeneration | None:
+        files = self._active_files()
+        if files is None:
+            return None
+        try:
+            meta_document = json.loads(files[1].read_text(encoding="utf-8"))
+            if not isinstance(meta_document, dict):
+                raise ValueError("active metadata must be an object")
+            meta = _meta_from_document(cast("dict[str, Any]", meta_document))
+            body = files[0].read_bytes()
+            index = build_mapping_index(parse_anime_lists(body), overrides)
+        except (OSError, ValueError, ConfigError, MappingError):
+            return None
+        pointer_state: _State | None = None
+        source_fence_valid = True
+        if files[2] is not None:
+            pointer = self._load_active_pointer()
+            if pointer is None:
+                return None
+            generation, pointer_state = pointer
+            if generation != files[2] or generation != _generation_id(_json_bytes(asdict(meta))):
+                return None
+            source_fence_valid = (
+                not pointer_state.source_change_pending
+                and pointer_state.source_url == meta.source_url
+                and pointer_state.source_epoch == meta.source_epoch
+                and pointer_state.content_sha256 == meta.content_sha256
+                and pointer_state.targets_digest == meta.targets_digest
+                and pointer_state.structure_digest == meta.structure_digest
+                and pointer_state.revision == meta.revision
+            )
+        transition, transition_valid = self._load_source_transition_with_validity()
+        source_fence_valid = (
+            source_fence_valid
+            and transition_valid
+            and (
+                transition is None
+                or (
+                    transition.source_url == meta.source_url
+                    and transition.source_epoch == meta.source_epoch
+                )
+            )
+        )
+        if (
+            content_digest(body) != meta.content_sha256
+            or targets_digest(index) != meta.targets_digest
+            or structure_digest(index) != meta.structure_digest
+            or index.entries_indexed != meta.entries_indexed
+            or index.mapping_rules != meta.mapping_rules
+            or index.explicit_pairs != meta.explicit_pairs
+        ):
+            return None
+        return _VerifiedGeneration(files, meta, index, pointer_state, source_fence_valid)
+
+    def _recover_pointer_state(self, verified: _VerifiedGeneration) -> None:
+        """Finish bookkeeping from a fully validated, source-bound pointer snapshot."""
+        committed_state = verified.pointer_state
+        if (
+            not verified.source_fence_valid
+            or committed_state is None
+            or not _source_url_matches(self, verified.meta.source_url)
+            or not _source_url_matches(self, committed_state.source_url)
+        ):
+            return
+        transition, transition_valid = self._load_source_transition_with_validity()
+        if (
+            transition_valid
+            and transition is not None
+            and transition.source_url == verified.meta.source_url
+            and transition.source_epoch == verified.meta.source_epoch
+            and transition.scheduler_state != committed_state
+        ):
+            self._save_source_transition(committed_state)
+        current, current_state_valid = self._load_state_with_validity()
+        if not current_state_valid:
+            self._save_state(committed_state)
+            return
+        same_source_epoch = (
+            _source_url_matches(self, current.source_url)
+            and current.source_epoch == committed_state.source_epoch
+        )
+        current_matches_generation = (
+            not current.source_change_pending
+            and current.content_sha256 == verified.meta.content_sha256
+            and current.targets_digest == verified.meta.targets_digest
+            and current.structure_digest == verified.meta.structure_digest
+            and current.revision == verified.meta.revision
+        )
+        current_matches_committed_attempt = (
+            current.refresh_attempt_id == committed_state.refresh_attempt_id
+            and current.last_attempted_iso == committed_state.last_attempted_iso
+        )
+        current_matches_scheduler = _same_scheduler_snapshot(current, committed_state)
+        interrupted_source_change = current.source_change_pending and same_source_epoch
+        interrupted_bookkeeping = same_source_epoch and not current_matches_generation
+        interrupted_scheduler_update = (
+            same_source_epoch
+            and current_matches_generation
+            and current_matches_committed_attempt
+            and not current_matches_scheduler
+        )
+        if interrupted_source_change or interrupted_bookkeeping or interrupted_scheduler_update:
+            self._save_state(committed_state)
+
+    def _recover_pending_transition_scheduler(self, active: ActiveMappings | None) -> None:
+        current, current_valid = self._load_state_with_validity()
+        if active is not None:
+            if (
+                current_valid
+                and not current.source_change_pending
+                and current.source_url == active.source_url
+                and current.source_epoch == active.source_epoch
+                and current.content_sha256 == active.content_sha256
+                and current.targets_digest == active.targets_digest
+                and current.structure_digest == active.structure_digest
+                and current.revision == active.revision
+            ):
+                self._save_pointer_scheduler_state(current)
+            return
+        pointer = self._load_active_pointer()
+        pending_state = (
+            pointer[1]
+            if pointer is not None
+            and pointer[1].source_change_pending
+            and _source_url_matches(self, pointer[1].source_url)
+            else None
+        )
+        if pending_state is None:
+            transition, transition_valid = self._load_source_transition_with_validity()
+            if (
+                transition_valid
+                and transition is not None
+                and transition.scheduler_state.source_change_pending
+                and _source_url_matches(self, transition.source_url)
+            ):
+                pending_state = transition.scheduler_state
+        if pending_state is None:
+            return
+        if (
+            current_valid
+            and current.source_change_pending
+            and current.source_url == pending_state.source_url
+            and current.source_epoch == pending_state.source_epoch
+        ):
+            if current.refresh_attempt_id != pending_state.refresh_attempt_id:
+                return
+            if _same_scheduler_snapshot(current, pending_state):
+                return
+        self._save_state(pending_state)
+
+    def _cleanup_generations(self) -> None:
+        """Discard unreferenced generations after pointer and state are committed."""
+        files = self._active_files()
+        if files is None or files[2] is None:
+            return
+        try:
+            generations = tuple(self.generations_path.iterdir())
+        except OSError:
+            return
+        for generation_dir in generations:
+            if (
+                generation_dir.is_dir()
+                and _is_hex64(generation_dir.name)
+                and generation_dir.name != files[2]
+            ):
+                shutil.rmtree(generation_dir, ignore_errors=True)
+        for legacy_path in (self._legacy_active_path, self._legacy_meta_path):
+            with suppress(OSError):
+                legacy_path.unlink(missing_ok=True)
+
+    def _migrate_legacy_active_generation(
+        self,
+        overrides: Overrides | None,
+        *,
+        transition_state: _State | None = None,
+    ) -> None:
+        """Migrate a flat cache before transition, retaining the transition fence."""
+        files = self._active_files()
+        if files is None or files[2] is not None:
+            return
+        meta = self._load_meta()
+        body = self._read_active_bytes()
+        if meta is None or body is None or content_digest(body) != meta.content_sha256:
+            return
+        try:
+            parsed = parse_anime_lists(body)
+            upstream_index = build_mapping_index(parsed)
+            index = build_mapping_index(parsed, overrides)
+        except (MappingError, ConfigError):
+            return
+        if (
+            upstream_index.entries_indexed != meta.entries_indexed
+            or upstream_index.mapping_rules != meta.mapping_rules
+            or upstream_index.explicit_pairs != meta.explicit_pairs
+        ):
+            return
+        index_matches = (
+            targets_digest(index) == meta.targets_digest
+            and structure_digest(index) == meta.structure_digest
+        )
+        if not index_matches and transition_state is None:
+            return
+
+        state, state_valid = self._load_state_with_validity()
+        if not (
+            state_valid
+            and not state.source_change_pending
+            and state.source_url == meta.source_url
+            and state.source_epoch == meta.source_epoch
+            and state.content_sha256 == meta.content_sha256
+            and state.targets_digest == meta.targets_digest
+            and state.structure_digest == meta.structure_digest
+            and state.revision == meta.revision
+        ):
+            state = _State(
+                source_url=meta.source_url,
+                source_epoch=meta.source_epoch,
+                content_sha256=meta.content_sha256,
+                targets_digest=meta.targets_digest,
+                structure_digest=meta.structure_digest,
+                revision=meta.revision,
+                last_success_iso=meta.activated_iso,
+            )
+        if transition_state is not None:
+            state = transition_state
+
+        meta_bytes = _json_bytes(asdict(meta))
+        generation = _generation_id(meta_bytes)
+        generation_dir = self.generations_path / generation
+        xml_path = generation_dir / "active.xml"
+        meta_path = generation_dir / "active.meta.json"
+        _atomic_write(xml_path, body)
+        _atomic_write(meta_path, meta_bytes)
+        with xml_path.open("rb") as staged_file:
+            staged_digest = hashlib.file_digest(staged_file, "sha256").hexdigest()
+        if staged_digest != meta.content_sha256:
+            return
+        _atomic_write(
+            self.active_generation_path,
+            _json_bytes({"generation": generation, "state": asdict(state)}),
+        )
+        self._cleanup_generations()
 
     def _active_verified(self) -> bool:
         meta = self._load_meta()
         state = self._load_state()
         body = self._read_active_bytes()
+        transition, transition_valid = self._load_source_transition_with_validity()
+        if not transition_valid:
+            return False
         if (
             meta is None
             or body is None
+            or not self._pointer_matches_meta(meta)
             or not _source_url_matches(self, meta.source_url)
             or not _source_url_matches(self, state.source_url)
             or state.source_change_pending
+            or state.source_epoch != meta.source_epoch
+            or (
+                transition is not None
+                and (
+                    transition.source_url != meta.source_url
+                    or transition.source_epoch != meta.source_epoch
+                )
+            )
             or content_digest(body) != meta.content_sha256
         ):
             return False
@@ -520,10 +1079,59 @@ class MappingStore:
             and _source_url_matches(self, state.source_url)
             and _source_url_matches(self, meta.source_url)
             and self._active_verified()
+            and state.source_epoch == meta.source_epoch
             and state.content_sha256 == meta.content_sha256
             and state.targets_digest == meta.targets_digest
             and state.structure_digest == meta.structure_digest
             and state.revision == meta.revision
+        )
+
+    def active_identity(self) -> tuple[int, str, str, str, str | None] | None:
+        """Read the selected verified generation identity without parsing or indexing XML."""
+        while True:
+            with self.generation_lock(
+                wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS
+            ) as acquired:
+                if acquired:
+                    return self.active_identity_locked()
+
+    def active_identity_locked(self) -> tuple[int, str, str, str, str | None] | None:
+        """Read identity without reacquiring the generation lock held by the caller."""
+        files = self._active_files()
+        meta = self._load_meta()
+        body = self._read_active_bytes()
+        state = self._load_state()
+        transition, transition_valid = self._load_source_transition_with_validity()
+        if (
+            files is None
+            or meta is None
+            or body is None
+            or not transition_valid
+            or not self._pointer_matches_meta(meta)
+            or not _source_url_matches(self, meta.source_url)
+            or not _source_url_matches(self, state.source_url)
+            or state.source_change_pending
+            or state.source_epoch != meta.source_epoch
+            or state.content_sha256 != meta.content_sha256
+            or state.targets_digest != meta.targets_digest
+            or state.structure_digest != meta.structure_digest
+            or state.revision != meta.revision
+            or content_digest(body) != meta.content_sha256
+            or (
+                transition is not None
+                and (
+                    transition.source_url != meta.source_url
+                    or transition.source_epoch != meta.source_epoch
+                )
+            )
+        ):
+            return None
+        return (
+            meta.revision,
+            meta.content_sha256,
+            meta.targets_digest,
+            meta.structure_digest,
+            meta.source_epoch,
         )
 
 
@@ -560,6 +1168,294 @@ def _require_source_endpoint(store: MappingStore, endpoint: ApiEndpoint) -> None
         )
 
 
+def _begin_from_pointer_transition(
+    store: MappingStore,
+    state: _State,
+    valid: bool,
+) -> _State | None:
+    pointer = store._load_active_pointer()
+    if pointer is None:
+        return None
+    pointer_state = pointer[1]
+    meta = store._load_meta()
+    pointer_transition_pending = (
+        pointer_state.source_change_pending
+        or meta is None
+        or pointer_state.source_url != meta.source_url
+        or pointer_state.source_epoch != meta.source_epoch
+        or pointer_state.content_sha256 != meta.content_sha256
+        or pointer_state.targets_digest != meta.targets_digest
+        or pointer_state.structure_digest != meta.structure_digest
+        or pointer_state.revision != meta.revision
+    )
+    if not pointer_transition_pending:
+        return None
+    if pointer_state.source_change_pending and _source_url_matches(store, pointer_state.source_url):
+        if (
+            valid
+            and state.source_url == pointer_state.source_url
+            and state.source_epoch == pointer_state.source_epoch
+            and state.source_change_pending
+        ):
+            same_attempt = (
+                state.refresh_attempt_id == pointer_state.refresh_attempt_id
+                and state.last_attempted_iso == pointer_state.last_attempted_iso
+            )
+            pointer_state = (
+                pointer_state
+                if same_attempt and not _same_scheduler_snapshot(state, pointer_state)
+                else state
+            )
+    else:
+        state = _State(
+            source_url=store.source_url,
+            source_epoch=uuid.uuid4().hex,
+            source_change_pending=True,
+        )
+        pointer_state = state
+    state = pointer_state
+    store._save_pointer_transition(state)
+    store._save_source_transition(state)
+    if not valid or state != store._load_state():
+        store._save_state(state)
+    return state
+
+
+def _begin_refresh_state(store: MappingStore, overrides: Overrides | None) -> _State | None:
+    with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return None
+        return _begin_refresh_state_locked(store, overrides)
+
+
+def _recover_refresh_state_if_missing(
+    store: MappingStore, state: _State, valid: bool, overrides: Overrides | None
+) -> tuple[_State, bool]:
+    if valid:
+        return state, valid
+    committed = store._verify_active_generation(overrides)
+    if (
+        committed is not None
+        and committed.source_fence_valid
+        and committed.pointer_state is not None
+        and _source_url_matches(store, committed.meta.source_url)
+    ):
+        store._recover_pointer_state(committed)
+        return store._load_state_with_validity()
+    return state, valid
+
+
+def _resume_transition_state(
+    store: MappingStore,
+    state: _State,
+    valid: bool,
+    transition: _SourceTransition | None,
+    transition_valid: bool,
+    overrides: Overrides | None,
+) -> _State | None:
+    if valid and _source_url_matches(store, state.source_url):
+        if not transition_valid and state.source_change_pending and state.source_epoch is not None:
+            store._save_pointer_transition(state)
+            store._save_source_transition(state)
+            return state
+        if (
+            transition_valid
+            and transition is not None
+            and transition.source_url == state.source_url
+            and transition.source_epoch == state.source_epoch
+        ):
+            snapshot = transition.scheduler_state
+            if (
+                state.refresh_attempt_id == snapshot.refresh_attempt_id
+                and state.last_attempted_iso == snapshot.last_attempted_iso
+                and not _same_scheduler_snapshot(state, snapshot)
+            ):
+                store._migrate_legacy_active_generation(overrides, transition_state=snapshot)
+                store._save_state(snapshot)
+                return snapshot
+            store._migrate_legacy_active_generation(overrides, transition_state=state)
+            return state
+        if transition_valid and transition is None:
+            if state.source_epoch is None and state.source_change_pending:
+                state = _State(
+                    source_url=store.source_url,
+                    source_epoch=uuid.uuid4().hex,
+                    source_change_pending=True,
+                )
+                store._migrate_legacy_active_generation(overrides, transition_state=state)
+                store._save_pointer_transition(state)
+                store._save_source_transition(state)
+                store._save_state(state)
+            elif state.source_epoch is not None:
+                store._migrate_legacy_active_generation(overrides, transition_state=state)
+                store._save_pointer_transition(state)
+                store._save_source_transition(state)
+            return state
+    if not valid:
+        return _resume_invalid_source_state(store, state, transition, transition_valid, overrides)
+    return None
+
+
+def _resume_invalid_source_state(
+    store: MappingStore,
+    state: _State,
+    transition: _SourceTransition | None,
+    transition_valid: bool,
+    overrides: Overrides | None,
+) -> _State | None:
+    if not transition_valid:
+        return None
+    if transition is not None and _source_url_matches(store, transition.source_url):
+        state = transition.scheduler_state
+    elif transition is None and _source_url_matches(store, state.source_url):
+        state = _State(
+            source_url=store.source_url,
+            source_epoch=uuid.uuid4().hex,
+            source_change_pending=True,
+        )
+    else:
+        return None
+    store._migrate_legacy_active_generation(overrides, transition_state=state)
+    store._save_pointer_transition(state)
+    store._save_source_transition(state)
+    store._save_state(state)
+    return state
+
+
+def _start_source_transition(
+    store: MappingStore,
+    transition: _SourceTransition | None,
+    transition_valid: bool,
+    overrides: Overrides | None,
+) -> _State:
+    state = (
+        transition.scheduler_state
+        if transition_valid
+        and transition is not None
+        and _source_url_matches(store, transition.source_url)
+        and transition.scheduler_state.source_change_pending
+        else _State(
+            source_url=store.source_url,
+            source_epoch=uuid.uuid4().hex,
+            source_change_pending=True,
+        )
+    )
+    store._migrate_legacy_active_generation(overrides, transition_state=state)
+    store._save_pointer_transition(state)
+    store._save_source_transition(state)
+    store._save_state(state)
+    return state
+
+
+def _begin_refresh_state_locked(store: MappingStore, overrides: Overrides | None) -> _State | None:
+    state, valid = store._load_state_with_validity()
+    transition, transition_valid = store._load_source_transition_with_validity()
+    state, valid = _recover_refresh_state_if_missing(store, state, valid, overrides)
+    if (
+        not valid
+        and transition_valid
+        and transition is None
+        and _source_url_matches(store, state.source_url)
+    ):
+        files = store._active_files()
+        if files is not None and files[2] is None:
+            store._migrate_legacy_active_generation(overrides)
+            committed = store._verify_active_generation(overrides)
+            if (
+                committed is not None
+                and committed.source_fence_valid
+                and _source_url_matches(store, committed.meta.source_url)
+            ):
+                store._recover_pointer_state(committed)
+                state, valid = store._load_state_with_validity()
+    pointer_state = _begin_from_pointer_transition(store, state, valid)
+    if pointer_state is not None:
+        return pointer_state
+    if not valid and not transition_valid:
+        return None
+    active_meta = store._load_meta()
+    if active_meta is not None and not _source_url_matches(store, active_meta.source_url):
+        return _start_source_transition(store, transition, transition_valid, overrides)
+    resumed_state = _resume_transition_state(
+        store, state, valid, transition, transition_valid, overrides
+    )
+    if resumed_state is not None:
+        return resumed_state
+    return _start_source_transition(store, transition, transition_valid, overrides)
+
+
+def _state_after_active_check(
+    store: MappingStore, state: _State, active_valid: bool
+) -> _State | None:
+    current = store._load_state()
+    if active_valid or current.etag is None:
+        return current
+    with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return None
+        current = store._load_state()
+        if _same_refresh_generation(current, state) and _source_url_matches(
+            store, current.source_url
+        ):
+            current.etag = None
+            store._save_state(current)
+        return current
+
+
+def _prepare_refresh_state(
+    store: MappingStore, overrides_text: str | None
+) -> tuple[_State | None, Overrides | None, bool]:
+    cache_overrides: Overrides | None = None
+    overrides_valid = True
+    if overrides_text is not None:
+        try:
+            cache_overrides = load_overrides(overrides_text)
+        except ConfigError:
+            overrides_valid = False
+    state = _begin_refresh_state(store, cache_overrides)
+    if state is None:
+        return None, cache_overrides, overrides_valid
+    active_valid = overrides_valid and load_active(store, cache_overrides) is not None
+    return _state_after_active_check(store, state, active_valid), cache_overrides, overrides_valid
+
+
+def _start_refresh_attempt(
+    store: MappingStore, expected_state: _State, now: datetime
+) -> tuple[_State | None, RefreshOutcome | None]:
+    with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return None, RefreshOutcome.FAILED_LOCKED
+        state = store._load_state()
+        if not _source_url_matches(store, state.source_url) or not _same_refresh_generation(
+            state, expected_state
+        ):
+            return None, RefreshOutcome.FAILED_STALE
+        state.last_attempted_iso = _iso(now)
+        state.refresh_attempt_id = uuid.uuid4().hex
+        store._save_state(state)
+        return state, None
+
+
+def _prepare_refresh_request(
+    store: MappingStore,
+    endpoint: ApiEndpoint,
+    now: datetime,
+    *,
+    force: bool,
+    overrides_text: str | None,
+) -> tuple[_State | None, RefreshOutcome | None]:
+    state, overrides, overrides_valid = _prepare_refresh_state(store, overrides_text)
+    if state is None:
+        return None, RefreshOutcome.FAILED_LOCKED
+    if not force and not due(store, now, overrides if overrides_valid else None):
+        return None, RefreshOutcome.NOT_DUE
+    state = store._load_state()
+    if not _source_url_matches(store, state.source_url):
+        return None, RefreshOutcome.FAILED_STALE
+    _require_source_endpoint(store, endpoint)
+    return _start_refresh_attempt(store, state, now)
+
+
 def _is_due(state: _State, now: datetime) -> bool:
     try:
         next_due = _parse_iso(state.next_due_iso)
@@ -574,7 +1470,40 @@ def _state_for_source(store: MappingStore, state: _State) -> tuple[_State, bool]
     """Return source-specific scheduler state, resetting all inherited validators/timing."""
     if _source_url_matches(store, state.source_url):
         return state, False
-    return _State(source_url=store.source_url, source_change_pending=True), True
+    return (
+        _State(
+            source_url=store.source_url,
+            source_epoch=uuid.uuid4().hex,
+            source_change_pending=True,
+        ),
+        True,
+    )
+
+
+def _same_refresh_generation(current: _State, expected: _State) -> bool:
+    return (
+        current.source_url == expected.source_url
+        and current.source_epoch == expected.source_epoch
+        and current.refresh_attempt_id == expected.refresh_attempt_id
+        and current.source_change_pending == expected.source_change_pending
+        and current.content_sha256 == expected.content_sha256
+        and current.targets_digest == expected.targets_digest
+        and current.structure_digest == expected.structure_digest
+        and current.revision == expected.revision
+    )
+
+
+def _same_scheduler_snapshot(current: _State, expected: _State) -> bool:
+    return (
+        current.last_attempted_iso == expected.last_attempted_iso
+        and current.last_success_iso == expected.last_success_iso
+        and current.next_due_iso == expected.next_due_iso
+        and current.etag == expected.etag
+        and current.accept_encoding == expected.accept_encoding
+        and current.consecutive_failures == expected.consecutive_failures
+        and current.refresh_attempt_id == expected.refresh_attempt_id
+        and current.last_outcome == expected.last_outcome
+    )
 
 
 def _recovery_backoff_active(state: _State, now: datetime) -> bool:
@@ -598,9 +1527,26 @@ def _record_failure(
     now: datetime,
     outcome: RefreshOutcome,
 ) -> RefreshOutcome:
+    with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return RefreshOutcome.FAILED_LOCKED
+        current = store._load_state()
+        if not _same_refresh_generation(current, state):
+            return RefreshOutcome.FAILED_STALE
+        current.last_attempted_iso = state.last_attempted_iso or current.last_attempted_iso
+        return _record_failure_locked(store, current, now, outcome)
+
+
+def _record_failure_locked(
+    store: MappingStore,
+    state: _State,
+    now: datetime,
+    outcome: RefreshOutcome,
+) -> RefreshOutcome:
     state.consecutive_failures += 1
     state.next_due_iso = _iso(now + timedelta(hours=_backoff_hours(state.consecutive_failures)))
     state.last_outcome = outcome.value
+    store._save_pointer_scheduler_state(state)
     store._save_state(state)
     if store._active_verified():
         return outcome
@@ -619,6 +1565,36 @@ def _record_success(
     revision: int,
     outcome: RefreshOutcome,
 ) -> RefreshOutcome:
+    state = _successful_state(
+        store,
+        state,
+        now,
+        response,
+        refresh_hours,
+        content_sha256,
+        targets,
+        structure,
+        revision,
+        outcome,
+    )
+    store._save_pointer_scheduler_state(state)
+    store._save_state(state)
+    return outcome
+
+
+def _successful_state(
+    store: MappingStore,
+    state: _State,
+    now: datetime,
+    response: httpx.Response,
+    refresh_hours: float,
+    content_sha256: str,
+    targets: str,
+    structure: str,
+    revision: int,
+    outcome: RefreshOutcome,
+) -> _State:
+    state = replace(state)
     etag = response.headers.get("etag")
     state.etag = etag
     state.accept_encoding = ACCEPT_ENCODING
@@ -632,8 +1608,7 @@ def _record_success(
     state.next_due_iso = _iso(now + timedelta(hours=refresh_hours))
     state.consecutive_failures = 0
     state.last_outcome = outcome.value
-    store._save_state(state)
-    return outcome
+    return state
 
 
 def _activate(
@@ -642,6 +1617,7 @@ def _activate(
     state_view: tuple[str, str, str, int],
     now: datetime,
     index: MappingIndex,
+    successful_state: _State,
 ) -> None:
     content_sha256, targets, structure, revision = state_view
     meta = _Meta(
@@ -651,12 +1627,29 @@ def _activate(
         revision=revision,
         activated_iso=_iso(now),
         source_url=store.source_url,
+        source_epoch=successful_state.source_epoch,
         entries_indexed=index.entries_indexed,
         mapping_rules=index.mapping_rules,
         explicit_pairs=index.explicit_pairs,
     )
-    _atomic_write(store.active_path, body)
-    _atomic_write(store.meta_path, _json_bytes(asdict(meta)))
+    meta_bytes = _json_bytes(asdict(meta))
+    generation = _generation_id(meta_bytes)
+    generation_dir = store.generations_path / generation
+    xml_path = generation_dir / "active.xml"
+    meta_path = generation_dir / "active.meta.json"
+    _atomic_write(xml_path, body)
+    _atomic_write(meta_path, meta_bytes)
+
+    with xml_path.open("rb") as staged_file:
+        staged_digest = hashlib.file_digest(staged_file, "sha256").hexdigest()
+    staged_meta = _meta_from_document(
+        cast("dict[str, Any]", json.loads(meta_path.read_text(encoding="utf-8")))
+    )
+    if staged_digest != meta.content_sha256 or staged_meta != meta:
+        raise OSError("staged mapping generation did not match its validated metadata")
+
+    pointer = {"generation": generation, "state": asdict(successful_state)}
+    _atomic_write(store.active_generation_path, _json_bytes(pointer))
 
 
 def _accept_content(
@@ -686,6 +1679,15 @@ def _accept_content(
     with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
         if not acquired:
             return _record_failure(store, state, now, RefreshOutcome.FAILED_LOCKED)
+        current_state = store._load_state()
+        if not _source_url_matches(store, current_state.source_url) or not _same_refresh_generation(
+            current_state, state
+        ):
+            return RefreshOutcome.FAILED_STALE
+        current_state.last_attempted_iso = (
+            state.last_attempted_iso or current_state.last_attempted_iso
+        )
+        state = current_state
         meta = store._load_meta()
         if (
             meta is not None
@@ -707,8 +1709,7 @@ def _accept_content(
                 RefreshOutcome.UNCHANGED,
             )
         revision = meta.revision + 1 if meta is not None else 1
-        _activate(store, body, (content_sha256, targets, structure, revision), now, index)
-        return _record_success(
+        successful_state = _successful_state(
             store,
             state,
             now,
@@ -720,6 +1721,25 @@ def _accept_content(
             revision,
             RefreshOutcome.ACTIVATED,
         )
+        _activate(
+            store,
+            body,
+            (content_sha256, targets, structure, revision),
+            now,
+            index,
+            successful_state,
+        )
+        transition, transition_valid = store._load_source_transition_with_validity()
+        if (
+            transition_valid
+            and transition is not None
+            and transition.source_url == successful_state.source_url
+            and transition.source_epoch == successful_state.source_epoch
+        ):
+            store._save_source_transition(successful_state)
+        store._save_state(successful_state)
+        store._cleanup_generations()
+        return RefreshOutcome.ACTIVATED
 
 
 def refresh(
@@ -751,26 +1771,15 @@ def refresh(
     if max_bytes <= 0:
         raise ConfigError("max_bytes must be greater than 0")
     now_utc = _as_utc(now)
-    state, source_changed = _state_for_source(store, store._load_state())
-    if source_changed:
-        # Persist the source switch before any request so a crash cannot keep the old
-        # validator or weekly schedule attached to the new URL.
-        store._save_state(state)
-    cache_overrides: Overrides | None = None
-    overrides_valid = True
-    if overrides_text is not None:
-        try:
-            cache_overrides = load_overrides(overrides_text)
-        except ConfigError:
-            overrides_valid = False
-    active_valid = overrides_valid and load_active(store, cache_overrides) is not None
-    if not active_valid and state.etag is not None:
-        state.etag = None
-        store._save_state(state)
-    if not force and not due(store, now_utc, cache_overrides if overrides_valid else None):
-        return RefreshOutcome.NOT_DUE
-    _require_source_endpoint(store, endpoint)
-    state.last_attempted_iso = _iso(now_utc)
+    state, preflight_outcome = _prepare_refresh_request(
+        store,
+        endpoint,
+        now_utc,
+        force=force,
+        overrides_text=overrides_text,
+    )
+    if state is None:
+        return preflight_outcome or RefreshOutcome.FAILED_STALE
     try:
         # max_redirects=0: the canonical source answers 200 (docs §3);
         # any redirect (same- or cross-origin) is a contract violation and
@@ -836,6 +1845,7 @@ def _handle_not_modified(
     refresh_hours: float,
     overrides_text: str | None,
 ) -> RefreshOutcome:
+    attempted_state = state
     overrides: Overrides | None = None
     overrides_valid = True
     if overrides_text is not None:
@@ -843,28 +1853,48 @@ def _handle_not_modified(
             overrides = load_overrides(overrides_text)
         except ConfigError:
             overrides_valid = False
-    if (
-        not overrides_valid
-        or load_active(store, overrides) is None
-        or not store._state_matches_active(state)
-    ):
+    active = load_active(store, overrides) if overrides_valid else None
+    state = store._load_state()
+    if not overrides_valid or active is None:
         # The validator is alive but our cache is not (deleted/tampered):
         # drop the ETag so the next attempt performs a full fetch, and fail
         # this one — 304 yields no content to activate.
-        state.etag = None
-        return _record_failure(store, state, now_utc, RefreshOutcome.FAILED_TRANSPORT)
-    return _record_success(
-        store,
-        state,
-        now_utc,
-        response,
-        refresh_hours,
-        cast("str", state.content_sha256),
-        cast("str", state.targets_digest),
-        cast("str", state.structure_digest),
-        state.revision,
-        RefreshOutcome.UNCHANGED,
-    )
+        with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+            if not acquired:
+                return RefreshOutcome.FAILED_LOCKED
+            current = store._load_state()
+            if not _same_refresh_generation(current, attempted_state):
+                return RefreshOutcome.FAILED_STALE
+            current.last_attempted_iso = (
+                attempted_state.last_attempted_iso or current.last_attempted_iso
+            )
+            current.etag = None
+            return _record_failure_locked(store, current, now_utc, RefreshOutcome.FAILED_TRANSPORT)
+    with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return RefreshOutcome.FAILED_LOCKED
+        current = store._load_state()
+        if (
+            not _same_refresh_generation(current, attempted_state)
+            or not _source_url_matches(store, current.source_url)
+            or not store._state_matches_active(current)
+        ):
+            return RefreshOutcome.FAILED_STALE
+        current.last_attempted_iso = (
+            attempted_state.last_attempted_iso or current.last_attempted_iso
+        )
+        return _record_success(
+            store,
+            current,
+            now_utc,
+            response,
+            refresh_hours,
+            cast("str", current.content_sha256),
+            cast("str", current.targets_digest),
+            cast("str", current.structure_digest),
+            current.revision,
+            RefreshOutcome.UNCHANGED,
+        )
 
 
 def due(store: MappingStore, now: datetime, overrides: Overrides | None = None) -> bool:
@@ -874,12 +1904,18 @@ def due(store: MappingStore, now: datetime, overrides: Overrides | None = None) 
     triggers recovery immediately, except while a persisted failed-recovery backoff is open.
     """
     now_utc = _as_utc(now)
-    state = store._load_state()
-    if not _source_url_matches(store, state.source_url):
-        return True
-    if load_active(store, overrides) is None:
-        return not _recovery_backoff_active(state, now_utc)
-    return _is_due(state, now_utc)
+    while True:
+        with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+            if not acquired:
+                continue
+            store._recover_pending_transition_scheduler(None)
+            active = _load_active_locked(store, overrides)
+            state = store._load_state()
+            if not _source_url_matches(store, state.source_url):
+                return True
+            if active is None:
+                return not _recovery_backoff_active(state, now_utc)
+            return _is_due(state, now_utc)
 
 
 def next_refresh_due(store: MappingStore, now: datetime, refresh_hours: float) -> datetime:
@@ -887,29 +1923,72 @@ def next_refresh_due(store: MappingStore, now: datetime, refresh_hours: float) -
     if refresh_hours <= 0:
         raise ConfigError("refresh_hours must be greater than 0")
     now_utc = _as_utc(now)
-    state, source_changed = _state_for_source(store, store._load_state())
-    if source_changed:
-        return now_utc
-    if not store._active_verified():
-        if _recovery_backoff_active(state, now_utc):
-            return _parse_iso(state.next_due_iso) or now_utc
-        return now_utc
-    try:
-        scheduled = _parse_iso(state.next_due_iso)
-    except ValueError:
-        scheduled = None
-    if scheduled is None or scheduled <= now_utc:
-        return now_utc
-    return scheduled
+    while True:
+        with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+            if not acquired:
+                continue
+            store._recover_pending_transition_scheduler(None)
+            active = _load_active_locked(store, None)
+            state, source_changed = _state_for_source(store, store._load_state())
+            if source_changed:
+                return now_utc
+            if active is None:
+                if _recovery_backoff_active(state, now_utc):
+                    return _parse_iso(state.next_due_iso) or now_utc
+                return now_utc
+            try:
+                scheduled = _parse_iso(state.next_due_iso)
+            except ValueError:
+                scheduled = None
+            if scheduled is None or scheduled <= now_utc:
+                return now_utc
+            return scheduled
 
 
-def status(store: MappingStore, now: datetime) -> MappingStatus:
-    """Read-only disk view of the cache and schedule (no network, no index parse)."""
+def status(
+    store: MappingStore,
+    now: datetime,
+    *,
+    overrides_text: str | None = None,
+) -> MappingStatus:
+    """Report the cache and schedule, reconciling any committed generation first."""
+    overrides: Overrides | None = None
+    overrides_valid = True
+    if overrides_text is not None:
+        try:
+            overrides = load_overrides(overrides_text)
+        except ConfigError:
+            overrides_valid = False
+    while True:
+        with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+            if acquired:
+                active = _load_active_locked(store, overrides) if overrides_valid else None
+                store._recover_pending_transition_scheduler(active)
+                return _status_locked(store, now, active)
+
+
+def _status_locked(
+    store: MappingStore, now: datetime, active: ActiveMappings | None
+) -> MappingStatus:
     now_utc = _as_utc(now)
     state, source_changed = _state_for_source(store, store._load_state())
     meta = store._load_meta()
-    active_present = not source_changed and store._state_matches_active(state)
-    if source_changed or not store._active_verified():
+    active_present = (
+        not source_changed
+        and active is not None
+        and meta is not None
+        and _source_url_matches(store, state.source_url)
+        and _source_url_matches(store, meta.source_url)
+        and not state.source_change_pending
+        and state.source_epoch == meta.source_epoch
+        and state.content_sha256 == meta.content_sha256
+        and state.targets_digest == meta.targets_digest
+        and state.structure_digest == meta.structure_digest
+        and state.revision == meta.revision
+        and active.content_sha256 == meta.content_sha256
+        and active.revision == meta.revision
+    )
+    if source_changed or active is None:
         meta = None
     if not active_present and not _recovery_backoff_active(state, now_utc):
         state.next_due_iso = _iso(now_utc)
@@ -957,32 +2036,46 @@ def load_active(
     produced the active index) returns ``None``: the caller must refresh before linking.
     ``None`` also means no cache at all.
     """
-    meta = store._load_meta()
-    body = None if meta is None else store._read_active_bytes()
-    if meta is None or body is None or not _source_url_matches(store, meta.source_url):
+    while True:
+        with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
+            if acquired:
+                return _load_active_locked(store, overrides)
+
+
+def _load_active_locked(
+    store: MappingStore,
+    overrides: Overrides | None,
+) -> ActiveMappings | None:
+    """Load a generation while its pointer and files are fenced from activation/cleanup."""
+    verified = store._verify_active_generation(overrides)
+    if verified is None:
         return None
+    if verified.files[2] is not None:
+        store._cleanup_generations()
+    if not verified.source_fence_valid:
+        return None
+    store._recover_pointer_state(verified)
+    meta = verified.meta
     state = store._load_state()
-    if not _source_url_matches(store, state.source_url) or state.source_change_pending:
-        return None
-    if content_digest(body) != meta.content_sha256:
-        return None
-    try:
-        parsed = parse_anime_lists(body)
-        index = build_mapping_index(parsed, overrides)
-    except (MappingError, ConfigError):
-        return None
     if (
-        targets_digest(index) != meta.targets_digest
-        or structure_digest(index) != meta.structure_digest
+        not _source_url_matches(store, meta.source_url)
+        or not _source_url_matches(store, state.source_url)
+        or state.source_change_pending
+        or state.source_epoch != meta.source_epoch
+        or state.content_sha256 != meta.content_sha256
+        or state.targets_digest != meta.targets_digest
+        or state.structure_digest != meta.structure_digest
+        or state.revision != meta.revision
     ):
         return None
     return ActiveMappings(
-        index=index,
+        index=verified.index,
         content_sha256=meta.content_sha256,
         targets_digest=meta.targets_digest,
         structure_digest=meta.structure_digest,
         revision=meta.revision,
         activated_iso=meta.activated_iso,
         source_url=meta.source_url,
+        source_epoch=meta.source_epoch,
         overrides_applied=overrides is not None,
     )

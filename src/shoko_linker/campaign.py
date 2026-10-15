@@ -1277,10 +1277,19 @@ def _apply_mapping(
 
 
 def _ensure_campaign_mapping_generation(
-    deps: DaemonDeps, active: ActiveMappings, now_iso: str
+    deps: DaemonDeps,
+    active: ActiveMappings,
+    now_iso: str,
+    *,
+    generation_lock_held: bool = False,
 ) -> None:
     """Do not make drift/quarantine decisions from a sweep stale before candidate processing."""
-    if mapping_generation_stale(deps, active, now_iso):
+    stale = (
+        mapping_generation_stale(deps, active, now_iso, generation_lock_held=True)
+        if generation_lock_held
+        else mapping_generation_stale(deps, active, now_iso)
+    )
+    if stale:
         raise CampaignMappingGenerationChangedError()
 
 
@@ -1301,7 +1310,12 @@ def _campaign_quarantine_with_generation_guard(
                     "campaign apply deferred: mapping generation is being activated; "
                     "retry with a fresh sweep, zero POSTs",
                 )
-            _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
+            _ensure_campaign_mapping_generation(
+                context.deps,
+                context.active,
+                context.now_iso,
+                generation_lock_held=True,
+            )
             _campaign_quarantine(context.store, file_id, reason, context.now_iso, counters, reasons)
     except ApplyLockUnavailableError as exc:
         raise CampaignDeferredError(

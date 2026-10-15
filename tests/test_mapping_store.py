@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, cast
 
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+import shoko_linker.mapping_store as mapping_store_module
 from shoko_linker.config import DEFAULT_MAPPING_SOURCE_URL, DEFAULT_REFRESH_HOURS, parse_settings
 from shoko_linker.errors import ConfigError, HttpPolicyError
 from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.mapping_store import (
     ACCEPT_ENCODING,
     MAX_BACKOFF_HOURS,
+    MappingStatus,
     MappingStore,
     RefreshOutcome,
     due,
@@ -336,6 +340,8 @@ def test_new_valid_content_activates_revision_two(tmp_path: Path) -> None:
 def test_formatting_only_content_is_unchanged_with_validators_refreshed(tmp_path: Path) -> None:
     store, source, endpoint = activated_store(tmp_path)
     before = read_json(store.state_path)
+    pointer_before = read_json(store.active_generation_path)
+    generations_before = tuple(store.generations_path.iterdir())
     assert store.active_path.read_bytes() == SMALL_XML
 
     source.queue(ok_response(REORDERED_XML, ETAG_B))
@@ -349,6 +355,11 @@ def test_formatting_only_content_is_unchanged_with_validators_refreshed(tmp_path
     assert state["etag"] == ETAG_B
     assert state["next_due_iso"] == iso(LATER + timedelta(hours=HOURS))
     assert store.active_path.read_bytes() == SMALL_XML
+    pointer_after = read_json(store.active_generation_path)
+    assert pointer_after["generation"] == pointer_before["generation"]
+    assert pointer_after["state"]["etag"] == ETAG_B
+    assert pointer_after["state"]["next_due_iso"] == iso(LATER + timedelta(hours=HOURS))
+    assert tuple(store.generations_path.iterdir()) == generations_before
 
 
 def test_identical_200_content_is_unchanged_with_validator_update(tmp_path: Path) -> None:
@@ -577,6 +588,127 @@ def test_restart_persistence_sees_state_validators_and_schedule(tmp_path: Path) 
     assert revived_source.requests[0].headers["If-None-Match"] == ETAG_A
 
 
+def test_legacy_flat_cache_is_readable_and_migrates_on_activation(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    legacy_xml = store.active_path.read_bytes()
+    legacy_meta = read_json(store.meta_path)
+    legacy_state = read_json(store.state_path)
+    legacy_meta.pop("source_epoch")
+    legacy_state.pop("source_epoch")
+    store.active_generation_path.unlink()
+    store.source_transition_path.unlink()
+    store._legacy_active_path.write_bytes(legacy_xml)
+    store._legacy_meta_path.write_text(json.dumps(legacy_meta), encoding="utf-8")
+    store.state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+
+    assert load_active(store) is not None
+    assert store.active_path == store._legacy_active_path
+
+    source.queue(ok_response(EXTENDED_XML, ETAG_B))
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert outcome is RefreshOutcome.ACTIVATED
+    assert store.active_generation_path.exists()
+    assert store.active_path.read_bytes() == EXTENDED_XML
+    assert not store._legacy_active_path.exists()
+    assert not store._legacy_meta_path.exists()
+
+
+def test_legacy_cache_is_fenced_before_a_source_transition(tmp_path: Path) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    legacy_xml = store_a.active_path.read_bytes()
+    legacy_meta = read_json(store_a.meta_path)
+    legacy_state = read_json(store_a.state_path)
+    legacy_meta.pop("source_epoch")
+    legacy_state.pop("source_epoch")
+    legacy_state.pop("refresh_attempt_id")
+    store_a.active_generation_path.unlink()
+    store_a.source_transition_path.unlink()
+    store_a._legacy_active_path.write_bytes(legacy_xml)
+    store_a._legacy_meta_path.write_text(json.dumps(legacy_meta), encoding="utf-8")
+    store_a.state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/legacy-transition/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    assert (
+        refresh(store_b, endpoint_for(source_b, store_b), now=LATER, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+
+    store_a.state_path.unlink()
+    store_a.source_transition_path.unlink()
+    assert load_active(MappingStore(store_a.directory, source_url=SOURCE_URL)) is None
+
+
+def test_legacy_transition_fence_survives_changed_overrides_and_state_loss(
+    tmp_path: Path,
+) -> None:
+    store_a = make_store(tmp_path)
+    source_a = ScriptedSource()
+    source_a.queue(ok_response(SMALL_XML, ETAG_A))
+    endpoint_a = endpoint_for(source_a, store_a)
+    assert (
+        refresh(
+            store_a,
+            endpoint_a,
+            now=NOW,
+            refresh_hours=HOURS,
+            overrides_text=OVERRIDE_ADD_GAP,
+        )
+        is RefreshOutcome.ACTIVATED
+    )
+    legacy_xml = store_a.active_path.read_bytes()
+    legacy_meta = read_json(store_a.meta_path)
+    store_a.active_generation_path.unlink()
+    store_a._legacy_active_path.write_bytes(legacy_xml)
+    store_a._legacy_meta_path.write_text(json.dumps(legacy_meta), encoding="utf-8")
+
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/changed-overrides/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    assert (
+        refresh(store_b, endpoint_for(source_b, store_b), now=LATER, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_b.state_path.unlink()
+    store_b.source_transition_path.unlink()
+
+    reopened_a = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    assert load_active(reopened_a, load_overrides(OVERRIDE_ADD_GAP)) is None
+
+
+@pytest.mark.parametrize("count_field", ["entries_indexed", "mapping_rules", "explicit_pairs"])
+def test_legacy_transition_refuses_metadata_counts_that_disagree_with_xml(
+    tmp_path: Path, count_field: str
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    legacy_xml = store_a.active_path.read_bytes()
+    legacy_meta = read_json(store_a.meta_path)
+    legacy_meta[count_field] += 1
+    store_a.active_generation_path.unlink()
+    store_a._legacy_active_path.write_bytes(legacy_xml)
+    store_a._legacy_meta_path.write_text(json.dumps(legacy_meta), encoding="utf-8")
+
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/bad-legacy-counts/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    outcome = refresh(
+        store_b,
+        endpoint_for(source_b, store_b),
+        now=LATER,
+        refresh_hours=HOURS,
+        overrides_text=OVERRIDE_ADD_GAP,
+    )
+
+    assert outcome is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    assert source_b.requests
+    assert not store_a.active_generation_path.exists()
+
+
 def test_source_change_on_same_host_requires_fresh_activation(tmp_path: Path) -> None:
     store_a, _, _ = activated_store(tmp_path)
     source_b_url = f"{BASE_ORIGIN}/Anime-Lists/mirror/anime-list-full.xml"
@@ -654,6 +786,174 @@ def test_failed_source_change_keeps_old_bytes_but_never_authorizes_them(
     assert source_a_again.requests[0].headers.get("If-None-Match") is None
 
 
+def test_due_holds_generation_lock_across_source_and_backoff_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/due-race/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    endpoint_b = endpoint_for(source_b, store_b)
+    original_load_state = store_a._load_state
+    transition_outcomes: list[RefreshOutcome] = []
+    attempted_transition = False
+
+    def attempt_transition_while_due_reads_state() -> Any:
+        nonlocal attempted_transition
+        if not attempted_transition:
+            attempted_transition = True
+            transition_outcomes.append(refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS))
+        return original_load_state()
+
+    monkeypatch.setattr(store_a, "_load_state", attempt_transition_while_due_reads_state)
+
+    assert due(store_a, LATER) is False
+    assert transition_outcomes == [RefreshOutcome.FAILED_LOCKED]
+    assert store_a._load_state().source_url == SOURCE_URL
+
+
+def test_lost_state_cannot_reauthorize_old_generation_after_switching_back(
+    tmp_path: Path,
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/failed-then-returned/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    endpoint_b = endpoint_for(source_b, store_b)
+    assert (
+        refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+
+    store_a_again = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    source_a_again = ScriptedSource()
+    source_a_again.queue(status_response(503))
+    endpoint_a_again = endpoint_for(source_a_again, store_a_again)
+    assert (
+        refresh(
+            store_a_again,
+            endpoint_a_again,
+            now=LATER + timedelta(hours=1),
+            refresh_hours=HOURS,
+            force=True,
+        )
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_a_again.state_path.unlink()
+
+    reopened_a = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    assert load_active(reopened_a) is None
+
+
+def test_lost_state_default_source_transition_fences_nondefault_generation(
+    tmp_path: Path,
+) -> None:
+    source_a_url = f"{BASE_ORIGIN}/Anime-Lists/nondefault-before-default/anime-list-full.xml"
+    store_a = MappingStore(tmp_path / "mappings", source_url=source_a_url)
+    source_a = ScriptedSource()
+    source_a.queue(ok_response(SMALL_XML, ETAG_A))
+    assert (
+        refresh(store_a, endpoint_for(source_a, store_a), now=NOW, refresh_hours=HOURS)
+        is RefreshOutcome.ACTIVATED
+    )
+    store_a.state_path.unlink()
+
+    store_default = MappingStore(store_a.directory, source_url=DEFAULT_MAPPING_SOURCE_URL)
+    source_default = ScriptedSource()
+    source_default.queue(status_response(503))
+    assert (
+        refresh(
+            store_default,
+            endpoint_for(source_default, store_default),
+            now=LATER,
+            refresh_hours=HOURS,
+        )
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_default.state_path.unlink()
+
+    assert load_active(MappingStore(store_a.directory, source_url=source_a_url)) is None
+
+
+def test_default_source_switchback_stays_fenced_after_state_and_marker_loss(
+    tmp_path: Path,
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    store_a.state_path.unlink()
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/default-switchback/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    assert (
+        refresh(store_b, endpoint_for(source_b, store_b), now=LATER, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_b.state_path.unlink()
+    store_b.source_transition_path.unlink()
+
+    assert load_active(MappingStore(store_a.directory, source_url=SOURCE_URL)) is None
+
+
+def test_source_transition_marker_survives_lost_state_after_switchback(
+    tmp_path: Path,
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/marker-switchback/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    assert (
+        refresh(store_b, endpoint_for(source_b, store_b), now=LATER, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+
+    store_a_again = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    source_a = ScriptedSource()
+    source_a.queue(status_response(503))
+    assert (
+        refresh(
+            store_a_again,
+            endpoint_for(source_a, store_a_again),
+            now=LATER + timedelta(hours=1),
+            refresh_hours=HOURS,
+            force=True,
+        )
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_a_again.state_path.unlink()
+
+    reopened_a = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    assert load_active(reopened_a) is None
+    reopened_a.source_transition_path.unlink()
+    assert load_active(reopened_a) is None
+    reopened_a.source_transition_path.write_text("{corrupt fence", encoding="utf-8")
+    assert load_active(reopened_a) is None
+
+
+def test_transition_marker_blocks_old_cache_if_source_state_write_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/interrupted-transition/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    endpoint_b = endpoint_for(source_b, store_b)
+
+    def fail_state_write(state: Any) -> None:
+        raise OSError("simulated state write interruption")
+
+    monkeypatch.setattr(store_b, "_save_state", fail_state_write)
+    with pytest.raises(OSError, match="state write interruption"):
+        refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS)
+
+    assert source_b.requests == []
+    assert store_b.source_transition_path.exists()
+    assert load_active(MappingStore(store_a.directory, source_url=source_b_url)) is None
+    assert load_active(MappingStore(store_a.directory, source_url=SOURCE_URL)) is None
+
+
 @pytest.mark.parametrize(
     "corruption",
     ["delete_active", "corrupt_active", "delete_meta", "corrupt_meta", "tamper_active"],
@@ -714,20 +1014,20 @@ def test_failed_missing_cache_recovery_obeys_persisted_backoff(tmp_path: Path) -
     assert len(source.requests) == request_count
 
 
-def test_corrupt_state_file_is_treated_as_empty_not_crash(tmp_path: Path) -> None:
+def test_corrupt_state_file_recovers_committed_generation_snapshot(tmp_path: Path) -> None:
     store, source, endpoint = activated_store(tmp_path)
     store.state_path.write_text("{not json", encoding="utf-8")
-    assert due(store, NOW) is True
+    assert due(store, NOW) is False
     assert status(store, NOW).consecutive_failures == NO_ENTRIES
     assert status(store, NOW).revision == REVISION_ONE
     headers = store.request_headers()
-    assert "If-None-Match" not in headers
-    source.queue(ok_response(SMALL_XML, ETAG_A))
+    assert headers["If-None-Match"] == ETAG_A
     outcome = refresh(store, endpoint, now=NOW, refresh_hours=HOURS)
-    assert outcome is RefreshOutcome.UNCHANGED
+    assert outcome is RefreshOutcome.NOT_DUE
+    assert len(source.requests) == 1
 
 
-def test_state_with_bad_fields_loads_as_empty(tmp_path: Path) -> None:
+def test_state_with_bad_fields_recovers_committed_generation_snapshot(tmp_path: Path) -> None:
     store, _, _ = activated_store(tmp_path)
     bad = {
         "source_url": "ftp://nope/anime.xml",
@@ -738,11 +1038,14 @@ def test_state_with_bad_fields_loads_as_empty(tmp_path: Path) -> None:
         "surprise": 1,
     }
     store.state_path.write_text(json.dumps(bad), encoding="utf-8")
-    assert due(store, NOW) is True
-    assert store.request_headers() == {"Accept-Encoding": ACCEPT_ENCODING}
+    assert due(store, NOW) is False
+    assert store.request_headers() == {
+        "Accept-Encoding": ACCEPT_ENCODING,
+        "If-None-Match": ETAG_A,
+    }
     view = status(store, NOW)
     assert view.consecutive_failures == NO_ENTRIES
-    assert view.last_outcome is None
+    assert view.last_outcome is RefreshOutcome.ACTIVATED
     assert view.revision == REVISION_ONE
 
 
@@ -1001,3 +1304,965 @@ def test_source_redirect_is_refused_and_cache_never_moves(tmp_path: Path) -> Non
     assert store._load_state().etag == before_etag
     assert len(source.requests) == THREE_REQUESTS
     assert all(str(request.url) == SOURCE_URL for request in source.requests)
+
+
+def _atomic_boundary_fault(
+    store: MappingStore, fault: str, interrupted: list[bool]
+) -> Callable[[Path, bytes | bytearray], None]:
+    original_atomic_write = mapping_store_module._atomic_write
+
+    def fail_atomic_write(path: Path, payload: bytes | bytearray) -> None:
+        generation_file = store.generations_path in path.parents
+        if (
+            fault == "before_xml"
+            and not interrupted[0]
+            and generation_file
+            and path.name == "active.xml"
+        ):
+            interrupted[0] = True
+            raise OSError("simulated crash before staging XML")
+        if (
+            fault == "after_xml_stage"
+            and not interrupted[0]
+            and generation_file
+            and path.name == "active.meta.json"
+        ):
+            interrupted[0] = True
+            raise OSError("simulated crash after staging XML")
+        if (
+            fault == "before_pointer_publish"
+            and not interrupted[0]
+            and path == store.active_generation_path
+        ):
+            interrupted[0] = True
+            raise OSError("simulated crash before publishing active generation")
+        original_atomic_write(path, payload)
+
+    return fail_atomic_write
+
+
+def _partial_write_boundary_fault(
+    store: MappingStore, fault: str, interrupted: list[bool]
+) -> Callable[[Path, bytes | bytearray], int]:
+    original_write_bytes = Path.write_bytes
+    initial_files = store._active_files()
+    initial_generation = None if initial_files is None else initial_files[2]
+
+    def fail_during_write(path: Path, payload: bytes | bytearray) -> int:
+        if fault == "during_xml_stage" and not interrupted[0] and path.name == "active.xml.new":
+            interrupted[0] = True
+            original_write_bytes(path, bytes(payload[: max(1, len(payload) // 2)]))
+            raise OSError("simulated crash during XML staging")
+        if (
+            fault == "during_meta_stage"
+            and not interrupted[0]
+            and path.name == "active.meta.json.new"
+        ):
+            interrupted[0] = True
+            original_write_bytes(path, bytes(payload[: max(1, len(payload) // 2)]))
+            raise OSError("simulated crash during metadata staging")
+        pointer_temp = store.active_generation_path.with_name(
+            f"{store.active_generation_path.name}.new"
+        )
+        if fault == "during_pointer_publish" and not interrupted[0] and path == pointer_temp:
+            interrupted[0] = True
+            original_write_bytes(path, bytes(payload[: max(1, len(payload) // 2)]))
+            raise OSError("simulated crash during active generation publication")
+        state_temp = store.state_path.with_name(f"{store.state_path.name}.new")
+        current_files = store._active_files()
+        current_generation = None if current_files is None else current_files[2]
+        if (
+            fault == "during_bookkeeping"
+            and not interrupted[0]
+            and path == state_temp
+            and current_generation != initial_generation
+        ):
+            interrupted[0] = True
+            original_write_bytes(path, bytes(payload[: max(1, len(payload) // 2)]))
+            raise OSError("simulated crash during activation bookkeeping")
+        return original_write_bytes(path, payload)
+
+    return fail_during_write
+
+
+def _inject_activation_fault(
+    store: MappingStore, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> list[bool]:
+    interrupted = [False]
+    if fault in {"before_xml", "after_xml_stage", "before_pointer_publish"}:
+        monkeypatch.setattr(
+            mapping_store_module,
+            "_atomic_write",
+            _atomic_boundary_fault(store, fault, interrupted),
+        )
+    elif fault in {
+        "during_xml_stage",
+        "during_meta_stage",
+        "during_pointer_publish",
+        "during_bookkeeping",
+    }:
+        monkeypatch.setattr(
+            Path,
+            "write_bytes",
+            _partial_write_boundary_fault(store, fault, interrupted),
+        )
+    elif fault == "before_bookkeeping":
+        initial_files = store._active_files()
+        initial_generation = None if initial_files is None else initial_files[2]
+        original_save_state = store._save_state
+
+        def fail_before_bookkeeping(state: Any) -> None:
+            current_files = store._active_files()
+            current_generation = None if current_files is None else current_files[2]
+            if current_generation != initial_generation:
+                interrupted[0] = True
+                raise OSError("simulated crash before activation bookkeeping")
+            original_save_state(state)
+
+        monkeypatch.setattr(store, "_save_state", fail_before_bookkeeping)
+    else:
+        previous_generation = store._active_files()
+        previous_id = None if previous_generation is None else previous_generation[2]
+        original_cleanup = store._cleanup_generations
+
+        def fail_after_activation() -> None:
+            files = store._active_files()
+            if files is not None and files[2] != previous_id:
+                interrupted[0] = True
+                raise OSError("simulated crash after activation")
+            original_cleanup()
+
+        monkeypatch.setattr(store, "_cleanup_generations", fail_after_activation)
+    return interrupted
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_xml"),
+    [
+        ("before_xml", SMALL_XML),
+        ("during_xml_stage", SMALL_XML),
+        ("after_xml_stage", SMALL_XML),
+        ("during_meta_stage", SMALL_XML),
+        ("before_pointer_publish", SMALL_XML),
+        ("during_pointer_publish", SMALL_XML),
+        ("before_bookkeeping", EXTENDED_XML),
+        ("during_bookkeeping", EXTENDED_XML),
+        ("after_activation", EXTENDED_XML),
+    ],
+)
+def test_interrupted_generation_activation_recovers_consistently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str, expected_xml: bytes
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    interrupted = _inject_activation_fault(store, monkeypatch, fault)
+
+    source.queue(ok_response(EXTENDED_XML, ETAG_B))
+    with pytest.raises(OSError, match="simulated crash"):
+        refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert interrupted == [True]
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    active = load_active(reopened)
+    assert active is not None
+    metadata = read_json(reopened.meta_path)
+    state = read_json(reopened.state_path)
+    assert reopened.active_path.read_bytes() == expected_xml
+    assert metadata["content_sha256"] == content_digest(expected_xml)
+    assert active.content_sha256 == metadata["content_sha256"]
+    assert state["content_sha256"] == metadata["content_sha256"]
+    assert status(reopened, LATER).active_present is True
+    assert due(reopened, LATER) is False
+    pointer = json.loads(reopened.active_generation_path.read_text(encoding="utf-8"))
+    assert {path.name for path in reopened.generations_path.iterdir()} == {pointer["generation"]}
+    assert not reopened._legacy_active_path.exists()
+    assert not reopened._legacy_meta_path.exists()
+
+
+def test_interrupted_source_change_before_pointer_never_authorizes_old_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    old_xml = store_a.active_path.read_bytes()
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/new-source/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(ok_response(EXTENDED_XML, ETAG_B))
+    endpoint_b = endpoint_for(source_b, store_b)
+    initial_files = store_a._active_files()
+    assert initial_files is not None
+    initial_generation = initial_files[2]
+    real_atomic_write = mapping_store_module._atomic_write
+    interrupted = False
+
+    def fail_before_pointer(path: Path, payload: bytes | bytearray) -> None:
+        nonlocal interrupted
+        if path == store_b.active_generation_path:
+            pointer = json.loads(payload)
+            if (
+                not pointer["state"]["source_change_pending"]
+                and pointer["generation"] != initial_generation
+            ):
+                interrupted = True
+                raise OSError("simulated source-change interruption before pointer")
+        real_atomic_write(path, payload)
+
+    monkeypatch.setattr(mapping_store_module, "_atomic_write", fail_before_pointer)
+    with pytest.raises(OSError, match="source-change interruption"):
+        refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS)
+
+    assert interrupted is True
+    reopened_b = MappingStore(store_a.directory, source_url=source_b_url)
+    assert load_active(reopened_b) is None
+    assert reopened_b.active_path.read_bytes() == old_xml
+    assert reopened_b._load_state().source_change_pending is True
+    pointer = read_json(reopened_b.active_generation_path)
+    assert {path.name for path in reopened_b.generations_path.iterdir()} == {pointer["generation"]}
+
+
+def test_source_change_activation_recovers_only_its_committed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/committed-source/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(ok_response(EXTENDED_XML, ETAG_B))
+    endpoint_b = endpoint_for(source_b, store_b)
+    real_save_state = store_b._save_state
+    save_count = 0
+
+    def fail_activation_bookkeeping(state: Any) -> None:
+        nonlocal save_count
+        save_count += 1
+        if save_count == 3:
+            raise OSError("simulated source-change bookkeeping interruption")
+        real_save_state(state)
+
+    monkeypatch.setattr(store_b, "_save_state", fail_activation_bookkeeping)
+    with pytest.raises(OSError, match="bookkeeping interruption"):
+        refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS)
+
+    assert save_count == 3
+    reopened_b = MappingStore(store_a.directory, source_url=source_b_url)
+    active_b = load_active(reopened_b)
+    assert active_b is not None
+    assert reopened_b.active_path.read_bytes() == EXTENDED_XML
+    assert read_json(reopened_b.meta_path)["source_url"] == source_b_url
+    assert reopened_b._load_state().source_change_pending is False
+    assert load_active(MappingStore(store_a.directory, source_url=SOURCE_URL)) is None
+
+
+def test_active_identity_distinguishes_a_reactivated_source_epoch(tmp_path: Path) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    first_active = load_active(store_a)
+    first_identity = store_a.active_identity()
+    assert first_active is not None
+    assert first_identity is not None
+
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/identity-epoch/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(ok_response(EXTENDED_XML, ETAG_B))
+    assert (
+        refresh(store_b, endpoint_for(source_b, store_b), now=LATER, refresh_hours=HOURS)
+        is RefreshOutcome.ACTIVATED
+    )
+
+    store_a_again = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    source_a_again = ScriptedSource()
+    source_a_again.queue(ok_response(SMALL_XML, '"returning-a"'))
+    assert (
+        refresh(
+            store_a_again,
+            endpoint_for(source_a_again, store_a_again),
+            now=LATER + timedelta(hours=1),
+            refresh_hours=HOURS,
+        )
+        is RefreshOutcome.ACTIVATED
+    )
+    second_active = load_active(store_a_again)
+    second_identity = store_a_again.active_identity()
+
+    assert second_active is not None
+    assert second_active.index == first_active.index
+    assert second_identity is not None
+    assert second_identity[:4] != first_identity[:4]
+    assert second_identity[4] != first_identity[4]
+
+
+def test_incomplete_state_is_recovered_for_a_nondefault_mapping_source(tmp_path: Path) -> None:
+    source_url = f"{BASE_ORIGIN}/Anime-Lists/nondefault/anime-list-full.xml"
+    store = MappingStore(tmp_path / "mappings", source_url=source_url)
+    source = ScriptedSource()
+    source.queue(ok_response(SMALL_XML, ETAG_B))
+    endpoint = endpoint_for(source, store)
+    assert refresh(store, endpoint, now=NOW, refresh_hours=HOURS) is RefreshOutcome.ACTIVATED
+    store.state_path.write_text("{}", encoding="utf-8")
+
+    reopened = MappingStore(store.directory, source_url=source_url)
+    active = load_active(reopened)
+
+    assert active is not None
+    assert active.source_url == source_url
+    assert reopened._load_state().source_url == source_url
+    assert reopened.request_headers()["If-None-Match"] == ETAG_B
+
+
+def test_direct_refresh_after_nondefault_state_loss_keeps_committed_generation(
+    tmp_path: Path,
+) -> None:
+    source_url = f"{BASE_ORIGIN}/Anime-Lists/direct-recovery/anime-list-full.xml"
+    store = MappingStore(tmp_path / "mappings", source_url=source_url)
+    source = ScriptedSource()
+    source.queue(ok_response(SMALL_XML, ETAG_B))
+    endpoint = endpoint_for(source, store)
+    assert refresh(store, endpoint, now=NOW, refresh_hours=HOURS) is RefreshOutcome.ACTIVATED
+    store.state_path.unlink()
+    source.queue(status_response(503))
+    reopened = MappingStore(store.directory, source_url=source_url)
+    reopened_endpoint = endpoint_for(source, reopened)
+
+    outcome = refresh(
+        reopened,
+        reopened_endpoint,
+        now=LATER,
+        refresh_hours=HOURS,
+        force=True,
+    )
+
+    assert outcome is RefreshOutcome.FAILED_TRANSPORT
+    assert load_active(reopened) is not None
+    assert reopened._load_state().consecutive_failures == ONE_FAILURE
+
+
+def test_status_recovers_committed_generation_created_with_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    initial_files = store._active_files()
+    initial_generation = None if initial_files is None else initial_files[2]
+    original_save_state = store._save_state
+
+    def fail_state_write(state: Any) -> None:
+        current_files = store._active_files()
+        current_generation = None if current_files is None else current_files[2]
+        if current_generation != initial_generation:
+            raise OSError("simulated override activation bookkeeping interruption")
+        original_save_state(state)
+
+    monkeypatch.setattr(store, "_save_state", fail_state_write)
+    source.queue(ok_response(SMALL_XML, ETAG_B))
+    with pytest.raises(OSError, match="override activation bookkeeping"):
+        refresh(
+            store,
+            endpoint,
+            now=LATER,
+            refresh_hours=HOURS,
+            force=True,
+            overrides_text=OVERRIDE_ADD_GAP,
+        )
+
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    view = status(reopened, LATER, overrides_text=OVERRIDE_ADD_GAP)
+
+    assert view.active_present is True
+    assert view.revision == REVISION_TWO
+    assert view.last_success_iso == iso(LATER)
+
+
+def test_state_loss_after_failed_refresh_recovers_latest_backoff(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    source.queue(status_response(503))
+    assert (
+        refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+        is RefreshOutcome.FAILED_TRANSPORT
+    )
+    expected_due = LATER + timedelta(hours=FIRST_BACKOFF_HOURS)
+    assert due(store, LATER + timedelta(minutes=30)) is False
+    store.state_path.unlink()
+
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    assert load_active(reopened) is not None
+
+    state = read_json(reopened.state_path)
+    assert state["consecutive_failures"] == ONE_FAILURE
+    assert state["next_due_iso"] == iso(expected_due)
+    assert due(reopened, LATER + timedelta(minutes=30)) is False
+
+
+def test_pending_source_backoff_survives_state_loss(tmp_path: Path) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/pending-backoff/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    assert (
+        refresh(
+            store_b,
+            endpoint_for(source_b, store_b),
+            now=LATER,
+            refresh_hours=HOURS,
+        )
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_b.state_path.unlink()
+
+    reopened_b = MappingStore(store_a.directory, source_url=source_b_url)
+    retry_source = ScriptedSource()
+    retry_endpoint = endpoint_for(retry_source, reopened_b)
+    outcome = refresh(
+        reopened_b,
+        retry_endpoint,
+        now=LATER + timedelta(minutes=30),
+        refresh_hours=HOURS,
+    )
+
+    assert outcome is RefreshOutcome.NOT_DUE
+    assert retry_source.requests == []
+
+
+def test_initial_default_failure_backoff_survives_state_loss(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    source.queue(status_response(503))
+    assert (
+        refresh(store, endpoint_for(source, store), now=NOW, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store.state_path.unlink()
+
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    retry_source = ScriptedSource()
+    outcome = refresh(
+        reopened,
+        endpoint_for(retry_source, reopened),
+        now=NOW + timedelta(minutes=30),
+        refresh_hours=HOURS,
+    )
+
+    assert outcome is RefreshOutcome.NOT_DUE
+    assert retry_source.requests == []
+
+
+@pytest.mark.parametrize("next_due_mode", ["missing", "null"])
+def test_pending_transition_with_incomplete_scheduler_snapshot_uses_state_backoff(
+    tmp_path: Path, next_due_mode: str
+) -> None:
+    source_url = f"{BASE_ORIGIN}/Anime-Lists/incomplete-snapshot/anime-list-full.xml"
+    store = MappingStore(tmp_path / "mappings", source_url=source_url)
+    source = ScriptedSource()
+    source.queue(status_response(503))
+    assert (
+        refresh(store, endpoint_for(source, store), now=NOW, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    transition = read_json(store.source_transition_path)
+    if next_due_mode == "missing":
+        transition["scheduler_state"].pop("next_due_iso")
+    else:
+        transition["scheduler_state"]["next_due_iso"] = None
+    store.source_transition_path.write_text(json.dumps(transition), encoding="utf-8")
+
+    retry_source = ScriptedSource()
+    reopened = MappingStore(store.directory, source_url=source_url)
+    outcome = refresh(
+        reopened,
+        endpoint_for(retry_source, reopened),
+        now=NOW + timedelta(minutes=30),
+        refresh_hours=HOURS,
+    )
+
+    assert outcome is RefreshOutcome.NOT_DUE
+    assert retry_source.requests == []
+
+
+def test_incomplete_default_transition_snapshot_fails_closed_after_state_loss(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    source.queue(status_response(503))
+    assert (
+        refresh(store, endpoint_for(source, store), now=NOW, refresh_hours=HOURS)
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    transition = read_json(store.source_transition_path)
+    transition["scheduler_state"].pop("next_due_iso")
+    store.source_transition_path.write_text(json.dumps(transition), encoding="utf-8")
+    store.state_path.unlink()
+
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    retry_source = ScriptedSource()
+    outcome = refresh(
+        reopened,
+        endpoint_for(retry_source, reopened),
+        now=NOW + timedelta(minutes=30),
+        refresh_hours=HOURS,
+    )
+
+    assert outcome is RefreshOutcome.FAILED_LOCKED
+    assert retry_source.requests == []
+
+
+def test_status_recovers_pending_source_backoff_after_state_loss(tmp_path: Path) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/status-pending-backoff/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    source_b.queue(status_response(503))
+    assert (
+        refresh(
+            store_b,
+            endpoint_for(source_b, store_b),
+            now=LATER,
+            refresh_hours=HOURS,
+        )
+        is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    store_b.state_path.unlink()
+
+    view = status(
+        MappingStore(store_a.directory, source_url=source_b_url),
+        LATER + timedelta(minutes=30),
+    )
+
+    assert view.active_present is False
+    assert view.consecutive_failures == ONE_FAILURE
+    assert view.next_due_iso == iso(LATER + timedelta(hours=FIRST_BACKOFF_HOURS))
+
+
+def test_state_loss_after_304_recovers_latest_validator_and_schedule(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    source.queue(not_modified(ETAG_B))
+    assert (
+        refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+        is RefreshOutcome.UNCHANGED
+    )
+    expected_due = LATER + timedelta(hours=HOURS)
+    store.state_path.unlink()
+
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    assert load_active(reopened) is not None
+
+    state = read_json(reopened.state_path)
+    assert state["etag"] == ETAG_B
+    assert state["next_due_iso"] == iso(expected_due)
+    assert reopened.request_headers()["If-None-Match"] == ETAG_B
+    assert due(reopened, LATER + timedelta(minutes=30)) is False
+
+
+def test_first_activation_recovers_scheduler_snapshot_after_state_write_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    source.queue(ok_response(SMALL_XML, ETAG_A))
+    endpoint = endpoint_for(source, store)
+    original_save_state = store._save_state
+    initial_files = store._active_files()
+    initial_generation = None if initial_files is None else initial_files[2]
+
+    def fail_state_write(state: Any) -> None:
+        current_files = store._active_files()
+        current_generation = None if current_files is None else current_files[2]
+        if current_generation != initial_generation:
+            raise OSError("simulated first-install bookkeeping interruption")
+        original_save_state(state)
+
+    monkeypatch.setattr(store, "_save_state", fail_state_write)
+    with pytest.raises(OSError, match="first-install bookkeeping"):
+        refresh(store, endpoint, now=NOW, refresh_hours=HOURS)
+
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    assert load_active(reopened) is not None
+    assert status(reopened, NOW).active_present is True
+    assert due(reopened, NOW) is False
+    assert reopened.request_headers()["If-None-Match"] == ETAG_A
+
+
+def test_delayed_response_cannot_revert_a_newer_source_transition_epoch(
+    tmp_path: Path,
+) -> None:
+    store_a, _, _ = activated_store(tmp_path)
+    store_a_again = MappingStore(store_a.directory, source_url=SOURCE_URL)
+    source_b_url = f"{BASE_ORIGIN}/Anime-Lists/interleaved-source/anime-list-full.xml"
+    store_b = MappingStore(store_a.directory, source_url=source_b_url)
+    source_b = ScriptedSource()
+    endpoint_b = endpoint_for(source_b, store_b)
+    source_a_again = ScriptedSource()
+    endpoint_a_again = endpoint_for(source_a_again, store_a_again)
+    delayed_source = ScriptedSource()
+    latest_scheduler_state: list[dict[str, Any]] = []
+
+    def delayed_response(request: httpx.Request) -> httpx.Response:
+        source_b.queue(ok_response(EXTENDED_XML, ETAG_B))
+        assert (
+            refresh(store_b, endpoint_b, now=LATER, refresh_hours=HOURS) is RefreshOutcome.ACTIVATED
+        )
+        source_a_again.queue(ok_response(EXTENDED_XML, '"returning-a"'))
+        assert (
+            refresh(
+                store_a_again,
+                endpoint_a_again,
+                now=LATER + timedelta(hours=1),
+                refresh_hours=HOURS,
+            )
+            is RefreshOutcome.ACTIVATED
+        )
+        latest_scheduler_state.append(read_json(store_a.state_path))
+        return ok_response(SMALL_XML, '"stale-a"')(request)
+
+    delayed_source.queue(delayed_response)
+    delayed_endpoint = endpoint_for(delayed_source, store_a)
+    outcome = refresh(
+        store_a,
+        delayed_endpoint,
+        now=LATER + timedelta(hours=2),
+        refresh_hours=HOURS,
+        force=True,
+    )
+
+    assert outcome is not RefreshOutcome.ACTIVATED
+    active = load_active(store_a)
+    assert active is not None
+    assert store_a.active_path.read_bytes() == EXTENDED_XML
+    metadata = store_a._load_meta()
+    assert metadata is not None
+    assert store_a._load_state().source_epoch == metadata.source_epoch
+    assert read_json(store_a.state_path) == latest_scheduler_state[0]
+
+
+def test_stale_transport_failure_does_not_replace_newer_refresh_schedule(
+    tmp_path: Path,
+) -> None:
+    store, _, _ = activated_store(tmp_path)
+    nested_store = MappingStore(store.directory, source_url=store.source_url)
+    nested_source = ScriptedSource()
+    nested_endpoint = endpoint_for(nested_source, nested_store)
+    delayed_source = ScriptedSource()
+    newer_state: list[dict[str, Any]] = []
+
+    def delayed_failure(request: httpx.Request) -> httpx.Response:
+        nested_source.queue(not_modified(ETAG_B))
+        assert (
+            refresh(
+                nested_store,
+                nested_endpoint,
+                now=LATER,
+                refresh_hours=HOURS,
+                force=True,
+            )
+            is RefreshOutcome.UNCHANGED
+        )
+        newer_state.append(read_json(store.state_path))
+        return status_response(503)(request)
+
+    delayed_source.queue(delayed_failure)
+    delayed_endpoint = endpoint_for(delayed_source, store)
+    outcome = refresh(
+        store,
+        delayed_endpoint,
+        now=LATER + timedelta(hours=1),
+        refresh_hours=HOURS,
+        force=True,
+    )
+
+    assert outcome is RefreshOutcome.FAILED_STALE
+    assert read_json(store.state_path) == newer_state[0]
+
+
+def _leave_pointer_before_state_bookkeeping(
+    store: MappingStore,
+    source: ScriptedSource,
+    endpoint: ApiEndpoint,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as fault_patch:
+        _inject_activation_fault(store, fault_patch, "before_bookkeeping")
+        source.queue(ok_response(EXTENDED_XML, ETAG_B))
+        with pytest.raises(OSError, match="activation bookkeeping"):
+            refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+
+def _start_paused_recovery(
+    store: MappingStore, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Event, Event, list[Any], list[BaseException], Thread]:
+    reader_store = MappingStore(store.directory, source_url=store.source_url)
+    original_load_state = reader_store._load_state
+    state_read = Event()
+    continue_recovery = Event()
+    first_read = True
+
+    def pause_recovery_state_read() -> Any:
+        nonlocal first_read
+        state = original_load_state()
+        if first_read:
+            first_read = False
+            state_read.set()
+            if not continue_recovery.wait(timeout=10):
+                raise TimeoutError("test did not release mapping recovery")
+        return state
+
+    monkeypatch.setattr(reader_store, "_load_state", pause_recovery_state_read)
+    reader_result: list[Any] = []
+    reader_errors: list[BaseException] = []
+
+    def run_reader() -> None:
+        try:
+            reader_result.append(load_active(reader_store))
+        except BaseException as error:
+            reader_errors.append(error)
+
+    reader_thread = Thread(target=run_reader)
+    reader_thread.start()
+    return state_read, continue_recovery, reader_result, reader_errors, reader_thread
+
+
+def _start_concurrent_activation(
+    store: MappingStore, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Event, list[RefreshOutcome], list[BaseException], Thread]:
+    writer_store = MappingStore(store.directory, source_url=store.source_url)
+    writer_source = ScriptedSource()
+    writer_source.queue(ok_response(SMALL_XML, '"newest"'))
+    writer_endpoint = endpoint_for(writer_source, writer_store)
+    real_save_state = writer_store._save_state
+    newest_state_saved = Event()
+
+    def record_newest_state(state: Any) -> None:
+        real_save_state(state)
+        if state.content_sha256 == content_digest(SMALL_XML):
+            newest_state_saved.set()
+
+    monkeypatch.setattr(writer_store, "_save_state", record_newest_state)
+    writer_result: list[RefreshOutcome] = []
+    writer_errors: list[BaseException] = []
+
+    def run_writer() -> None:
+        try:
+            writer_result.append(
+                refresh(
+                    writer_store,
+                    writer_endpoint,
+                    now=LATER + timedelta(hours=1),
+                    refresh_hours=HOURS,
+                    force=True,
+                )
+            )
+        except BaseException as error:
+            writer_errors.append(error)
+
+    writer_thread = Thread(target=run_writer)
+    writer_thread.start()
+    return newest_state_saved, writer_result, writer_errors, writer_thread
+
+
+def test_pointer_state_recovery_cannot_overwrite_a_concurrent_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    _leave_pointer_before_state_bookkeeping(store, source, endpoint, monkeypatch)
+    state_read, continue_recovery, reader_result, reader_errors, reader_thread = (
+        _start_paused_recovery(store, monkeypatch)
+    )
+    assert state_read.wait(timeout=5)
+    newest_state_saved, writer_result, writer_errors, writer_thread = _start_concurrent_activation(
+        store, monkeypatch
+    )
+    writer_thread.join(timeout=5)
+    committed_before_recovery = newest_state_saved.is_set()
+    continue_recovery.set()
+    reader_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert reader_errors == []
+    assert writer_errors == []
+    assert committed_before_recovery is False
+    assert reader_result[0] is not None
+    writer_store = MappingStore(store.directory, source_url=store.source_url)
+    active_meta = read_json(writer_store.meta_path)
+    persisted_state = read_json(writer_store.state_path)
+    assert persisted_state["content_sha256"] == active_meta["content_sha256"]
+
+
+def _start_cleanup_writer(
+    store: MappingStore,
+    old_generation: Path,
+    old_generation_removed: Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Event, list[RefreshOutcome], Thread]:
+    writer_store = MappingStore(store.directory, source_url=store.source_url)
+    writer_source = ScriptedSource()
+    writer_source.queue(ok_response(EXTENDED_XML, ETAG_B))
+    writer_endpoint = endpoint_for(writer_source, writer_store)
+    original_cleanup = writer_store._cleanup_generations
+    writer_lock_attempted = Event()
+    original_generation_lock = writer_store.generation_lock
+
+    @contextmanager
+    def observe_writer_lock(*, wait_seconds: float = 0.0) -> Iterator[bool]:
+        writer_lock_attempted.set()
+        with original_generation_lock(wait_seconds=wait_seconds) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(writer_store, "generation_lock", observe_writer_lock)
+
+    def observe_cleanup() -> None:
+        original_cleanup()
+        if not old_generation.exists():
+            old_generation_removed.set()
+
+    monkeypatch.setattr(writer_store, "_cleanup_generations", observe_cleanup)
+    writer_results: list[RefreshOutcome] = []
+    writer_thread = Thread(
+        target=lambda: writer_results.append(
+            refresh(
+                writer_store,
+                writer_endpoint,
+                now=LATER,
+                refresh_hours=HOURS,
+                force=True,
+            )
+        )
+    )
+    writer_thread.start()
+    return writer_lock_attempted, writer_results, writer_thread
+
+
+def test_active_generation_read_is_fenced_from_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _, _ = activated_store(tmp_path)
+    files = store._active_files()
+    assert files is not None
+    assert files[2] is not None
+    old_generation = store.generations_path / files[2]
+    old_metadata_path = old_generation / "active.meta.json"
+    original_read_text = Path.read_text
+    selected_files = Event()
+    continue_read = Event()
+    old_generation_removed = Event()
+
+    def pause_selected_metadata(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == old_metadata_path:
+            selected_files.set()
+            if not continue_read.wait(timeout=10):
+                raise TimeoutError("test did not release selected generation read")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", pause_selected_metadata)
+    reader_results: list[Any] = []
+    reader_thread = Thread(target=lambda: reader_results.append(load_active(store)))
+    reader_thread.start()
+    assert selected_files.wait(timeout=5)
+    writer_lock_attempted, writer_results, writer_thread = _start_cleanup_writer(
+        store, old_generation, old_generation_removed, monkeypatch
+    )
+    assert writer_lock_attempted.wait(timeout=5)
+    removed_before_reader_finished = old_generation_removed.is_set()
+    continue_read.set()
+    reader_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert removed_before_reader_finished is False
+    assert reader_results[0] is not None
+    assert reader_results[0].content_sha256 == content_digest(SMALL_XML)
+    assert writer_results == [RefreshOutcome.ACTIVATED]
+    assert old_generation_removed.is_set()
+
+
+def test_load_active_retries_until_generation_lock_is_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _, _ = activated_store(tmp_path)
+    reader_store = MappingStore(store.directory, source_url=store.source_url)
+    monkeypatch.setattr(mapping_store_module, "GENERATION_LOCK_REFRESH_WAIT_SECONDS", 0.02)
+    lock_held = Event()
+    release_lock = Event()
+    second_attempt = Event()
+
+    def hold_generation_lock() -> None:
+        with store.generation_lock(wait_seconds=0.0) as acquired:
+            assert acquired
+            lock_held.set()
+            if not release_lock.wait(timeout=5):
+                raise TimeoutError("test did not release mapping generation lock")
+
+    holder = Thread(target=hold_generation_lock)
+    holder.start()
+    assert lock_held.wait(timeout=5)
+    original_lock = reader_store.generation_lock
+    lock_attempts = 0
+
+    @contextmanager
+    def observe_lock_retries(*, wait_seconds: float = 0.0) -> Iterator[bool]:
+        nonlocal lock_attempts
+        lock_attempts += 1
+        if lock_attempts == 2:
+            second_attempt.set()
+        with original_lock(wait_seconds=wait_seconds) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(reader_store, "generation_lock", observe_lock_retries)
+    reader_results: list[Any] = []
+    reader = Thread(target=lambda: reader_results.append(load_active(reader_store)))
+    reader.start()
+    assert second_attempt.wait(timeout=5)
+    release_lock.set()
+    reader.join(timeout=5)
+    holder.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert not holder.is_alive()
+    assert reader_results[0] is not None
+
+
+def test_status_snapshot_is_fenced_from_concurrent_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _, _ = activated_store(tmp_path)
+    files = store._active_files()
+    assert files is not None
+    assert files[2] is not None
+    old_generation = store.generations_path / files[2]
+    reader_store = MappingStore(store.directory, source_url=store.source_url)
+    original_load_state = reader_store._load_state
+    state_reads = 0
+    selected_status_state = Event()
+    continue_status = Event()
+
+    def pause_status_state() -> Any:
+        nonlocal state_reads
+        state = original_load_state()
+        state_reads += 1
+        if state_reads == 2:
+            selected_status_state.set()
+            if not continue_status.wait(timeout=10):
+                raise TimeoutError("test did not release status snapshot")
+        return state
+
+    monkeypatch.setattr(reader_store, "_load_state", pause_status_state)
+    status_results: list[MappingStatus] = []
+    reader_thread = Thread(target=lambda: status_results.append(status(reader_store, LATER)))
+    reader_thread.start()
+    assert selected_status_state.wait(timeout=5)
+
+    old_generation_removed = Event()
+    writer_lock_attempted, writer_results, writer_thread = _start_cleanup_writer(
+        store, old_generation, old_generation_removed, monkeypatch
+    )
+    assert writer_lock_attempted.wait(timeout=5)
+    removed_before_status_finished = old_generation_removed.wait(timeout=0.5)
+    continue_status.set()
+    reader_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert removed_before_status_finished is False
+    assert status_results[0].active_present is True
+    assert writer_results == [RefreshOutcome.ACTIVATED]
+    assert old_generation_removed.is_set()

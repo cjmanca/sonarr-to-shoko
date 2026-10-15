@@ -114,9 +114,6 @@ from .mapping_store import (
 from .mapping_store import (
     refresh as mapping_refresh,
 )
-from .mapping_store import (
-    status as mapping_status,
-)
 from .mappings import MappingIndex, ResolutionStatus, TargetIdentity, effective_targets
 from .mappings import resolve as resolve_mapping
 from .policies import RunPolicy
@@ -1722,30 +1719,35 @@ def _process_candidate(
     return _close_send(deps, plan, file_id, cycle_key, send_iso, send)
 
 
-def mapping_generation_identity(deps: DaemonDeps, now_iso: str) -> tuple[int, str, str, str] | None:
+def mapping_generation_identity(
+    deps: DaemonDeps, _now_iso: str, *, generation_lock_held: bool = False
+) -> tuple[int, str, str, str, str | None] | None:
     """The disk-active generation's identity tuple, ``None`` when the active cache is absent.
 
     Cheap by design (meta + content digest read, no index parse): F11 re-checks it per submission
     so a mapping refresh that swaps generations mid-batch is observed *before* the next POST.
     """
-    status = mapping_status(deps.mapping_store, _parse_iso(now_iso))
-    if not status.active_present or status.content_sha256 is None:
-        return None
-    return (
-        status.revision,
-        status.content_sha256,
-        status.targets_digest or "",
-        status.structure_digest or "",
-    )
+    if generation_lock_held:
+        return deps.mapping_store.active_identity_locked()
+    return deps.mapping_store.active_identity()
 
 
-def mapping_generation_stale(deps: DaemonDeps, active: ActiveMappings, now_iso: str) -> bool:
+def mapping_generation_stale(
+    deps: DaemonDeps,
+    active: ActiveMappings,
+    now_iso: str,
+    *,
+    generation_lock_held: bool = False,
+) -> bool:
     """True when the disk-active generation is no longer the one the guards validated against."""
-    return mapping_generation_identity(deps, now_iso) != (
+    return mapping_generation_identity(
+        deps, now_iso, generation_lock_held=generation_lock_held
+    ) != (
         active.revision,
         active.content_sha256,
         active.targets_digest,
         active.structure_digest,
+        active.source_epoch,
     )
 
 

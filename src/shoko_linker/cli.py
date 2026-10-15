@@ -880,7 +880,7 @@ def _run_report(args: argparse.Namespace) -> int:
     settings = load_settings(cast(str, args.config))
     now = datetime.fromisoformat(current_iso())
     mapping_store = open_mapping_store(settings)
-    status = mapping_status(mapping_store, now)
+    status = mapping_status(mapping_store, now, overrides_text=read_overrides_text(settings))
     db_path = state_path(settings)
     store = open_state_store(settings) if db_path.exists() else None
     attestation = attestation_verdict_for(settings).payload()
@@ -983,7 +983,7 @@ def _run_health(args: argparse.Namespace) -> int:
     settings = load_settings(cast(str, args.config))
     now = datetime.fromisoformat(current_iso())
     mapping_store = open_mapping_store(settings)
-    status = mapping_status(mapping_store, now)
+    status = mapping_status(mapping_store, now, overrides_text=read_overrides_text(settings))
     db_path = state_path(settings)
     store = open_state_store(settings) if db_path.exists() else None
     try:
@@ -1009,7 +1009,7 @@ def _run_mappings_status(settings: Settings, *, json_out: bool) -> int:
     """Offline generation status: digests/age/schedule plus state-DB candidate counts."""
     now = datetime.fromisoformat(current_iso())
     store = open_mapping_store(settings)
-    status = mapping_status(store, now)
+    status = mapping_status(store, now, overrides_text=read_overrides_text(settings))
     affected: dict[str, int] = {}
     db_path = state_path(settings)
     state_store: StateStore | None = None
@@ -1070,7 +1070,7 @@ def _run_mappings_refresh(settings: Settings, *, force: bool, json_out: bool) ->
         )
     finally:
         endpoint.client.close()
-    status = mapping_status(store, now)
+    status = mapping_status(store, now, overrides_text=read_overrides_text(settings))
     payload = refresh_payload(
         outcome,
         status,

@@ -305,6 +305,10 @@ class Env:
     def mapping_dir(self) -> Path:
         return self.tmp_path / "mappings"
 
+    @property
+    def active_mapping_path(self) -> Path:
+        return MappingStore(self.mapping_dir, source_url=SOURCE_URL).active_path
+
     def limits(self) -> Any:
         settings = load_settings(self.config_path)
         return cli.budget_limits_from_settings(settings)
@@ -312,7 +316,7 @@ class Env:
     def open_store(self) -> StateStore:
         return StateStore(self.state_path, budget_limits=self.limits())
 
-    def seed_mapping(self) -> None:
+    def seed_mapping(self, *, overrides_text: str | None = None) -> None:
         """Seed the last-known-good cache without polluting the env request logs."""
         from shoko_linker.mapping_store import refresh
 
@@ -320,7 +324,14 @@ class Env:
         store = MappingStore(self.mapping_dir, source_url=SOURCE_URL)
         endpoint = _source_endpoint(store, seed_stubs.source)
         try:
-            refresh(store, endpoint, now=_parse(self.now_iso), refresh_hours=168.0, force=True)
+            refresh(
+                store,
+                endpoint,
+                now=_parse(self.now_iso),
+                refresh_hours=168.0,
+                force=True,
+                overrides_text=overrides_text,
+            )
         finally:
             endpoint.client.close()
 
@@ -499,7 +510,7 @@ def test_mappings_refresh_activation_then_304_makes_no_service_requests(
     assert main(["mappings", "refresh", config, "--json"]) == EXIT_OK
     activated = captured_json(capsys)
     assert activated["outcome"] == RefreshOutcome.ACTIVATED.value
-    assert env.mapping_dir.joinpath("active.xml").exists()
+    assert env.active_mapping_path.exists()
 
     env.stubs.conditional_304 = True
     env.now_iso = "2026-01-08T00:00:00+00:00"
@@ -515,7 +526,7 @@ def test_mappings_refresh_failure_keeps_last_known_good(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
     env.seed_mapping()
-    before = (env.mapping_dir / "active.xml").read_bytes()
+    before = env.active_mapping_path.read_bytes()
     env.stubs.source_status = 500
     env.now_iso = "2026-01-08T00:00:00+00:00"
     code = main(["mappings", "refresh", str(env.config_path), "--json"])
@@ -523,7 +534,7 @@ def test_mappings_refresh_failure_keeps_last_known_good(
     assert code == EXIT_RUNTIME
     assert payload["outcome"] == RefreshOutcome.FAILED_TRANSPORT.value
     assert payload["success"] is False
-    assert (env.mapping_dir / "active.xml").read_bytes() == before
+    assert env.active_mapping_path.read_bytes() == before
     assert payload["generation"]["generation_active"] is True
     assert env.stubs.all_service_requests() == []
 
@@ -588,6 +599,30 @@ def test_mappings_status_reports_generation_and_state_counts(
     }
     assert env.stubs.all_service_requests() == []
     assert DUMMY_SHOKO_KEY not in json.dumps(payload)
+
+
+def test_mappings_status_validates_generation_with_configured_overrides(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override_text = (
+        "add:\n"
+        "  - {tvdb_series: 267440, season: 1, episode: 2, anidb_id: 1234, "
+        "anidb_episode: 2, type: Episode}\n"
+    )
+    document = cast("dict[str, Any]", yaml.safe_load(env.config_path.read_text(encoding="utf-8")))
+    document["mappings"]["overrides_file"] = "/config/overrides.yaml"
+    env.config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    monkeypatch.setattr(cli, "read_overrides_text", lambda settings: override_text)
+    env.seed_mapping(overrides_text=override_text)
+
+    assert main(["mappings", "status", str(env.config_path), "--json"]) == EXIT_OK
+    payload = captured_json(capsys)
+
+    assert payload["generation_active"] is True
+    assert payload["revision"] >= 1
+    assert payload["targets_digest"]
+    assert payload["structure_digest"]
+    assert env.stubs.all_service_requests() == []
 
 
 def test_mappings_status_absent_generation_is_informational(

@@ -1212,7 +1212,7 @@ def test_pending_target_drift_defers_if_mapping_changes_during_resolution(
         monkeypatch.setattr(
             campaign_mod,
             "mapping_generation_stale",
-            lambda *_args: stale["value"],
+            lambda *_args, **_kwargs: stale["value"],
         )
         monkeypatch.setattr(campaign_mod, "_resolved_pending_plan", resolve_as_drift)
         counters = campaign_mod._CampaignCounters()
@@ -1288,7 +1288,7 @@ def test_campaign_shoko_episode_id_drift_defers_if_mapping_generation_changes(
     env.stubs.shoko_internal_overrides[ANIDB_EP] = DIVERGENT_SHOKO_EP
     stale_checks = 0
 
-    def generation_changes_after_queue_read(*_args: Any) -> bool:
+    def generation_changes_after_queue_read(*_args: Any, **_kwargs: Any) -> bool:
         nonlocal stale_checks
         stale_checks += 1
         return stale_checks >= 3
