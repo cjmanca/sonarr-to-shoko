@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
@@ -69,7 +69,7 @@ from .attestation import (
     write_attestation,
 )
 from .audit import collect_audit_inputs, run_audit
-from .bootstrap import load_bootstrap_settings
+from .bootstrap import DEFAULT_DATABASE_PATH, BootstrapSettings, load_bootstrap_settings
 from .campaign import (
     DRAIN_AUTHORIZATION_RULE,
     CampaignDigestMismatchError,
@@ -110,6 +110,7 @@ from .daemon import (
     run_cycle,
     run_daemon,
 )
+from .dashboard import DashboardApplication, DashboardStatus, create_dashboard_server
 from .errors import ConfigError, HttpPolicyError, LinkerError, PolicyError
 from .http import ApiEndpoint, make_shoko_client, make_sonarr_client
 from .logging_setup import configure_logging
@@ -120,6 +121,7 @@ from .mapping_store import (
 from .mapping_store import (
     status as mapping_status,
 )
+from .onboarding import OnboardingManager, OnboardingStatus, ScopeBinding
 from .policies import PolicyRequest, RunPolicy, parse_policy
 from .reporting import (
     META_CYCLE_ALIVE,
@@ -156,7 +158,14 @@ from .reporting import (
     refresh_payload,
     report_payload,
 )
-from .service import bootstrap_endpoints, run_service
+from .service import (
+    SERVICE_POLL_SECONDS,
+    bootstrap_endpoints,
+    probe_connections,
+    run_dashboard_worker,
+    settings_for_scope,
+)
+from .service_setup import ServiceSetupController
 from .state import (
     ATTESTATION_PAUSE_REASON,
     META_LAST_CYCLE_END_ISO,
@@ -167,6 +176,7 @@ from .state import (
     META_WRITES_DISABLED_REASON,
     BudgetLimits,
     EligibilityVerdict,
+    FileState,
     StateError,
     StateStore,
     WriteDisabledError,
@@ -185,6 +195,8 @@ EXIT_STATE: Final[int] = 5
 _POLICY_CHOICES: Final[list[str]] = [
     policy.value for policy in RunPolicy if policy is not RunPolicy.SERVICE
 ]
+DASHBOARD_PORT_MAX: Final[int] = 65535
+DASHBOARD_BIND_HOST: Final[str] = "0.0.0.0"  # noqa: S104 - container port is unpublished by default
 _NOT_IMPLEMENTED_LIVE_READ_ONLY: Final[str] = (
     "validate --live-read-only: not implemented — live read-only checks arrive in "
     "the M7-b slice; no network call was made"
@@ -869,32 +881,349 @@ def _run_daemon(args: argparse.Namespace) -> int:
     return EXIT_RUNTIME if last is not None and last.failed else EXIT_OK
 
 
+class _NormalServiceRuntime:
+    def __init__(
+        self,
+        settings: BootstrapSettings,
+        sonarr: ApiEndpoint,
+        shoko: ApiEndpoint,
+        state: StopState,
+    ) -> None:
+        self.settings = settings
+        self.sonarr = sonarr
+        self.shoko = shoko
+        self.state = state
+        self.logger = logging.getLogger(__name__)
+        self.latest: dict[str, Any] = {
+            "connection": None,
+            "authorized": False,
+            "next_action": "Create the dashboard account and complete setup to begin.",
+            "diagnostics": (),
+            "mapping_cache": "Waiting for setup and the first service check.",
+        }
+        self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
+
+    def status(self) -> DashboardStatus:
+        connection = self.latest["connection"]
+        message = (
+            connection.messages[0]
+            if connection is not None and connection.messages
+            else "Connected to Sonarr and Shoko."
+            if connection is not None and connection.ready
+            else "Checking the Sonarr and Shoko connections."
+        )
+        path = Path(self.settings.database_path)
+        if not path.exists():
+            return DashboardStatus(message, 0, 0, 0, False, self.latest["next_action"])
+        store = StateStore(path)
+        try:
+            paused, _reason = store.get_service_pause()
+            waiting = sum(
+                len(store.files_in_state(item))
+                for item in (
+                    FileState.MATCHED,
+                    FileState.MAPPED,
+                    FileState.PLANNED,
+                    FileState.WAITING,
+                )
+            )
+            review = sum(
+                len(store.files_in_state(item))
+                for item in (FileState.AMBIGUOUS, FileState.CONFLICT, FileState.BLOCKED_SAFETY)
+            )
+            return DashboardStatus(
+                message,
+                len(store.files_in_state(FileState.VERIFIED)),
+                waiting,
+                review,
+                bool(self.latest["authorized"]) and not paused,
+                cast(str, self.latest["next_action"]),
+                cast(tuple[str, ...], self.latest["diagnostics"]),
+                cast(str, self.latest["mapping_cache"]),
+            )
+        finally:
+            store.close()
+
+    def onboarding_context(self) -> tuple[Any, Any] | None:
+        path = Path(self.settings.database_path)
+        if not path.exists():
+            return None
+        store = StateStore(path)
+        try:
+            return self.setup.current_context(store)
+        finally:
+            store.close()
+
+    def worker_tick(self) -> None:
+        connection = probe_connections(self.sonarr, self.shoko)
+        self.latest["connection"] = connection
+        if not connection.ready:
+            self.latest["authorized"] = False
+            self.latest["next_action"] = (
+                connection.messages[0]
+                if connection.messages
+                else "Check the Sonarr and Shoko connections."
+            )
+            return
+        store = StateStore(Path(self.settings.database_path))
+        try:
+            context = self.setup.current_context(store)
+            if context is None:
+                self.latest["authorized"] = False
+                self.latest["next_action"] = (
+                    "Complete or review scope and safety setup before automatic linking."
+                )
+                return
+            binding, assessment = context
+            manager = OnboardingManager(store)
+            decision = manager.evaluate(binding, assessment, iso=current_iso())
+            if decision.status is not OnboardingStatus.AUTHORIZED:
+                self.latest["authorized"] = False
+                self.latest["next_action"] = decision.message
+                return
+            self._run_authorized_cycle(store, binding, manager)
+        except (ConfigError, HttpPolicyError, StateError, OSError, ValueError):
+            self._cycle_deferred()
+            self.logger.warning("Normal service cycle was deferred and will be retried.")
+        except Exception:
+            self._cycle_deferred()
+            self.logger.error("Normal service cycle failed; it will be retried.")
+        finally:
+            store.close()
+
+    def _service_authorized(self, store: StateStore, manager: OnboardingManager) -> bool:
+        context = self.setup.current_context(store)
+        if context is None:
+            return False
+        binding, assessment = context
+        return (
+            manager.evaluate(binding, assessment, iso=current_iso()).status
+            is OnboardingStatus.AUTHORIZED
+        )
+
+    def _run_authorized_cycle(
+        self, store: StateStore, binding: ScopeBinding, manager: OnboardingManager
+    ) -> None:
+        effective = settings_for_scope(
+            self.settings, roots=binding.roots, mappings=binding.path_mappings
+        )
+        store.budget_limits = budget_limits_from_settings(effective)
+        mapping_store = open_mapping_store(effective)
+        deps = build_daemon_deps(
+            effective,
+            store=store,
+            mapping_store=mapping_store,
+            max_submissions=effective.sync.max_new_per_cycle,
+            overrides_text=read_overrides_text(effective),
+            shutdown_requested=self.state.should_stop,
+        )
+        endpoints = (deps.sonarr, deps.shoko, deps.mapping_source)
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: self._service_authorized(store, manager),
+        )
+        try:
+            self._run_daemon_cycle(deps, store, effective)
+        finally:
+            for endpoint in endpoints:
+                endpoint.client.close()
+
+    def _run_daemon_cycle(self, deps: DaemonDeps, store: StateStore, settings: Settings) -> None:
+        cycle_key_value = "service-unstarted"
+
+        def begin_cycle() -> str:
+            nonlocal cycle_key_value
+            started = current_iso()
+            cycle_key_value = _begin_budget_cycle(store, "service", started, f"service-{started}")
+            _start_cycle_meta(store, cycle_key_value, started, settings.sync.interval_seconds)
+            return started
+
+        def completed(report: CycleReport) -> None:
+            ended = current_iso()
+            started = store.get_meta(META_LAST_CYCLE_START_ISO) or ended
+            persist_cycle_meta(
+                store,
+                report,
+                started_iso=started,
+                ended_iso=ended,
+                interval_seconds=settings.sync.interval_seconds,
+                full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
+            )
+            self.latest["diagnostics"] = report.reasons[:20]
+            self.latest["mapping_cache"] = (
+                "Available from the last service check."
+                if report.mapping_revision > 0
+                else "Not ready; linking will wait for verified episode mappings."
+            )
+            self.latest["next_action"] = (
+                "Automatic linking is processing eligible files."
+                if not report.failed
+                else "A service check needs attention; automatic linking will retry safely."
+            )
+
+        self.latest["authorized"] = True
+        self.latest["next_action"] = "Automatic linking is running for the confirmed scope."
+        run_daemon(
+            deps,
+            cycle_key=lambda _index: cycle_key_value,
+            now_iso=begin_cycle,
+            interval_seconds=settings.sync.interval_seconds,
+            stop_after_cycles=1,
+            should_stop=self.state.should_stop,
+            policy=RunPolicy.SERVICE,
+            mode=CycleMode.APPLY,
+            jitter_ratio=0.0,
+            full_cycle=lambda iso: full_cycle_due(store, iso),
+            on_cycle_complete=completed,
+        )
+
+    def _cycle_deferred(self) -> None:
+        self.latest["authorized"] = False
+        self.latest["next_action"] = "A service check needs attention; it will retry safely."
+
+
 def _run_service(_args: argparse.Namespace) -> int:
-    """Start the normal connection monitor without requiring a YAML configuration."""
+    """Run the authenticated dashboard and guarded service worker on one serialized thread."""
     settings = load_bootstrap_settings()
     configure_logging(logging.DEBUG if cast(bool, _args.verbose) else logging.INFO)
     state = StopState()
     _SHUTDOWN_WAKE.clear()
     installed = make_signal_handlers(state)
     logger = logging.getLogger(__name__)
-    logger.info(
-        "service started in read-only setup mode; automatic linking remains paused "
-        "until scope and safety setup are complete"
-    )
     if installed:
         logger.debug("signal handlers installed: %s", ", ".join(_signal_name(n) for n in installed))
     sonarr, shoko = bootstrap_endpoints(settings)
     try:
-        run_service(
-            sonarr,
-            shoko,
+        dashboard_port = int(os.environ.get("DASHBOARD_PORT", "8080"))
+        if not 1 <= dashboard_port <= DASHBOARD_PORT_MAX:
+            raise ValueError
+    except ValueError:
+        sonarr.client.close()
+        shoko.client.close()
+        raise ConfigError("DASHBOARD_PORT must be an integer between 1 and 65535") from None
+
+    runtime = _NormalServiceRuntime(settings, sonarr, shoko, state)
+    application = DashboardApplication(
+        settings.database_path,
+        status_provider=runtime.status,
+        onboarding_context=runtime.onboarding_context,
+        setup_provider=runtime.setup.view,
+        setup_action=runtime.setup.action,
+    )
+    server = None
+    try:
+        server = create_dashboard_server(DASHBOARD_BIND_HOST, dashboard_port, application)
+        logger.info("service started; no dashboard host port is published by default")
+        run_dashboard_worker(
+            server,
+            worker_tick=runtime.worker_tick,
             stop_requested=state.should_stop,
-            wait=interruptible_sleep,
+            monotonic=time.monotonic,
+            worker_interval_seconds=SERVICE_POLL_SECONDS,
         )
+    except OSError:
+        logger.error("Dashboard listener could not start; check its port configuration.")
+        return EXIT_RUNTIME
     finally:
+        if server is not None:
+            server.server_close()
         sonarr.client.close()
         shoko.client.close()
     return EXIT_OK
+
+
+def _run_status(_args: argparse.Namespace) -> int:
+    """Show normal-service state without network access or requiring connection secrets."""
+    path = Path(DEFAULT_DATABASE_PATH)
+    if not path.exists():
+        print("Automatic linking is waiting for first-use setup in the dashboard.")
+        return EXIT_OK
+    store = StateStore(path)
+    try:
+        account = store.get_dashboard_account()
+        manager = OnboardingManager(store)
+        record = manager.record()
+        paused, _reason = store.get_service_pause()
+        if paused:
+            linking = "paused"
+        elif record is None:
+            linking = "waiting for setup confirmation"
+        else:
+            linking = "setup confirmed; current worker state is available in the dashboard"
+        print(f"Dashboard account: {'created' if account is not None else 'not created'}")
+        print(f"Automatic linking: {linking}")
+        print(f"Verified files: {len(store.files_in_state(FileState.VERIFIED))}")
+        waiting = sum(
+            len(store.files_in_state(state))
+            for state in (FileState.MATCHED, FileState.MAPPED, FileState.PLANNED, FileState.WAITING)
+        )
+        review = sum(
+            len(store.files_in_state(state))
+            for state in (FileState.AMBIGUOUS, FileState.CONFLICT, FileState.BLOCKED_SAFETY)
+        )
+        print(f"Waiting files: {waiting}")
+        print(f"Files needing review: {review}")
+        return EXIT_OK
+    except (StateError, OSError, ValueError) as exc:
+        print(f"state unavailable: {exc}", file=sys.stderr)
+        return EXIT_STATE
+    finally:
+        store.close()
+
+
+def _run_pause(_args: argparse.Namespace) -> int:
+    """Persist an ordinary local pause using the same onboarding state as the dashboard."""
+    store = StateStore(Path(DEFAULT_DATABASE_PATH))
+    try:
+        OnboardingManager(store).pause(iso=current_iso())
+    except (StateError, OSError, ValueError) as exc:
+        print(f"could not pause automatic linking: {exc}", file=sys.stderr)
+        return EXIT_STATE
+    finally:
+        store.close()
+    print("Automatic linking is paused.")
+    return EXIT_OK
+
+
+def _run_resume(_args: argparse.Namespace) -> int:
+    """Resume only after fresh endpoint, scope, compatibility, and Shoko-safety checks."""
+    path = Path(DEFAULT_DATABASE_PATH)
+    if not path.exists():
+        print("Complete dashboard setup before automatic linking can resume.")
+        return EXIT_STATE
+    store = StateStore(path)
+    try:
+        try:
+            manager = OnboardingManager(store)
+            record = manager.record()
+        except (StateError, OSError, ValueError) as exc:
+            print(f"could not read setup state: {exc}", file=sys.stderr)
+            return EXIT_STATE
+        if record is None:
+            print("Complete dashboard setup before automatic linking can resume.")
+            return EXIT_STATE
+        try:
+            bootstrap = load_bootstrap_settings()
+            sonarr, shoko = bootstrap_endpoints(bootstrap)
+            try:
+                controller = ServiceSetupController(bootstrap, sonarr, shoko, path)
+                context = controller.current_context(store)
+                if context is None:
+                    print("Current services or anime scope need review before linking can resume.")
+                    return EXIT_STATE
+                binding, assessment = context
+                decision = manager.resume(binding, assessment, iso=current_iso())
+            finally:
+                sonarr.client.close()
+                shoko.client.close()
+        except (ConfigError, HttpPolicyError, StateError, OSError, ValueError) as exc:
+            print(f"Current setup could not be verified; automatic linking remains paused: {exc}")
+            return EXIT_STATE
+        print(decision.message)
+        return EXIT_OK if decision.status is OnboardingStatus.AUTHORIZED else EXIT_STATE
+    finally:
+        store.close()
 
 
 def _daemon_cycle_key(index: int) -> str:
@@ -1957,6 +2286,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="debug-level logging")
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     _add_service(subparsers)
+    _add_ordinary_controls(subparsers)
     _add_validate(subparsers)
     _add_once(subparsers)
     _add_daemon(subparsers)
@@ -1984,6 +2314,20 @@ def _add_service(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]
         ),
     )
     parser.set_defaults(handler=_run_service)
+
+
+def _add_ordinary_controls(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Expose plain-language local service controls without a YAML configuration."""
+    definitions: tuple[tuple[str, str, CommandHandler], ...] = (
+        ("status", "Show normal service status without network access.", _run_status),
+        ("pause", "Pause automatic linking and preserve queued work.", _run_pause),
+        ("resume", "Recheck setup and safety before resuming automatic linking.", _run_resume),
+    )
+    for name, help_text, handler in definitions:
+        parser = subparsers.add_parser(name, help=help_text)
+        parser.set_defaults(handler=handler)
 
 
 def _add_validate(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -2540,6 +2884,9 @@ def _run_config(args: argparse.Namespace) -> int:
 
 _COMMAND_HANDLERS: Final[dict[str, CommandHandler]] = {
     "service": _run_service,
+    "status": _run_status,
+    "pause": _run_pause,
+    "resume": _run_resume,
     "validate": _run_validate,
     "once": _run_once,
     "daemon": _run_daemon,

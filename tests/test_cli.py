@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from shoko_linker import cli
+from shoko_linker.bootstrap import BootstrapSettings
 from shoko_linker.cli import (
     EXIT_APPLY_GATE_REFUSAL,
     EXIT_CONFIG_INVALID,
@@ -20,7 +21,10 @@ from shoko_linker.cli import (
     EXIT_RUNTIME,
     main,
 )
+from shoko_linker.config import SecretRef
 from shoko_linker.http import ApiEndpoint
+from shoko_linker.service import SERVICE_POLL_SECONDS, ConnectionReport
+from shoko_linker.state import StateStore
 
 EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
@@ -32,6 +36,38 @@ def test_service_command_requires_no_yaml_path() -> None:
     except SystemExit as exc:
         pytest.fail(f"service must be a normal command with no required config path: {exc}")
     assert args.command == "service"
+
+
+def test_ordinary_control_commands_require_no_yaml_path() -> None:
+    for command in ("status", "pause", "resume"):
+        try:
+            args = cli.build_parser().parse_args([command])
+        except SystemExit as exc:
+            pytest.fail(f"{command} must be a normal command with no YAML path: {exc}")
+        assert args.command == command
+
+
+def test_ordinary_controls_persist_pause_and_refuse_resume_without_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(cli, "DEFAULT_DATABASE_PATH", state_path)
+
+    assert main(["pause"]) == EXIT_OK
+    assert "paused" in capsys.readouterr().out
+    assert main(["status"]) == EXIT_OK
+    status = capsys.readouterr().out
+    assert "Automatic linking: paused" in status
+
+    assert main(["resume"]) == cli.EXIT_STATE
+    assert "Complete dashboard setup" in capsys.readouterr().out
+    store = StateStore(state_path)
+    try:
+        assert store.get_service_pause() == (True, "user_paused")
+    finally:
+        store.close()
 
 
 def test_service_reports_missing_connection_setting_without_secret_values(
@@ -51,7 +87,7 @@ def test_service_reports_missing_connection_setting_without_secret_values(
     assert "shoko-test-key-never-a-real-secret" not in captured.err
 
 
-def test_service_command_starts_monitor_from_environment_without_config_file(
+def test_service_command_starts_managed_dashboard_worker_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SONARR_URL", "http://sonarr:8989")
@@ -60,15 +96,25 @@ def test_service_command_starts_monitor_from_environment_without_config_file(
     monkeypatch.setenv("SHOKO_API_KEY", "shoko-test-key-never-a-real-secret")
     sonarr = ApiEndpoint(httpx.Client(), lambda: {})
     shoko = ApiEndpoint(httpx.Client(), lambda: {})
-    invoked: list[tuple[ApiEndpoint, ApiEndpoint]] = []
+    invoked: dict[str, Any] = {}
     monkeypatch.setattr(
         cli, "bootstrap_endpoints", lambda _settings: (sonarr, shoko), raising=False
     )
+
+    class FakeServer:
+        def server_close(self) -> None:
+            invoked["closed"] = True
+
+    server = FakeServer()
     monkeypatch.setattr(
         cli,
-        "run_service",
-        lambda sonarr_arg, shoko_arg, **_kwargs: invoked.append((sonarr_arg, shoko_arg)),
-        raising=False,
+        "create_dashboard_server",
+        lambda host, port, app: invoked.update(host=host, port=port, app=app) or server,
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_dashboard_worker",
+        lambda server_arg, **kwargs: invoked.update(server=server_arg, **kwargs),
     )
     monkeypatch.setattr(cli, "make_signal_handlers", lambda _state: ())
 
@@ -78,7 +124,88 @@ def test_service_command_starts_monitor_from_environment_without_config_file(
         sonarr.client.close()
         shoko.client.close()
 
-    assert invoked == [(sonarr, shoko)]
+    assert invoked["host"] == "0.0.0.0"  # noqa: S104
+    assert invoked["port"] == 8080
+    assert invoked["server"] is server
+    assert invoked["worker_interval_seconds"] == SERVICE_POLL_SECONDS
+    assert invoked["app"].setup_provider is not None
+    assert invoked["app"].setup_action is not None
+    assert invoked["closed"] is True
+
+
+def test_service_worker_never_builds_daemon_dependencies_before_onboarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SONARR_URL", "http://sonarr:8989")
+    monkeypatch.setenv("SONARR_API_KEY", "sonarr-test-key-never-a-real-secret")
+    monkeypatch.setenv("SHOKO_URL", "http://shoko:8111")
+    monkeypatch.setenv("SHOKO_API_KEY", "shoko-test-key-never-a-real-secret")
+    monkeypatch.setattr(
+        cli,
+        "load_bootstrap_settings",
+        lambda: BootstrapSettings(
+            "http://sonarr:8989",
+            SecretRef("SONARR_API_KEY"),
+            "http://shoko:8111",
+            SecretRef("SHOKO_API_KEY"),
+            tmp_path / "state.sqlite3",
+        ),
+    )
+    sonarr = ApiEndpoint(httpx.Client(), lambda: {})
+    shoko = ApiEndpoint(httpx.Client(), lambda: {})
+    monkeypatch.setattr(cli, "bootstrap_endpoints", lambda _settings: (sonarr, shoko))
+    monkeypatch.setattr(cli, "make_signal_handlers", lambda _state: ())
+    monkeypatch.setattr(
+        cli,
+        "probe_connections",
+        lambda *_: ConnectionReport(True, True, ()),
+    )
+
+    class FakeController:
+        def __init__(self, *_args: Any) -> None:
+            pass
+
+        def current_context(self, _store: Any) -> None:
+            return None
+
+        def view(self) -> None:
+            return None
+
+        def action(self, _action: str, _form: Any) -> str:
+            return "Complete setup first."
+
+    monkeypatch.setattr(cli, "ServiceSetupController", FakeController)
+
+    class FakeServer:
+        def server_close(self) -> None:
+            return None
+
+    server = FakeServer()
+    invoked: dict[str, Any] = {}
+    monkeypatch.setattr(
+        cli,
+        "create_dashboard_server",
+        lambda _host, _port, app: invoked.update(app=app) or server,
+    )
+
+    def worker_loop(_server: Any, **kwargs: Any) -> None:
+        kwargs["worker_tick"]()
+        invoked["status"] = kwargs
+
+    monkeypatch.setattr(cli, "run_dashboard_worker", worker_loop)
+    monkeypatch.setattr(
+        cli,
+        "build_daemon_deps",
+        lambda *_args, **_kwargs: pytest.fail("daemon must remain unconfigured before consent"),
+    )
+
+    try:
+        assert main(["service"]) == EXIT_OK
+        message = invoked["app"].status_provider().next_action
+        assert "Complete or review scope and safety setup" in message
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
 
 
 def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:

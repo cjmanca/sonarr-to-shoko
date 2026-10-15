@@ -297,6 +297,14 @@ class OnboardingManager:
         self.store.set_service_pause(True, "user_paused", iso)
         return OnboardingDecision(OnboardingStatus.PAUSED, "Automatic linking is paused.")
 
+    def pause_for_review(self, reason: str, message: str, *, iso: str) -> OnboardingDecision:
+        """Persist a system hold when current scope facts require renewed user review."""
+        _validate_iso(iso)
+        if reason not in SYSTEM_PAUSE_REASONS:
+            raise OnboardingError("unsupported automatic-service review pause reason")
+        self._pause_for_system_change(reason, iso)
+        return OnboardingDecision(OnboardingStatus.NEEDS_CONFIRMATION, message)
+
     def resume(
         self, binding: ScopeBinding, assessment: SafetyAssessment, *, iso: str
     ) -> OnboardingDecision:

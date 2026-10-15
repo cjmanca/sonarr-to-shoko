@@ -821,6 +821,14 @@ def _fetch_import_folders(
     return parse_import_folders(payload)
 
 
+def collect_import_folders(endpoint: ApiEndpoint) -> tuple[ImportFolder, ...] | None:
+    """Read the validated import-folder list without paging through Shoko's files."""
+    folders, reasons, _details = _fetch_import_folders(endpoint)
+    if reasons:
+        return None
+    return tuple(sorted(folders.values(), key=lambda folder: (folder.path, folder.id)))
+
+
 def _fetch_json(
     endpoint: ApiEndpoint, path: str, params: Mapping[str, Any] | None = None
 ) -> _JsonOutcome:

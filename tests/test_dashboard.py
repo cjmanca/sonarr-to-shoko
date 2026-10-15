@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +20,9 @@ from shoko_linker.dashboard import (
     DASHBOARD_SESSION_SECONDS,
     MAX_DASHBOARD_REQUEST_BYTES,
     DashboardApplication,
+    DashboardSetupView,
     DashboardStatus,
+    _b64decode,
     create_dashboard_server,
     hash_password,
     verify_password,
@@ -103,6 +107,7 @@ def make_app(
             automatic_linking=True,
             next_action="No action is needed.",
             diagnostics=("internal trace sentinel",),
+            mapping_cache_status="Episode mappings are available.",
         ),
     )
 
@@ -188,6 +193,7 @@ def test_login_is_generic_and_status_requires_authentication(tmp_path: Path) -> 
             assert "4" in page.text
             assert "2" in page.text
             assert "No action is needed." in page.text
+            assert "Episode mappings are available." in page.text
             assert "internal trace sentinel" in page.text
             assert API_SECRET_SENTINEL not in page.text
         with httpx.Client(follow_redirects=False) as visitor:
@@ -245,6 +251,11 @@ def test_sessions_expire_and_tampered_cookie_is_rejected(tmp_path: Path) -> None
         stop_server(server, thread)
 
 
+def test_dashboard_cookie_base64_rejects_noncanonical_padding_bits() -> None:
+    with pytest.raises(ValueError, match="non-canonical"):
+        _b64decode("AB")
+
+
 def test_pause_resume_require_one_time_csrf_and_resume_rechecks_onboarding(
     tmp_path: Path,
 ) -> None:
@@ -283,6 +294,73 @@ def test_pause_resume_require_one_time_csrf_and_resume_rechecks_onboarding(
             with open_state(tmp_path / "state.sqlite3") as store:
                 assert store.get_service_pause() == (False, "")
                 assert OnboardingManager(store).record() is not None
+    finally:
+        stop_server(server, thread)
+
+
+def test_setup_scope_and_safety_controls_are_authenticated_and_csrf_protected(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+    selected_roots: list[str] = []
+
+    def setup_view() -> DashboardSetupView:
+        return DashboardSetupView(
+            message="Choose the Sonarr folder and review safety before automatic linking.",
+            root_options=tuple(f"/anime/{index}" for index in range(12)),
+            shoko_root_options=("/shoko/anime",),
+            selected_roots=tuple(selected_roots),
+            inferred_mappings=(("/anime/9", "/shoko/anime"),) if selected_roots else (),
+            required_confirmations=("Confirm plugin side effects",),
+        )
+
+    def save_setup(action: str, form: Mapping[str, str]) -> str:
+        calls.append((action, dict(form)))
+        if action == "scope":
+            selected_roots.extend(value for key, value in form.items() if key.startswith("root_"))
+        return "Setup saved."
+
+    app = DashboardApplication(
+        tmp_path / "state.sqlite3",
+        clock=MutableClock(),
+        setup_provider=setup_view,
+        setup_action=save_setup,
+    )
+    server, thread, base_url = start_server(app)
+    try:
+        with httpx.Client(follow_redirects=False) as client:
+            assert setup_account(client, base_url).status_code == 303
+            page = client.get(f"{base_url}/status")
+            assert "Choose the Sonarr folder" in page.text
+            assert "/anime/9" in page.text
+            first_token = csrf_from(page.text)
+            selected = client.post(
+                f"{base_url}/setup/scope",
+                data={
+                    "csrf_token": first_token,
+                    **{f"root_{index}": f"/anime/{index}" for index in range(12)},
+                },
+                headers=same_origin(base_url),
+            )
+            assert selected.status_code == 200
+            confirm_page = client.get(f"{base_url}/status")
+            assert "Confirm plugin side effects" in confirm_page.text
+            assert hashlib.sha256(b"Confirm plugin side effects").hexdigest() in confirm_page.text
+            confirmed = client.post(
+                f"{base_url}/setup/confirm",
+                data={
+                    "csrf_token": csrf_from(confirm_page.text),
+                    "confirm_0": "1",
+                    "automatic_link_consent": "1",
+                },
+                headers=same_origin(base_url),
+            )
+            assert confirmed.status_code == 200
+        assert calls[0][0] == "scope"
+        assert len(calls[0][1]) == 13
+        assert calls[0][1]["root_11"] == "/anime/11"
+        assert calls[1][0] == "confirm"
+        assert calls[1][1]["automatic_link_consent"] == "1"
     finally:
         stop_server(server, thread)
 

@@ -45,7 +45,7 @@ MAX_DASHBOARD_REQUEST_BYTES: Final[int] = 8192
 MAX_DASHBOARD_DRAIN_BYTES: Final[int] = 65_536
 MIN_DASHBOARD_PASSWORD_CHARS: Final[int] = 12
 MAX_DASHBOARD_PASSWORD_CHARS: Final[int] = 256
-MAX_DASHBOARD_FORM_FIELDS: Final[int] = 8
+MAX_DASHBOARD_FORM_FIELDS: Final[int] = 64
 MAX_DASHBOARD_COOKIE_CHARS: Final[int] = 2048
 MAX_DASHBOARD_BASE64_CHARS: Final[int] = 256
 SCRYPT_FIELD_COUNT: Final[int] = 6
@@ -71,6 +71,22 @@ class DashboardStatus:
     automatic_linking: bool
     next_action: str
     diagnostics: tuple[str, ...] = ()
+    mapping_cache_status: str = "Waiting for setup."
+
+
+@dataclass(frozen=True)
+class DashboardSetupView:
+    """Current safe scope/safety choices shown only after dashboard authentication."""
+
+    message: str
+    root_options: tuple[str, ...]
+    shoko_root_options: tuple[str, ...] = ()
+    selected_roots: tuple[str, ...] = ()
+    inferred_mappings: tuple[tuple[str, str], ...] = ()
+    mapping_options: tuple[tuple[str, str], ...] = ()
+    mapping_required: bool = False
+    required_confirmations: tuple[str, ...] = ()
+    confirmation_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -163,7 +179,10 @@ def _b64encode(value: bytes) -> str:
 def _b64decode(value: str) -> bytes:
     if not value or len(value) > MAX_DASHBOARD_BASE64_CHARS:
         raise ValueError("invalid base64 field")
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    if _b64encode(decoded) != value:
+        raise ValueError("non-canonical base64 field")
+    return decoded
 
 
 def _decode_session_cookie(signing_key: bytes, cookie_header: str) -> _SessionToken | None:
@@ -217,12 +236,16 @@ class DashboardApplication:
         status_provider: Callable[[], DashboardStatus] | None = None,
         onboarding_context: Callable[[], tuple[ScopeBinding, SafetyAssessment] | None]
         | None = None,
+        setup_provider: Callable[[], DashboardSetupView | None] | None = None,
+        setup_action: Callable[[str, Mapping[str, str]], str] | None = None,
     ) -> None:
         self.state_path = Path(state_path)
         self.budget_limits = budget_limits
         self.clock = clock
         self.status_provider = status_provider or self._default_status
         self.onboarding_context = onboarding_context
+        self.setup_provider = setup_provider
+        self.setup_action = setup_action
 
     @staticmethod
     def _default_status() -> DashboardStatus:
@@ -304,7 +327,8 @@ class DashboardApplication:
             )
         paused, _reason = store.get_service_pause()
         status = self.status_provider()
-        page = self._status_page(status, session.csrf_token, paused=paused)
+        setup = None if self.setup_provider is None else self.setup_provider()
+        page = self._status_page(status, session.csrf_token, paused=paused, setup=setup)
         return self._html(HTTPStatus.OK, page)
 
     def _post(
@@ -320,7 +344,9 @@ class DashboardApplication:
             return self._setup(store, form)
         if path == "/login":
             return self._login(store, form)
-        if path in {"/pause", "/resume"}:
+        control_paths = {"/pause", "/resume", "/setup/scope", "/setup/confirm"}
+        setup_action_available = not path.startswith("/setup/") or self.setup_action is not None
+        if path in control_paths and setup_action_available:
             return self._control(store, path, headers.get("cookie", ""), form)
         return self._error(HTTPStatus.NOT_FOUND, "Page not found.")
 
@@ -393,7 +419,7 @@ class DashboardApplication:
         manager = OnboardingManager(store)
         if path == "/pause":
             manager.pause(iso=now.isoformat())
-        else:
+        elif path == "/resume":
             context = None if self.onboarding_context is None else self.onboarding_context()
             if context is None:
                 decision = OnboardingDecision(
@@ -411,6 +437,22 @@ class DashboardApplication:
                     ),
                     set_cookie=cookie,
                 )
+        else:
+            action = "scope" if path == "/setup/scope" else "confirm"
+            assert self.setup_action is not None
+            message = self.setup_action(action, form)
+            setup = None if self.setup_provider is None else self.setup_provider()
+            return self._html(
+                HTTPStatus.OK,
+                self._status_page(
+                    self.status_provider(),
+                    next_csrf,
+                    paused=store.get_service_pause()[0],
+                    next_action=message,
+                    setup=setup,
+                ),
+                set_cookie=cookie,
+            )
         return self._redirect("/status", set_cookie=cookie)
 
     def _new_session(self, store: StateStore, signing_key: bytes, now: datetime) -> str | None:
@@ -553,6 +595,7 @@ class DashboardApplication:
         *,
         paused: bool,
         next_action: str | None = None,
+        setup: DashboardSetupView | None = None,
     ) -> str:
         active = status.automatic_linking and not paused
         action = next_action or ("Automatic linking is paused." if paused else status.next_action)
@@ -572,9 +615,70 @@ class DashboardApplication:
             f"<dl><dt>Verified files</dt><dd>{status.linked_files}</dd>"
             f"<dt>Waiting</dt><dd>{status.waiting_files}</dd>"
             f"<dt>Need review</dt><dd>{status.review_files}</dd>"
+            f"<dt>Episode mappings</dt><dd>{html.escape(status.mapping_cache_status)}</dd>"
             f"<dt>Automatic linking</dt><dd>{'Running' if active else 'Paused'}</dd></dl>"
             f"<p>{html.escape(action)}</p><nav>{controls}</nav>"
+            f"{DashboardApplication._setup_section(setup, csrf_token)}"
             f"<details><summary>Advanced diagnostics</summary><ul>{diagnostics}</ul></details>",
+        )
+
+    @staticmethod
+    def _setup_section(setup: DashboardSetupView | None, csrf_token: str) -> str:
+        if setup is None:
+            return ""
+        root_choices = "".join(
+            f'<label><input type="checkbox" name="root_{index}" '
+            f'value="{html.escape(root, quote=True)}"'
+            f'{" checked" if root in setup.selected_roots else ""}>'
+            f"{html.escape(root)}</label>"
+            for index, root in enumerate(setup.root_options)
+        )
+        scope_form = (
+            '<form method="post" action="/setup/scope">'
+            f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+            f"{root_choices}<button>Continue</button></form>"
+            if setup.root_options
+            else ""
+        )
+        mapping_summary = "".join(
+            f"<li>{html.escape(sonarr)} → {html.escape(shoko)}</li>"
+            for sonarr, shoko in setup.inferred_mappings
+        )
+        mapping_fields = ""
+        if setup.mapping_required and setup.selected_roots:
+            fields: list[str] = []
+            for index, root in enumerate(setup.selected_roots):
+                options = "".join(
+                    f'<option value="{option_index}">{html.escape(source)} → '
+                    f"{html.escape(target)}</option>"
+                    for option_index, (source, target) in enumerate(setup.mapping_options)
+                    if source == root
+                )
+                fields.append(
+                    f"<label>Folder match for {html.escape(root)} "
+                    f'<select name="mapping_{index}" required>{options}</select></label>'
+                )
+            mapping_fields = "".join(fields)
+        facts = "".join(
+            f'<label><input type="checkbox" name="confirm_{index}" '
+            f'value="{hashlib.sha256(fact.encode("utf-8")).hexdigest()}">'
+            f"{html.escape(fact)}</label>"
+            for index, fact in enumerate(setup.required_confirmations)
+        )
+        confirm_form = ""
+        if setup.selected_roots and setup.confirmation_enabled:
+            confirm_form = (
+                '<form method="post" action="/setup/confirm">'
+                '<input type="hidden" name="csrf_token" '
+                f'value="{html.escape(csrf_token, quote=True)}">'
+                f"<ul>{mapping_summary}</ul>{mapping_fields}{facts}"
+                '<label><input type="checkbox" name="automatic_link_consent" value="1" required>'
+                "I authorize automatic linking for this scope.</label>"
+                "<button>Confirm setup</button></form>"
+            )
+        return (
+            "<section><h2>Set up automatic linking</h2>"
+            f"<p>{html.escape(setup.message)}</p>{scope_form}{confirm_form}</section>"
         )
 
     @staticmethod

@@ -35,6 +35,7 @@ from shoko_linker.shoko import (
     ShokoMatchResult,
     SnapshotReason,
     build_identity,
+    collect_import_folders,
     collect_shoko_discovery,
     compare_identity,
     index_sonarr_files,
@@ -201,6 +202,20 @@ def discover(stub: ShokoStub, **kwargs: Any) -> ShokoDiscovery:
         return collect_shoko_discovery(endpoint, **kwargs)
     finally:
         endpoint.client.close()
+
+
+def test_collect_import_folders_checks_only_the_folder_endpoint() -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Anime", SHOKO_ROOT)]
+    endpoint = shoko_endpoint(stub.handler)
+    try:
+        folders = collect_import_folders(endpoint)
+    finally:
+        endpoint.client.close()
+    assert folders is not None
+    assert tuple(item.path for item in folders) == (SHOKO_ROOT,)
+    assert stub.paths() == [FOLDER_PATH]
+    assert stub.methods() == ["GET"]
 
 
 def reconcile(

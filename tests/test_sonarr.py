@@ -206,6 +206,23 @@ def collect(stub: SonarrStub, settings: Settings) -> SonarrInventory:
         endpoint.client.close()
 
 
+def test_read_only_scope_inventory_does_not_require_an_unconfirmed_path_mapping() -> None:
+    stub = standard_stub()
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        inventory = collect_sonarr_inventory(
+            endpoint,
+            allowed_roots=(ANIME_ROOT,),
+            anime_only=True,
+        )
+    finally:
+        endpoint.client.close()
+    assert inventory.verdict.complete is True
+    assert {file.series_id for file in inventory.files} == {SERIES_ANIME}
+    child_requests = [request for request in stub.requests if request.url.path in SECONDARY_PATHS]
+    assert {request.url.params["seriesId"] for request in child_requests} == {str(SERIES_ANIME)}
+
+
 def test_excluded_series_produce_no_secondary_requests(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:

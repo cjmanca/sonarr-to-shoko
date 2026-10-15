@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from http.server import HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
+import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker.bootstrap import BootstrapSettings
+from shoko_linker.config import SecretRef
+from shoko_linker.errors import ConfigError
 from shoko_linker.http import ApiEndpoint, make_timeout, shoko_headers, sonarr_headers
+from shoko_linker.paths import PathMapping
 from shoko_linker.service import (
     SERVICE_POLL_SECONDS,
     probe_connections,
@@ -136,6 +143,44 @@ def test_service_rechecks_connections_and_waits_interruptibly_between_cycles() -
     assert waits == [SERVICE_POLL_SECONDS]
 
 
+def test_managed_dashboard_and_worker_run_serially_on_one_loop() -> None:
+    from shoko_linker.service import run_dashboard_worker
+
+    @dataclass
+    class FakeState:
+        seconds: float = 0.0
+        stopped: bool = False
+        inside_tick: bool = False
+
+    current = FakeState()
+    ticks: list[float] = []
+
+    class FakeServer:
+        timeout = 0.0
+
+        def handle_request(self) -> None:
+            assert current.inside_tick is False
+            current.seconds += self.timeout
+            if current.seconds >= 3.2:
+                current.stopped = True
+
+    def tick() -> None:
+        assert current.inside_tick is False
+        current.inside_tick = True
+        ticks.append(current.seconds)
+        current.inside_tick = False
+
+    run_dashboard_worker(
+        cast(HTTPServer, FakeServer()),
+        worker_tick=tick,
+        stop_requested=lambda: current.stopped,
+        monotonic=lambda: current.seconds,
+        worker_interval_seconds=3.0,
+        request_poll_seconds=1.0,
+    )
+    assert ticks == [0.0, 3.0]
+
+
 def test_container_and_compose_start_service_without_yaml_or_published_port() -> None:
     dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = yaml.safe_load((REPOSITORY_ROOT / "compose.example.yaml").read_text(encoding="utf-8"))
@@ -148,3 +193,33 @@ def test_container_and_compose_start_service_without_yaml_or_published_port() ->
     assert {"SONARR_URL", "SONARR_API_KEY", "SHOKO_URL", "SHOKO_API_KEY"} <= set(environment)
     assert service["volumes"] == ["shoko-sonarr-linker-data:/data"]
     assert "ports" not in service
+
+
+def test_service_settings_are_built_only_from_confirmed_scope_and_exact_mappings(
+    tmp_path: Path,
+) -> None:
+    from shoko_linker.service import settings_for_scope
+
+    bootstrap = BootstrapSettings(
+        sonarr_url="http://sonarr:8989",
+        sonarr_api_key=SecretRef("SONARR_API_KEY"),
+        shoko_url="http://shoko:8111",
+        shoko_api_key=SecretRef("SHOKO_API_KEY"),
+        database_path=tmp_path / "state.sqlite3",
+    )
+    settings = settings_for_scope(
+        bootstrap,
+        roots=("/data/media/anime",),
+        mappings=(PathMapping("/data/media/anime", "/anime"),),
+    )
+    assert settings.anime_only is True
+    assert settings.sonarr.allowed_roots == ("/data/media/anime",)
+    assert settings.shoko.allowed_roots == ("/anime",)
+    assert settings.path_mappings == (PathMapping("/data/media/anime", "/anime"),)
+    assert settings.sync.apply_changes is False
+    assert settings.sync.rolling_new_limit == 5000
+    assert settings.database.path == str(bootstrap.database_path)
+    assert "SONARR_API_KEY" in settings.secret_env_vars
+    assert "dummy-sonarr-key" not in repr(settings)
+    with pytest.raises(ConfigError, match="explicitly selected"):
+        settings_for_scope(bootstrap, roots=(), mappings=())

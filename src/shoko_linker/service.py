@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from http.server import HTTPServer
 from typing import Final, Literal
 
 import httpx
+import yaml  # type: ignore[import-untyped]
 
 from .bootstrap import BootstrapSettings
-from .errors import HttpPolicyError
+from .config import DatabaseSettings, Settings, parse_settings
+from .errors import ConfigError, HttpPolicyError
 from .http import (
     ApiEndpoint,
     make_client,
@@ -18,6 +21,7 @@ from .http import (
     shoko_headers,
     sonarr_headers,
 )
+from .paths import PathMapping
 
 _logger = logging.getLogger(__name__)
 
@@ -58,6 +62,47 @@ def bootstrap_endpoints(settings: BootstrapSettings) -> tuple[ApiEndpoint, ApiEn
             lambda: shoko_headers(shoko_key),
             secret_values=(shoko_key,),
         ),
+    )
+
+
+def settings_for_scope(
+    bootstrap: BootstrapSettings,
+    *,
+    roots: tuple[str, ...],
+    mappings: tuple[PathMapping, ...],
+) -> Settings:
+    """Build full daemon settings only from non-empty, validated setup scope and mappings."""
+    if not roots:
+        raise ConfigError(
+            "Sonarr scope must be explicitly selected before linking can be configured."
+        )
+    if not mappings:
+        raise ConfigError("Path mappings must be verified before linking can be configured.")
+    shoko_roots = tuple(sorted({mapping.shoko for mapping in mappings}))
+    document = {
+        "sonarr": {
+            "url": bootstrap.sonarr_url,
+            "api_key_env": bootstrap.sonarr_api_key.env_var,
+            "allowed_roots": list(roots),
+        },
+        "shoko": {
+            "url": bootstrap.shoko_url,
+            "api_key_env": bootstrap.shoko_api_key.env_var,
+            "allowed_roots": list(shoko_roots),
+        },
+        "paths": {
+            "mappings": [{"sonarr": mapping.sonarr, "shoko": mapping.shoko} for mapping in mappings]
+        },
+        "mappings": {"source": "anime-lists"},
+        "sync": {"apply_changes": False},
+        # Bootstrap owns this service path; keep it outside the POSIX-only media-path schema.
+        "database": {"path": "/data/state.sqlite3"},
+    }
+    parsed = parse_settings(yaml.safe_dump(document, sort_keys=True))
+    return replace(
+        parsed,
+        anime_only=True,
+        database=DatabaseSettings(str(bootstrap.database_path)),
     )
 
 
@@ -134,3 +179,28 @@ def run_service(
         if stop_requested():
             break
         wait(SERVICE_POLL_SECONDS)
+
+
+def run_dashboard_worker(
+    server: HTTPServer,
+    *,
+    worker_tick: Callable[[], None],
+    stop_requested: Callable[[], bool],
+    monotonic: Callable[[], float],
+    worker_interval_seconds: float,
+    request_poll_seconds: float = 0.5,
+) -> None:
+    """Serve one dashboard request or one worker tick at a time on the calling thread."""
+    if worker_interval_seconds <= 0 or request_poll_seconds <= 0:
+        raise ValueError("service intervals must be positive")
+    next_worker_tick = monotonic()
+    while not stop_requested():
+        now = monotonic()
+        if now >= next_worker_tick:
+            worker_tick()
+            next_worker_tick = monotonic() + worker_interval_seconds
+        if stop_requested():
+            break
+        remaining = max(0.0, next_worker_tick - monotonic())
+        server.timeout = min(request_poll_seconds, remaining or request_poll_seconds)
+        server.handle_request()

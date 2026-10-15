@@ -646,7 +646,13 @@ def compare_baseline(previous: BaselineSnapshot, current: BaselineSnapshot) -> R
 # ------------------------------------------------------------------------------ I/O
 
 
-def collect_sonarr_inventory(endpoint: ApiEndpoint, settings: Settings) -> SonarrInventory:
+def collect_sonarr_inventory(
+    endpoint: ApiEndpoint,
+    settings: Settings | None = None,
+    *,
+    allowed_roots: Sequence[str] | None = None,
+    anime_only: bool | None = None,
+) -> SonarrInventory:
     """Read the eligible Sonarr collection once (series, episodes, files, rootfolders).
 
     Requests use relative API paths through :func:`shoko_linker.http.resolve_and_send`.
@@ -654,6 +660,23 @@ def collect_sonarr_inventory(endpoint: ApiEndpoint, settings: Settings) -> Sonar
     so one broken series response cannot crash the inventory; per-series fetches
     stop at that series.
     """
+    if settings is None:
+        if not allowed_roots or anime_only is not True:
+            raise ValueError("setup inventory requires explicit roots and anime-only selection")
+        try:
+            effective_roots = tuple(normalize_posix(root) for root in allowed_roots)
+        except (PathError, TypeError):
+            raise ValueError("setup inventory roots are invalid") from None
+        if len(set(effective_roots)) != len(effective_roots):
+            raise ValueError("setup inventory roots must be unique")
+        effective_anime_only = True
+    else:
+        effective_roots = (
+            settings.sonarr.allowed_roots
+            if allowed_roots is None
+            else tuple(normalize_posix(root) for root in allowed_roots)
+        )
+        effective_anime_only = settings.anime_only if anime_only is None else anime_only
     warnings: list[str] = []
     reasons: list[VerdictReason] = []
     details: list[str] = []
@@ -668,11 +691,11 @@ def collect_sonarr_inventory(endpoint: ApiEndpoint, settings: Settings) -> Sonar
     details.extend(series_result.details)
     eligible, excluded = select_eligible_series(
         series_result.series,
-        settings.sonarr.allowed_roots,
-        anime_only=settings.anime_only,
+        effective_roots,
+        anime_only=effective_anime_only,
     )
 
-    warnings.extend(_collect_root_folder_warnings(endpoint, settings.sonarr.allowed_roots))
+    warnings.extend(_collect_root_folder_warnings(endpoint, effective_roots))
 
     episodes_all: list[SonarrEpisode] = []
     files_all: list[SonarrFile] = []
