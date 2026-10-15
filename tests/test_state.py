@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import time
 from contextlib import AbstractContextManager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -215,7 +216,7 @@ def test_f17_probe_v1_database_opens_and_answers_campaign_queries(tmp_path: Path
 
 
 def test_f17_v1_migration_preserves_every_row_and_advances_version(tmp_path: Path) -> None:
-    """Opening v1 upgrades in place through v3 without changing any historical row."""
+    """Opening v1 upgrades in place through v4 without changing any historical row."""
     path = tmp_path / "state.sqlite3"
     before = v1fx.build_v1_database(path)
     with open_store(path) as store:
@@ -230,13 +231,16 @@ def test_f17_v1_migration_preserves_every_row_and_advances_version(tmp_path: Pat
     assert all(row[13:] == (None, None, "") for row in after["campaigns"])
     # schema_version audit history: the v1 row survives, and v2/v3 are appended.
     assert after["schema_version"][0] == before["schema_version"][0]
-    assert len(after["schema_version"]) == len(before["schema_version"]) + 2
-    assert after["schema_version"][-2][0:3:2] == (2, "migrated from 1")
-    assert after["schema_version"][-1][0:3:2] == (3, "migrated from 2")
+    assert len(after["schema_version"]) == len(before["schema_version"]) + 3
+    assert after["schema_version"][-3][0:3:2] == (2, "migrated from 1")
+    assert after["schema_version"][-2][0:3:2] == (3, "migrated from 2")
+    assert after["schema_version"][-1][0:3:2] == (4, "migrated from 3")
     assert second_view(path, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
     assert second_view(
         path, "SELECT name FROM sqlite_master WHERE type='table' AND name='onboarding'"
     ) == [("onboarding",)]
+    assert second_view(path, "SELECT COUNT(*) FROM dashboard_account") == [(0,)]
+    assert second_view(path, "SELECT COUNT(*) FROM dashboard_sessions") == [(0,)]
 
 
 def test_f17_migrated_campaign_is_not_drain_authorized(tmp_path: Path) -> None:
@@ -342,6 +346,66 @@ def test_verified_service_mapping_drift_is_durable_and_tracks_latest_generation(
     assert persisted[0].detected_iso == T1
 
 
+def test_dashboard_account_and_csrf_session_state_are_atomic_and_durable(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    session_hash = "a" * 64
+    first_csrf_hash = "b" * 64
+    second_csrf_hash = "c" * 64
+    with open_store(path) as store:
+        assert store.get_dashboard_account() is None
+        assert (
+            store.create_dashboard_account("admin", "scrypt$16384$8$1$salt$hash", b"k" * 32, T0)
+            is True
+        )
+        assert (
+            store.create_dashboard_account("attacker", "scrypt$16384$8$1$salt$hash", b"z" * 32, T1)
+            is False
+        )
+        account = store.get_dashboard_account()
+        assert account is not None
+        assert account.username == "admin"
+        assert account.signing_key == b"k" * 32
+        assert (
+            store.create_dashboard_session(
+                session_hash, first_csrf_hash, int(datetime.fromisoformat(T2).timestamp()), T0
+            )
+            is True
+        )
+        now_epoch = int(datetime.fromisoformat(T1).timestamp())
+        assert store.get_dashboard_session(session_hash, now_epoch) is not None
+        assert (
+            store.rotate_dashboard_session_csrf(session_hash, "d" * 64, second_csrf_hash, now_epoch)
+            is False
+        )
+        assert (
+            store.rotate_dashboard_session_csrf(
+                session_hash,
+                first_csrf_hash,
+                second_csrf_hash,
+                now_epoch,
+            )
+            is True
+        )
+        assert (
+            store.rotate_dashboard_session_csrf(
+                session_hash,
+                first_csrf_hash,
+                "e" * 64,
+                now_epoch,
+            )
+            is False
+        )
+    with open_store(path) as reopened:
+        account = reopened.get_dashboard_account()
+        session = reopened.get_dashboard_session(
+            session_hash, int(datetime.fromisoformat(T1).timestamp())
+        )
+        assert account is not None
+        assert account.username == "admin"
+        assert session is not None
+        assert session.csrf_hash == second_csrf_hash
+
+
 def test_f17_pending_and_indeterminate_sends_are_not_replayed(tmp_path: Path) -> None:
     """F17: opening a v1 install must not auto-send anything — live rows stay held."""
     path = tmp_path / "state.sqlite3"
@@ -438,6 +502,7 @@ def test_f17_interim_v1_with_drain_columns_upgrades_cleanly(tmp_path: Path) -> N
     assert audit[0] == (1, "initial v1 schema")
     assert audit[1] == (2, "migrated from 1")
     assert audit[2] == (3, "migrated from 2")
+    assert audit[3] == (4, "migrated from 3")
 
 
 def test_f17_future_schema_version_is_refused_fail_closed(tmp_path: Path) -> None:
@@ -445,12 +510,16 @@ def test_f17_future_schema_version_is_refused_fail_closed(tmp_path: Path) -> Non
     path = tmp_path / "state.sqlite3"
     before = v1fx.build_v1_database(path)
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA user_version=4")
+    future_version = SCHEMA_VERSION + 1
+    conn.execute(f"PRAGMA user_version={future_version}")
     conn.commit()
     conn.close()
-    with pytest.raises(sqlite3.DatabaseError, match="newer than supported 3"), open_store(path):
+    with (
+        pytest.raises(sqlite3.DatabaseError, match=f"newer than supported {SCHEMA_VERSION}"),
+        open_store(path),
+    ):
         pass
-    assert second_view(path, "PRAGMA user_version") == [(4,)]
+    assert second_view(path, "PRAGMA user_version") == [(future_version,)]
     assert v1fx.snapshot_state(path) == before
 
 

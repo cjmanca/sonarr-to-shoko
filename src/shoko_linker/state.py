@@ -95,13 +95,16 @@ already has the columns upgrades cleanly. The step, the ``PRAGMA user_version=2`
 ``schema_version`` audit row commit in **one transaction**: a failing step rolls back whole, the
 store refuses to open with a recoverable :class:`StateError`, and the file stays usable at its
 original version with every history row intact. At F17, fresh databases initialized directly at
-v2; current fresh databases initialize at v3, and a v2 database upgrades in place. A
+v2; current fresh databases initialize at v4, and older databases upgrade in place. A
 ``user_version > SCHEMA_VERSION`` is refused (fail closed). Migrations never rewrite send, budget
 or campaign rows.
 
 **M3 (schema v3):** the `onboarding` table stores scope/version/safety digests, explicit
 operator confirmations, automatic-link consent, and pause state. The `2 → 3` migration adds
 the table without changing any existing row.
+
+**M5.1 (schema v4):** empty dashboard-account and dashboard-session tables are added by the
+`3 → 4` migration. Existing installs never inherit an account or session.
 
 F9 (also schema v1, unshipped — no released image exists): the per-cycle budget window_key is
 made durable-unique. :meth:`StateStore.begin_cycle` allocates ``<label>-<run_id>-<seq>`` window
@@ -134,7 +137,7 @@ import sqlite3
 import sys
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -171,7 +174,7 @@ else:
 
 _O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
-SCHEMA_VERSION: Final[int] = 3
+SCHEMA_VERSION: Final[int] = 4
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
 GLOBAL_BUDGET_KEY: Final[str] = "_global"
 MAX_DETAIL_CHARS: Final[int] = 1000
@@ -179,6 +182,10 @@ DIGEST_HEX_CHARS: Final[int] = 64
 TARGET_TRIPLE_LEN: Final[int] = 3
 MAX_ONBOARDING_JSON_CHARS: Final[int] = 100_000
 MAX_SERVICE_RATE_JSON_CHARS: Final[int] = 4096
+MAX_DASHBOARD_USERNAME_CHARS: Final[int] = 64
+MAX_DASHBOARD_PASSWORD_HASH_CHARS: Final[int] = 512
+MAX_DASHBOARD_SESSIONS: Final[int] = 100
+DASHBOARD_SIGNING_KEY_BYTES: Final[int] = 32
 
 # meta keys (documented contract for M6-b/M7; the scheduler fills the
 # cycle/timestamp keys when the daemon loop lands).
@@ -584,6 +591,26 @@ class ServiceMappingDrift:
     active_structure_digest: str
     mapping_revision: str
     detected_iso: str
+
+
+@dataclass(frozen=True)
+class DashboardAccount:
+    """First dashboard user; credential hash and signing key are redacted from repr."""
+
+    username: str
+    password_hash: str = field(repr=False)
+    signing_key: bytes = field(repr=False)
+    created_iso: str
+
+
+@dataclass(frozen=True)
+class DashboardSession:
+    """Expiring login record stores only session/CSRF hashes, never bearer values."""
+
+    session_id_hash: str = field(repr=False)
+    csrf_hash: str = field(repr=False)
+    expires_epoch: int
+    created_iso: str
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1031,19 @@ CREATE TABLE onboarding (
     pause_reason TEXT NOT NULL DEFAULT '',
     updated_iso TEXT NOT NULL
 );
+CREATE TABLE dashboard_account (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    signing_key BLOB NOT NULL CHECK (length(signing_key) = 32),
+    created_iso TEXT NOT NULL
+);
+CREATE TABLE dashboard_sessions (
+    session_id_hash TEXT PRIMARY KEY CHECK (length(session_id_hash) = 64),
+    csrf_hash TEXT NOT NULL CHECK (length(csrf_hash) = 64),
+    expires_epoch INTEGER NOT NULL,
+    created_iso TEXT NOT NULL
+);
 CREATE INDEX idx_files_state ON files (state);
 CREATE INDEX idx_files_cohort ON files (cohort);
 CREATE INDEX idx_files_campaign ON files (campaign_id);
@@ -1012,6 +1052,7 @@ CREATE INDEX idx_files_series_file ON files (sonarr_series_id, sonarr_file_id);
 CREATE INDEX idx_sends_request_fingerprint ON sends (request_fingerprint);
 CREATE INDEX idx_sends_file ON sends (shoko_file_id);
 CREATE INDEX idx_baseline_files_identity ON baseline_files (sonarr_series_id, sonarr_file_id);
+CREATE INDEX idx_dashboard_sessions_expiry ON dashboard_sessions (expires_epoch);
 """
 
 #: The three campaigns columns that distinguish v2 from v1 (column name → ADD COLUMN DDL;
@@ -1059,13 +1100,65 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         raise sqlite3.DatabaseError("onboarding table has an unexpected schema")
 
 
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """M5.1: add empty dashboard identity/session tables; never inherit an account."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_account ("
+        "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+        "username TEXT NOT NULL, "
+        "password_hash TEXT NOT NULL, "
+        "signing_key BLOB NOT NULL CHECK (length(signing_key) = 32), "
+        "created_iso TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_sessions ("
+        "session_id_hash TEXT PRIMARY KEY CHECK (length(session_id_hash) = 64), "
+        "csrf_hash TEXT NOT NULL CHECK (length(csrf_hash) = 64), "
+        "expires_epoch INTEGER NOT NULL, "
+        "created_iso TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_expiry"
+        " ON dashboard_sessions (expires_epoch)"
+    )
+    expected = {
+        "dashboard_account": {
+            "singleton",
+            "username",
+            "password_hash",
+            "signing_key",
+            "created_iso",
+        },
+        "dashboard_sessions": {"session_id_hash", "csrf_hash", "expires_epoch", "created_iso"},
+    }
+    for table, columns in expected.items():
+        actual = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if actual != columns:
+            raise sqlite3.DatabaseError(f"{table} table has an unexpected schema")
+    account_info = {
+        str(row[1]): _as_int(row[5], "dashboard_account.primary_key")
+        for row in conn.execute("PRAGMA table_info(dashboard_account)")
+    }
+    session_info = {
+        str(row[1]): _as_int(row[5], "dashboard_sessions.primary_key")
+        for row in conn.execute("PRAGMA table_info(dashboard_sessions)")
+    }
+    if account_info["singleton"] != 1 or session_info["session_id_hash"] != 1:
+        raise sqlite3.DatabaseError("dashboard tables are missing their required primary keys")
+    if conn.execute("SELECT 1 FROM dashboard_account LIMIT 1").fetchone() is not None:
+        raise sqlite3.DatabaseError("dashboard account must not be inherited during migration")
+    if conn.execute("SELECT 1 FROM dashboard_sessions LIMIT 1").fetchone() is not None:
+        raise sqlite3.DatabaseError("dashboard sessions must not be inherited during migration")
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
-# v3 is the current schema; 1→2 (F17) and 2→3 (M3) upgrade existing databases in place.
+# v4 is current: 1→2 (F17), 2→3 (M3), and 3→4 (M5.1) upgrade in place.
 # Future slices append entries here and bump SCHEMA_VERSION. Migrations never destroy
 # tables, never rewrite stored rows, and never run backwards.
 _MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
 }
 
 
@@ -1353,12 +1446,19 @@ class StateStore:
         self._apply_lock: ApplyProcessLock | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
+        if os.name != "nt":
+            try:
+                self.path.chmod(0o600)
+            except OSError as exc:
+                self._conn.close()
+                raise StateError("state database permissions could not be restricted") from exc
         self._conn.isolation_level = None  # explicit transactions only
         self._conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        self._secure_database_permissions()
         if self.get_meta(META_WRITES_DISABLED) == "1":
             self._writes_disabled = True
             self._writes_reason = self.get_meta(META_WRITES_DISABLED_REASON) or "unspecified"
@@ -1371,6 +1471,21 @@ class StateStore:
         if lock is not None:
             lock.release()
         self._conn.close()
+
+    def _secure_database_permissions(self) -> None:
+        """Keep the database and SQLite sidecars owner-only on POSIX installations."""
+        if os.name == "nt":
+            return
+        for candidate in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            if candidate.exists():
+                try:
+                    candidate.chmod(0o600)
+                except OSError as exc:
+                    raise StateError("state database permissions could not be restricted") from exc
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -1492,6 +1607,142 @@ class StateStore:
         self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     # ---------------------------------------------------------- onboarding
+
+    def get_dashboard_account(self) -> DashboardAccount | None:
+        row = self._conn.execute(
+            "SELECT username, password_hash, signing_key, created_iso"
+            " FROM dashboard_account WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        username = _as_str(row[0], "dashboard_account.username")
+        password_hash = _as_str(row[1], "dashboard_account.password_hash")
+        signing_key = row[2]
+        if not isinstance(signing_key, bytes) or len(signing_key) != DASHBOARD_SIGNING_KEY_BYTES:
+            raise StateError("dashboard signing key is malformed")
+        created_iso = _as_str(row[3], "dashboard_account.created_iso")
+        _require_iso(created_iso, "dashboard_account.created_iso")
+        return DashboardAccount(username, password_hash, signing_key, created_iso)
+
+    @_mutation
+    def create_dashboard_account(
+        self, username: str, password_hash: str, signing_key: bytes, iso: str
+    ) -> bool:
+        """Atomically enroll exactly one dashboard account; credentials are never inferred."""
+        if (
+            not isinstance(username, str)
+            or not username
+            or username != username.strip()
+            or len(username) > MAX_DASHBOARD_USERNAME_CHARS
+            or not username.isprintable()
+        ):
+            raise StateError("dashboard username is invalid")
+        if (
+            not isinstance(password_hash, str)
+            or not password_hash.startswith("scrypt$")
+            or len(password_hash) > MAX_DASHBOARD_PASSWORD_HASH_CHARS
+        ):
+            raise StateError("dashboard password hash is invalid")
+        if not isinstance(signing_key, bytes) or len(signing_key) != DASHBOARD_SIGNING_KEY_BYTES:
+            raise StateError("dashboard signing key must contain 32 random bytes")
+        _require_iso(iso, "dashboard_account.created_iso")
+        with self._transaction():
+            existing = self._conn.execute(
+                "SELECT 1 FROM dashboard_account WHERE singleton = 1"
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._conn.execute(
+                "INSERT INTO dashboard_account"
+                " (singleton, username, password_hash, signing_key, created_iso)"
+                " VALUES (1, ?, ?, ?, ?)",
+                (username, password_hash, signing_key, iso),
+            )
+        self._secure_database_permissions()
+        return True
+
+    @_mutation
+    def create_dashboard_session(
+        self,
+        session_id_hash: str,
+        csrf_hash: str,
+        expires_epoch: int,
+        iso: str,
+    ) -> bool:
+        """Insert one bounded expiring session; raw bearer and CSRF tokens never reach SQLite."""
+        _require_hex64(session_id_hash, "dashboard_session.session_id_hash")
+        _require_hex64(csrf_hash, "dashboard_session.csrf_hash")
+        if isinstance(expires_epoch, bool) or not isinstance(expires_epoch, int):
+            raise StateError("dashboard session expiry must be an integer epoch")
+        _require_iso(iso, "dashboard_session.created_iso")
+        if expires_epoch <= int(_parse_iso(iso).timestamp()):
+            raise StateError("dashboard session expiry must be in the future")
+        with self._transaction():
+            if (
+                self._conn.execute("SELECT 1 FROM dashboard_account WHERE singleton = 1").fetchone()
+                is None
+            ):
+                raise StateError("dashboard account is not configured")
+            self._conn.execute(
+                "DELETE FROM dashboard_sessions WHERE expires_epoch <= ?",
+                (int(_parse_iso(iso).timestamp()),),
+            )
+            active_count = _as_int(
+                self._conn.execute("SELECT COUNT(*) FROM dashboard_sessions").fetchone()[0],
+                "dashboard_sessions.count",
+            )
+            if active_count >= MAX_DASHBOARD_SESSIONS:
+                return False
+            cursor = self._conn.execute(
+                "INSERT INTO dashboard_sessions"
+                " (session_id_hash, csrf_hash, expires_epoch, created_iso)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT (session_id_hash) DO NOTHING",
+                (session_id_hash, csrf_hash, expires_epoch, iso),
+            )
+            return cursor.rowcount == 1
+
+    def get_dashboard_session(
+        self, session_id_hash: str, now_epoch: int
+    ) -> DashboardSession | None:
+        _require_hex64(session_id_hash, "dashboard_session.session_id_hash")
+        if isinstance(now_epoch, bool) or not isinstance(now_epoch, int):
+            raise StateError("dashboard session clock must be an integer epoch")
+        row = self._conn.execute(
+            "SELECT session_id_hash, csrf_hash, expires_epoch, created_iso"
+            " FROM dashboard_sessions WHERE session_id_hash = ?",
+            (session_id_hash,),
+        ).fetchone()
+        if row is None or _as_int(row[2], "dashboard_session.expires_epoch") <= now_epoch:
+            return None
+        created_iso = _as_str(row[3], "dashboard_session.created_iso")
+        _require_iso(created_iso, "dashboard_session.created_iso")
+        return DashboardSession(
+            _as_str(row[0], "dashboard_session.session_id_hash"),
+            _as_str(row[1], "dashboard_session.csrf_hash"),
+            _as_int(row[2], "dashboard_session.expires_epoch"),
+            created_iso,
+        )
+
+    @_mutation
+    def rotate_dashboard_session_csrf(
+        self,
+        session_id_hash: str,
+        expected_csrf_hash: str,
+        next_csrf_hash: str,
+        now_epoch: int,
+    ) -> bool:
+        """Consume the current CSRF nonce exactly once and replace it atomically."""
+        _require_hex64(session_id_hash, "dashboard_session.session_id_hash")
+        _require_hex64(expected_csrf_hash, "dashboard_session.expected_csrf_hash")
+        _require_hex64(next_csrf_hash, "dashboard_session.next_csrf_hash")
+        if isinstance(now_epoch, bool) or not isinstance(now_epoch, int):
+            raise StateError("dashboard session clock must be an integer epoch")
+        cursor = self._conn.execute(
+            "UPDATE dashboard_sessions SET csrf_hash = ?"
+            " WHERE session_id_hash = ? AND csrf_hash = ? AND expires_epoch > ?",
+            (next_csrf_hash, session_id_hash, expected_csrf_hash, now_epoch),
+        )
+        return cursor.rowcount == 1
 
     def get_service_rate_state_json(self) -> str | None:
         """Return the bounded adaptive-rate controller state, if initialized."""

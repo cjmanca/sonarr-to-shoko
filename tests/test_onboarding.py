@@ -92,18 +92,21 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
     before = _create_v2_database(path)
 
     with open_state(path) as store:
-        assert store.schema_version() == 3
+        assert store.schema_version() == 4
         assert store.get_onboarding_json() is None
         assert store.get_service_pause() == (False, "")
+        assert store.get_dashboard_account() is None
+        assert store.get_dashboard_session("a" * 64, 1792041600) is None
 
     after = v1fx.snapshot_state(path)
     for table in ("meta", "baselines", "baseline_files", "files", "sends", "campaigns", "budgets"):
         assert after[table] == before[table]
     assert after["schema_version"][: len(before["schema_version"])] == before["schema_version"]
-    assert after["schema_version"][-1][0:3:2] == (3, "migrated from 2")
+    assert after["schema_version"][-2][0:3:2] == (3, "migrated from 2")
+    assert after["schema_version"][-1][0:3:2] == (4, "migrated from 3")
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone() == (3,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (4,)
     finally:
         conn.close()
 
