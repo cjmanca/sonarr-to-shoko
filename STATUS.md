@@ -26,7 +26,8 @@
 - `git diff --check` → no whitespace errors. Git emitted its Windows CRLF-to-LF working-copy warning for `tests/test_campaign.py`.
 - A sequential read-only review found no behavior issues and one P3 docstring accuracy issue; the docstring was corrected and focused tests/static checks rerun. The reviewer could not run tests in its separate environment; no reviewer test success is claimed.
 - No live Sonarr/Shoko requests or writes occurred.
+- Implementation commit `a387e0dbeb3ba73774217c9c6b25419608495961` and verification record commit `ae631e3fb0e00691349864686f376413a8754f4b` were pushed to `origin/main`. The remote ref was verified at `ae631e3fb0e00691349864686f376413a8754f4b` after the push.
 
 ## Next action
 
-Commit this post-commit status update, then push both authorized commits to `origin/main`.
+No further offline implementation work remains. Live integration, deployment, and production write safety remain external and unverified.
