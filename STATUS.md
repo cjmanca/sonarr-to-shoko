@@ -5,6 +5,7 @@
 **Historical approved PLAN.md SHA-256:** `D43140F0DF399F09EDFE5B2D9A851F4266D7293BA6DD02D06605B7FE981A20AB` (the previous F34 handoff).
 **Plan selection:** The current redesign handoff was already present in the working tree when `/goal` was invoked, and the user explicitly requested implementing that `PLAN.md` handoff. It is adopted for this run and remains unchanged; the old F34 digest does not describe the selected redesign.
 **Baseline HEAD:** `5f9d4a3` (`docs: add user experience redesign design`).
+**Latest accepted local commit:** `8919789` (`docs: establish UX redesign plan`).
 **Branch/worktree:** `main`; one worktree at the repository root, as requested.
 **Mode:** Local/offline implementation only. No live Sonarr/Shoko requests or writes, production deployment, or GHCR publishing.
 
@@ -20,7 +21,7 @@
 - M0 — product requirements and execution checkpoint: **accepted**. `PROJECT.md` now makes environment startup, one-time onboarding authorization, automatic backlog processing, dashboard privacy/login, advanced CLI compatibility, and updated acceptance criteria authoritative. `PLAN.md` still matches its selected digest.
 - M1 — zero-configuration startup: **next**. M2–M6: **not started**.
 - Design-doc check: staged `git diff --cached --check` passed before commit; no runtime/code test was applicable to the design-only commit.
-- M0 verification: `git diff --check` returned no whitespace errors; computed working `PLAN.md` SHA-256 remained `587b920f90062092599c178ac3619ce830c66764f95fd71043158d2610dbc733`.
+- M0 verification: `git diff --check` and staged `git diff --cached --check` returned no whitespace errors; `PLAN.md` SHA-256 remained `587b920f90062092599c178ac3619ce830c66764f95fd71043158d2610dbc733`; the current plan version, `PROJECT.md`, `STATUS.md`, and separate implementation plan were committed as `8919789`.
 - No product behavior or Docker/test verification has been claimed.
 
 ## Open risks / next action
