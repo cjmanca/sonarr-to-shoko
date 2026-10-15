@@ -28,4 +28,6 @@
 ## External validation / next action
 
 - **EXTERNAL/UNVERIFIED:** live Sonarr/Shoko behavior and physical-safety inspection, actual pull of the published GHCR image, post-push CI/GHCR publishing, and an Unraid installation.
-- Next: commit this ledger update, push both commits to `origin/main` as explicitly requested, and verify the remote ref.
+- Delivery commits `8bdf12bb0c8b14f7957e3c0ebc7d27bb9625ca55` and `c5a7a4f63fe39bc3641903a8b0cba55e304ae5ba` were pushed with `git push origin main`.
+- Immediately after that push, `git rev-parse HEAD` and `git ls-remote origin refs/heads/main` both returned `c5a7a4f63fe39bc3641903a8b0cba55e304ae5ba`; the working tree was clean.
+- Next: no repository implementation work remains. External validations above require the target services/operator environment.
