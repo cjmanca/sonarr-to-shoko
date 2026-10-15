@@ -20,8 +20,8 @@
 | Baseline and frozen plan | complete | Clean tracked baseline at `4ef9235`; plan SHA-256 recorded above. Full baseline pytest run passed. |
 | F31 — Mapping crash consistency | complete | Immutable digest-identified generation files are selected by an atomic pointer. Source-transition and scheduler snapshots, epoch/attempt fencing, verified legacy migration, and lock-fenced reads/cleanup preserve last-known-good data across interrupted activation and state loss. |
 | F32 — Campaign quarantine accounting | complete | First-time pending progress claims consume the batch allowance; previously recorded claims are skipped without recounting. Mocked tests cover 100-file DRY_RUN quarantine staging, `--batch-size 1`, restart before attribution, no extra POSTs, and unchanged submission/rolling-budget counters. |
-| F33 — Operational deadline guidance | pending | — |
-| Final validation and independent review | pending | Project-wide validation and final review remain for the end of F33. |
+| F33 — Operational deadline guidance | complete | Preparation warns from the approved file count and configured rolling limits; it leaves deadlines, limits, and safety leases unchanged. README and deployment guidance explain the optimistic horizon and separate lease renewal. |
+| Final validation and independent review | pending | Full project checks, Docker build/smoke checks, and final safety-critical review remain. |
 
 ## F31 — Mapping crash consistency (complete)
 
@@ -59,6 +59,24 @@
 - Local F32 implementation commit: `ac157eb` (`fix: bound campaign quarantine attribution`).
 - No live Sonarr/Shoko requests or writes occurred; no push, publish, or deployment was performed.
 
+## F33 — Operational deadline guidance (complete)
+
+- Added `campaign_deadline_warning()` and wired it into `campaign prepare`. It estimates the optimistic wait until the final rolling-budget window as `max(0, ceil(files / rolling_new_limit) - 1) × rolling_window_hours`; it warns when that wait reaches or exceeds the requested deadline and explicitly warns that a zero submission limit makes completion impossible. The warning is returned in JSON `warnings` and printed in human-readable output.
+- Preparation does not change the requested deadline, approved submission count, configured rate limits, or attestation lease. The warning calls out transient failures, pending Shoko jobs, verification delays, and separate safety-attestation renewal.
+- `README.md` and `docs/deployment.md` explain the estimate, the 7,000-file example (5,712 hours / 238 days until the last window can begin), choosing `--deadline-hours`, and periodic safety reinspection/lease renewal.
+- Parameterized preparation tests cover 10, 200, 201, and 7,000 files at 200 submissions per 168-hour window, a deliberately short deadline, a sufficient deadline, and a zero submission limit. They verify warnings, unchanged plan deadline/rate limits, and zero Shoko POSTs. A text-mode test verifies the warning is visible without `--json`.
+- Sequential read-only review of horizon arithmetic, CLI output, plan mutation boundaries, tests, and documentation found no P0/P1/P2/P3 findings. Rate-limit enforcement and authorization behavior are unchanged.
+
+### F33 verification evidence
+
+- `uv run pytest -q tests/test_campaign.py tests/test_cli_m7.py` → passed through **100%** (mocked/offline integrations only).
+- `uv run ruff check src/shoko_linker/campaign.py src/shoko_linker/cli.py tests/test_campaign.py` → passed.
+- `uv run ruff format --check src/shoko_linker/campaign.py src/shoko_linker/cli.py tests/test_campaign.py` → **3 files already formatted**.
+- `uv run mypy src/shoko_linker/campaign.py src/shoko_linker/cli.py tests/test_campaign.py` → passed.
+- `git diff --check` → no whitespace errors (Git emitted the working-copy CRLF/LF normalization warning for `tests/test_campaign.py`).
+- Local F33 implementation commit: `a500c03` (`feat: warn about campaign deadline limits`).
+- No live Sonarr/Shoko requests or writes occurred; no push, publish, or deployment was performed.
+
 ## Next action
 
-Start F33: inspect campaign preparation, configured rolling limits, and operator documentation; add the requested optimistic completion-horizon warning without changing deadlines, safety leases, or submission limits.
+Run the full project validation from `PLAN.md`, including the repository-wide tests, Ruff, mypy, Docker build, Docker smoke checks, and final safety-critical review.
