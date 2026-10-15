@@ -278,6 +278,7 @@ class Settings:
     database: DatabaseSettings
     safety: SafetySettings = DEFAULT_SAFETY_SETTINGS
     campaign: CampaignSettings = DEFAULT_CAMPAIGN_SETTINGS
+    anime_only: bool = False
 
     @property
     def apply_enabled(self) -> bool:

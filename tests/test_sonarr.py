@@ -9,6 +9,7 @@ secondary requests).
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from shoko_linker.sonarr import (
     index_series_files,
     parse_episode_entries,
     parse_file_entries,
+    parse_series_entries,
     select_eligible_series,
     validate_root_folders,
 )
@@ -220,6 +222,40 @@ def test_excluded_series_produce_no_secondary_requests(
     assert stub.secondary_series_ids() == {SERIES_ANIME}
     assert inventory.verdict.complete is True
     assert inventory.verdict.auto_apply_eligible is True
+
+
+def test_normal_service_inventory_preserves_only_anime_series_in_shared_root(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = replace(
+        settings_with_roots(base_document, write_document, [ANIME_ROOT]), anime_only=True
+    )
+    stub = standard_stub()
+    shared_live_id = 700
+    stub.series.append(
+        series_entry(
+            shared_live_id, "Live Action in Shared Root", f"{ANIME_ROOT}/Live", type_="standard"
+        )
+    )
+    stub.episodes[shared_live_id] = [
+        episode_entry(7001, shared_live_id, 1, 1, "Drama E01", file_id=7000)
+    ]
+    stub.files[shared_live_id] = [
+        file_entry(7000, shared_live_id, f"{ANIME_ROOT}/Live/S01E01.mkv", 900)
+    ]
+
+    inventory = collect(stub, settings)
+
+    assert {item.series.id for item in inventory.eligible_series} == {SERIES_ANIME}
+    assert shared_live_id in {item.id for item in inventory.excluded_series}
+    assert stub.secondary_series_ids() == {SERIES_ANIME}
+
+
+def test_series_parser_records_verified_series_type() -> None:
+    result = parse_series_entries([series_entry(SERIES_ANIME, "Anime", ANIME_ROOT, type_="anime")])
+
+    assert result.reasons == ()
+    assert result.series[0].series_type == "anime"
 
 
 def test_multiple_allowed_roots_admit_their_series(

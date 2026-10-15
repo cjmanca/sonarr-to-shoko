@@ -87,6 +87,23 @@ Zero network calls to any live Shoko; zero writes.
   (`APIExtensions.cs:182-191`). Opposite convention from Sonarr — parsers must be
   per-service.
 
+### Version and startup compatibility
+
+- At the pinned v5.3.3 ref, **`GET /api/v3/Init/Version`** is implemented by
+  `InitController.GetVersion` and returns `ComponentVersionSet.Server.Version`
+  (with optional `ReleaseChannel`, `Commit`, `Tag`, and `ReleaseDate`). The response
+  shape is `Server.Version`; do not assume a top-level version field. This read-only
+  endpoint provides Shoko's server version without requesting the secret-bearing
+  admin-only `/Settings` document. Source: `InitController.cs` at
+  [`892461188e5f1cc3ccf1b9b6eb1d4dfd31bea6f8`](https://github.com/ShokoAnime/ShokoServer/blob/892461188e5f1cc3ccf1b9b6eb1d4dfd31bea6f8/Shoko.Server/API/v3/Controllers/InitController.cs),
+  `ComponentVersion.cs`, and `ComponentVersionSet.cs` at the same ref.
+- **`GET /api/v3/Init/Status`** returns `ServerStatus` with startup state, startup
+  message, uptime, and database-blocked state. It is a read-only availability signal;
+  do not call `POST /api/v3/Init/StartServer` from the linker.
+- This project has verified linking side-effect semantics only for Shoko **5.3.3**;
+  newer Shoko versions (including the v6 rewrite) remain unsupported until their
+  `ManualLinkJob` semantics and safety inputs are independently verified.
+
 ### `GET /api/v3/File` — listing unrecognized files
 
 - Params: `pageSize` (default **100**, max 1000, `0`=unlimited), `page` (default 1),

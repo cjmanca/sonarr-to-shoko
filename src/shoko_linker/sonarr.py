@@ -1,10 +1,11 @@
 """Read-only Sonarr v3 inventory, eligibility filtering, and baseline identity.
 
 Only series whose ``rootFolderPath`` lies component-aware inside a configured
-``sonarr.allowed_roots`` entry are eligible; ``seriesType`` is deliberately never
-consulted, so live-action TV is excluded by root scope, never by guess. Only
-eligible series trigger ``api/v3/episode`` and ``api/v3/episodefile`` reads —
-an excluded series produces zero secondary requests.
+``sonarr.allowed_roots`` entry are eligible. The normal service additionally requires
+the verified Sonarr ``seriesType == "anime"`` field; legacy advanced YAML can retain
+the previous explicit-root-only behavior. Only eligible series trigger
+``api/v3/episode`` and ``api/v3/episodefile`` reads — an excluded series produces
+zero secondary requests.
 
 All I/O goes through :func:`shoko_linker.http.resolve_and_send` with relative API
 paths, so urlBase preservation, the manual same-origin redirect walk, the no-retry
@@ -82,12 +83,13 @@ class RebaselineReason(Enum):
 
 @dataclass(frozen=True)
 class SonarrSeries:
-    """One Sonarr series resource (``seriesType`` intentionally not modeled)."""
+    """One Sonarr series resource; an absent ``series_type`` is never anime evidence."""
 
     id: int
     title: str
     root_folder_path: str
     tvdb_id: int | None
+    series_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -258,16 +260,23 @@ class RebaselineVerdict:
 def select_eligible_series(
     series: Sequence[SonarrSeries],
     allowed_roots: Sequence[str],
+    *,
+    anime_only: bool = False,
 ) -> tuple[tuple[EligibleSeries, ...], tuple[SonarrSeries, ...]]:
     """Split series by exact component-aware root containment.
 
-    ``seriesType`` is never consulted. A series whose root is unusable as a POSIX
-    path (or absent from the allowlist) is excluded, so scope always fails closed.
-    Output order is by series ID, independent of API enumeration order.
+    When ``anime_only`` is true, only the positively identified Sonarr type ``anime``
+    is admitted, even when a live-action series shares the same allowed root. Otherwise
+    the explicit-root-only legacy behavior is retained. A series whose root is unusable
+    as a POSIX path (or absent from the allowlist) is excluded. Output order is by series
+    ID, independent of API enumeration order.
     """
     eligible: list[EligibleSeries] = []
     excluded: list[SonarrSeries] = []
     for item in series:
+        if anime_only and item.series_type != "anime":
+            excluded.append(item)
+            continue
         root = _matching_root(item.root_folder_path, allowed_roots)
         if root is None:
             excluded.append(item)
@@ -293,7 +302,8 @@ def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
         title = _required_str(entry, "title")
         root = _required_str(entry, "rootFolderPath")
         tvdb_id, tvdb_ok = _optional_int(entry, "tvdbId")
-        problems = _series_problems(series_id, title, root, tvdb_ok)
+        series_type, series_type_ok = _optional_text(entry, "seriesType")
+        problems = _series_problems(series_id, title, root, tvdb_ok, series_type_ok)
         if problems:
             reasons.append(VerdictReason.MALFORMED_RESPONSE)
             details.append(f"series entry {index} malformed ({', '.join(problems)})")
@@ -302,7 +312,13 @@ def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
         assert title is not None
         assert root is not None
         series.append(
-            SonarrSeries(id=series_id, title=title, root_folder_path=root, tvdb_id=tvdb_id)
+            SonarrSeries(
+                id=series_id,
+                title=title,
+                root_folder_path=root,
+                tvdb_id=tvdb_id,
+                series_type=series_type,
+            )
         )
     return SeriesParseResult(tuple(series), tuple(reasons), tuple(details))
 
@@ -650,7 +666,11 @@ def collect_sonarr_inventory(endpoint: ApiEndpoint, settings: Settings) -> Sonar
     series_result = parse_series_entries(outcome.payload)
     reasons.extend(series_result.reasons)
     details.extend(series_result.details)
-    eligible, excluded = select_eligible_series(series_result.series, settings.sonarr.allowed_roots)
+    eligible, excluded = select_eligible_series(
+        series_result.series,
+        settings.sonarr.allowed_roots,
+        anime_only=settings.anime_only,
+    )
 
     warnings.extend(_collect_root_folder_warnings(endpoint, settings.sonarr.allowed_roots))
 
@@ -892,6 +912,16 @@ def _optional_int(entry: Mapping[str, Any], key: str) -> tuple[int | None, bool]
     return value, True
 
 
+def _optional_text(entry: Mapping[str, Any], key: str) -> tuple[str | None, bool]:
+    """``(value, ok)``: missing/null is unknown; a present value must be non-empty text."""
+    if key not in entry or entry[key] is None:
+        return None, True
+    value = entry[key]
+    if not isinstance(value, str) or not value.strip():
+        return None, False
+    return value.strip().lower(), True
+
+
 def _episode_file_id(entry: Mapping[str, Any]) -> tuple[int, bool]:
     """``(file_id, ok)``: missing/None/0 all mean no file; negative/non-int is malformed."""
     file_id = entry.get("episodeFileId")
@@ -907,6 +937,7 @@ def _series_problems(
     title: str | None,
     root: str | None,
     tvdb_ok: bool,
+    series_type_ok: bool,
 ) -> list[str]:
     problems: list[str] = []
     if series_id is None or series_id <= 0:
@@ -917,6 +948,8 @@ def _series_problems(
         problems.append("missing/invalid rootFolderPath")
     if not tvdb_ok:
         problems.append("invalid tvdbId")
+    if not series_type_ok:
+        problems.append("invalid seriesType")
     return problems
 
 
