@@ -194,6 +194,10 @@ def _attestation_closed() -> bool:
     return False
 
 
+def _service_authorization_closed() -> bool:
+    return False
+
+
 def _no_attestation_verdict() -> AttestationVerdict | None:
     return None
 
@@ -228,8 +232,8 @@ class DaemonDeps:
     """Every injected dependency a cycle needs: endpoints, stores, clocks, safety inputs.
 
     M7 supplies the real endpoints/attestation lease; tests inject ``MockTransport``
-    endpoints, fake clocks, and tmp stores. Defaults are safe-closed (no attestation,
-    no jitter, monotonic clock) so a partially wired daemon never writes.
+    endpoints, fake clocks, and tmp stores. Defaults are safe-closed (no attestation or service
+    consent, no jitter, monotonic clock) so a partially wired daemon never writes.
     ``blocked_over=None`` (the default) is **not** "no threshold": every preflight call
     site resolves it through :func:`effective_blocked_over` to
     ``sync.queue_blocked_tolerance`` (default 0 — a blocked queue suppresses apply).
@@ -248,6 +252,10 @@ class DaemonDeps:
     pid: int = field(default_factory=os.getpid)
     attestation_valid: Callable[[], bool] = _attestation_closed
     attestation_verdict: Callable[[], AttestationVerdict | None] = _no_attestation_verdict
+    #: The ordinary service has its own durable, scope-bound consent. It never borrows the
+    #: advanced CLI's apply gate or operator attestation.
+    service_mode: bool = False
+    service_authorized: Callable[[], bool] = _service_authorization_closed
     lease_seconds: float = 600.0
     blocked_over: int | None = None
     verification_timeout_seconds: float = 600.0
@@ -363,8 +371,9 @@ class DaemonReport:
 
 @dataclass(frozen=True)
 class _EligibilityFlags:
-    attestation: bool
-    gate: bool
+    attestation: bool | None
+    gate: bool | None
+    service_authorized: bool | None
     budgets_ok: bool
     mapping_stable: bool
     source_stable: bool
@@ -639,9 +648,11 @@ def _eligibility_flags(
 ) -> _EligibilityFlags:
     source_stable = deps.store.get_meta("requires_rebaseline") != "1"
     paused = _global_pause_reason(deps, campaign=campaign) is not None
+    use_service_authorization = deps.service_mode and not campaign
     return _EligibilityFlags(
-        attestation=deps.attestation_valid(),
-        gate=apply_gate(deps.settings),
+        attestation=None if use_service_authorization else deps.attestation_valid(),
+        gate=None if use_service_authorization else apply_gate(deps.settings),
+        service_authorized=deps.service_authorized() if use_service_authorization else None,
         budgets_ok=_budget_headroom(deps, now_iso, campaign=campaign),
         mapping_stable=mapping_present and not paused,
         source_stable=source_stable,
@@ -656,20 +667,24 @@ def compute_eligibility(
 ) -> EligibilityVerdict:
     """Compose the cycle-level auto-apply verdict from every safety input.
 
-    Refuses when any of: the apply gate is closed, the attestation is missing, budgets
-    are exhausted, no active mapping generation is present, the source is discontinuous,
-    or writes are paused. Daemon cycles consult this in APPLY mode; campaign apply consults
-    it with ``campaign=True`` so a daemon-lease write pause never blocks an authorized campaign.
+    Advanced mode requires the apply gate and operator attestation; explicitly selected normal
+    service mode instead requires current onboarding consent. Both modes still require budget
+    headroom, an active mapping generation, source continuity, and no applicable write pause.
+    Campaign eligibility always uses its separate legacy authorization path.
     """
     active = load_active(deps.mapping_store, _load_overrides(deps))
     flags = _eligibility_flags(deps, active is not None, now_iso, campaign=campaign)
     reasons: list[str] = []
     if deps.store.writes_disabled:
         reasons.append("writes_disabled")
-    if not flags.gate:
-        reasons.append("apply_gate_closed")
-    if not flags.attestation:
-        reasons.append("attestation_invalid")
+    if deps.service_mode and not campaign:
+        if not flags.service_authorized:
+            reasons.append("onboarding_not_authorized")
+    else:
+        if flags.gate is False:
+            reasons.append("apply_gate_closed")
+        if flags.attestation is False:
+            reasons.append("attestation_invalid")
     if not flags.budgets_ok:
         reasons.append("budgets_exhausted")
     if active is None:
@@ -1609,7 +1624,10 @@ def _post_preflight_freshness_guard(
     guard = _candidate_freshness_guard(deps, active, send_iso)
     if guard is not None:
         return guard
-    if not deps.attestation_valid() or not apply_gate(deps.settings):
+    if deps.service_mode:
+        if not deps.service_authorized():
+            return _ApplyOutcome(0, 1, ("service_authorization_changed",), ())
+    elif not deps.attestation_valid() or not apply_gate(deps.settings):
         # Transient safety (F8 semantics): defer, never quarantine.
         return _ApplyOutcome(0, 1, ("attestation_expired",), ())
     return None
@@ -1640,11 +1658,12 @@ def _process_candidate(
 ) -> _ApplyOutcome:
     """One file's guarded send: fresh safety inputs → eligibility → preflight → prepare →
     mark_sent → submit → verify (F11: every submission timestamp comes from the fresh clock)."""
-    # F2: the attestation lease and the apply gate are re-evaluated per candidate, not from the
-    # cycle-start snapshot, so a lease that expires (or a gate that closes) mid-cycle stops the
-    # remaining submissions. A blocked candidate defers (stays planned) — never quarantined.
-    attestation_ok = deps.attestation_valid()
-    gate_open = apply_gate(deps.settings)
+    # Advanced mode re-evaluates its lease and apply gate per candidate; normal service mode
+    # re-evaluates current onboarding consent. A blocked candidate defers (stays planned), never
+    # quarantined.
+    service_authorized = deps.service_authorized() if deps.service_mode else None
+    attestation_ok = None if deps.service_mode else deps.attestation_valid()
+    gate_open = None if deps.service_mode else apply_gate(deps.settings)
     # F11: fresh per-submission time + live safety inputs. A cycle-start snapshot must never
     # authorize a POST after a shutdown lands or the mapping generation swaps mid-cycle.
     send_iso = deps.now()
@@ -1656,6 +1675,8 @@ def _process_candidate(
         now=send_iso,
         attestation_valid=attestation_ok,
         gate_open=gate_open,
+        service_mode=deps.service_mode,
+        service_authorized=service_authorized,
         budgets_ok=flags.budgets_ok,
         mapping_stable=flags.mapping_stable,
         source_stable=flags.source_stable,
@@ -1669,6 +1690,8 @@ def _process_candidate(
         folders,
         attestation_valid=attestation_ok,
         apply_gate_open=gate_open,
+        service_mode=deps.service_mode,
+        service_authorized=service_authorized,
         queue=queue,
         active_targets_digest=active.targets_digest,
         active_structure_digest=active.structure_digest,
@@ -2387,7 +2410,8 @@ def _run_cycle_body(
     drift: list[str] = []
     existing_link: list[str] = []
 
-    reasons.extend(attestation_gate(deps, now_iso, mutate=mode is CycleMode.APPLY))
+    if not deps.service_mode:
+        reasons.extend(attestation_gate(deps, now_iso, mutate=mode is CycleMode.APPLY))
 
     phase = _mapping_phase(deps, now_iso)
     inventory = collect_sonarr_inventory(deps.sonarr, deps.settings)
@@ -2518,6 +2542,7 @@ def _run_cycle_body(
     if (
         mode is CycleMode.APPLY
         and reconciliation_ready
+        and not deps.service_mode
         and deps.settings.campaign.daemon_auto_apply
     ):
         campaign_drain = _drain_campaign(

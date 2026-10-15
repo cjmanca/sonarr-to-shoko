@@ -751,6 +751,110 @@ def test_new_arrival_submits_exactly_one_and_verifies(
     assert report.counts.verified == 1
 
 
+def test_service_apply_uses_current_onboarding_consent_without_legacy_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([new_file])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[new_file],
+            shoko_files=[new_file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO, MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            attestation=False,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="svc"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 1
+    assert report.counts.verified == 1
+
+
+def test_service_apply_refuses_without_current_onboarding_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([new_file])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[new_file],
+            shoko_files=[new_file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            attestation=True,
+        )
+        deps = replace(deps, service_mode=True)
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="svc"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert "onboarding_not_authorized" in report.reasons
+
+
+def test_service_rechecks_onboarding_after_preflight_before_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    new_file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([new_file])
+    authorization = {"current": True}
+
+    def revoke_during_preflight(path: str) -> None:
+        if path.endswith("/File/500"):
+            authorization["current"] = False
+
+    shoko.on_get = revoke_during_preflight
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[new_file],
+            shoko_files=[new_file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            attestation=False,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: authorization["current"],
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="svc"
+        )
+    finally:
+        store.close()
+    assert shoko.posts_count() == 0
+    assert any("service_authorization_changed" in reason for reason in report.reasons)
+
+
 def test_restart_preserves_original_ed2k_and_rejects_reused_shoko_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2065,6 +2169,13 @@ def test_compute_eligibility_requires_all_safety_inputs(
         assert verdict.eligible is False
         assert "apply_gate_closed" in verdict.reasons
         assert "attestation_invalid" in verdict.reasons
+        service_consent_must_not_unlock_advanced_mode = replace(
+            deps, service_authorized=lambda: True
+        )
+        advanced_verdict = compute_eligibility(service_consent_must_not_unlock_advanced_mode, T0)
+        assert advanced_verdict.eligible is False
+        assert "apply_gate_closed" in advanced_verdict.reasons
+        assert "attestation_invalid" in advanced_verdict.reasons
         monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
         deps_open = build_deps(
             tmp_path,

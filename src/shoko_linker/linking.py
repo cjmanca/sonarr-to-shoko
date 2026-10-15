@@ -761,23 +761,63 @@ def fetch_queue(endpoint: ApiEndpoint) -> QueueSnapshot | None:
     return QueueSnapshot(counts[0], counts[1], counts[2])
 
 
+def _authorization_refusals(
+    *,
+    service_mode: bool,
+    service_authorized: bool | None,
+    attestation_valid: bool | None,
+    apply_gate_open: bool | None,
+) -> tuple[tuple[PreflightReason, str], ...]:
+    """Return only the explicit authorization lane's missing safety predicates."""
+    if service_mode:
+        if service_authorized is not True:
+            return (
+                (
+                    PreflightReason.BLOCKED_SAFETY,
+                    "current automatic-link onboarding authorization is missing or invalid",
+                ),
+            )
+        return ()
+
+    refusals: list[tuple[PreflightReason, str]] = []
+    if attestation_valid is not True:
+        refusals.append(
+            (
+                PreflightReason.BLOCKED_SAFETY,
+                "safety attestation is missing/invalid: the gate stays closed",
+            )
+        )
+    if apply_gate_open is not True:
+        refusals.append(
+            (
+                PreflightReason.BLOCKED_SAFETY,
+                "the apply gate is closed (sync.apply_changes and the operator opt-in are both "
+                "required; dry-run never reaches this point in apply mode)",
+            )
+        )
+    return tuple(refusals)
+
+
 def preflight(
     endpoint: ApiEndpoint,
     plan: LinkPlan,
     settings: Settings,
     folders: Mapping[int, ImportFolder],
     *,
-    attestation_valid: bool,
-    apply_gate_open: bool,
+    attestation_valid: bool | None,
+    apply_gate_open: bool | None,
     queue: QueueSnapshot | None,
     active_targets_digest: str,
     active_structure_digest: str,
     blocked_over: int | None = None,
     mapping_index: MappingIndex | None = None,
+    service_mode: bool = False,
+    service_authorized: bool | None = None,
 ) -> PreflightVerdict:
     """The fresh gate immediately before the single POST; every check fails closed.
 
-    Order: safety inputs first (a blocked attestation/gate sends **zero** requests),
+    Order: authorization inputs first (legacy attestation/gate or service onboarding sends
+    **zero** requests when blocked),
     then the queue anomaly input, then the **pure** generation checks (mapping
     digests, active-index candidate set), and only then the fresh network reads:
     ``File/{id}?include=XRefs,AbsolutePaths`` (existence, candidacy flags
@@ -794,17 +834,13 @@ def preflight(
             reasons.append(reason)
         details.append(detail)
 
-    if not attestation_valid:
-        add(
-            PreflightReason.BLOCKED_SAFETY,
-            "safety attestation is missing/invalid: the gate stays closed",
-        )
-    if not apply_gate_open:
-        add(
-            PreflightReason.BLOCKED_SAFETY,
-            "the apply gate is closed (sync.apply_changes and the operator opt-in are both "
-            "required; dry-run never reaches this point in apply mode)",
-        )
+    for reason, detail in _authorization_refusals(
+        service_mode=service_mode,
+        service_authorized=service_authorized,
+        attestation_valid=attestation_valid,
+        apply_gate_open=apply_gate_open,
+    ):
+        add(reason, detail)
     if not reasons:
         if queue is None:
             add(

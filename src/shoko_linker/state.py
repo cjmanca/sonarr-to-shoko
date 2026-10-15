@@ -1809,24 +1809,33 @@ class StateStore:
         shoko_file_id: int,
         *,
         now: str,
-        attestation_valid: bool,
-        gate_open: bool,
+        attestation_valid: bool | None,
+        gate_open: bool | None,
         budgets_ok: bool,
         mapping_stable: bool,
         source_stable: bool,
+        service_mode: bool = False,
+        service_authorized: bool | None = None,
     ) -> EligibilityVerdict:
         """Pure composition of durable facts + caller-supplied external facts.
 
-        Daemon auto-apply requires: a complete, auto-apply-eligible baseline, the
-        file in the ``new_arrival`` cohort (backlog and campaign files never
-        auto-apply), a valid attestation, an open apply gate, budget headroom,
-        stable mappings, a stable source, and no pending rebaseline requirement.
+        Both paths require a complete eligible baseline, a ``new_arrival`` file, budget
+        headroom, stable mappings/source, and no pending rebaseline. Advanced mode additionally
+        requires a valid attestation and open apply gate; service mode uses its separate current
+        onboarding authorization instead. Backlog/campaign files never use this auto-apply path.
         """
         _require_iso(now, "now")
         reasons = self._eligibility_reasons(shoko_file_id, now)
+        authorization_gates = (
+            ((service_authorized is True, "onboarding_not_authorized"),)
+            if service_mode
+            else (
+                (gate_open is True, "apply_gate_closed"),
+                (attestation_valid is True, "attestation_invalid"),
+            )
+        )
         gates = (
-            (gate_open, "apply_gate_closed"),
-            (attestation_valid, "attestation_invalid"),
+            *authorization_gates,
             (budgets_ok, "budgets_exhausted"),
             (mapping_stable, "mapping_unstable"),
             (source_stable, "source_unstable"),
