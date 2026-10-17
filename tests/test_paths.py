@@ -22,6 +22,11 @@ def test_normalize_posix_collapses_and_strips() -> None:
     assert normalize_posix("/data//media/./anime/") == "/data/media/anime"
 
 
+def test_normalize_posix_preserves_meaningful_component_whitespace() -> None:
+    path = "/anime/Series / file.mkv "
+    assert normalize_posix(path) == path
+
+
 def test_normalize_posix_rejects_relative_root_and_backslashes() -> None:
     with pytest.raises(PathError):
         normalize_posix("data/media/anime")
@@ -69,6 +74,11 @@ def test_apply_mapping_replaces_component_boundary() -> None:
         "/anime/Show/S01E01.mkv"
     )
     assert apply_mapping("/data/media/anime", ANIME_TO_SHOKO) == "/anime"
+
+
+def test_apply_mapping_preserves_meaningful_component_whitespace() -> None:
+    path = "/data/media/anime/Series /file.mkv "
+    assert apply_mapping(path, ANIME_TO_SHOKO) == "/anime/Series /file.mkv "
 
 
 def test_apply_mapping_rejects_outside_paths_and_escapes() -> None:

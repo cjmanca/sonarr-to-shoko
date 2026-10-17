@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Minimal source excerpts from Anime-Lists/anime-lists commit
+  996d6a8b98c0c8ba94378875746a83b66dc590d4 (2026-10-14):
+  https://raw.githubusercontent.com/Anime-Lists/anime-lists/996d6a8b98c0c8ba94378875746a83b66dc590d4/anime-list-full.xml
+  Unrelated pairs/entries were removed; retained attributes and pairs are verbatim.
+-->
+<anime-list>
+  <anime anidbid="193" tvdbid="76932" defaulttvdbseason="2">
+    <name>Ranma 1/2 Nettou Hen</name>
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="6" start="95" end="118" offset="-94">;103-10;</mapping>
+    </mapping-list>
+  </anime>
+  <anime anidbid="4237" tvdbid="103071" defaulttvdbseason="1">
+    <name>Kirarin Revolution</name>
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="2">;101-50;102-51;</mapping>
+      <mapping anidbseason="1" tvdbseason="3">;103-1;</mapping>
+    </mapping-list>
+  </anime>
+  <anime anidbid="1431" tvdbid="79032" defaulttvdbseason="1">
+    <name>Kono Minikuku mo Utsukushii Sekai</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0">;1-0;101-3;102-4;103-5;201-1;401-2;</mapping>
+    </mapping-list>
+  </anime>
+</anime-list>

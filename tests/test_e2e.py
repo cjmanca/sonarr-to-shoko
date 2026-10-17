@@ -363,6 +363,38 @@ def test_new_sonarr_file_after_baseline_links_and_verifies(
     assert view.pending_episode_jobs == 0
 
 
+@pytest.mark.parametrize(("shoko_path_has_space", "expected_posts"), [(False, 0), (True, 1)])
+def test_service_matches_only_the_exact_path_including_filename_whitespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shoko_path_has_space: bool,
+    expected_posts: int,
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    world, clock, _lease = _small_mapped_world(tmp_path, per_series=1)
+    spec = eh.FileSpec(N_SERIES, 1001, BACKLOG_SHOKO)
+    world.sonarr.files[N_SERIES][0]["path"] += " "
+    if shoko_path_has_space:
+        location = world.shoko.rows[spec.shoko_id].locations[0]
+        world.shoko.rows[spec.shoko_id].locations[0] = eh.ShokoLocation(
+            place_id=location.place_id,
+            folder=location.folder,
+            relative=location.relative + " ",
+            absolute=location.absolute + " ",
+            accessible=location.accessible,
+        )
+    store = eh.open_store(world)
+    _seed_baseline(store, [eh.FileSpec(99, 99001, 99999)])
+    try:
+        deps = eh.build_deps(world, store, clock, max_submissions=1)
+        report = _run_apply(deps, clock, "path-whitespace")
+    finally:
+        store.close()
+
+    assert report.counts.submitted == expected_posts
+    assert world.shoko.posts_count() == expected_posts
+
+
 # ------------------------------------------------------------ 3. late-arriving file
 
 
@@ -805,6 +837,10 @@ def test_weekly_refresh_304_then_activated_remaps_backlog_without_posts(
     try:
         deps = eh.build_deps(world, store, clock, max_submissions=N_SERIES)
         first = _run_apply(deps, clock, "c1")
+        # APPLY reconciliation intentionally spreads metadata lookups over bounded
+        # batches. Finish a durable cursor traversal before inspecting the backlog.
+        for batch in range(1, 10):
+            first = _run_apply(deps, clock, f"c1-batch-{batch}")
         assert first.counts.planned == PER_SERIES_HUNDRED
         assert first.counts.backlog == 2 * PER_SERIES_HUNDRED
         clock.jump(7 * 24 * 3600.0)
@@ -814,6 +850,8 @@ def test_weekly_refresh_304_then_activated_remaps_backlog_without_posts(
         world.source.set_xml(eh.xml_document(entry1 + entry2))
         clock.jump(7 * 24 * 3600.0)
         activated = _run_apply(deps, clock, "c3")
+        for batch in range(1, 10):
+            _run_apply(deps, clock, f"c3-batch-{batch}")
         planned = len(store.files_in_state(FileState.PLANNED))
     finally:
         store.close()
@@ -927,7 +965,7 @@ def test_override_add_moves_ambiguous_file_to_planned_without_posts(
 # ---------------------------------------------- 12. file-id reuse and rebaseline
 
 
-def test_file_id_reuse_detected_and_rebaseline_flag_clears(
+def test_file_id_reuse_detected_and_rebaseline_flag_clears(  # noqa: PLR0915
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
@@ -973,6 +1011,10 @@ def test_file_id_reuse_detected_and_rebaseline_flag_clears(
                 _row(BACKLOG_SHOKO + idx, eh.shoko_path(1, file_no), f"series1/file{file_no}.mkv")
             )
         restored = _run_apply(deps, clock, "c4", 900)
+        assert store.get_meta("requires_rebaseline") == "1"
+        assert restored.counts.submitted == 0
+        store.clear_requires_rebaseline(clock.iso())
+        restored = _run_apply(deps, clock, "c5", 1200)
         cleared = store.get_meta("requires_rebaseline")
         record_new = store.get_file(NEW_B)
     finally:
@@ -1080,7 +1122,7 @@ def test_async_xrefs_materialize_late_and_verify_across_cycles(
     assert world.shoko.posts_count() == 1
 
 
-def test_partial_materialization_past_deadline_releases_slot_per_ledger(
+def test_partial_materialization_after_terminal_review_keeps_slot_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
@@ -1119,16 +1161,22 @@ def test_partial_materialization_past_deadline_releases_slot_per_ledger(
         second = _run_apply(deps, clock, "c2")
         closed = store.get_file(21101)
         final_view = store.budget_view()
-        noops = store.get_meta("slot_release_noops")
         held_after = store.live_send_counts()
+        send = store.connection.execute(
+            "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = ?",
+            (21101,),
+        ).fetchone()
+        active_send = store.active_send_details(21101)
     finally:
         store.close()
-    assert second.counts.verified == 1
+    assert second.counts.verified == 0
     assert closed is not None
-    assert closed.state is FileState.VERIFIED
-    assert final_view.pending_file_requests == 0
-    assert noops is None
-    assert held_after == (0, 0)
+    assert closed.state is FileState.PARTIAL
+    assert final_view.pending_file_requests == 1
+    assert tuple(send) == ("inspected_review", "partial", 0)
+    assert active_send is None
+    assert held_after == (1, JOBS_TWO)
+    assert world.shoko.posts_count() == 1
 
 
 def test_lost_post_connection_reset_indeterminate_then_xref_inspection_closes(
@@ -1161,7 +1209,7 @@ def test_lost_post_connection_reset_indeterminate_then_xref_inspection_closes(
     assert world.shoko.posts_count() == 1
 
 
-def test_lost_post_http_502_indeterminate_then_partial_close_releases_slot(
+def test_lost_post_http_502_indeterminate_then_partial_review_keeps_slot_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
@@ -1184,12 +1232,19 @@ def test_lost_post_http_502_indeterminate_then_partial_close_releases_slot(
         second = _run_apply(deps, clock, "c2")
         closed = store.get_file(NEW_A)
         view = store.budget_view()
+        held = store.live_send_counts()
+        send = store.connection.execute(
+            "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = ?",
+            (NEW_A,),
+        ).fetchone()
     finally:
         store.close()
     assert second.counts.indeterminate == 0
     assert closed is not None
     assert closed.state is FileState.PARTIAL
-    assert view.pending_file_requests == 0
+    assert view.pending_file_requests == 1
+    assert held == (1, 1)
+    assert tuple(send) == ("inspected_review", "partial", 0)
     assert world.shoko.posts_count() == 1
 
 
@@ -1259,10 +1314,10 @@ def _finish_crash_cycle(
     ).fetchone()
     final_view = reopened.budget_view()
     reopened.close()
-    assert second.counts.submitted == 0
+    assert second.counts.submitted == N_TWO
     assert void_after_replan[0] == 1
-    assert flag_after_drop == "1"
-    assert third.counts.submitted == N_TWO
+    assert flag_after_drop == "0"  # verified recovery accounts for the async link's departure
+    assert third.counts.submitted == 0
     assert world.shoko.posts_count() == N_THREE
     assert sorted(file_id for file_id, _ in world.shoko.posts) == [NEW_A, NEW_B, NEW_C]
     assert rows[0] is not None
@@ -1660,9 +1715,9 @@ def test_e2e_module_scenario_matrix_is_complete() -> None:
         "test_blocked_queue_zero_posts_with_tolerance_zero",
         "test_huge_benign_queue_applies_within_budget_caps",
         "test_async_xrefs_materialize_late_and_verify_across_cycles",
-        "test_partial_materialization_past_deadline_releases_slot_per_ledger",
+        "test_partial_materialization_after_terminal_review_keeps_slot_held",
         "test_lost_post_connection_reset_indeterminate_then_xref_inspection_closes",
-        "test_lost_post_http_502_indeterminate_then_partial_close_releases_slot",
+        "test_lost_post_http_502_indeterminate_then_partial_review_keeps_slot_held",
         "test_crash_between_prepare_and_send_replans_once_without_double_post",
         "test_campaign_canary_batches_quarantine_and_revoke",
         "test_lease_expiry_degrades_daemon_to_read_only_then_reattest_resumes",

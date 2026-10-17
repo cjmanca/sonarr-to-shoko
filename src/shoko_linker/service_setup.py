@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import logging
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -26,6 +30,7 @@ from .setup import (
     ApiCompatibility,
     MappingDiscoveryStatus,
     PathMappingDiscovery,
+    ScopeReadStatus,
     ScopeStatus,
     discover_sonarr_scope,
     infer_path_mappings,
@@ -41,6 +46,50 @@ from .sonarr import SonarrInventory, collect_sonarr_inventory
 from .state import StateError, StateStore, open_state
 
 SETUP_VIEW_CACHE_SECONDS = 30.0
+
+
+def _setup_snapshot_digest(
+    view: DashboardSetupView,
+    compatibility: ApiCompatibility,
+    scope: AnimeScopeDiscovery,
+    assessment: SafetyAssessment,
+) -> str:
+    """Bind a rendered setup form to its exact non-secret choices and safety facts."""
+    document = {
+        "compatibility": {
+            "sonarr_version": compatibility.sonarr_version,
+            "shoko_version": compatibility.shoko_version,
+            "sonarr_supported": compatibility.sonarr_supported,
+            "shoko_supported": compatibility.shoko_supported,
+            "capabilities": compatibility.capabilities,
+        },
+        "scope": {
+            "status": scope.status.value,
+            "read_status": scope.read_status.value,
+            "candidates": tuple(
+                (candidate.path, candidate.series_ids) for candidate in scope.candidates
+            ),
+            "root_options": view.root_options,
+            "selected_roots": view.selected_roots,
+        },
+        "shoko_root_options": view.shoko_root_options,
+        "inferred_mappings": view.inferred_mappings,
+        "mapping_options": view.mapping_options,
+        "mapping_required": view.mapping_required,
+        "required_confirmations": view.required_confirmations,
+        "confirmation_enabled": view.confirmation_enabled,
+        "safety": {
+            "api_available": assessment.api_available,
+            "status": assessment.status.value,
+            "observed_settings": dict(sorted(assessment.observed_settings.items())),
+            "unsafe_settings": assessment.unsafe_settings,
+            "unknown_settings": assessment.unknown_settings,
+            "unverifiable_facts": assessment.unverifiable_facts,
+            "digest": assessment.digest,
+        },
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class ServiceSetupController:
@@ -63,6 +112,10 @@ class ServiceSetupController:
         self._view_environment: (
             tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment] | None
         ) = None
+        self._view_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._view_generation = 0
+        self._refreshing = False
 
     @staticmethod
     def onboarding(store: StateStore) -> OnboardingManager:
@@ -97,35 +150,61 @@ class ServiceSetupController:
                     record.binding, assessment, iso=datetime.now(UTC).isoformat()
                 )
                 return None
+            pause_reason: str | None = None
+            pause_message = ""
             if (
-                not compatibility.compatible
+                scope.read_status is not ScopeReadStatus.COMPLETE
                 or compatibility.sonarr_version is None
                 or compatibility.shoko_version is None
-                or not set(record.binding.roots)
-                <= {candidate.path for candidate in scope.candidates}
+                or (
+                    assessment.status is SafetyStatus.UNKNOWN
+                    and assessment.digest != record.binding.safety_digest
+                )
             ):
+                pause_reason = "setup_unavailable"
+                pause_message = (
+                    "Current setup checks could not be completed. Automatic linking is paused "
+                    "until the Sonarr and Shoko checks recover."
+                )
+            elif not compatibility.compatible or not set(record.binding.roots) <= {
+                candidate.path for candidate in scope.candidates
+            }:
+                pause_reason = "setup_changed"
+                pause_message = (
+                    "Current services or anime scope need review before automatic linking."
+                )
+            else:
+                folders = collect_import_folders(self.shoko)
+                if folders is None or any(
+                    not folder.path_usable or folder.drop_folder_type == "Unknown"
+                    for folder in folders
+                ):
+                    pause_reason = "setup_unavailable"
+                    pause_message = (
+                        "Current Shoko import folders could not be completely verified. Automatic "
+                        "linking is paused until the folder check recovers."
+                    )
+                else:
+                    safe_targets = {
+                        folder.path
+                        for folder in folders
+                        if folder.path_usable and folder.drop_folder_type == DROP_TYPE_NONE
+                    }
+                    if (
+                        not {mapping.shoko for mapping in record.binding.path_mappings}
+                        <= safe_targets
+                    ):
+                        pause_reason = "setup_changed"
+                        pause_message = (
+                            "Shoko import folders changed. Review setup before automatic linking."
+                        )
+            if pause_reason is not None:
                 self.onboarding(store).pause_for_review(
-                    "setup_changed",
-                    "Current services or anime scope need review before automatic linking.",
-                    iso=datetime.now(UTC).isoformat(),
+                    pause_reason, pause_message, iso=datetime.now(UTC).isoformat()
                 )
                 return None
-            folders = collect_import_folders(self.shoko)
-            safe_targets = {
-                folder.path
-                for folder in folders or ()
-                if folder.path_usable and folder.drop_folder_type == DROP_TYPE_NONE
-            }
-            if (
-                folders is None
-                or {mapping.shoko for mapping in record.binding.path_mappings} > safe_targets
-            ):
-                self.onboarding(store).pause_for_review(
-                    "setup_changed",
-                    "Shoko import folders changed. Review setup before automatic linking.",
-                    iso=datetime.now(UTC).isoformat(),
-                )
-                return None
+            assert compatibility.sonarr_version is not None
+            assert compatibility.shoko_version is not None
             binding = replace(
                 record.binding,
                 sonarr_url=self.bootstrap.sonarr_url,
@@ -233,19 +312,86 @@ class ServiceSetupController:
             message = assessment.message
         return message
 
+    @staticmethod
+    def _loading_view() -> DashboardSetupView:
+        return DashboardSetupView(
+            message=(
+                "Checking current Sonarr and Shoko setup. " "Scope choices will appear when ready."
+            ),
+            root_options=(),
+            confirmation_enabled=False,
+        )
+
     def view(self, *, refresh: bool = False) -> DashboardSetupView | None:
+        """Return the cached setup snapshot; a cache miss schedules discovery off-request."""
+        if refresh:
+            return self.refresh_view()
         now = time.monotonic()
-        if (
-            not refresh
-            and self._view_cache is not None
-            and now - self._view_cache[0] < SETUP_VIEW_CACHE_SECONDS
-        ):
-            return self._view_cache[1]
+        with self._view_lock:
+            if (
+                self._view_cache is not None
+                and now - self._view_cache[0] < SETUP_VIEW_CACHE_SECONDS
+            ):
+                return self._view_cache[1]
+            if not self._refreshing:
+                self._refreshing = True
+                worker = threading.Thread(
+                    target=self._refresh_in_background,
+                    name="shoko-linker-setup-discovery",
+                    daemon=True,
+                )
+                worker.start()
+        return self._loading_view()
+
+    def _refresh_in_background(self) -> None:
+        try:
+            self.refresh_view()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Setup discovery failed; it will be retried on a later status request."
+            )
+        finally:
+            with self._view_lock:
+                self._refreshing = False
+
+    def refresh_view(self) -> DashboardSetupView | None:
+        """Perform a full setup discovery for a worker or an explicit offline/test caller."""
+        with self._refresh_lock:
+            while True:
+                with self._view_lock:
+                    self._view_generation += 1
+                    generation = self._view_generation
+                    self._view_cache = None
+                    self._view_environment = None
+                    selected_roots = self._selected_roots
+                    selected_mappings = self._selected_mappings
+                view, environment = self._compute_view(selected_roots, selected_mappings)
+                with self._view_lock:
+                    if generation != self._view_generation:
+                        continue
+                    self._view_environment = environment
+                    self._view_cache = (time.monotonic(), view)
+                    return view
+
+    def _invalidate_view(self) -> None:
+        with self._view_lock:
+            self._view_generation += 1
+            self._view_cache = None
+            self._view_environment = None
+
+    def _compute_view(
+        self,
+        selected_roots: tuple[str, ...],
+        selected_mappings: tuple[PathMapping, ...],
+    ) -> tuple[
+        DashboardSetupView | None,
+        tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment],
+    ]:
         compatibility, scope, assessment = self._environment()
-        self._view_environment = (compatibility, scope, assessment)
+        environment = (compatibility, scope, assessment)
         saved_record = self._saved_record()
-        roots = self._selected_roots or (() if saved_record is None else saved_record.binding.roots)
-        mappings = self._selected_mappings or (
+        roots = selected_roots or (() if saved_record is None else saved_record.binding.roots)
+        mappings = selected_mappings or (
             () if saved_record is None else saved_record.binding.path_mappings
         )
         inventory, discovery, path_result, inferred, mapping_required, mapping_options = (
@@ -277,6 +423,7 @@ class ServiceSetupController:
             mapping_options = ()
         confirmation_enabled = (
             compatibility.compatible
+            and scope.read_status is ScopeReadStatus.COMPLETE
             and scope.status not in {ScopeStatus.BLOCKED, ScopeStatus.NO_ANIME}
             and bool(roots)
             and {candidate.path for candidate in scope.candidates} >= set(roots)
@@ -306,8 +453,10 @@ class ServiceSetupController:
             if current_binding.digest == saved_record.binding_digest and set(required) <= set(
                 saved_record.confirmed_facts
             ):
-                self._view_cache = (now, None)
-                return None
+                with open_state(self.state_path) as store:
+                    reconfirmation_required = self.onboarding(store).reconfirmation_required()
+                if not reconfirmation_required:
+                    return None, environment
 
         message = self._message(
             compatibility,
@@ -335,25 +484,48 @@ class ServiceSetupController:
             required_confirmations=required,
             confirmation_enabled=confirmation_enabled,
         )
-        self._view_cache = (now, view)
-        return view
+        view = replace(
+            view,
+            snapshot_digest=_setup_snapshot_digest(view, compatibility, scope, assessment),
+        )
+        return view, environment
 
     def action(self, action: str, form: Mapping[str, str]) -> str:
         try:
-            self._view_cache = None
             if action == "scope":
                 return self._select_scope(form)
             if action == "confirm":
                 return self._confirm(form)
         except (ConfigError, OnboardingError, OSError, PathError, StateError, ValueError) as exc:
             return f"Setup was not saved. {exc}"
+        finally:
+            self._invalidate_view()
         return "That setup action is not available."
 
     def _select_scope(self, form: Mapping[str, str]) -> str:
+        view, environment, generation = self._submitted_view(form)
+        if view is None or environment is None:
+            raise ValueError("Refresh setup before choosing an anime folder.")
+        shown_compatibility, shown_scope, shown_assessment = environment
         compatibility, scope, _assessment = self._environment()
-        if not compatibility.compatible:
-            return "Service versions need review before choosing a folder."
-        candidates = tuple(candidate.path for candidate in scope.candidates)
+        if scope.read_status is not ScopeReadStatus.COMPLETE:
+            raise ValueError(
+                "The current Sonarr anime scope check is incomplete or unavailable. Wait for it "
+                "to recover before choosing a folder."
+            )
+        if (
+            not compatibility.compatible
+            or compatibility != shown_compatibility
+            or scope.status is not shown_scope.status
+            or scope.read_status is not shown_scope.read_status
+            or tuple((candidate.path, candidate.series_ids) for candidate in scope.candidates)
+            != tuple((candidate.path, candidate.series_ids) for candidate in shown_scope.candidates)
+            or _assessment.digest != shown_assessment.digest
+            or _assessment.status is not shown_assessment.status
+            or _assessment.unverifiable_facts != shown_assessment.unverifiable_facts
+        ):
+            raise ValueError("Current scope or safety changed. Review refreshed setup first.")
+        candidates = view.root_options
         selected: list[str] = []
         for key, value in form.items():
             if not key.startswith("root_"):
@@ -367,19 +539,49 @@ class ServiceSetupController:
             selected.append(expected)
         if not selected:
             raise ValueError("Select at least one Sonarr anime folder.")
-        self._selected_roots = tuple(sorted(set(selected)))
-        self._selected_mappings = ()
+        with self._view_lock:
+            self._assert_snapshot_current_locked(view, generation)
+            self._selected_roots = tuple(sorted(set(selected)))
+            self._selected_mappings = ()
         return "Anime scope selected. Checking exact file paths and folder correspondence."
 
-    def _confirm(self, form: Mapping[str, str]) -> str:
-        view = self.view(refresh=True)
+    def _confirm(  # noqa: PLR0912, PLR0915 - ordered fail-closed setup authorization checks
+        self, form: Mapping[str, str]
+    ) -> str:
+        view, environment, generation = self._submitted_view(form)
+        with self._view_lock:
+            selected_roots = self._selected_roots
         if view is None or not view.confirmation_enabled:
             raise ValueError("Current scope, file correspondence, or safety checks are not ready.")
-        environment = self._view_environment
         if environment is None:
             raise ValueError("Refresh setup before confirming the selected scope.")
-        compatibility, scope, assessment = environment
+        shown_compatibility, shown_scope, shown_assessment = environment
+        compatibility, scope, assessment = self._environment()
         roots = view.selected_roots
+        if selected_roots and tuple(sorted(selected_roots)) != roots:
+            raise ValueError(
+                "The selected scope changed. Review refreshed setup before confirming."
+            )
+        if scope.read_status is not ScopeReadStatus.COMPLETE:
+            raise ValueError(
+                "The current Sonarr anime scope check is incomplete or unavailable. Wait for it "
+                "to recover before confirming setup."
+            )
+        if (
+            compatibility != shown_compatibility
+            or scope.status is not shown_scope.status
+            or scope.read_status is not shown_scope.read_status
+            or tuple((candidate.path, candidate.series_ids) for candidate in scope.candidates)
+            != tuple((candidate.path, candidate.series_ids) for candidate in shown_scope.candidates)
+            or assessment.digest != shown_assessment.digest
+            or assessment.status is not shown_assessment.status
+            or assessment.unverifiable_facts != shown_assessment.unverifiable_facts
+        ):
+            raise ValueError(
+                "Current scope or safety changed. Review refreshed setup before confirming."
+            )
+        if assessment.status is SafetyStatus.UNSAFE:
+            raise ValueError("Unsafe Shoko settings must be fixed before setup confirmation.")
         if not set(roots) <= {candidate.path for candidate in scope.candidates}:
             raise ValueError("The selected Sonarr anime folder is no longer available.")
         mappings: tuple[PathMapping, ...]
@@ -405,6 +607,10 @@ class ServiceSetupController:
                 tuple(PathMapping(source, target) for source, target in view.inferred_mappings)
             )
         required = tuple(sorted((*assessment.unknown_settings, *assessment.unverifiable_facts)))
+        if required != view.required_confirmations:
+            raise ValueError(
+                "Current safety facts changed. Review refreshed setup before confirming."
+            )
         confirmed = tuple(
             fact
             for index, fact in enumerate(required)
@@ -414,6 +620,20 @@ class ServiceSetupController:
             raise ValueError("Review and confirm every listed safety fact before continuing.")
         if form.get("automatic_link_consent") != "1":
             raise ValueError("Explicit consent to automatic linking is required.")
+        folders = collect_import_folders(self.shoko)
+        safe_targets = {
+            folder.path
+            for folder in folders or ()
+            if folder.path_usable and folder.drop_folder_type == DROP_TYPE_NONE
+        }
+        if (
+            folders is None
+            or any(
+                not folder.path_usable or folder.drop_folder_type == "Unknown" for folder in folders
+            )
+            or not {mapping.shoko for mapping in mappings} <= safe_targets
+        ):
+            raise ValueError("The selected Shoko folder is no longer a safe import target.")
         if (
             not compatibility.compatible
             or compatibility.sonarr_version is None
@@ -431,15 +651,57 @@ class ServiceSetupController:
             safety_digest=assessment.digest,
             unverifiable_facts=assessment.unverifiable_facts,
         )
-        with open_state(self.state_path) as store:
-            self.onboarding(store).confirm_setup(
-                binding,
-                assessment,
-                confirmed_facts=confirmed,
-                automatic_link_consent=True,
-                iso=datetime.now(UTC).isoformat(),
-            )
-        self._selected_roots = roots
-        self._selected_mappings = mappings
-        self._view_cache = None
+        with self._view_lock:
+            self._assert_snapshot_current_locked(view, generation)
+            with open_state(self.state_path) as store:
+                self.onboarding(store).confirm_setup(
+                    binding,
+                    assessment,
+                    confirmed_facts=confirmed,
+                    automatic_link_consent=True,
+                    iso=datetime.now(UTC).isoformat(),
+                )
+            self._selected_roots = roots
+            self._selected_mappings = mappings
         return "Setup saved. Automatic linking will start after current safety checks pass."
+
+    def _submitted_view(
+        self, form: Mapping[str, str]
+    ) -> tuple[
+        DashboardSetupView | None,
+        tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment] | None,
+        int,
+    ]:
+        with self._view_lock:
+            cached = self._view_cache
+            environment = self._view_environment
+            generation = self._view_generation
+        if cached is None or time.monotonic() - cached[0] >= SETUP_VIEW_CACHE_SECONDS:
+            raise ValueError("Setup choices expired. Refresh setup before continuing.")
+        view = cached[1]
+        supplied = form.get("setup_digest", "")
+        if (
+            view is None
+            or not view.snapshot_digest
+            or not supplied
+            or not hmac.compare_digest(
+                supplied.encode("utf-8"), view.snapshot_digest.encode("ascii")
+            )
+        ):
+            raise ValueError("Setup choices changed or the form is incomplete. Refresh setup.")
+        if environment is None:
+            raise ValueError("Refresh setup before continuing.")
+        return view, environment, generation
+
+    def _assert_snapshot_current_locked(self, view: DashboardSetupView, generation: int) -> None:
+        """Prevent a concurrent refresh from changing form meanings before local persistence."""
+        cached = self._view_cache
+        if (
+            generation != self._view_generation
+            or cached is None
+            or cached[1] is None
+            or not hmac.compare_digest(
+                cached[1].snapshot_digest.encode("ascii"), view.snapshot_digest.encode("ascii")
+            )
+        ):
+            raise ValueError("Setup choices changed during this request. Review refreshed setup.")

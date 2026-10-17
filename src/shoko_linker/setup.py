@@ -51,6 +51,14 @@ class ScopeStatus(Enum):
     SELECT_SCOPE = "select_scope"
 
 
+class ScopeReadStatus(Enum):
+    """Whether the Sonarr scope inventory was read and parsed completely."""
+
+    COMPLETE = "complete"
+    UNAVAILABLE = "unavailable"
+    INCOMPLETE = "incomplete"
+
+
 @dataclass(frozen=True)
 class RootFolder:
     """A validated Sonarr root folder and its reported accessibility."""
@@ -75,6 +83,7 @@ class AnimeScopeDiscovery:
     candidates: tuple[AnimeRootCandidate, ...]
     message: str
     details: tuple[str, ...] = ()
+    read_status: ScopeReadStatus = ScopeReadStatus.COMPLETE
 
 
 @dataclass(frozen=True)
@@ -141,19 +150,26 @@ class PathMappingDiscovery:
     details: tuple[str, ...] = ()
 
 
-def _get_json(endpoint: ApiEndpoint, path: str) -> Any | None:
-    """GET one documented setup endpoint; transport/status/shape errors fail closed."""
+@dataclass(frozen=True)
+class _JsonRead:
+    status: ScopeReadStatus
+    payload: Any = None
+
+
+def _get_json(endpoint: ApiEndpoint, path: str) -> _JsonRead:
+    """GET one documented setup endpoint and preserve read completeness evidence."""
     try:
         response = resolve_and_send(endpoint, "GET", path)
     except (HttpPolicyError, httpx.HTTPError):
-        return None
+        return _JsonRead(ScopeReadStatus.UNAVAILABLE)
     try:
         if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-            return None
+            return _JsonRead(ScopeReadStatus.UNAVAILABLE)
         try:
-            return response.json()
+            payload = response.json()
         except ValueError:
-            return None
+            return _JsonRead(ScopeReadStatus.INCOMPLETE)
+        return _JsonRead(ScopeReadStatus.COMPLETE, payload)
     finally:
         response.close()
 
@@ -172,7 +188,7 @@ def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCom
     version/capability metadata needed here. Shoko's settings endpoint is deliberately
     not used: it is admin-only and returns secret-bearing server configuration.
     """
-    sonarr_payload = _get_json(sonarr, "api/v3/system/status")
+    sonarr_payload = _get_json(sonarr, "api/v3/system/status").payload
     sonarr_version_raw = sonarr_payload.get("version") if isinstance(sonarr_payload, dict) else None
     sonarr_version = (
         sonarr_version_raw.strip()
@@ -183,7 +199,7 @@ def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCom
         False if sonarr_version is None else _sonarr_version_supported(sonarr_version)
     )
 
-    shoko_payload = _get_json(shoko, "api/v3/Init/Version")
+    shoko_payload = _get_json(shoko, "api/v3/Init/Version").payload
     server = shoko_payload.get("Server") if isinstance(shoko_payload, dict) else None
     shoko_version_raw = server.get("Version") if isinstance(server, dict) else None
     shoko_version = (
@@ -233,7 +249,9 @@ def build_setup_readiness(
     """Summarize the next safe setup action; safety authorization is a later gate."""
     stage = SetupReadinessStage.BLOCKED
     message = ""
-    if not compatibility.compatible:
+    if scope.read_status is not ScopeReadStatus.COMPLETE:
+        message = "Cannot completely verify the current Sonarr anime scope. Check its connection."
+    elif not compatibility.compatible:
         message = (
             compatibility.messages[0]
             if compatibility.messages
@@ -288,8 +306,13 @@ def _parse_root_folders(raw: Any) -> tuple[RootFolder, ...] | None:
     return tuple(sorted(folders, key=lambda folder: folder.path))
 
 
-def _blocked(message: str, details: Sequence[str] = ()) -> AnimeScopeDiscovery:
-    return AnimeScopeDiscovery(ScopeStatus.BLOCKED, (), message, tuple(details))
+def _blocked(
+    message: str,
+    details: Sequence[str] = (),
+    *,
+    read_status: ScopeReadStatus = ScopeReadStatus.COMPLETE,
+) -> AnimeScopeDiscovery:
+    return AnimeScopeDiscovery(ScopeStatus.BLOCKED, (), message, tuple(details), read_status)
 
 
 def select_anime_roots(
@@ -362,27 +385,53 @@ def select_anime_roots(
     return _blocked("No accessible registered Sonarr root contains the detected anime series.")
 
 
-def discover_sonarr_scope(endpoint: ApiEndpoint) -> AnimeScopeDiscovery:
+def discover_sonarr_scope(  # noqa: PLR0911 - ordered fail-closed API read validation
+    endpoint: ApiEndpoint,
+) -> AnimeScopeDiscovery:
     """Fetch only the Sonarr series/root-folder inventories and determine safe anime roots."""
-    raw_series = _get_json(endpoint, SERIES_PATH)
+    series_read = _get_json(endpoint, SERIES_PATH)
+    if series_read.status is not ScopeReadStatus.COMPLETE:
+        return _blocked(
+            "Cannot safely read Sonarr series. Check the address, API key, and API version.",
+            read_status=series_read.status,
+        )
+    raw_series = series_read.payload
     if not isinstance(raw_series, list):
         return _blocked(
-            "Cannot safely read Sonarr series. Check the address, API key, and API version."
+            "Cannot safely read Sonarr series. Check the address, API key, and API version.",
+            read_status=ScopeReadStatus.INCOMPLETE,
         )
     series_result = parse_series_entries(raw_series)
     if series_result.reasons:
         return _blocked(
             "Sonarr returned incomplete series data; automatic scope discovery is paused.",
             series_result.details,
+            read_status=ScopeReadStatus.INCOMPLETE,
         )
 
-    raw_roots = _get_json(endpoint, ROOTFOLDER_PATH)
+    root_read = _get_json(endpoint, ROOTFOLDER_PATH)
+    if root_read.status is not ScopeReadStatus.COMPLETE:
+        return _blocked(
+            "Cannot safely read Sonarr root folders. Check the address, API key, and API version.",
+            read_status=root_read.status,
+        )
+    raw_roots = root_read.payload
     root_folders = _parse_root_folders(raw_roots)
     if root_folders is None:
         return _blocked(
-            "Cannot safely read Sonarr root folders. Check the address, API key, and API version."
+            "Cannot safely read Sonarr root folders. Check the address, API key, and API version.",
+            read_status=ScopeReadStatus.INCOMPLETE,
         )
-    return select_anime_roots(series_result.series, root_folders)
+    discovery = select_anime_roots(series_result.series, root_folders)
+    if any(item.series_type is None for item in series_result.series):
+        return AnimeScopeDiscovery(
+            discovery.status,
+            discovery.candidates,
+            discovery.message,
+            discovery.details,
+            ScopeReadStatus.INCOMPLETE,
+        )
+    return discovery
 
 
 def _eligible_shoko_file(file: ShokoFile) -> bool:

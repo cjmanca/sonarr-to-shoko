@@ -194,10 +194,89 @@ def test_enumerate_missing_returns_exactly_untagged_shas(tmp_path: Path) -> None
     b = _commit(repo, "b")
     c = _commit(repo, "c")
     known = {f"sha-{a}", f"sha-{b}", "latest"}
-    result = enum.enumerate_missing(repo, upto=c, known_tags=known, max_shas=100)
+    result = enum.enumerate_missing(
+        repo, upto=c, known_tags=known, max_shas=100, first_buildable=None
+    )
     assert result.shas == [c]
     assert {s.sha for s in result.skipped} == {a, b}
     assert all(s.reason == "already-tagged" for s in result.skipped)
+
+
+def test_default_backfill_starts_at_inclusive_buildable_boundary_and_progresses(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    earlier = [_commit(repo, f"pre-boundary-{index}") for index in range(2)]
+    boundary = _commit(repo, "boundary")
+    buildable = [_commit(repo, f"buildable-{index}") for index in range(4)]
+
+    first = enum.enumerate_missing(
+        repo,
+        upto=buildable[-1],
+        known_tags=set(),
+        max_shas=2,
+        first_buildable=boundary,
+    )
+
+    assert first.shas == [boundary, buildable[0]]
+    assert first.overflow == buildable[1:]
+    assert {item.sha for item in first.skipped if item.reason == "pre-boundary"} == set(earlier)
+    assert all(sha not in first.shas + first.overflow for sha in earlier)
+    assert any("first-buildable boundary" in note and "inclusive" in note for note in first.notes)
+
+    second = enum.enumerate_missing(
+        repo,
+        upto=buildable[-1],
+        known_tags={f"sha-{sha}" for sha in first.shas},
+        max_shas=2,
+        first_buildable=boundary,
+    )
+    assert second.shas == buildable[1:3]
+    assert second.overflow == [buildable[3]]
+
+
+def test_explicit_since_range_remains_exclusive_and_overrides_default_boundary(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    since = _commit(repo, "explicit-since")
+    before_boundary = _commit(repo, "explicit-pre-boundary")
+    boundary = _commit(repo, "boundary")
+    after = _commit(repo, "after")
+
+    result = enum.enumerate_missing(
+        repo,
+        upto=after,
+        since=since,
+        known_tags=set(),
+        max_shas=10,
+        first_buildable=boundary,
+    )
+
+    assert result.shas == [before_boundary, boundary, after]
+    assert not any(item.reason == "pre-boundary" for item in result.skipped)
+    assert any("explicit backfill range" in note for note in result.notes)
+
+
+def test_default_backfill_fails_closed_when_boundary_is_not_on_selected_history(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    main_tip = _commit(repo, "main")
+    _git(repo, "checkout", "--orphan", "unrelated")
+    unrelated_tip = _commit(repo, "unrelated")
+
+    result = enum.enumerate_missing(
+        repo,
+        upto=unrelated_tip,
+        known_tags=set(),
+        first_buildable=main_tip,
+    )
+
+    assert result.shas == []
+    assert result.overflow == []
+    assert any(item.reason == "boundary-not-ancestor" for item in result.skipped)
+    assert any("no default history scanned" in note for note in result.notes)
 
 
 def test_enumerate_missing_tolerates_ls_remote_tag_forms(tmp_path: Path) -> None:
@@ -205,7 +284,9 @@ def test_enumerate_missing_tolerates_ls_remote_tag_forms(tmp_path: Path) -> None
     a = _commit(repo, "a")
     b = _commit(repo, "b")
     known = {f"refs/tags/sha-{a}", f"refs/tags/sha-{a}^{{}}", "refs/tags/latest"}
-    result = enum.enumerate_missing(repo, upto=b, known_tags=known, max_shas=100)
+    result = enum.enumerate_missing(
+        repo, upto=b, known_tags=known, max_shas=100, first_buildable=None
+    )
     assert result.shas == [b]
 
 
@@ -216,7 +297,9 @@ def test_enumerate_missing_registry_tag_format_zero_reschedule(tmp_path: Path) -
     b = _commit(repo, "b")
     c = _commit(repo, "c")
     known = {f"sha-{a}", f"sha-{b}", f"sha-{c}", "latest"}  # ghcr_tags.py plain tag names
-    result = enum.enumerate_missing(repo, upto=c, known_tags=known, max_shas=100)
+    result = enum.enumerate_missing(
+        repo, upto=c, known_tags=known, max_shas=100, first_buildable=None
+    )
     assert result.shas == []
     assert {s.sha for s in result.skipped} == {a, b, c}
     assert all(s.reason == "already-tagged" for s in result.skipped)
@@ -228,7 +311,9 @@ def test_enumerate_missing_accepts_mixed_tag_formats(tmp_path: Path) -> None:
     b = _commit(repo, "b")
     c = _commit(repo, "c")
     known = {f"refs/tags/sha-{a}", f"refs/tags/sha-{a}^{{}}", f"sha-{b}", "SHA-B", "latest"}
-    result = enum.enumerate_missing(repo, upto=c, known_tags=known, max_shas=100)
+    result = enum.enumerate_missing(
+        repo, upto=c, known_tags=known, max_shas=100, first_buildable=None
+    )
     assert result.shas == [c]
     assert {s.sha for s in result.skipped} == {a, b}
 
@@ -240,7 +325,14 @@ def test_enumerate_missing_unverified_provenance_reschedules(tmp_path: Path) -> 
     b = _commit(repo, "b")
     c = _commit(repo, "c")
     known = {f"sha-{a}", f"sha-{b}", f"sha-{c}"}
-    result = enum.enumerate_missing(repo, upto=c, known_tags=known, unverified={a}, max_shas=100)
+    result = enum.enumerate_missing(
+        repo,
+        upto=c,
+        known_tags=known,
+        unverified={a},
+        max_shas=100,
+        first_buildable=None,
+    )
     assert result.shas == [a]
     reasons = {s.sha: s.reason for s in result.skipped}
     assert reasons[b] == "already-tagged"
@@ -268,6 +360,8 @@ def test_cli_missing_accepts_unverified_file(tmp_path: Path) -> None:
             b,
             "--known-tags-file",
             str(tags_file),
+            "--first-buildable",
+            a,
             "--unverified-file",
             str(unverified_file),
         ],
@@ -304,7 +398,9 @@ def test_max_shas_overflow_is_reported_not_dropped_oldest_first(tmp_path: Path) 
     assert result.shas == [b, c]
     assert result.overflow == [d, e]
     assert any("overflow" in note for note in result.notes)
-    missing = enum.enumerate_missing(repo, upto=e, known_tags=set(), max_shas=2)
+    missing = enum.enumerate_missing(
+        repo, upto=e, known_tags=set(), max_shas=2, first_buildable=None
+    )
     assert missing.shas == [a, b]
     assert missing.overflow == [c, d, e]
 
@@ -399,6 +495,8 @@ def test_cli_json_contract(tmp_path: Path) -> None:
             b,
             "--known-tags-file",
             str(tags_file),
+            "--first-buildable",
+            a,
         ],
         capture_output=True,
         text=True,

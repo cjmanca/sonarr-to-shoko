@@ -11,12 +11,15 @@ import logging
 import re
 import secrets
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socket import SHUT_RDWR
+from threading import Timer
 from typing import Final
 from urllib.parse import parse_qs, urlsplit
 
@@ -43,6 +46,7 @@ _logger = logging.getLogger(__name__)
 DASHBOARD_SESSION_SECONDS: Final[int] = 12 * 60 * 60
 MAX_DASHBOARD_REQUEST_BYTES: Final[int] = 8192
 MAX_DASHBOARD_DRAIN_BYTES: Final[int] = 65_536
+DASHBOARD_REQUEST_TIMEOUT_SECONDS: Final[float] = 5.0
 MIN_DASHBOARD_PASSWORD_CHARS: Final[int] = 12
 MAX_DASHBOARD_PASSWORD_CHARS: Final[int] = 256
 MAX_DASHBOARD_FORM_FIELDS: Final[int] = 64
@@ -72,6 +76,9 @@ class DashboardStatus:
     next_action: str
     diagnostics: tuple[str, ...] = ()
     mapping_cache_status: str = "Waiting for setup."
+    excluded_files: int = 0
+    scope_excluded_files: int = 0
+    exclusion_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +94,7 @@ class DashboardSetupView:
     mapping_required: bool = False
     required_confirmations: tuple[str, ...] = ()
     confirmation_enabled: bool = True
+    snapshot_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -600,6 +608,14 @@ class DashboardApplication:
         active = status.automatic_linking and not paused
         action = next_action or ("Automatic linking is paused." if paused else status.next_action)
         diagnostics = "".join(f"<li>{html.escape(item)}</li>" for item in status.diagnostics)
+        exclusion_categories = (
+            ", ".join(
+                f"{html.escape(reason)}: {count}"
+                for reason, count in status.exclusion_counts
+                if count
+            )
+            or "None"
+        )
         controls = (
             f'<form method="post" action="/pause">'
             f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
@@ -615,8 +631,14 @@ class DashboardApplication:
             f"<dl><dt>Verified files</dt><dd>{status.linked_files}</dd>"
             f"<dt>Waiting</dt><dd>{status.waiting_files}</dd>"
             f"<dt>Need review</dt><dd>{status.review_files}</dd>"
+            f"<dt>Latest cycle exclusions</dt><dd>{status.excluded_files}</dd>"
+            f"<dt>Excluded outside scope</dt><dd>{status.scope_excluded_files}</dd>"
+            f"<dt>Exclusion categories</dt><dd>{exclusion_categories}</dd>"
             f"<dt>Episode mappings</dt><dd>{html.escape(status.mapping_cache_status)}</dd>"
             f"<dt>Automatic linking</dt><dd>{'Running' if active else 'Paused'}</dd></dl>"
+            "<p>Waiting includes work being prepared or waiting for Shoko to confirm a link.</p>"
+            "<p>Partial or uncertain link results need attention; conflicts and safety issues "
+            "are included.</p>"
             f"<p>{html.escape(action)}</p><nav>{controls}</nav>"
             f"{DashboardApplication._setup_section(setup, csrf_token)}"
             f"<details><summary>Advanced diagnostics</summary><ul>{diagnostics}</ul></details>",
@@ -636,6 +658,8 @@ class DashboardApplication:
         scope_form = (
             '<form method="post" action="/setup/scope">'
             f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+            '<input type="hidden" name="setup_digest" '
+            f'value="{html.escape(setup.snapshot_digest, quote=True)}">'
             f"{root_choices}<button>Continue</button></form>"
             if setup.root_options
             else ""
@@ -671,6 +695,8 @@ class DashboardApplication:
                 '<form method="post" action="/setup/confirm">'
                 '<input type="hidden" name="csrf_token" '
                 f'value="{html.escape(csrf_token, quote=True)}">'
+                '<input type="hidden" name="setup_digest" '
+                f'value="{html.escape(setup.snapshot_digest, quote=True)}">'
                 f"<ul>{mapping_summary}</ul>{mapping_fields}{facts}"
                 '<label><input type="checkbox" name="automatic_link_consent" value="1" required>'
                 "I authorize automatic linking for this scope.</label>"
@@ -726,6 +752,28 @@ def create_dashboard_server(host: str, port: int, application: DashboardApplicat
         server_version = "ShokoSonarrLinker"
         sys_version = ""
 
+        def handle(self) -> None:
+            # Bound the entire accepted request, including trickled headers/body.
+            # Socket inactivity timeouts alone reset whenever another byte arrives.
+            self.connection.settimeout(DASHBOARD_REQUEST_TIMEOUT_SECONDS)
+            deadline = Timer(DASHBOARD_REQUEST_TIMEOUT_SECONDS, self._expire_connection)
+            self._read_deadline = deadline
+            deadline.daemon = True
+            deadline.start()
+            try:
+                super().handle()
+            except OSError:
+                # Timeouts, EOF/reset, and disconnected response readers are ordinary
+                # client failures; never emit request data or tracebacks.
+                self.close_connection = True
+            finally:
+                deadline.cancel()
+
+        def _expire_connection(self) -> None:
+            # The request may already have completed/disconnected.
+            with suppress(OSError):
+                self.connection.shutdown(SHUT_RDWR)
+
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler hook
             self._dispatch()
 
@@ -751,13 +799,20 @@ def create_dashboard_server(host: str, port: int, application: DashboardApplicat
             if self.headers.get("Transfer-Encoding") is not None:
                 self._send(application._error(HTTPStatus.BAD_REQUEST, "Invalid request body."))
                 return
-            self._dispatch(self.rfile.read(length))
+            body = self.rfile.read(length)
+            if len(body) != length:
+                self.close_connection = True
+                return
+            self._dispatch(body)
 
         def _dispatch(self, body: bytes = b"") -> None:
+            # The deadline bounds client input, not local password hashing or setup work.
+            self._read_deadline.cancel()
             response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             self._send(response)
 
         def _send(self, response: DashboardResponse) -> None:
+            self._read_deadline.cancel()
             self.send_response(response.status)
             self.send_header("Content-Length", str(len(response.body)))
             self.send_header("Cache-Control", "no-store")

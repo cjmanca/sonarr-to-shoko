@@ -9,7 +9,6 @@ secondary requests).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -241,19 +240,170 @@ def test_excluded_series_produce_no_secondary_requests(
     assert inventory.verdict.auto_apply_eligible is True
 
 
-def test_normal_service_inventory_preserves_only_anime_series_in_shared_root(
+def test_changed_series_manifest_discards_cached_children(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
-    settings = replace(
-        settings_with_roots(base_document, write_document, [ANIME_ROOT]), anime_only=True
-    )
+    stub = standard_stub()
+    extra_id = 6
+    extra_root = f"{ANIME_ROOT}/Extra"
+    stub.series.append(series_entry(extra_id, "Extra", extra_root))
+    stub.episodes[extra_id] = [episode_entry(60, extra_id, 1, 1, "E01", file_id=600)]
+    stub.files[extra_id] = [file_entry(600, extra_id, f"{extra_root}/E01.mkv", 6000)]
+    settings = settings_with_roots(base_document, write_document, [ANIME_ROOT])
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        first = collect_sonarr_inventory(endpoint, settings)
+        assert first.verdict.complete is True
+        assert first.series_manifest_hash is not None
+        assert first.fetched_series_children is not None
+
+        stub.series[0]["tvdbId"] = 9999
+        changed = collect_sonarr_inventory(
+            endpoint,
+            settings,
+            cached_manifest_hash=first.series_manifest_hash,
+            cached_series_children=first.fetched_series_children,
+            series_cursor=extra_id,
+            swept_series_ids=first.swept_series_ids,
+            series_deadline=0.0,
+            monotonic=lambda: 0.0,
+        )
+    finally:
+        endpoint.client.close()
+
+    assert changed.series_cursor == 0
+    assert changed.files == ()
+    assert changed.verdict.complete is False
+    assert VerdictReason.INCOMPLETE_SNAPSHOT in changed.verdict.reasons
+
+
+def test_failed_refresh_invalidates_previously_swept_child_fragment(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    stub = standard_stub()
+    settings = settings_with_roots(base_document, write_document, [ANIME_ROOT])
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        first = collect_sonarr_inventory(endpoint, settings)
+        assert first.verdict.complete is True
+        assert first.swept_series_ids == frozenset({SERIES_ANIME})
+
+        stub.episodes_status[SERIES_ANIME] = 503
+        failed = collect_sonarr_inventory(
+            endpoint,
+            settings,
+            cached_manifest_hash=first.series_manifest_hash,
+            cached_series_children=first.fetched_series_children,
+            series_cursor=first.series_cursor,
+            swept_series_ids=first.swept_series_ids,
+        )
+    finally:
+        endpoint.client.close()
+
+    assert failed.verdict.complete is False
+    assert failed.files == ()
+    assert failed.swept_series_ids == frozenset()
+    assert failed.refresh_sweep_complete is False
+
+
+def test_failed_fragment_cannot_complete_a_later_rotation_from_old_sweep_membership(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    stub = standard_stub()
+    for series_id in (6, 7, 8):
+        root = f"{ANIME_ROOT}/Series {series_id}"
+        stub.series.append(series_entry(series_id, f"Series {series_id}", root))
+        stub.episodes[series_id] = [episode_entry(series_id * 10, series_id, 1, 1, "E01")]
+        stub.files[series_id] = [
+            file_entry(series_id * 100, series_id, f"{root}/E01.mkv", series_id * 1000)
+        ]
+    settings = settings_with_roots(base_document, write_document, [ANIME_ROOT])
+    elapsed = [0.0]
+
+    def timed_handler(request: httpx.Request) -> httpx.Response:
+        response = stub.handler(request)
+        if request.url.path in SECONDARY_PATHS:
+            elapsed[0] += 1.0
+        return response
+
+    endpoint = sonarr_endpoint(timed_handler)
+    try:
+        first = collect_sonarr_inventory(endpoint, settings)
+        assert first.verdict.complete is True
+
+        # Persist one successful child refresh as an incomplete sweep, like a bounded
+        # apply slice.  The remaining cached fragments are from the earlier full sweep.
+        elapsed[0] = 0.0
+        partial = collect_sonarr_inventory(
+            endpoint,
+            settings,
+            cached_manifest_hash=first.series_manifest_hash,
+            cached_series_children=first.fetched_series_children,
+            series_cursor=first.series_cursor,
+            swept_series_ids=frozenset(),
+            series_deadline=2.0,
+            monotonic=lambda: elapsed[0],
+        )
+        assert partial.swept_series_ids == frozenset({SERIES_ANIME})
+        assert partial.refresh_sweep_complete is False
+
+        # All child refreshes fail.  The previously successful series 1 fragment and
+        # its sweep membership must both be invalidated, not carried into the next pass.
+        stub.episodes_status.update({series_id: 503 for series_id in (1, 6, 7, 8)})
+        failed = collect_sonarr_inventory(
+            endpoint,
+            settings,
+            cached_manifest_hash=first.series_manifest_hash,
+            cached_series_children=first.fetched_series_children,
+            series_cursor=partial.series_cursor,
+            swept_series_ids=partial.swept_series_ids,
+        )
+
+        # Series 1 remains unavailable while the rest recover.  A stale cache plus the
+        # old sweep bit would let series 6-8 finish a false-complete inventory before
+        # series 1 is ever re-read.
+        stub.episodes_status = {1: 503}
+        remaining_cache = first.fetched_series_children if failed.files else {}
+        recovered = collect_sonarr_inventory(
+            endpoint,
+            settings,
+            cached_manifest_hash=first.series_manifest_hash,
+            cached_series_children=remaining_cache,
+            series_cursor=failed.series_cursor,
+            swept_series_ids=failed.swept_series_ids,
+        )
+    finally:
+        endpoint.client.close()
+
+    assert failed.files == ()
+    assert failed.swept_series_ids == frozenset()
+    assert recovered.verdict.complete is False
+    assert recovered.refresh_sweep_complete is False
+    assert SERIES_ANIME not in recovered.swept_series_ids
+    assert all(file.series_id != SERIES_ANIME for file in recovered.files)
+
+
+@pytest.mark.parametrize("anime_only", [None, False, True])
+@pytest.mark.parametrize("series_type", ["standard", "daily", "unknown", "", None])
+def test_all_inventory_paths_preserve_only_anime_series_in_shared_root(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    anime_only: bool | None,
+    series_type: str | None,
+) -> None:
+    settings = settings_with_roots(base_document, write_document, [ANIME_ROOT])
     stub = standard_stub()
     shared_live_id = 700
     stub.series.append(
         series_entry(
-            shared_live_id, "Live Action in Shared Root", f"{ANIME_ROOT}/Live", type_="standard"
+            shared_live_id,
+            "Live Action in Shared Root",
+            f"{ANIME_ROOT}/Live",
+            type_=series_type or "",
         )
     )
+    if series_type is None:
+        stub.series[-1].pop("seriesType")
     stub.episodes[shared_live_id] = [
         episode_entry(7001, shared_live_id, 1, 1, "Drama E01", file_id=7000)
     ]
@@ -261,10 +411,15 @@ def test_normal_service_inventory_preserves_only_anime_series_in_shared_root(
         file_entry(7000, shared_live_id, f"{ANIME_ROOT}/Live/S01E01.mkv", 900)
     ]
 
-    inventory = collect(stub, settings)
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        inventory = collect_sonarr_inventory(endpoint, settings, anime_only=anime_only)
+    finally:
+        endpoint.client.close()
 
     assert {item.series.id for item in inventory.eligible_series} == {SERIES_ANIME}
-    assert shared_live_id in {item.id for item in inventory.excluded_series}
+    if series_type:
+        assert shared_live_id in {item.id for item in inventory.excluded_series}
     assert stub.secondary_series_ids() == {SERIES_ANIME}
 
 
@@ -551,7 +706,9 @@ def test_urlbase_307_redirect_reaches_prefixed_api_path(
 
 def test_select_eligible_series_is_pure_and_component_aware() -> None:
     series = (
-        SonarrSeries(id=1, title="In", root_folder_path="/anime", tvdb_id=None),
+        SonarrSeries(
+            id=1, title="In", root_folder_path="/anime", tvdb_id=None, series_type="anime"
+        ),
         SonarrSeries(id=2, title="Sibling", root_folder_path="/anime-old/X", tvdb_id=None),
         SonarrSeries(id=3, title="Escaper", root_folder_path="/anime/../secret", tvdb_id=None),
         SonarrSeries(id=4, title="Other", root_folder_path="/other/X", tvdb_id=None),

@@ -19,7 +19,7 @@ from shoko_linker.onboarding import (
 )
 from shoko_linker.paths import PathMapping
 from shoko_linker.safety_check import SafetyAssessment, assess_settings_payload
-from shoko_linker.state import _CAMPAIGN_V2_DRAIN_COLUMNS, StateError, open_state
+from shoko_linker.state import _CAMPAIGN_V2_DRAIN_COLUMNS, SCHEMA_VERSION, StateError, open_state
 
 SONARR_ROOT = "/data/media/anime"
 SHOKO_ROOT = "/anime"
@@ -94,7 +94,7 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
     assert before["campaigns"][0][7] == "approved"
 
     with open_state(path) as store:
-        assert store.schema_version() == 4
+        assert store.schema_version() == SCHEMA_VERSION
         # Prior campaign approval survives, but does not populate normal-service consent.
         assert store.get_onboarding_json() is None
         assert store.get_service_pause() == (False, "")
@@ -102,14 +102,26 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
         assert store.get_dashboard_session("a" * 64, 1792041600) is None
 
     after = v1fx.snapshot_state(path)
-    for table in ("meta", "baselines", "baseline_files", "files", "sends", "campaigns", "budgets"):
+    for table in ("meta", "baselines", "baseline_files", "files", "campaigns", "budgets"):
         assert after[table] == before[table]
+    legacy_send_fields = len(before["sends"][0])
+    assert [row[:legacy_send_fields] for row in after["sends"]] == before["sends"]
+    assert [row[legacy_send_fields:] for row in after["sends"]] == [
+        (None, "unknown", None, ""),
+        (None, "unknown", None, ""),
+        (None, "unknown", None, ""),
+    ]
     assert after["schema_version"][: len(before["schema_version"])] == before["schema_version"]
-    assert after["schema_version"][-2][0:3:2] == (3, "migrated from 2")
-    assert after["schema_version"][-1][0:3:2] == (4, "migrated from 3")
+    assert [row[0:3:2] for row in after["schema_version"][len(before["schema_version"]) :]] == [
+        (3, "migrated from 2"),
+        (4, "migrated from 3"),
+        (5, "migrated from 4"),
+        (6, "migrated from 5"),
+        (7, "migrated from 6"),
+    ]
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone() == (4,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         conn.close()
 
@@ -339,6 +351,153 @@ def test_user_pause_survives_scope_reconfirmation_until_explicit_resume(tmp_path
         assert (
             manager.resume(changed, assessment, iso=T_PLUS_30_DAYS).status
             is OnboardingStatus.AUTHORIZED
+        )
+
+
+def test_hard_reconfirmation_survives_transient_failures_and_restart(tmp_path: Path) -> None:
+    assessment = safe_assessment()
+    binding = make_binding(assessment)
+    changed = replace(binding, shoko_version="5.3.4")
+    path = tmp_path / "state.sqlite3"
+
+    with open_state(path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        assert (
+            manager.evaluate(changed, assessment, iso=T_PLUS_30_DAYS).status
+            is OnboardingStatus.NEEDS_CONFIRMATION
+        )
+        manager.pause_for_review(
+            "setup_unavailable", "Services are temporarily unavailable.", iso=T_PLUS_30_DAYS
+        )
+        assert store.get_service_pause() == (True, "setup_changed")
+
+    with open_state(path) as reopened:
+        manager = OnboardingManager(reopened)
+        manager.pause_for_review(
+            "setup_unavailable", "Services are still unavailable.", iso=T_PLUS_30_DAYS
+        )
+        assert reopened.get_service_pause() == (True, "setup_changed")
+        assert (
+            manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status
+            is OnboardingStatus.NEEDS_CONFIRMATION
+        )
+
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T_PLUS_30_DAYS,
+        )
+        assert reopened.get_service_pause() == (False, "")
+        assert manager.evaluate(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.AUTHORIZED
+        )
+
+
+def test_user_pause_cannot_clear_hard_reconfirmation_across_restart(tmp_path: Path) -> None:
+    assessment = safe_assessment()
+    binding = make_binding(assessment)
+    changed = replace(binding, shoko_version="5.3.4")
+    path = tmp_path / "state.sqlite3"
+
+    with open_state(path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        manager.evaluate(changed, assessment, iso=T_PLUS_30_DAYS)
+        manager.pause(iso=T_PLUS_30_DAYS)
+        assert store.get_service_pause() == (True, "user_paused")
+
+    with open_state(path) as reopened:
+        manager = OnboardingManager(reopened)
+        assert (
+            manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status
+            is OnboardingStatus.NEEDS_CONFIRMATION
+        )
+        assert reopened.get_service_pause() == (True, "user_paused")
+
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T_PLUS_30_DAYS,
+        )
+        assert manager.evaluate(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.PAUSED
+        )
+        assert manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.AUTHORIZED
+        )
+
+
+def test_transient_setup_failure_resumes_with_existing_consent(tmp_path: Path) -> None:
+    assessment = safe_assessment()
+    binding = make_binding(assessment)
+    path = tmp_path / "state.sqlite3"
+
+    with open_state(path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        manager.pause_for_review(
+            "setup_unavailable", "Services are temporarily unavailable.", iso=T_PLUS_30_DAYS
+        )
+
+    with open_state(path) as reopened:
+        manager = OnboardingManager(reopened)
+        assert manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.AUTHORIZED
+        )
+        assert reopened.get_service_pause() == (False, "")
+
+
+def test_legacy_hard_pause_is_latched_before_a_temporary_outage_can_replace_it(
+    tmp_path: Path,
+) -> None:
+    assessment = safe_assessment()
+    binding = make_binding(assessment)
+    path = tmp_path / "state.sqlite3"
+
+    with open_state(path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        store.set_service_pause(True, "setup_changed", T_PLUS_30_DAYS)
+        assert store.get_meta("onboarding_reconfirmation_required") is None
+        manager.pause_for_review(
+            "setup_unavailable", "Services are temporarily unavailable.", iso=T_PLUS_30_DAYS
+        )
+
+    with open_state(path) as reopened:
+        manager = OnboardingManager(reopened)
+        manager.pause(iso=T_PLUS_30_DAYS)
+        assert (
+            manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status
+            is OnboardingStatus.NEEDS_CONFIRMATION
         )
 
 

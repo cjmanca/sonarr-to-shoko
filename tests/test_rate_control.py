@@ -148,9 +148,9 @@ def test_service_budget_limits_honor_stricter_config_and_clamp_looser_values() -
             rolling_window_hours=240.0,
         )
     )
-    assert hard == BudgetLimits(20, 10, 20, 5000, 168.0)
+    assert hard == BudgetLimits(20, 10, 20, 100_000, 240.0, ((5000, 168.0),))
     stricter = service_budget_limits(BudgetLimits(4, 3, 2, 100, 24.0))
-    assert stricter == BudgetLimits(4, 3, 2, 100, 24.0)
+    assert stricter == BudgetLimits(4, 3, 2, 100, 24.0, ((5000, 168.0),))
 
 
 def test_rate_state_round_trips_and_rejects_malformed_documents() -> None:

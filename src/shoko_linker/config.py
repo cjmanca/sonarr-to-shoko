@@ -278,7 +278,7 @@ class Settings:
     database: DatabaseSettings
     safety: SafetySettings = DEFAULT_SAFETY_SETTINGS
     campaign: CampaignSettings = DEFAULT_CAMPAIGN_SETTINGS
-    anime_only: bool = False
+    anime_only: bool = True
 
     @property
     def apply_enabled(self) -> bool:
@@ -684,9 +684,24 @@ def normalize_service_url(raw: str) -> str:
         raise ConfigError("URL: must include a host")
     if parts.query or parts.fragment:
         raise ConfigError("URL: must not include a query or fragment")
-    host = parts.hostname.lower()
-    if parts.port is not None:
-        host = f"{host}:{parts.port}"
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ConfigError("URL: must contain a valid port") from exc
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        literal = authority[1:closing_bracket]
+        zone_start = literal.find("%")
+        if zone_start >= 0:
+            literal = literal[:zone_start].lower() + literal[zone_start:]
+        else:
+            literal = literal.lower()
+        host = f"[{literal}]"
+    else:
+        host = parts.hostname.lower()
+    if port is not None:
+        host = f"{host}:{port}"
     return urlunsplit((scheme, host, parts.path.rstrip("/"), "", ""))
 
 

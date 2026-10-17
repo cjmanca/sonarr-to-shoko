@@ -239,6 +239,89 @@ def test_dashboard_stays_responsive_and_pause_is_durable_while_worker_is_blocked
     assert observed_pause == [(True, "user_paused")]
 
 
+@pytest.mark.parametrize(
+    "partial",
+    [
+        b"",
+        b"POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\na",
+        b"GET / HTTP/1.1\r\nHost:",
+        b"POST /login HTTP/1.1\r\nContent-Length: 9000\r\n\r\na",
+    ],
+)
+@pytest.mark.parametrize("trickle", [False, True])
+def test_partial_dashboard_requests_release_controls_and_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, partial: bytes, trickle: bool
+) -> None:
+    import socket
+
+    from shoko_linker import dashboard
+    from shoko_linker.service import run_dashboard_worker
+
+    monkeypatch.setattr(dashboard, "DASHBOARD_REQUEST_TIMEOUT_SECONDS", 0.5)
+    server = dashboard.create_dashboard_server(
+        "127.0.0.1", 0, dashboard.DashboardApplication(tmp_path / "state.sqlite3")
+    )
+    stop = threading.Event()
+    accepted = threading.Event()
+    get_request = server.get_request
+
+    def observe_accept() -> tuple[socket.socket, Any]:
+        request = get_request()
+        accepted.set()
+        return request
+
+    monkeypatch.setattr(server, "get_request", observe_accept)
+    runner = threading.Thread(
+        target=run_dashboard_worker,
+        kwargs={
+            "server": server,
+            "worker_tick": lambda: None,
+            "stop_requested": stop.is_set,
+            "monotonic": time.monotonic,
+            "worker_interval_seconds": 60,
+            "request_poll_seconds": 0.02,
+        },
+    )
+    runner.start()
+    address = ("127.0.0.1", server.server_port)
+    client = socket.create_connection(address, timeout=1)
+    second: socket.socket | None = None
+    stop_trickle = threading.Event()
+
+    def trickle_bytes() -> None:
+        while not stop_trickle.wait(timeout=0.05):
+            try:
+                client.sendall(b"a")
+            except OSError:
+                return
+
+    sender = threading.Thread(target=trickle_bytes)
+    try:
+        client.sendall(partial)
+        if trickle:
+            sender.start()
+        # The next request must be serviced even while the first client stays open.
+        _create_dashboard_account_and_pause(f"http://127.0.0.1:{server.server_port}")
+        accepted.clear()
+        second = socket.create_connection(address, timeout=1)
+        second.sendall(partial)
+        assert accepted.wait(timeout=1)
+        stop.set()
+        runner.join(timeout=2)
+        assert not runner.is_alive()
+        assert server.fileno() == -1
+    finally:
+        stop.set()
+        stop_trickle.set()
+        if trickle:
+            sender.join(timeout=2)
+        client.close()
+        if second is not None:
+            second.close()
+        runner.join(timeout=2)
+        server.server_close()
+
+
 def test_worker_exception_is_retried_and_repeated_start_stop_closes_server(
     tmp_path: Path,
 ) -> None:

@@ -287,7 +287,10 @@ jobs:
           fi
           run_missing() {
             local extra_unverified="${1:-}"
-            local args=(missing --repo . --upto "$TO" --known-tags-file known_tags.txt --max-shas "$MAX")
+            local args=(
+              missing --repo . --upto "$TO" --known-tags-file known_tags.txt
+              --max-shas "$MAX" --first-buildable "$FIRST_BUILDABLE"
+            )
             if [ -n "$FROM" ]; then args+=(--since "$FROM"); fi
             if [ -n "$extra_unverified" ]; then args+=(--unverified-file "$extra_unverified"); fi
             python3 scripts/enumerate_introduced.py "${args[@]}" > plan.json

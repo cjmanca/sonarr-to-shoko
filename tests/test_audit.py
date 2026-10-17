@@ -20,6 +20,7 @@ import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from shoko_linker import audit as audit_module
 from shoko_linker import cli
 from shoko_linker.audit import AuditClass, run_audit
 from shoko_linker.cli import EXIT_CONFIG_INVALID, EXIT_OK, main
@@ -77,6 +78,8 @@ class AuditStubs:
     shoko_requests: list[httpx.Request] = field(default_factory=list)
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     file_status: int = 200
+    episode_rows_override: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    file_pages: dict[int, tuple[int, list[dict[str, Any]]]] | None = None
 
     def specs(self) -> list[tuple[int, int, int, list[tuple[int, int]]]]:
         # (series_id, file_id, shoko_id, linked identities [(anime, anidb_ep)])
@@ -140,7 +143,9 @@ class AuditStubs:
             )
         if path.startswith("/api/v3/Series/AniDB/"):
             anime_id = int(path.split("/")[5])
-            if anime_id == ANIME_ID:
+            if anime_id in self.episode_rows_override:
+                rows = self.episode_rows_override[anime_id]
+            elif anime_id == ANIME_ID:
                 rows = [
                     {"ID": EP1_ID, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 1},
                     {"ID": EP2_ID, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 2},
@@ -149,8 +154,15 @@ class AuditStubs:
                 rows = [{"ID": 6001, "AnimeID": anime_id, "Type": "Episode", "EpisodeNumber": 1}]
             return httpx.Response(200, json={"Total": len(rows), "List": rows}, request=request)
         if path == "/api/v3/File":
-            rows = [self.file_row(spec) for spec in self.specs()]
-            return httpx.Response(200, json={"Total": len(rows), "List": rows}, request=request)
+            page = int(request.url.params.get("page", "1"))
+            if self.file_pages is not None:
+                total, rows = self.file_pages.get(page, (0, []))
+            else:
+                all_rows = [self.file_row(spec) for spec in self.specs()]
+                page_size = int(request.url.params.get("pageSize", "1000"))
+                total = len(all_rows)
+                rows = all_rows[(page - 1) * page_size : page * page_size]
+            return httpx.Response(200, json={"Total": total, "List": rows}, request=request)
         return httpx.Response(404, json={}, request=request)
 
     def sonarr(self, request: httpx.Request) -> httpx.Response:
@@ -164,12 +176,14 @@ class AuditStubs:
                         "id": 1,
                         "title": "Main",
                         "rootFolderPath": f"{SONARR_ROOT}/series1",
+                        "seriesType": "anime",
                         "tvdbId": TVDB_MAIN,
                     },
                     {
                         "id": 2,
                         "title": "Ambig",
                         "rootFolderPath": f"{SONARR_ROOT}/series2",
+                        "seriesType": "anime",
                         "tvdbId": TVDB_AMBIG,
                     },
                 ],
@@ -361,7 +375,49 @@ def test_audit_exact_set_rule(stubs: AuditStubs, tmp_path: Path) -> None:
     assert existence_only.classification is not AuditClass.LINKED_CONSISTENT
 
 
-def _run(stubs: AuditStubs, settings: Settings, active: Any) -> Any:
+@pytest.mark.parametrize(
+    "episode_rows",
+    [
+        [
+            {"ID": EP1_ID, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 1},
+            {"ID": 99999, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 1},
+            {"ID": EP2_ID, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 2},
+        ],
+        [
+            {"ID": True, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 1},
+            {"ID": EP2_ID, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 2},
+        ],
+    ],
+    ids=["contradictory-duplicate-identity", "malformed-id-type"],
+)
+def test_audit_does_not_mark_link_consistent_from_malformed_episode_listing(
+    stubs: AuditStubs,
+    tmp_path: Path,
+    episode_rows: list[dict[str, Any]],
+) -> None:
+    store = _seed_mapping(tmp_path)
+    active = load_active(store)
+    assert active is not None
+    settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+    stubs.episode_rows_override[ANIME_ID] = episode_rows
+
+    report = _run(stubs, settings, active)
+
+    finding = next(item for item in report.findings if item.shoko_file_id == 602)
+    assert finding.classification is AuditClass.AUDIT_INCOMPLETE
+    assert "malformed" in finding.detail
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
+    assert all(request.method != "POST" for request in stubs.shoko_requests)
+
+
+def _run(
+    stubs: AuditStubs,
+    settings: Settings,
+    active: Any,
+    *,
+    series_anidb: int | None = None,
+    limit: int = LIMIT_100,
+) -> Any:
     from shoko_linker.audit import collect_audit_inputs
 
     files, tvdb, _problem = collect_audit_inputs(_endpoint(stubs.sonarr, SONARR_BASE), settings)
@@ -371,22 +427,127 @@ def _run(stubs: AuditStubs, settings: Settings, active: Any) -> Any:
         active=active,
         sonarr_files=files,
         series_tvdb=tvdb,
+        series_anidb=series_anidb,
+        limit=limit,
         max_requests=LIMIT_100,
     )
 
 
-def test_audit_series_filter(stubs: AuditStubs, tmp_path: Path) -> None:
+@pytest.mark.parametrize("limit", [1, 4, 5])
+def test_audit_series_filter_is_applied_before_limit(
+    stubs: AuditStubs, tmp_path: Path, limit: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(audit_module, "PAGE_SIZE", 2)
     store = _seed_mapping(tmp_path)
     active = load_active(store)
     assert active is not None
     settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+
+    report = _run(stubs, settings, active, series_anidb=AMBIG_A, limit=limit)
+
+    assert [finding.shoko_file_id for finding in report.findings] == [700]
+    assert report.linked_examined == 1
+    assert report.truncated is False
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
+
+
+def test_audit_series_filter_truncates_when_matching_rows_exceed_limit(
+    stubs: AuditStubs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(audit_module, "PAGE_SIZE", 2)
+    store = _seed_mapping(tmp_path)
+    active = load_active(store)
+    assert active is not None
+    settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+    original_specs = stubs.specs
+    extra_matching_spec = (2, 31, 701, [(AMBIG_A, 6001)])
+    monkeypatch.setattr(stubs, "specs", lambda: [*original_specs(), extra_matching_spec])
+
+    report = _run(stubs, settings, active, series_anidb=AMBIG_A, limit=1)
+
+    assert [finding.shoko_file_id for finding in report.findings] == [700]
+    assert report.linked_examined == 1
+    assert report.truncated is True
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
+
+
+@pytest.mark.parametrize(
+    "failure_fragment",
+    [
+        "premature_empty_page_2",
+        "total_changed_page_2",
+        "duplicate_file_id_601",
+        "page_overshoot_1",
+    ],
+)
+def test_audit_malformed_pagination_is_truncated_and_actionable(
+    stubs: AuditStubs,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_fragment: str,
+) -> None:
+    monkeypatch.setattr(audit_module, "PAGE_SIZE", 2)
+    specs = stubs.specs()
+    rows = [stubs.file_row(spec) for spec in specs]
+    if failure_fragment == "premature_empty_page_2":
+        pages = {1: (3, rows[:2]), 2: (3, [])}
+    elif failure_fragment == "total_changed_page_2":
+        pages = {1: (3, rows[:2]), 2: (4, rows[2:4])}
+    elif failure_fragment == "duplicate_file_id_601":
+        pages = {1: (4, rows[:2]), 2: (4, [rows[1], rows[2]])}
+    else:
+        pages = {1: (1, rows[:2])}
+    stubs.file_pages = pages
+    store = _seed_mapping(tmp_path)
+    active = load_active(store)
+    assert active is not None
+    settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+
     report = _run(stubs, settings, active)
-    series_filtered = [
-        finding
-        for finding in report.findings
-        if finding.classification is AuditClass.AMBIGUOUS_MATCH
+
+    assert report.truncated is True
+    assert any(failure_fragment in failure for failure in report.failures)
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
+    assert all(request.method != "POST" for request in stubs.shoko_requests)
+
+
+def test_audit_valid_paged_listing_is_complete_and_get_only(
+    stubs: AuditStubs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(audit_module, "PAGE_SIZE", 2)
+    store = _seed_mapping(tmp_path)
+    active = load_active(store)
+    assert active is not None
+    settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+
+    report = _run(stubs, settings, active)
+
+    assert report.examined == len(stubs.specs())
+    assert report.truncated is False
+    assert report.failures == ()
+    assert sum(request.url.path == "/api/v3/File" for request in stubs.shoko_requests) == 3
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
+
+
+def test_audit_uses_strict_shared_anidb_identity_validation(
+    stubs: AuditStubs, tmp_path: Path
+) -> None:
+    store = _seed_mapping(tmp_path)
+    active = load_active(store)
+    assert active is not None
+    settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+    stubs.episode_rows_override[ANIME_ID] = [
+        {"ID": EP1_ID, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": True}
     ]
-    assert len(series_filtered) == 1
+
+    report = _run(stubs, settings, active)
+
+    assert any(
+        finding.classification is AuditClass.AUDIT_INCOMPLETE
+        and "target_episode_listing_malformed" in finding.detail
+        for finding in report.findings
+    )
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
 
 
 def test_audit_cli_is_get_only_and_informational(

@@ -18,7 +18,13 @@ from .state import StateStore
 
 ONBOARDING_DOCUMENT_SCHEMA: Final[str] = "shoko-sonarr-linker/onboarding/1"
 _HEX64_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
-SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset({"setup_changed", "unsafe_shoko_settings"})
+SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
+    {"setup_changed", "setup_unavailable", "unsafe_shoko_settings"}
+)
+SYSTEM_RECONFIRMATION_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
+    {"setup_changed", "unsafe_shoko_settings"}
+)
+_RECONFIRMATION_REQUIRED_META: Final[str] = "onboarding_reconfirmation_required"
 
 
 class OnboardingError(ValueError):
@@ -281,10 +287,19 @@ class OnboardingManager:
             consented_iso=iso,
         )
         self.store.save_onboarding_json(record.to_json(), iso)
+        # Only a newly validated, digest-bound confirmation clears the independent hard hold.
+        self.store.clear_meta(_RECONFIRMATION_REQUIRED_META)
         paused, reason = self.store.get_service_pause()
         if paused and reason in SYSTEM_PAUSE_REASONS:
             self.store.set_service_pause(False, "", iso)
         return record
+
+    def reconfirmation_required(self) -> bool:
+        """Return the durable hard-consent hold, including pre-latch legacy pause reasons."""
+        if self.store.get_meta(_RECONFIRMATION_REQUIRED_META) is not None:
+            return True
+        paused, reason = self.store.get_service_pause()
+        return paused and reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
 
     def evaluate(
         self, binding: ScopeBinding, assessment: SafetyAssessment, *, iso: str
@@ -294,11 +309,14 @@ class OnboardingManager:
 
     def pause(self, *, iso: str) -> OnboardingDecision:
         _validate_iso(iso)
+        if self.reconfirmation_required():
+            # Preserve legacy hard holds before the user-facing pause reason replaces them.
+            self.store.set_meta(_RECONFIRMATION_REQUIRED_META, "1")
         self.store.set_service_pause(True, "user_paused", iso)
         return OnboardingDecision(OnboardingStatus.PAUSED, "Automatic linking is paused.")
 
     def pause_for_review(self, reason: str, message: str, *, iso: str) -> OnboardingDecision:
-        """Persist a system hold when current scope facts require renewed user review."""
+        """Persist a system hold for changed or temporarily unverifiable setup facts."""
         _validate_iso(iso)
         if reason not in SYSTEM_PAUSE_REASONS:
             raise OnboardingError("unsupported automatic-service review pause reason")
@@ -316,6 +334,13 @@ class OnboardingManager:
         return decision
 
     def _pause_for_system_change(self, reason: str, iso: str) -> None:
+        is_hard_hold = reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
+        if is_hard_hold:
+            self.store.set_meta(_RECONFIRMATION_REQUIRED_META, "1")
+        elif self.reconfirmation_required():
+            # A temporary outage cannot downgrade an existing reconfirmation requirement.
+            self.store.set_meta(_RECONFIRMATION_REQUIRED_META, "1")
+            return
         paused, existing_reason = self.store.get_service_pause()
         if paused and existing_reason == "user_paused":
             return
@@ -363,6 +388,9 @@ class OnboardingManager:
                     message = (
                         "Setup or Shoko safety changed. Confirm the current scope and safety facts."
                     )
+                elif self.reconfirmation_required():
+                    status = OnboardingStatus.NEEDS_CONFIRMATION
+                    message = "Setup must be confirmed again before automatic linking can resume."
                 elif not record.automatic_link_consent:
                     status = OnboardingStatus.NEEDS_CONFIRMATION
                     message = "Explicit consent to automatic linking is required."
@@ -371,6 +399,11 @@ class OnboardingManager:
                     if paused and respect_user_pause:
                         status = OnboardingStatus.PAUSED
                         message = "Automatic linking is paused."
+                    elif paused and reason == "setup_unavailable":
+                        message = (
+                            "Current setup checks pass. Resume automatic linking to clear the "
+                            "temporary connection hold."
+                        )
                     elif paused and reason != "user_paused":
                         status = OnboardingStatus.NEEDS_CONFIRMATION
                         message = (

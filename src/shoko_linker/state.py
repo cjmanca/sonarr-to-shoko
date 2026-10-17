@@ -45,17 +45,19 @@ fallback**.
 Budget-slot release ownership (M6 review P1-2/P2-4, second-round P1-A): the reservation
 is released **exactly once** — the send row carries a ``slot_released`` flag that is
 set atomically in the same transaction as the counter decrement, so *every* release
-path (verified, partial-close, void, rejected/refused, and the operator ``resolve_send``)
-funnels through :meth:`StateStore._release_send_slot_tx`. A release attempt on a row whose
+path (verified, void, rejected/refused, and the operator ``resolve_send``)
+funnels through :meth:`StateStore._release_send_slot_tx`. A partial or contradictory inspection
+does not release a possible-delivery reservation; only an explicit operator resolution does.
+A release attempt on a row whose
 ``slot_released=1`` is a **no-op** (recorded in the ``slot_release_noops`` meta audit list).
 :func:`max` clamping in :meth:`StateStore._adjust_pending_tx` remains only as a defensive
-backstop — the invariants must (and their tests do) hold **without** relying on it: a
-PARTIAL close that releases the held slot, then a late ``ManualLinkJob`` that lands the
-VERIFIED verdict, must **not** release the same reservation a second time. The APIs that
+backstop — the invariants must (and their tests do) hold **without** relying on it. An
+unqualified PARTIAL observation keeps its slot held until a later VERIFIED result or
+explicit resolution; a qualified PARTIAL/contradictory inspection becomes terminal review
+and also keeps its slot held. The APIs that
 observe the terminal facts are :meth:`StateStore.record_verification` (VERIFIED),
 :meth:`StateStore.record_send_outcome` (REJECTED/REFUSED, pinned zero-write),
-:meth:`StateStore.void_prepared_send` (definite not-sent),
-:meth:`StateStore.release_send_slot` (daemon partial-close) and
+:meth:`StateStore.void_prepared_send` (definite not-sent) and
 :meth:`StateStore.resolve_send` (operator terminal review). :meth:`StateStore.mark_completed`
 only records cycle completion counters — it never releases pending.
 
@@ -95,9 +97,11 @@ already has the columns upgrades cleanly. The step, the ``PRAGMA user_version=2`
 ``schema_version`` audit row commit in **one transaction**: a failing step rolls back whole, the
 store refuses to open with a recoverable :class:`StateError`, and the file stays usable at its
 original version with every history row intact. At F17, fresh databases initialized directly at
-v2; current fresh databases initialize at v4, and older databases upgrade in place. A
-``user_version > SCHEMA_VERSION`` is refused (fail closed). Migrations never rewrite send, budget
-or campaign rows.
+v2; current fresh databases initialize at v7, and older databases upgrade in place. A
+``user_version > SCHEMA_VERSION`` is refused (fail closed). The 5 → 6 migration does not infer
+campaign ownership from mutable file rows; 6 → 7 records immutable per-send ownership. Legacy
+attempts compatible with a persisted campaign approval stay unknown until explicit operator
+resolution; campaign totals are reconciled monotonically only after ownership is established.
 
 **M3 (schema v3):** the `onboarding` table stores scope/version/safety digests, explicit
 operator confirmations, automatic-link consent, and pause state. The `2 → 3` migration adds
@@ -105,6 +109,11 @@ the table without changing any existing row.
 
 **M5.1 (schema v4):** empty dashboard-account and dashboard-session tables are added by the
 `3 → 4` migration. Existing installs never inherit an account or session.
+
+**Trailing budgets (schema v5):** the `4 → 5` migration adds timestamped reservation
+counts, recovers debt from send history, and retains anonymous legacy counter debt
+conservatively from upgrade time. Release/void paths never refund rolling reservations;
+new reservations and send intents commit together under ``BEGIN IMMEDIATE``.
 
 F9 (also schema v1, unshipped — no released image exists): the per-cycle budget window_key is
 made durable-unique. :meth:`StateStore.begin_cycle` allocates ``<label>-<run_id>-<seq>`` window
@@ -118,26 +127,30 @@ shape; completed per-cycle rows beyond :data:`BUDGET_CYCLE_RETENTION` are pruned
 ``indeterminate_write → waiting → planned → prepared_not_sent → request_may_have_been_sent``,
 so a held row can reach a re-submittable state **only via the operator's explicit
 ``waiting``/``planned`` decisions**. The daemon **never initiates** that chain from
-``indeterminate_write``/``conflict``/``partial`` — those rows are verified/held, and the only
-daemon-side release is the past-deadline partial close. Closing a live-held terminal row is an
-operator action (``resolve_send``, M7 CLI). **M7's CLI must not expose a "reset to planned"
-for a sent row**: a ``request_may_have_been_sent``/``indeterminate_write`` row is never
+``indeterminate_write``/``conflict``/``partial`` — those rows are verified/held, and terminal
+partial or contradictory inspections keep their reservation for explicit operator resolution.
+Closing a live-held terminal row is an operator action (``resolve_send``, M7 CLI).
+**M7's CLI must not expose a "reset to planned" for a sent row**:
+a ``request_may_have_been_sent``/``indeterminate_write`` row is never
 rewound to ``planned`` directly, and resolving a sent row keeps the *same* request
-fingerprint refused while the row is live; re-plan is allowed only as a **fresh**
-``request_fingerprint`` (dedup covers active outcomes only).
+fingerprint refused permanently; re-plan is allowed only as a **fresh**
+``request_fingerprint`` (dedup retains every possibly-delivered outcome, including
+operator-resolved rows).
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import sqlite3
 import sys
+import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -145,6 +158,7 @@ from typing import Any, Final, Literal, ParamSpec, TypeVar, cast
 
 from .errors import LinkerError
 from .linking import SendOutcome, VerificationVerdict
+from .logging_setup import redact
 
 # Platform shim for the OS advisory apply lock (the F5 ownership fence). The kernel
 # releases an advisory lock when the owning process exits, so a crash frees it; a meta
@@ -174,12 +188,15 @@ else:
 
 _O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
-SCHEMA_VERSION: Final[int] = 4
+SCHEMA_VERSION: Final[int] = 7
+MAPPING_RESOLVED_ID_COUNT: Final[int] = 2  # AniDB episode ID, Shoko episode ID
+META_MAPPING_TARGET_QUARANTINE_PREFIX: Final[str] = "file_mapping_quarantine:v1:"
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
 GLOBAL_BUDGET_KEY: Final[str] = "_global"
 MAX_DETAIL_CHARS: Final[int] = 1000
 DIGEST_HEX_CHARS: Final[int] = 64
 TARGET_TRIPLE_LEN: Final[int] = 3
+ANIDB_IDENTITY_FIELDS: Final[int] = 4
 MAX_ONBOARDING_JSON_CHARS: Final[int] = 100_000
 MAX_SERVICE_RATE_JSON_CHARS: Final[int] = 4096
 MAX_DASHBOARD_USERNAME_CHARS: Final[int] = 64
@@ -219,15 +236,23 @@ META_BUDGET_SEQ: Final[str] = "budget_cycle_seq"
 BUDGET_CYCLE_RETENTION: Final[int] = 64
 META_LAST_CYCLE_START_ISO: Final[str] = "last_cycle_start_iso"
 META_LAST_CYCLE_END_ISO: Final[str] = "last_cycle_end_iso"
+META_LAST_DISCOVERY_EXCLUSIONS: Final[str] = "last_discovery_exclusions:v1"
 META_NEXT_CYCLE_DUE_ISO: Final[str] = "next_cycle_due_iso"
 META_LAST_FULL_RECONCILE_ISO: Final[str] = "last_full_reconcile_iso"
 META_NEXT_FULL_RECONCILE_ISO: Final[str] = "next_full_reconcile_iso"
 META_SERVICE_CANARY_FILE_ID: Final[str] = "service_canary_file_id"
 META_SERVICE_CANARY_STATUS: Final[str] = "service_canary_status"
 META_SERVICE_CANARY_UPDATED_ISO: Final[str] = "service_canary_updated_iso"
+META_SERVICE_CANARY_SEND_ID: Final[str] = "service_canary_send_id"
+META_RECOVERY_CURSOR: Final[str] = "recovery_cursor:v1"
 META_SERVICE_RATE_STATE: Final[str] = "service_rate_state"
+META_SONARR_INVENTORY_MANIFEST: Final[str] = "sonarr_inventory_manifest:v1"
+META_SONARR_INVENTORY_CURSOR: Final[str] = "sonarr_inventory_cursor:v1"
+META_SONARR_INVENTORY_SWEEP: Final[str] = "sonarr_inventory_sweep:v1"
+META_SONARR_INVENTORY_FRAGMENT_PREFIX: Final[str] = "sonarr_inventory_fragment:v1:"
 META_SERVICE_MAPPING_DRIFT_PREFIX: Final[str] = "service_mapping_drift:"
-SERVICE_MAPPING_DRIFT_SCHEMA: Final[str] = "shoko-sonarr-linker/mapping-drift/1"
+SERVICE_MAPPING_DRIFT_SCHEMA_V1: Final[str] = "shoko-sonarr-linker/mapping-drift/1"
+SERVICE_MAPPING_DRIFT_SCHEMA: Final[str] = "shoko-sonarr-linker/mapping-drift/2"
 META_ATTESTATION_GATE: Final[str] = "attestation_gate"
 #: Per-campaign attestation gate bookkeeping key prefix (F8: campaign-scope lease
 #: transitions are tracked per campaign, never as the global daemon write pause).
@@ -251,9 +276,13 @@ _SYNC_NAMES: Final[Mapping[int, str]] = {0: "off", 1: "normal", 2: "full", 3: "e
 
 OUTCOME_PREPARED: Final[str] = "prepared"
 OUTCOME_ATTEMPTED: Final[str] = "attempted"
+OUTCOME_INSPECTED_REVIEW: Final[str] = "inspected_review"
 OUTCOME_VOIDED: Final[str] = "voided"
 OUTCOME_VERIFIED: Final[str] = "verified"
 OUTCOME_RESOLVED: Final[str] = "resolved"
+CAMPAIGN_OWNERSHIP_CAMPAIGN: Final[str] = "campaign"
+CAMPAIGN_OWNERSHIP_NON_CAMPAIGN: Final[str] = "non_campaign"
+CAMPAIGN_OWNERSHIP_UNKNOWN: Final[str] = "unknown"
 ACTIVE_SEND_OUTCOMES: Final[frozenset[str]] = frozenset(
     {OUTCOME_PREPARED, OUTCOME_ATTEMPTED, SendOutcome.ACCEPTED_UNVERIFIED.value}
 )
@@ -266,10 +295,9 @@ LIVE_SEND_OUTCOMES: Final[frozenset[str]] = ACTIVE_SEND_OUTCOMES | {
 CLOSED_SEND_OUTCOMES: Final[frozenset[str]] = frozenset(
     {OUTCOME_VOIDED, OUTCOME_VERIFIED, OUTCOME_RESOLVED}
 )
-# Resolve-gate (round-2 review F2): only terminal-review delivery states are operator-closable.
-RESOLVE_LEGAL_OUTCOMES: Final[frozenset[str]] = frozenset(
-    {SendOutcome.ACCEPTED_UNVERIFIED.value, SendOutcome.AMBIGUOUS_SEND.value}
-)
+# Resolve-gate (round-2 review F2): only a durable, identity-qualified terminal inspection is
+# operator-closable. An uninspected attempted/accepted/ambiguous send remains held.
+RESOLVE_LEGAL_OUTCOMES: Final[frozenset[str]] = frozenset({OUTCOME_INSPECTED_REVIEW})
 
 _RECOVERY_HOLD_INSTRUCTION: Final[str] = (
     "possible delivery: verify with GET File/{id}?include=XRefs (M5 verify_link) and "
@@ -282,6 +310,14 @@ _RECOVERY_REPLAN_INSTRUCTION: Final[str] = (
 
 class StateError(LinkerError):
     """The state store was asked something it must refuse (bad key, bad fingerprint)."""
+
+
+class CampaignSendRefusedError(StateError):
+    """A campaign safety recheck definitively refused a not-yet-attempted request."""
+
+
+class CampaignSubmissionLimitError(CampaignSendRefusedError):
+    """A campaign's durable attempted-send ceiling refused a prepared request."""
 
 
 class TransitionError(StateError):
@@ -333,6 +369,41 @@ class FileState(Enum):
     PARTIAL = "partial"
     INDETERMINATE_WRITE = "indeterminate_write"
     BLOCKED_SAFETY = "blocked_safety"
+
+
+# Ordinary status presents every persisted file in exactly one actionable group.
+# REQUEST_MAY_HAVE_BEEN_SENT is recoverable through the durable verification/hold path,
+# so it remains waiting; partial and indeterminate results are surfaced for review.
+_SERVICE_WAITING_FILE_STATES: Final[frozenset[FileState]] = frozenset(
+    {
+        FileState.DISCOVERED,
+        FileState.MATCHED,
+        FileState.MAPPED,
+        FileState.PLANNED,
+        FileState.PREPARED_NOT_SENT,
+        FileState.REQUEST_MAY_HAVE_BEEN_SENT,
+        FileState.VERIFYING,
+        FileState.WAITING,
+    }
+)
+_SERVICE_REVIEW_FILE_STATES: Final[frozenset[FileState]] = frozenset(
+    {
+        FileState.AMBIGUOUS,
+        FileState.CONFLICT,
+        FileState.PARTIAL,
+        FileState.INDETERMINATE_WRITE,
+        FileState.BLOCKED_SAFETY,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ServiceFileCounts:
+    """Persisted-file counts for the ordinary dashboard and ``status`` command."""
+
+    verified_files: int
+    waiting_files: int
+    review_files: int
 
 
 class Cohort(Enum):
@@ -582,7 +653,7 @@ class FileRecord:
 
 @dataclass(frozen=True)
 class ServiceMappingDrift:
-    """Persistent review marker for a verified Shoko file whose mapping generation changed."""
+    """Persistent review marker for a verified Shoko file whose mapping identity changed."""
 
     shoko_file_id: int
     previous_targets_digest: str | None
@@ -591,6 +662,7 @@ class ServiceMappingDrift:
     active_structure_digest: str
     mapping_revision: str
     detected_iso: str
+    reason: str = "mapping_drift_details_unavailable"
 
 
 @dataclass(frozen=True)
@@ -646,6 +718,8 @@ class BudgetLimits:
     per_cycle_new: int
     rolling_new: int
     rolling_window_hours: float
+    # Independent (reservation cap, trailing hours) ceilings over the same ledger.
+    additional_rolling_limits: tuple[tuple[int, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -693,6 +767,72 @@ class BudgetView:
     pending_episode_jobs: int
     paused_reason: str | None
     completed_submissions: int = 0
+    reservation_events: tuple[tuple[float, int], ...] | None = None
+
+    def rolling_count(self, limits: BudgetLimits, now_iso: str) -> int:
+        """Reservations in (now - window, now], including future clock-skew debt."""
+        cutoff = (_parse_iso(now_iso) - timedelta(hours=limits.rolling_window_hours)).timestamp()
+        if self.reservation_events is not None:
+            return sum(count for stamp, count in self.reservation_events if stamp > cutoff)
+        # Compatibility for callers constructing a historical counter-only view.
+        start = self.rolling_window_start_iso
+        return (
+            self.rolling_new_submissions
+            if start is None or _parse_iso(start).timestamp() > cutoff
+            else 0
+        )
+
+    def rolling_exhausted(self, limits: BudgetLimits, now_iso: str) -> bool:
+        """Every configured and immutable rolling ceiling must have headroom."""
+        return any(
+            self.rolling_count(replace(limits, rolling_window_hours=hours), now_iso) >= cap
+            for cap, hours in (
+                (limits.rolling_new, limits.rolling_window_hours),
+                *limits.additional_rolling_limits,
+            )
+        )
+
+    def rolling_retry_iso(self, limits: BudgetLimits, now_iso: str) -> str | None:
+        """Wait until ALL trailing ceilings leave room, not merely the shortest one."""
+        retries = [
+            retry
+            for cap, hours in (
+                (limits.rolling_new, limits.rolling_window_hours),
+                *limits.additional_rolling_limits,
+            )
+            if (
+                retry := self._window_retry_iso(
+                    replace(limits, rolling_new=cap, rolling_window_hours=hours), now_iso
+                )
+            )
+            is not None
+        ]
+        return max(retries, key=_parse_iso) if retries else None
+
+    def _window_retry_iso(self, limits: BudgetLimits, now_iso: str) -> str | None:
+        """First expiry leaving room for one reservation, even after a cap reduction."""
+        count = self.rolling_count(limits, now_iso)
+        if count < limits.rolling_new:
+            return None
+        events = self.reservation_events
+        if events is None:
+            start = self.rolling_window_start_iso
+            return (
+                None
+                if start is None
+                else (_parse_iso(start) + timedelta(hours=limits.rolling_window_hours)).isoformat()
+            )
+        cutoff = (_parse_iso(now_iso) - timedelta(hours=limits.rolling_window_hours)).timestamp()
+        for stamp, weight in events:
+            if stamp <= cutoff:
+                continue
+            count -= weight
+            if count < limits.rolling_new:
+                return (
+                    datetime.fromtimestamp(stamp, UTC)
+                    + timedelta(hours=limits.rolling_window_hours)
+                ).isoformat()
+        return None
 
 
 @dataclass(frozen=True)
@@ -778,6 +918,7 @@ class CampaignBinding:
 
 CAMPAIGN_STATUS_APPROVED: Final[str] = "approved"
 CAMPAIGN_BINDING_FIELDS: Final[int] = 3
+_LEGACY_CAMPAIGN_SNAPSHOT_FIELDS: Final[int] = 7
 CAMPAIGN_PLAN_PATH_COLUMN: Final[int] = 12
 CAMPAIGN_DRAIN_AUTHORIZED_ISO_COLUMN: Final[int] = 13
 CAMPAIGN_DRAIN_AUTHORIZED_DIGEST_COLUMN: Final[int] = 14
@@ -978,6 +1119,11 @@ CREATE TABLE sends (
     shoko_file_id INTEGER NOT NULL REFERENCES files (shoko_file_id),
     request_fingerprint TEXT NOT NULL,
     plan_fingerprint TEXT NOT NULL,
+    campaign_id TEXT,
+    campaign_ownership TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (campaign_ownership IN ('campaign', 'non_campaign', 'unknown')),
+    campaign_ownership_resolved_iso TEXT,
+    campaign_ownership_note TEXT NOT NULL DEFAULT '',
     attempted_iso TEXT NOT NULL,
     http_status INTEGER,
     outcome TEXT NOT NULL,
@@ -1049,11 +1195,29 @@ CREATE INDEX idx_files_cohort ON files (cohort);
 CREATE INDEX idx_files_campaign ON files (campaign_id);
 CREATE INDEX idx_files_path ON files (sonarr_path);
 CREATE INDEX idx_files_series_file ON files (sonarr_series_id, sonarr_file_id);
+CREATE TABLE budget_reservations (
+    reserved_epoch REAL PRIMARY KEY,
+    reservations INTEGER NOT NULL CHECK (reservations > 0)
+);
 CREATE INDEX idx_sends_request_fingerprint ON sends (request_fingerprint);
 CREATE INDEX idx_sends_file ON sends (shoko_file_id);
 CREATE INDEX idx_baseline_files_identity ON baseline_files (sonarr_series_id, sonarr_file_id);
 CREATE INDEX idx_dashboard_sessions_expiry ON dashboard_sessions (expires_epoch);
 """
+
+
+def _execute_schema_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Execute schema DDL one statement at a time without leaving its transaction."""
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.DatabaseError("schema SQL contains an incomplete statement")
+
 
 #: The three campaigns columns that distinguish v2 from v1 (column name → ADD COLUMN DDL;
 #: kept in sync with the tail of ``campaigns`` in ``_SCHEMA_SQL``).
@@ -1151,14 +1315,441 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
         raise sqlite3.DatabaseError("dashboard sessions must not be inherited during migration")
 
 
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Recover timestamped send debt, conservatively retaining untraceable reservations.
+
+    Old fixed counters can include anonymous reservations with no timestamp. Keep that
+    excess for a full window from upgrade; never forgive recent sends at an old boundary.
+    All sends (including rejected/voided) represent consumed reservations, not refunds.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS budget_reservations (reserved_epoch REAL PRIMARY KEY,"
+        " reservations INTEGER NOT NULL CHECK (reservations > 0))"
+    )
+    if conn.execute("SELECT 1 FROM budget_reservations LIMIT 1").fetchone() is not None:
+        raise sqlite3.DatabaseError("unexpected preexisting reservation history during upgrade")
+    stamps = [
+        _parse_iso(str(row[0])).timestamp()
+        for row in conn.execute("SELECT attempted_iso FROM sends")
+    ]
+    for stamp in stamps:
+        conn.execute(
+            "INSERT INTO budget_reservations VALUES (?, 1) ON CONFLICT (reserved_epoch)"
+            " DO UPDATE SET reservations = reservations + 1",
+            (stamp,),
+        )
+    row = conn.execute(
+        "SELECT rolling_new_submissions, rolling_window_start_iso"
+        " FROM budgets WHERE window_key = ?",
+        (GLOBAL_BUDGET_KEY,),
+    ).fetchone()
+    if row is not None:
+        start = _parse_iso(str(row[1])).timestamp() if row[1] is not None else float("-inf")
+        debt = max(0, int(row[0] or 0) - sum(stamp >= start for stamp in stamps))
+        if debt:
+            conn.execute(
+                "INSERT INTO budget_reservations VALUES (?, ?) ON CONFLICT (reserved_epoch)"
+                " DO UPDATE SET reservations = reservations + excluded.reservations",
+                (datetime.now(UTC).timestamp(), debt),
+            )
+
+
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """Keep v5→v6 data intact; ownership-safe counter recovery is performed in v7.
+
+    Counting through ``files.campaign_id`` is unsafe because rebinding a file can retroactively
+    move old sends between campaigns. The v7 migration can use durable approved binding snapshots
+    and event times to identify possible owners, but matching fingerprints alone is not proof of
+    campaign ownership.
+    """
+
+
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """Persist send ownership and conservatively backfill legacy ledger rows.
+
+    A campaign whose approved file and approval/deadline window cover a send makes it a *possible*
+    owner, even if runtime fingerprints differ: pending-target materialization and unrelated
+    mapping refreshes can legitimately change those hashes. Therefore legacy attempted sends in
+    any such scope remain ``unknown`` for operator adjudication. A send is safely classified as
+    non-campaign only when every persisted campaign approval snapshot is valid and none covered
+    its file at the attempt time. Prepared and voided rows have no attempted-send debt and remain
+    unknown, so a legacy prepared row cannot be transported under inferred ownership after
+    upgrade.
+
+    This intentionally never consults the mutable ``files.campaign_id`` or a plan file path.
+    """
+    existing_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sends)")}
+    additions = (
+        ("campaign_id", "TEXT"),
+        (
+            "campaign_ownership",
+            "TEXT NOT NULL DEFAULT 'unknown' CHECK"
+            " (campaign_ownership IN ('campaign', 'non_campaign', 'unknown'))",
+        ),
+        ("campaign_ownership_resolved_iso", "TEXT"),
+        ("campaign_ownership_note", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, ddl in additions:
+        if name not in existing_columns:
+            conn.execute(f"ALTER TABLE sends ADD COLUMN {name} {ddl}")
+
+    campaign_rows = conn.execute(
+        "SELECT campaign_id, digest, attestation_scope, approval_iso, deadline_iso, created_iso,"
+        " plan_fingerprint_set FROM campaigns"
+    ).fetchall()
+    rows = conn.execute(
+        "SELECT send_id, shoko_file_id, plan_fingerprint, request_fingerprint, attempted_iso,"
+        " outcome FROM sends WHERE campaign_ownership = 'unknown'"
+    ).fetchall()
+    for send_id_raw, file_id_raw, plan_fp_raw, request_fp_raw, attempted_raw, outcome_raw in rows:
+        send_id = _as_int(send_id_raw, "send_id")
+        outcome = _as_str(outcome_raw, "send outcome")
+        if outcome in (OUTCOME_PREPARED, OUTCOME_VOIDED):
+            continue
+        possible_owners, snapshots_valid = _legacy_campaign_owner_candidates(
+            shoko_file_id=file_id_raw,
+            plan_fingerprint=plan_fp_raw,
+            request_fingerprint=request_fp_raw,
+            attempted_iso=attempted_raw,
+            campaign_rows=campaign_rows,
+        )
+        if snapshots_valid and not possible_owners:
+            conn.execute(
+                "UPDATE sends SET campaign_id = NULL, campaign_ownership = ? WHERE send_id = ?",
+                (CAMPAIGN_OWNERSHIP_NON_CAMPAIGN, send_id),
+            )
+        # Any eligible file/time overlap, invalid timestamp, or incomplete approval snapshot
+        # remains explicitly unknown; the durable hold prevents undercounted writes.
+
+    conn.execute(
+        "UPDATE campaigns SET total_sent = MAX(total_sent, ("
+        " SELECT COUNT(*) FROM sends s"
+        " WHERE s.campaign_ownership = 'campaign'"
+        " AND s.campaign_id = campaigns.campaign_id"
+        " AND s.outcome NOT IN ('prepared', 'voided')"
+        "))"
+    )
+
+
+def _ownership_timestamp(raw: Any) -> datetime | None:
+    """Parse a timezone-aware legacy ownership timestamp; missing/naive values are uncertain."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _legacy_campaign_owner_candidates(
+    *,
+    shoko_file_id: Any,
+    plan_fingerprint: Any,
+    request_fingerprint: Any,
+    attempted_iso: Any,
+    campaign_rows: Sequence[Any],
+) -> tuple[tuple[str, ...], bool]:
+    """Return possible owners and whether every persisted approval snapshot is valid.
+
+    Each campaign row is ``(id, approval digest, attestation scope, approval time, deadline,
+    created time, approved binding JSON)``. The routine is shared by migration and manual
+    resolution so neither path can use a looser file/time owner test. A campaign whose persisted
+    binding contains this file in its active approval window remains a possible owner regardless
+    of fingerprint equality; target identities are validated against its digest-bound plan.
+    """
+    event_at = _ownership_timestamp(attempted_iso)
+    if (
+        event_at is None
+        or isinstance(shoko_file_id, bool)
+        or not isinstance(shoko_file_id, int)
+        or shoko_file_id < 1
+        or not isinstance(plan_fingerprint, str)
+        or not isinstance(request_fingerprint, str)
+        or len(plan_fingerprint) != DIGEST_HEX_CHARS
+        or len(request_fingerprint) != DIGEST_HEX_CHARS
+        or any(char not in "0123456789abcdef" for char in plan_fingerprint + request_fingerprint)
+    ):
+        return (), False
+
+    possible_owners: list[str] = []
+    evidence_complete = True
+    for row in campaign_rows:
+        snapshot = _parse_legacy_campaign_snapshot(row)
+        if snapshot is None:
+            evidence_complete = False
+            continue
+        campaign_id, approved_at, deadline_at, bindings = snapshot
+        if approved_at > event_at or (deadline_at is not None and event_at > deadline_at):
+            continue
+        if any(binding[0] == shoko_file_id for binding in bindings):
+            possible_owners.append(campaign_id)
+
+    return tuple(sorted(set(possible_owners))), evidence_complete
+
+
+def _parse_legacy_campaign_snapshot(
+    row: Any,
+) -> tuple[str, datetime, datetime | None, tuple[tuple[int, str, str], ...]] | None:
+    """Validate a persisted campaign approval row before using it as ownership evidence."""
+    if len(row) != _LEGACY_CAMPAIGN_SNAPSHOT_FIELDS:
+        return None
+    campaign_id, digest, scope, approval_raw, deadline_raw, created_raw, bindings_raw = row
+    if (
+        not isinstance(campaign_id, str)
+        or not campaign_id.strip()
+        or not isinstance(digest, str)
+        or len(digest) != DIGEST_HEX_CHARS
+        or any(char not in "0123456789abcdef" for char in digest)
+        or scope != f"campaign:{campaign_id}"
+        or not isinstance(bindings_raw, str)
+    ):
+        return None
+    created_at = _ownership_timestamp(created_raw)
+    approved_at = _ownership_timestamp(approval_raw)
+    deadline_at = None if deadline_raw is None else _ownership_timestamp(deadline_raw)
+    if (
+        created_at is None
+        or approved_at is None
+        or (deadline_raw is not None and deadline_at is None)
+        or created_at > approved_at
+        or (deadline_at is not None and deadline_at < approved_at)
+    ):
+        return None
+    try:
+        bindings = json.loads(bindings_raw)
+    except (TypeError, ValueError):
+        bindings = None
+    if not isinstance(bindings, list):
+        return None
+    parsed: list[tuple[int, str, str]] = []
+    seen_file_ids: set[int] = set()
+    for item in bindings:
+        if not _valid_legacy_campaign_binding(item, seen_file_ids):
+            return None
+        seen_file_ids.add(item[0])
+        parsed.append((item[0], item[1], item[2]))
+    return campaign_id, approved_at, deadline_at, tuple(parsed)
+
+
+def _valid_legacy_campaign_binding(item: Any, seen_file_ids: set[int]) -> bool:
+    return (
+        isinstance(item, list)
+        and len(item) == CAMPAIGN_BINDING_FIELDS
+        and not isinstance(item[0], bool)
+        and isinstance(item[0], int)
+        and item[0] > 0
+        and item[0] not in seen_file_ids
+        and isinstance(item[1], str)
+        and isinstance(item[2], str)
+        and len(item[1]) == DIGEST_HEX_CHARS
+        and len(item[2]) == DIGEST_HEX_CHARS
+        and all(char in "0123456789abcdef" for char in item[1] + item[2])
+    )
+
+
+def _legacy_campaign_identity_scope_matches(
+    *,
+    campaign_id: str,
+    campaign_digest: Any,
+    plan_path: Any,
+    approved_bindings_raw: Any,
+    shoko_file_id: Any,
+    plan_fingerprint: Any,
+    request_fingerprint: Any,
+    target_ids_raw: Any,
+) -> bool:
+    """Validate persisted send targets against digest-bound approved targets.
+
+    The plan fingerprint is intentionally opaque. The approved campaign document supplies the
+    committed AniDB identities and (when already materialized) Shoko episode IDs; the send row
+    supplies its immutable target triples. Pending approved targets may acquire Shoko IDs later,
+    but their AniDB identity set must still match exactly. Missing target identities remain held:
+    exact request fingerprints cover Shoko episode IDs, not the AniDB targets that produced them.
+    """
+    approved_entry = _read_legacy_campaign_plan_entry(
+        campaign_id,
+        campaign_digest,
+        plan_path,
+        approved_bindings_raw,
+        shoko_file_id,
+    )
+    if approved_entry is None:
+        return False
+    approved_targets = _parse_legacy_approved_targets(approved_entry)
+    send_targets = _parse_legacy_send_targets(target_ids_raw)
+    if approved_targets is None or send_targets is None:
+        return False
+    approved_identities, approved_episode_ids = approved_targets
+    if len({(target[0], target[1]) for target in send_targets}) != len(send_targets):
+        return False
+    send_identities = {(anidb_id, episode_id) for anidb_id, episode_id, _ in send_targets}
+    if send_identities != approved_identities:
+        return False
+    episode_ids = tuple(sorted({shoko_id for _, _, shoko_id in send_targets}))
+    if approved_episode_ids and episode_ids != approved_episode_ids:
+        return False
+    return _legacy_request_fingerprint_matches(
+        shoko_file_id, plan_fingerprint, request_fingerprint, episode_ids
+    )
+
+
+def _read_legacy_campaign_plan_entry(
+    campaign_id: str,
+    campaign_digest: Any,
+    plan_path: Any,
+    approved_bindings_raw: Any,
+    shoko_file_id: Any,
+) -> Mapping[str, Any] | None:
+    """Read one approved file entry only from a plan matching its persisted approval digest."""
+    if (
+        not isinstance(campaign_digest, str)
+        or len(campaign_digest) != DIGEST_HEX_CHARS
+        or not isinstance(plan_path, str)
+        or not plan_path
+        or not isinstance(shoko_file_id, int)
+        or isinstance(shoko_file_id, bool)
+        or not isinstance(approved_bindings_raw, str)
+    ):
+        return None
+    try:
+        raw = Path(plan_path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != campaign_digest:
+            return None
+        document = json.loads(raw.decode("utf-8"))
+        bindings = json.loads(approved_bindings_raw)
+    except (OSError, UnicodeDecodeError, ValueError):
+        document = None
+        bindings = None
+    if (
+        not isinstance(document, dict)
+        or document.get("campaign_id") != campaign_id
+        or not isinstance(document.get("files"), list)
+        or not isinstance(bindings, list)
+    ):
+        return None
+    approved_bindings = [
+        item
+        for item in bindings
+        if isinstance(item, list)
+        and len(item) == CAMPAIGN_BINDING_FIELDS
+        and item[0] == shoko_file_id
+    ]
+    file_entries = [
+        item
+        for item in document["files"]
+        if isinstance(item, dict)
+        and not isinstance(item.get("shoko_file_id"), bool)
+        and item.get("shoko_file_id") == shoko_file_id
+    ]
+    if len(approved_bindings) != 1 or len(file_entries) != 1:
+        return None
+    binding, entry = approved_bindings[0], file_entries[0]
+    if (
+        not isinstance(binding[1], str)
+        or not isinstance(binding[2], str)
+        or entry.get("plan_fingerprint") != binding[1]
+        or entry.get("request_fingerprint") != binding[2]
+    ):
+        return None
+    return entry
+
+
+def _parse_legacy_approved_targets(
+    approved_entry: Mapping[str, Any],
+) -> tuple[frozenset[tuple[int, int]], tuple[int, ...]] | None:
+    identities_raw = approved_entry.get("anidb_target_identities")
+    episode_ids_raw = approved_entry.get("shoko_episode_ids")
+    if (
+        not isinstance(identities_raw, list)
+        or not identities_raw
+        or not isinstance(episode_ids_raw, list)
+    ):
+        return None
+    identities: set[tuple[int, int]] = set()
+    for identity in identities_raw:
+        if (
+            not isinstance(identity, list)
+            or len(identity) != ANIDB_IDENTITY_FIELDS
+            or isinstance(identity[0], bool)
+            or isinstance(identity[1], bool)
+            or isinstance(identity[3], bool)
+            or not isinstance(identity[0], int)
+            or not isinstance(identity[1], int)
+            or not isinstance(identity[2], str)
+            or not isinstance(identity[3], int)
+            or identity[3] <= 0
+        ):
+            return None
+        identities.add((identity[0], identity[3]))
+    if len(identities) != len(identities_raw):
+        return None
+    episode_ids: list[int] = []
+    for episode_id in episode_ids_raw:
+        if isinstance(episode_id, bool) or not isinstance(episode_id, int) or episode_id <= 0:
+            return None
+        episode_ids.append(episode_id)
+    if len(set(episode_ids)) != len(episode_ids):
+        return None
+    return frozenset(identities), tuple(sorted(episode_ids))
+
+
+def _parse_legacy_send_targets(raw: Any) -> tuple[tuple[int, int, int], ...] | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        targets_raw = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(targets_raw, list) or not targets_raw:
+        return None
+    targets: list[tuple[int, int, int]] = []
+    for target in targets_raw:
+        if (
+            not isinstance(target, list)
+            or len(target) != TARGET_TRIPLE_LEN
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in target
+            )
+        ):
+            return None
+        targets.append((target[0], target[1], target[2]))
+    if len(set(targets)) != len(targets):
+        return None
+    return tuple(targets)
+
+
+def _legacy_request_fingerprint_matches(
+    shoko_file_id: int,
+    plan_fingerprint: str,
+    request_fingerprint: str,
+    episode_ids: tuple[int, ...],
+) -> bool:
+    lines = (
+        "method|POST",
+        f"path|api/v3/File/{shoko_file_id}/Link",
+        f"body|{episode_ids}",
+        f"plan|{plan_fingerprint}",
+    )
+    actual = hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
+    return actual == request_fingerprint
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
-# v4 is current: 1→2 (F17), 2→3 (M3), and 3→4 (M5.1) upgrade in place.
+# v5 adds timestamped reservations; v6 preserves data without inferring campaign ownership.
+# v7 adds immutable send ownership, fail-closed legacy attribution, and monotonic attempt totals.
 # Future slices append entries here and bump SCHEMA_VERSION. Migrations never destroy
-# tables, never rewrite stored rows, and never run backwards.
+# tables, never rewrite send outcomes, and never run backwards.
 _MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
+    4: _migrate_v4_to_v5,
+    5: _migrate_v5_to_v6,
+    6: _migrate_v6_to_v7,
 }
 
 
@@ -1168,6 +1759,42 @@ def _parse_iso(raw: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _enable_wal_mode(connection: sqlite3.Connection) -> None:
+    """Set WAL mode, retrying first-open lock races within the configured bound."""
+    deadline = time.monotonic() + DEFAULT_BUSY_TIMEOUT_MS / 1000
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise sqlite3.OperationalError(
+                    f"could not enable SQLite WAL mode within {DEFAULT_BUSY_TIMEOUT_MS} ms"
+                )
+            # journal_mode changes may return SQLITE_BUSY without honoring busy_timeout. Use
+            # short bounded waits so a concurrent first opener can finish its mode transition.
+            timeout_ms = max(1, min(100, int(remaining * 1000)))
+            connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+            try:
+                row = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            except sqlite3.OperationalError as exc:
+                if not any(reason in str(exc).casefold() for reason in ("locked", "busy")):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise sqlite3.OperationalError(
+                        f"could not enable SQLite WAL mode within {DEFAULT_BUSY_TIMEOUT_MS} ms: "
+                        f"{exc}"
+                    ) from exc
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                continue
+            mode = str(row[0]).lower() if row else ""
+            if mode != "wal":
+                raise sqlite3.OperationalError(
+                    f"SQLite refused WAL mode (reported {mode or 'no mode'})"
+                )
+            return
+    finally:
+        connection.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
 
 
 def _require_hex64(value: str, name: str) -> None:
@@ -1187,7 +1814,7 @@ def _require_iso(value: str, name: str) -> None:
 
 
 def _clip(detail: str) -> str:
-    return detail[:MAX_DETAIL_CHARS]
+    return redact(detail)[:MAX_DETAIL_CHARS]
 
 
 def _encode_identity(snapshot: FileIdentitySnapshot | None) -> str | None:
@@ -1446,22 +2073,27 @@ class StateStore:
         self._apply_lock: ApplyProcessLock | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
-        if os.name != "nt":
-            try:
-                self.path.chmod(0o600)
-            except OSError as exc:
+        try:
+            if os.name != "nt":
+                try:
+                    self.path.chmod(0o600)
+                except OSError as exc:
+                    raise StateError("state database permissions could not be restricted") from exc
+            self._conn.isolation_level = None  # explicit transactions only
+            self._conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+            _enable_wal_mode(self._conn)
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._init_schema()
+            self._secure_database_permissions()
+            # Opening a handle is not an authorization to clear a global stop. The property
+            # re-reads the durable marker on each check; observe it here too so the local latch
+            # cannot later be cleared by another handle's operator recovery.
+            _ = self.writes_disabled
+        except BaseException:
+            with contextlib.suppress(Exception):
                 self._conn.close()
-                raise StateError("state database permissions could not be restricted") from exc
-        self._conn.isolation_level = None  # explicit transactions only
-        self._conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
-        self._secure_database_permissions()
-        if self.get_meta(META_WRITES_DISABLED) == "1":
-            self._writes_disabled = True
-            self._writes_reason = self.get_meta(META_WRITES_DISABLED_REASON) or "unspecified"
+            raise
 
     # ------------------------------------------------------------- lifecycle
 
@@ -1494,7 +2126,64 @@ class StateStore:
 
     @property
     def writes_disabled(self) -> bool:
-        return self._writes_disabled
+        if self._writes_disabled:
+            return True
+        try:
+            row = self._conn.execute(
+                "SELECT (SELECT value FROM meta WHERE key = ?),"
+                " (SELECT value FROM meta WHERE key = ?)",
+                (META_WRITES_DISABLED, META_WRITES_DISABLED_REASON),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            self._latch_writes_disabled(f"write-stop state cannot be read: {exc}")
+            return True
+        if row is None:
+            self._latch_writes_disabled("write-stop state cannot be read: no result")
+            return True
+        marker = row[0]
+        if marker is not None and not isinstance(marker, str):
+            self._latch_writes_disabled("write-stop marker is malformed")
+            return True
+        if marker is not None:
+            reason = row[1] if isinstance(row[1], str) else "unspecified"
+            self._latch_writes_disabled(reason or "unspecified")
+            return True
+        return False
+
+    def _latch_writes_disabled(self, reason: str) -> None:
+        """Irreversibly stop this handle before attempting any durable bookkeeping."""
+        self._writes_disabled = True
+        if not self._writes_reason:
+            self._writes_reason = _clip(reason) or "unspecified"
+
+    def _assert_writes_enabled_tx(self) -> None:
+        """Check the kill switch after BEGIN IMMEDIATE, against a fresh serialized snapshot."""
+        if self._writes_disabled:
+            raise WriteDisabledError(f"state writes are disabled: {self._writes_reason}")
+        try:
+            row = self._conn.execute(
+                "SELECT (SELECT value FROM meta WHERE key = ?),"
+                " (SELECT value FROM meta WHERE key = ?)",
+                (META_WRITES_DISABLED, META_WRITES_DISABLED_REASON),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            reason = f"write-stop state cannot be read: {exc}"
+            self._latch_writes_disabled(reason)
+            raise WriteDisabledError(f"state writes stopped: {reason}") from exc
+        if row is None:
+            reason = "write-stop state cannot be read: no result"
+            self._latch_writes_disabled(reason)
+            raise WriteDisabledError(f"state writes stopped: {reason}")
+        marker = row[0]
+        if marker is not None and not isinstance(marker, str):
+            reason = "write-stop marker is malformed"
+            self._latch_writes_disabled(reason)
+            raise WriteDisabledError(f"state writes stopped: {reason}")
+        if marker is not None:
+            reason = row[1] if isinstance(row[1], str) else "unspecified"
+            reason = reason or "unspecified"
+            self._latch_writes_disabled(reason)
+            raise WriteDisabledError(f"state writes are disabled: {reason}")
 
     def journal_mode(self) -> str:
         row = self._conn.execute("PRAGMA journal_mode").fetchone()
@@ -1516,76 +2205,158 @@ class StateStore:
         """Forward-only migration entry point: applies registered steps, never
         destroys data, and refuses to open a schema newer than this build."""
         version = self.schema_version()
+        if version == SCHEMA_VERSION:
+            return version
         if version > SCHEMA_VERSION:
             raise StateError(
                 f"schema version {version} is newer than supported {SCHEMA_VERSION}; "
                 "refusing to migrate backwards"
             )
-        while version < SCHEMA_VERSION:
-            step = _MIGRATIONS.get(version)
-            if step is None:
-                raise StateError(f"no forward migration registered from version {version}")
-            with self._transaction():
-                # F17: the step, the version bump and the audit row commit as ONE transaction.
-                # A failing step rolls the whole migration back — the file stays at its original
-                # version with every row intact, and the operator gets a recoverable StateError
-                # (fix the volume/cause, reopen: the migration runs again from the same start).
-                try:
-                    step(self._conn)
-                except sqlite3.Error as exc:
-                    raise StateError(
-                        f"migration from schema version {version} failed: {exc}; "
-                        f"state left at version {version} (no changes committed, data intact) "
-                        "— recoverable: fix the cause and reopen"
-                    ) from exc
-                version += 1
-                self._conn.execute(f"PRAGMA user_version={version}")
-                self._conn.execute(
-                    "INSERT INTO schema_version (version, applied_iso, description)"
-                    " VALUES (?, ?, ?)",
-                    (version, datetime.now(UTC).isoformat(), f"migrated from {version - 1}"),
-                )
-        return version
+        while True:
+            with self._schema_maintenance_transaction(busy_context="schema migration"):
+                version = self.schema_version()
+                if version == SCHEMA_VERSION:
+                    return version
+                self._migrate_step_locked(version)
+
+    def _migrate_step_locked(self, version: int) -> int:
+        """Apply one migration step while the caller holds the schema write transaction."""
+        if version > SCHEMA_VERSION:
+            raise StateError(
+                f"schema version {version} is newer than supported {SCHEMA_VERSION}; "
+                "refusing to migrate backwards"
+            )
+        step = _MIGRATIONS.get(version)
+        if step is None:
+            raise StateError(f"no forward migration registered from version {version}")
+        # The step, schema-version bump, and audit row share this transaction. A second opener
+        # re-reads the version after obtaining the lock, so it cannot repeat a stale decision.
+        try:
+            step(self._conn)
+        except sqlite3.Error as exc:
+            raise StateError(
+                f"migration from schema version {version} failed: {exc}; "
+                f"state left at version {version} (no changes committed, data intact) "
+                "— recoverable: fix the cause and reopen"
+            ) from exc
+        next_version = version + 1
+        self._conn.execute(f"PRAGMA user_version={next_version}")
+        self._conn.execute(
+            "INSERT INTO schema_version (version, applied_iso, description)" " VALUES (?, ?, ?)",
+            (next_version, datetime.now(UTC).isoformat(), f"migrated from {version}"),
+        )
+        return next_version
 
     def integrity_report(self) -> IntegrityReport:
         return integrity_check(self)
 
     def _init_schema(self) -> None:
         version = self.schema_version()
+        if version == SCHEMA_VERSION:
+            return
         if version > SCHEMA_VERSION:
             raise sqlite3.DatabaseError(
                 f"schema version {version} is newer than supported {SCHEMA_VERSION}"
             )
-        if version == SCHEMA_VERSION:
-            return
-        if version > 0:
-            # F17: an existing database from an older schema is upgraded IN PLACE through the
-            # forward-only registry — never deleted, recreated, or treated as current.
+        continue_migration = False
+        with self._schema_maintenance_transaction(
+            busy_context="schema initialization or migration"
+        ):
+            # The first read is a read-only fast path for the common current-schema open. For
+            # initialization/upgrades, re-read only after BEGIN IMMEDIATE: another constructor
+            # may have finished while this connection waited for the writer lock.
+            version = self.schema_version()
+            if version > SCHEMA_VERSION:
+                raise sqlite3.DatabaseError(
+                    f"schema version {version} is newer than supported {SCHEMA_VERSION}"
+                )
+            if version == SCHEMA_VERSION:
+                return
+            if version > 0:
+                self._migrate_step_locked(version)
+                continue_migration = version + 1 < SCHEMA_VERSION
+            else:
+                _execute_schema_statements(self._conn, _SCHEMA_SQL)
+                self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self._conn.execute(
+                    "INSERT INTO schema_version (version, applied_iso, description)"
+                    " VALUES (?, ?, ?)",
+                    (
+                        SCHEMA_VERSION,
+                        datetime.now(UTC).isoformat(),
+                        f"initial v{SCHEMA_VERSION} schema",
+                    ),
+                )
+        if continue_migration:
             self.migrate()
-            return
-        with self._transaction():
-            self._conn.executescript(_SCHEMA_SQL)
-            self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            self._conn.execute(
-                "INSERT INTO schema_version (version, applied_iso, description)"
-                " VALUES (?, ?, ?)",
-                (
-                    SCHEMA_VERSION,
-                    datetime.now(UTC).isoformat(),
-                    f"initial v{SCHEMA_VERSION} schema",
-                ),
-            )
+
+    def _begin_immediate_tx(self, busy_context: str | None) -> None:
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if busy_context is None or not any(
+                reason in str(exc).casefold() for reason in ("locked", "busy")
+            ):
+                raise
+            raise StateError(
+                f"{busy_context} could not acquire SQLite's write lock within "
+                f"{DEFAULT_BUSY_TIMEOUT_MS} ms: {exc}"
+            ) from exc
+
+    def _rollback_tx(self) -> None:
+        self._conn.rollback()
+
+    def _commit_tx(self) -> None:
+        try:
+            self._conn.commit()
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.rollback()
+            raise
 
     @contextlib.contextmanager
-    def _transaction(self) -> Iterator[None]:
-        """One explicit transaction: every multi-row mutation commits atomically."""
-        self._conn.execute("BEGIN IMMEDIATE")
+    def _schema_maintenance_transaction(self, *, busy_context: str | None = None) -> Iterator[None]:
+        """Serialize DDL and registered migrations without clearing the durable write stop.
+
+        This bypass is intentionally separate from ordinary state transactions and is used only
+        by schema initialization/migration. Once construction finishes, ``writes_disabled`` reads
+        and latches the unchanged marker; callers still need the operator recovery command to clear
+        it.
+        """
+        self._begin_immediate_tx(busy_context)
         try:
             yield
         except BaseException:
-            self._conn.rollback()
+            self._rollback_tx()
             raise
-        self._conn.commit()
+        self._commit_tx()
+
+    @contextlib.contextmanager
+    def _write_stop_control_transaction(self) -> Iterator[None]:
+        """Transaction reserved for persisting or clearing the stop marker itself."""
+        self._begin_immediate_tx(None)
+        try:
+            yield
+        except BaseException:
+            self._rollback_tx()
+            raise
+        self._commit_tx()
+
+    @contextlib.contextmanager
+    def _transaction(
+        self,
+        *,
+        busy_context: str | None = None,
+    ) -> Iterator[None]:
+        """One write-serialized transaction with a fresh, durable stop check by default."""
+        self._begin_immediate_tx(busy_context)
+        try:
+            self._assert_writes_enabled_tx()
+            yield
+        except BaseException:
+            self._rollback_tx()
+            raise
+        self._commit_tx()
 
     # ------------------------------------------------------------- meta
 
@@ -1595,16 +2366,268 @@ class StateStore:
 
     @_mutation
     def set_meta(self, key: str, value: str) -> None:
-        self._conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?)"
-            " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     @_mutation
     def clear_meta(self, key: str) -> None:
         """Delete one meta key (bounded terminal-state bookkeeping cleanup; no-op if absent)."""
-        self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        with self._transaction():
+            self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+    def load_sonarr_inventory_cache(
+        self,
+    ) -> tuple[str | None, int, frozenset[int], dict[int, str]]:
+        """Load resumable Sonarr child responses for one stable series-list manifest."""
+        manifest = self.get_meta(META_SONARR_INVENTORY_MANIFEST)
+        raw_cursor = self.get_meta(META_SONARR_INVENTORY_CURSOR)
+        raw_sweep = self.get_meta(META_SONARR_INVENTORY_SWEEP)
+        try:
+            cursor = max(0, int(raw_cursor or "0"))
+        except ValueError:
+            cursor = 0
+        try:
+            decoded_sweep = json.loads(raw_sweep or "[]")
+            if not isinstance(decoded_sweep, list) or any(
+                type(item) is not int or item <= 0 for item in decoded_sweep
+            ):
+                decoded_sweep = []
+        except ValueError:
+            decoded_sweep = []
+        rows = self._conn.execute(
+            "SELECT key, value FROM meta WHERE substr(key, 1, ?) = ? ORDER BY key",
+            (len(META_SONARR_INVENTORY_FRAGMENT_PREFIX), META_SONARR_INVENTORY_FRAGMENT_PREFIX),
+        )
+        fragments: dict[int, str] = {}
+        for row in rows:
+            raw_id = str(row[0])[len(META_SONARR_INVENTORY_FRAGMENT_PREFIX) :]
+            try:
+                series_id = int(raw_id)
+            except ValueError:
+                continue
+            if series_id > 0:
+                fragments[series_id] = _as_str(row[1], "meta.value")
+        return manifest, cursor, frozenset(decoded_sweep), fragments
+
+    @_mutation
+    def save_sonarr_inventory_cache(
+        self,
+        manifest_hash: str,
+        cursor: int,
+        swept_series_ids: Sequence[int],
+        fetched_fragments: Mapping[int, str],
+        *,
+        reset: bool = False,
+        invalidated_series_ids: Sequence[int] = (),
+    ) -> None:
+        """Atomically persist bounded progress, successful children, and invalidations."""
+        if not isinstance(manifest_hash, str) or len(manifest_hash) != DIGEST_HEX_CHARS:
+            raise StateError("Sonarr inventory manifest hash is invalid")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise StateError("Sonarr inventory cursor is invalid")
+        if any(
+            isinstance(series_id, bool) or not isinstance(series_id, int) or series_id <= 0
+            for series_id in (*swept_series_ids, *invalidated_series_ids)
+        ):
+            raise StateError("Sonarr inventory contains an invalid series id")
+        if any(
+            isinstance(series_id, bool)
+            or not isinstance(series_id, int)
+            or series_id <= 0
+            or not isinstance(encoded, str)
+            for series_id, encoded in fetched_fragments.items()
+        ):
+            raise StateError("Sonarr inventory cache contains an invalid fragment")
+        with self._transaction():
+            if reset:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE substr(key, 1, ?) = ?",
+                    (
+                        len(META_SONARR_INVENTORY_FRAGMENT_PREFIX),
+                        META_SONARR_INVENTORY_FRAGMENT_PREFIX,
+                    ),
+                )
+            for series_id in set(invalidated_series_ids):
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key = ?",
+                    (f"{META_SONARR_INVENTORY_FRAGMENT_PREFIX}{series_id}",),
+                )
+            for series_id, encoded in fetched_fragments.items():
+                self._set_meta_tx(f"{META_SONARR_INVENTORY_FRAGMENT_PREFIX}{series_id}", encoded)
+            self._set_meta_tx(META_SONARR_INVENTORY_MANIFEST, manifest_hash)
+            self._set_meta_tx(META_SONARR_INVENTORY_CURSOR, str(cursor))
+            self._set_meta_tx(
+                META_SONARR_INVENTORY_SWEEP,
+                json.dumps(sorted(set(swept_series_ids)), separators=(",", ":")),
+            )
+
+    @_mutation
+    def remember_mapping_targets_bulk(
+        self, files: Mapping[int, Mapping[str, tuple[int | None, int | None]]]
+    ) -> frozenset[int]:
+        """Compare/freeze source→AniDB identities and monotonically fill resolved IDs.
+
+        This versioned meta document predates a send intent: even a pending or
+        budget-deferred plan must retain its original targets across restart.
+        A mismatch never updates the original document. BEGIN IMMEDIATE fences
+        competing reconciliation processes; a crash cannot partially rebaseline it.
+        """
+        with self._transaction():
+            return frozenset(
+                file_id
+                for file_id, targets in files.items()
+                if not self._remember_mapping_targets_tx(file_id, targets)
+            )
+
+    def _remember_mapping_targets_tx(
+        self, file_id: int, targets: Mapping[str, tuple[int | None, int | None]]
+    ) -> bool:
+        if not targets or self.get_file(file_id) is None:
+            raise StateError("mapping targets require a tracked file and nonempty destinations")
+        if self.mapping_target_quarantined(file_id):
+            return False
+        key = f"file_mapping_targets:v1:{file_id}"
+        raw = self.get_meta(key)
+        current = {source: list(ids) for source, ids in targets.items()}
+        if raw is not None:
+            try:
+                previous = json.loads(raw)
+            except ValueError as exc:
+                raise StateError("persisted mapping targets are malformed") from exc
+            if not isinstance(previous, dict) or any(
+                not isinstance(ids, list)
+                or len(ids) != MAPPING_RESOLVED_ID_COUNT
+                or any(
+                    value is not None and (type(value) is not int or value <= 0) for value in ids
+                )
+                for ids in previous.values()
+            ):
+                raise StateError("persisted mapping targets are malformed")
+            if previous.keys() != current.keys():
+                return False
+            for source, ids in current.items():
+                for position, value in enumerate(ids):
+                    prior = previous[source][position]
+                    if prior is not None and value is not None and prior != value:
+                        return False
+                    if prior is not None:
+                        ids[position] = prior
+        encoded = json.dumps(current, sort_keys=True, separators=(",", ":"))
+        if encoded != raw:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (key, encoded),
+            )
+        return True
+
+    def unfrozen_mapping_target_files(self) -> frozenset[int]:
+        """Legacy retryable files with evidence of resolved targets but no snapshot.
+
+        WAITING alone is not resolution evidence. Drift reasons and send history
+        survive old retry paths, however, and must not be erased by rematching.
+        Includes durable quarantines even if a snapshot or detail was subsequently
+        changed. In-flight/verified rows retain their independent protection rules.
+        """
+        rows = self._conn.execute(
+            "SELECT f.shoko_file_id FROM files AS f"
+            " WHERE f.campaign_id IS NULL AND f.cohort != 'campaign'"
+            " AND f.state IN ('discovered', 'matched', 'mapped', 'planned',"
+            " 'waiting', 'ambiguous', 'conflict')"
+            " AND (EXISTS (SELECT 1 FROM meta WHERE key = ? || f.shoko_file_id)"
+            " OR (NOT EXISTS (SELECT 1 FROM meta WHERE"
+            " key = 'file_mapping_targets:v1:' || f.shoko_file_id)"
+            " AND (f.state IN ('mapped', 'planned')"
+            " OR f.state_detail IN ('mapping_drift', 'mapping_changed')"
+            " OR instr(f.state_detail, 'service_mapping_target_changed') = 1"
+            " OR f.plan_fingerprint IS NOT NULL OR f.request_fingerprint IS NOT NULL"
+            " OR f.mapping_targets_digest IS NOT NULL OR f.mapping_structure_digest IS NOT NULL"
+            " OR f.mapping_revision IS NOT NULL"
+            " OR EXISTS (SELECT 1 FROM sends WHERE shoko_file_id = f.shoko_file_id))))",
+            (META_MAPPING_TARGET_QUARANTINE_PREFIX,),
+        )
+        return frozenset(_as_int(row[0], "shoko_file_id") for row in rows)
+
+    def mapping_target_quarantined(self, file_id: int) -> bool:
+        """Quarantine is a durable safety fact, independent of lifecycle state/details."""
+        return self.get_meta(f"{META_MAPPING_TARGET_QUARANTINE_PREFIX}{file_id}") is not None
+
+    @_mutation
+    def quarantine_unfrozen_mapping_targets(self, *, iso: str) -> frozenset[int]:
+        """Atomically classify legacy evidence and latch every candidate for review."""
+        _require_iso(iso, "iso")
+        with self._transaction():
+            return self._quarantine_mapping_targets_tx(self.unfrozen_mapping_target_files(), iso)
+
+    @_mutation
+    def quarantine_mapping_targets(
+        self,
+        file_ids: Sequence[int],
+        *,
+        iso: str,
+        reason: str = "service_mapping_target_changed",
+    ) -> frozenset[int]:
+        """Latch frozen-target/source drift, including CONFLICT rows; never alter sent files."""
+        _require_iso(iso, "iso")
+        if not isinstance(reason, str) or not reason.strip():
+            raise StateError("mapping target quarantine reason is invalid")
+        with self._transaction():
+            return self._quarantine_mapping_targets_tx(file_ids, iso, reason.strip())
+
+    def _quarantine_mapping_targets_tx(
+        self, file_ids: Iterable[int], iso: str, reason: str = "service_mapping_target_changed"
+    ) -> frozenset[int]:
+        quarantined: set[int] = set()
+        for file_id in sorted(set(file_ids)):
+            record = self.get_file(file_id)
+            if (
+                record is None
+                or record.campaign_id is not None
+                or record.cohort is Cohort.CAMPAIGN
+                or record.state
+                not in (
+                    FileState.DISCOVERED,
+                    FileState.MATCHED,
+                    FileState.MAPPED,
+                    FileState.PLANNED,
+                    FileState.WAITING,
+                    FileState.AMBIGUOUS,
+                    FileState.CONFLICT,
+                )
+            ):
+                continue
+            if record.state is not FileState.CONFLICT:
+                validate_transition(record.state, FileState.CONFLICT)
+            key = f"{META_MAPPING_TARGET_QUARANTINE_PREFIX}{file_id}"
+            # Retain the original evidence. State/detail refresh is not a new
+            # quarantine and must not replace its initial audit record.
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                (
+                    key,
+                    json.dumps(
+                        {
+                            "state": record.state.value,
+                            "detail": _clip(record.state_detail),
+                            "detected_iso": iso,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            if record.state is not FileState.CONFLICT or record.state_detail != reason:
+                self._conn.execute(
+                    "UPDATE files SET state = 'conflict',"
+                    " state_detail = ?, updated_iso = ?"
+                    " WHERE shoko_file_id = ?",
+                    (reason, iso, file_id),
+                )
+            quarantined.add(file_id)
+        return frozenset(quarantined)
 
     # ---------------------------------------------------------- onboarding
 
@@ -1737,11 +2760,12 @@ class StateStore:
         _require_hex64(next_csrf_hash, "dashboard_session.next_csrf_hash")
         if isinstance(now_epoch, bool) or not isinstance(now_epoch, int):
             raise StateError("dashboard session clock must be an integer epoch")
-        cursor = self._conn.execute(
-            "UPDATE dashboard_sessions SET csrf_hash = ?"
-            " WHERE session_id_hash = ? AND csrf_hash = ? AND expires_epoch > ?",
-            (next_csrf_hash, session_id_hash, expected_csrf_hash, now_epoch),
-        )
+        with self._transaction():
+            cursor = self._conn.execute(
+                "UPDATE dashboard_sessions SET csrf_hash = ?"
+                " WHERE session_id_hash = ? AND csrf_hash = ? AND expires_epoch > ?",
+                (next_csrf_hash, session_id_hash, expected_csrf_hash, now_epoch),
+            )
         return cursor.rowcount == 1
 
     def get_service_rate_state_json(self) -> str | None:
@@ -1800,6 +2824,7 @@ class StateStore:
         active_structure_digest: str,
         mapping_revision: str,
         iso: str,
+        reason: str = "mapping_target_changed",
     ) -> ServiceMappingDrift:
         """Persist a verified file's changed mapping identity without changing its Shoko XRefs."""
         if (
@@ -1826,6 +2851,9 @@ class StateStore:
             raise StateError("service mapping drift revision must be non-empty text")
         if len(mapping_revision) > MAX_DETAIL_CHARS:
             raise StateError("service mapping drift revision is too long")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_DETAIL_CHARS:
+            raise StateError("service mapping drift reason must be non-empty bounded text")
+        reason = reason.strip()
         _require_iso(iso, "service_mapping_drift.detected_iso")
         key = f"{META_SERVICE_MAPPING_DRIFT_PREFIX}{shoko_file_id}"
         with self._transaction():
@@ -1843,6 +2871,15 @@ class StateStore:
                 )
                 previous_targets_digest = existing.previous_targets_digest
                 previous_structure_digest = existing.previous_structure_digest
+                if (
+                    existing.active_targets_digest == active_targets_digest
+                    and existing.active_structure_digest == active_structure_digest
+                    and existing.mapping_revision == mapping_revision.strip()
+                    and existing.reason == reason
+                ):
+                    # Repeated reconciliation of the same mapping change is idempotent; keep
+                    # the first durable detection time instead of rewriting the marker.
+                    return existing
             record = ServiceMappingDrift(
                 shoko_file_id=shoko_file_id,
                 previous_targets_digest=previous_targets_digest,
@@ -1851,6 +2888,7 @@ class StateStore:
                 active_structure_digest=active_structure_digest,
                 mapping_revision=mapping_revision.strip(),
                 detected_iso=iso,
+                reason=reason,
             )
             document = {
                 "schema": SERVICE_MAPPING_DRIFT_SCHEMA,
@@ -1861,6 +2899,7 @@ class StateStore:
                 "active_structure_digest": record.active_structure_digest,
                 "mapping_revision": record.mapping_revision,
                 "detected_iso": record.detected_iso,
+                "reason": record.reason,
             }
             encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
             if len(encoded) > MAX_DETAIL_CHARS:
@@ -1876,7 +2915,7 @@ class StateStore:
             document = json.loads(encoded)
         except (TypeError, ValueError):
             raise StateError("persisted service mapping drift is malformed") from None
-        expected = {
+        expected_v1 = {
             "schema",
             "shoko_file_id",
             "previous_targets_digest",
@@ -1886,10 +2925,13 @@ class StateStore:
             "mapping_revision",
             "detected_iso",
         }
+        expected_v2 = expected_v1 | {"reason"}
+        schema = document.get("schema") if isinstance(document, dict) else None
         if (
             not isinstance(document, dict)
-            or set(document) != expected
-            or document["schema"] != SERVICE_MAPPING_DRIFT_SCHEMA
+            or schema not in {SERVICE_MAPPING_DRIFT_SCHEMA_V1, SERVICE_MAPPING_DRIFT_SCHEMA}
+            or set(document)
+            != (expected_v1 if schema == SERVICE_MAPPING_DRIFT_SCHEMA_V1 else expected_v2)
             or isinstance(document["shoko_file_id"], bool)
             or not isinstance(document["shoko_file_id"], int)
             or document["shoko_file_id"] != file_id
@@ -1902,6 +2944,11 @@ class StateStore:
             active_structure = document["active_structure_digest"]
             revision = document["mapping_revision"]
             detected_iso = document["detected_iso"]
+            reason = (
+                "mapping_drift_details_unavailable"
+                if schema == SERVICE_MAPPING_DRIFT_SCHEMA_V1
+                else document["reason"]
+            )
             for name, digest, optional in (
                 ("previous_targets_digest", previous_targets, True),
                 ("active_targets_digest", active_targets, False),
@@ -1918,6 +2965,8 @@ class StateStore:
                     raise ValueError(f"{name} is invalid")
             if not isinstance(revision, str) or not revision or len(revision) > MAX_DETAIL_CHARS:
                 raise ValueError("mapping_revision is invalid")
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_DETAIL_CHARS:
+                raise ValueError("reason is invalid")
             if not isinstance(detected_iso, str):
                 raise ValueError("detected_iso is invalid")
             _require_iso(detected_iso, "service_mapping_drift.detected_iso")
@@ -1929,6 +2978,7 @@ class StateStore:
                 active_structure_digest=active_structure,
                 mapping_revision=revision,
                 detected_iso=detected_iso,
+                reason=reason,
             )
         except (TypeError, ValueError, StateError) as exc:
             raise StateError(
@@ -1956,7 +3006,9 @@ class StateStore:
         return file_id, raw_status
 
     @_mutation
-    def record_service_canary(self, shoko_file_id: int, iso: str) -> int:
+    def record_service_canary(
+        self, shoko_file_id: int, iso: str, *, send_id: int | None = None
+    ) -> int:
         """Durably designate exactly one first service submission; never replace its identity."""
         if (
             isinstance(shoko_file_id, bool)
@@ -1964,6 +3016,10 @@ class StateStore:
             or shoko_file_id < 1
         ):
             raise StateError("service canary file id must be a positive integer")
+        if send_id is not None and (
+            isinstance(send_id, bool) or not isinstance(send_id, int) or send_id < 1
+        ):
+            raise StateError("service canary send id must be a positive integer")
         _require_iso(iso, "service_canary.updated_iso")
         with self._transaction():
             existing = self._conn.execute(
@@ -1978,15 +3034,41 @@ class StateStore:
                 if existing_file_id < 1 or str(existing_file_id) != raw:
                     raise StateError("service canary file id is invalid")
                 return existing_file_id
-            self._conn.executemany(
-                "INSERT INTO meta (key, value) VALUES (?, ?)",
-                (
-                    (META_SERVICE_CANARY_FILE_ID, str(shoko_file_id)),
-                    (META_SERVICE_CANARY_STATUS, "pending"),
-                    (META_SERVICE_CANARY_UPDATED_ISO, iso),
-                ),
-            )
+            entries = [
+                (META_SERVICE_CANARY_FILE_ID, str(shoko_file_id)),
+                (META_SERVICE_CANARY_STATUS, "pending"),
+                (META_SERVICE_CANARY_UPDATED_ISO, iso),
+            ]
+            if send_id is not None:
+                send = self._conn.execute(
+                    "SELECT shoko_file_id FROM sends WHERE send_id = ?", (send_id,)
+                ).fetchone()
+                if send is None or _as_int(send[0], "shoko_file_id") != shoko_file_id:
+                    raise StateError("service canary send does not belong to its file")
+                entries.append((META_SERVICE_CANARY_SEND_ID, str(send_id)))
+            self._conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", entries)
         return shoko_file_id
+
+    def service_canary_send_outcomes(self) -> tuple[str, ...]:
+        """Return attempted outcomes since the durable canary send anchor, in send order."""
+        canary = self.get_service_canary()
+        if canary is None:
+            return ()
+        raw_send_id = self.get_meta(META_SERVICE_CANARY_SEND_ID)
+        if raw_send_id is None:
+            return ()
+        try:
+            send_id = int(raw_send_id)
+        except ValueError:
+            raise StateError("service canary send id is invalid") from None
+        if send_id < 1 or str(send_id) != raw_send_id:
+            raise StateError("service canary send id is invalid")
+        rows = self._conn.execute(
+            "SELECT outcome FROM sends WHERE shoko_file_id = ? AND send_id >= ?"
+            " AND attempted_iso IS NOT NULL ORDER BY send_id",
+            (canary[0], send_id),
+        ).fetchall()
+        return tuple(_as_str(row[0], "send.outcome") for row in rows)
 
     @_mutation
     def set_service_canary_status(self, status: Literal["verified", "failed"], iso: str) -> None:
@@ -2075,13 +3157,14 @@ class StateStore:
                 (int(paused), _clip(reason), iso),
             )
 
-    @_mutation
     def disable_writes(self, reason: str) -> None:
         """Stop writes (fail closed). Persistence is best-effort; the in-memory stop is
         authoritative — there is no in-memory submission tracking fallback."""
-        self._writes_disabled = True
-        self._writes_reason = _clip(reason)
-        with contextlib.suppress(sqlite3.DatabaseError), self._transaction():
+        self._latch_writes_disabled(reason)
+        with (
+            contextlib.suppress(sqlite3.DatabaseError),
+            self._write_stop_control_transaction(),
+        ):
             self._conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, '1')"
                 " ON CONFLICT (key) DO UPDATE SET value = '1'",
@@ -2103,7 +3186,7 @@ class StateStore:
         self._writes_disabled = False
         self._writes_reason = ""
         try:
-            with self._transaction():
+            with self._write_stop_control_transaction():
                 self._conn.execute("DELETE FROM meta WHERE key = ?", (META_WRITES_DISABLED,))
                 self._conn.execute("DELETE FROM meta WHERE key = ?", (META_WRITES_DISABLED_REASON,))
         except sqlite3.DatabaseError as exc:
@@ -2203,6 +3286,36 @@ class StateStore:
         """Indexed by ``idx_files_state``; deterministic order by id."""
         rows = self._conn.execute(_SQL_FILES_BY_STATE, (state.value,)).fetchall()
         return tuple(_row_to_file_record(row) for row in rows)
+
+    def service_file_counts(self) -> ServiceFileCounts:
+        """Classify all persisted files for ordinary status without remote access."""
+        verified_states = frozenset({FileState.VERIFIED})
+        classified_states = (
+            _SERVICE_WAITING_FILE_STATES | _SERVICE_REVIEW_FILE_STATES | verified_states
+        )
+        if (
+            _SERVICE_WAITING_FILE_STATES & _SERVICE_REVIEW_FILE_STATES
+            or _SERVICE_WAITING_FILE_STATES & verified_states
+            or _SERVICE_REVIEW_FILE_STATES & verified_states
+            or classified_states != frozenset(FileState)
+        ):
+            raise StateError(
+                "ordinary status file-state classification is incomplete or overlapping"
+            )
+        rows = self._conn.execute("SELECT state, COUNT(*) FROM files GROUP BY state").fetchall()
+        counts: dict[FileState, int] = {}
+        for raw_state, raw_count in rows:
+            value = _as_str(raw_state, "file state")
+            try:
+                state = FileState(value)
+            except ValueError as exc:
+                raise StateError(f"file state {value!r} is unsupported") from exc
+            counts[state] = _as_int(raw_count, "file count")
+        return ServiceFileCounts(
+            verified_files=counts.get(FileState.VERIFIED, 0),
+            waiting_files=sum(counts.get(state, 0) for state in _SERVICE_WAITING_FILE_STATES),
+            review_files=sum(counts.get(state, 0) for state in _SERVICE_REVIEW_FILE_STATES),
+        )
 
     def files_in_cohort(self, cohort: Cohort) -> tuple[FileRecord, ...]:
         """Indexed by ``idx_files_cohort``; deterministic order by id."""
@@ -2452,6 +3565,7 @@ class StateStore:
                 pending_episode_jobs=0,
                 paused_reason=None,
                 completed_submissions=_cycle_completed(cycle_row),
+                reservation_events=self._reservation_events(),
             )
         return BudgetView(
             window_key=cycle_key,
@@ -2462,6 +3576,16 @@ class StateStore:
             pending_episode_jobs=_as_int(global_row[3], "pending_episode_jobs"),
             paused_reason=_as_optional_str(global_row[4]),
             completed_submissions=_cycle_completed(cycle_row),
+            reservation_events=self._reservation_events(),
+        )
+
+    def _reservation_events(self) -> tuple[tuple[float, int], ...]:
+        return tuple(
+            (float(row[0]), int(row[1]))
+            for row in self._conn.execute(
+                "SELECT reserved_epoch, reservations FROM budget_reservations"
+                " ORDER BY reserved_epoch"
+            )
         )
 
     def _ensure_global_budget_tx(self) -> None:
@@ -2581,14 +3705,13 @@ class StateStore:
         )
         if paused and not (campaign and (daemon_attestation_pause or daemon_mapping_churn_pause)):
             return BudgetRefusal(False, "paused", f"writes paused: {paused}")
-        rolling = _as_int(global_row[0], "rolling_new_submissions")
-        rolling_start = _as_optional_str(global_row[1])
-        now = _parse_iso(iso)
-        if rolling_start is None or now - _parse_iso(rolling_start) >= timedelta(
-            hours=limits.rolling_window_hours
-        ):
-            rolling = 0
-            rolling_start = iso
+        events = self._reservation_events()
+        cutoff = (_parse_iso(iso) - timedelta(hours=limits.rolling_window_hours)).timestamp()
+        active_events = [(stamp, count) for stamp, count in events if stamp > cutoff]
+        rolling = sum(count for _, count in active_events)
+        rolling_start = (
+            datetime.fromtimestamp(active_events[0][0], UTC).isoformat() if active_events else iso
+        )
         cycle_row = self._conn.execute(
             "SELECT cycle_new_submissions FROM budgets WHERE window_key = ?",
             (cycle_key,),
@@ -2604,6 +3727,8 @@ class StateStore:
             pending_jobs=pending_jobs,
             expected_episode_jobs=expected_episode_jobs,
         )
+        if refusal is None:
+            refusal = self._additional_rolling_refusal(limits, events, iso)
         if refusal is not None:
             # P3d: persist the refusal reason marker alongside the counters.
             self._set_meta_tx(
@@ -2612,6 +3737,11 @@ class StateStore:
             )
             return refusal
         rolling += 1
+        self._conn.execute(
+            "INSERT INTO budget_reservations VALUES (?, 1) ON CONFLICT (reserved_epoch)"
+            " DO UPDATE SET reservations = reservations + 1",
+            (_parse_iso(iso).timestamp(),),
+        )
         cycle_new += 1
         pending_files += 1
         pending_jobs += expected_episode_jobs
@@ -2635,6 +3765,19 @@ class StateStore:
             pending_file_requests=pending_files,
             pending_episode_jobs=pending_jobs,
         )
+
+    @staticmethod
+    def _additional_rolling_refusal(
+        limits: BudgetLimits, events: tuple[tuple[float, int], ...], iso: str
+    ) -> BudgetRefusal | None:
+        for cap, hours in limits.additional_rolling_limits:
+            cutoff = (_parse_iso(iso) - timedelta(hours=hours)).timestamp()
+            count = sum(weight for stamp, weight in events if stamp > cutoff)
+            if count >= cap:
+                return BudgetRefusal(
+                    False, "rolling_new_exhausted", f"{count} reservations in {hours}h (max {cap})"
+                )
+        return None
 
     @staticmethod
     def _limit_refusal(
@@ -2687,7 +3830,7 @@ class StateStore:
         """Release an anonymous slot reserved by :meth:`try_reserve_slot` (no send row).
 
         Send-bound slots are owned by the single-release funnels (``record_verification``,
-        ``record_send_outcome``, ``void_prepared_send``, ``resolve_send``, partial-close),
+        ``record_send_outcome``, ``void_prepared_send``, ``resolve_send``),
         which mark the send row ``slot_released``. A raw release here that would drive
         ``pending`` below the live unreleased-send ledger is refused (round-2 review F1):
         releasing a send-bound slot here bypassed the ledger and let a later VERIFIED close
@@ -2738,6 +3881,35 @@ class StateStore:
     def _require_cycle_key(cycle_key: str) -> None:
         if not cycle_key.strip():
             raise StateError("cycle_key must be a non-empty string")
+
+    def _campaign_file_is_approved_tx(self, campaign_id: str, shoko_file_id: int) -> bool:
+        """Check file membership against persisted approved bindings, never a plan file."""
+        row = self._conn.execute(
+            "SELECT plan_fingerprint_set FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            bindings = json.loads(_as_str(row[0], "plan_fingerprint_set"))
+        except (TypeError, ValueError) as exc:
+            raise StateError(f"campaign {campaign_id!r} has invalid approved bindings") from exc
+        if not isinstance(bindings, list):
+            raise StateError(f"campaign {campaign_id!r} has invalid approved bindings")
+        return any(
+            isinstance(item, list)
+            and len(item) == CAMPAIGN_BINDING_FIELDS
+            and not isinstance(item[0], bool)
+            and item[0] == shoko_file_id
+            for item in bindings
+        )
+
+    def _unresolved_campaign_send_ids_tx(self) -> tuple[int, ...]:
+        rows = self._conn.execute(
+            "SELECT send_id FROM sends WHERE campaign_ownership = ?"
+            " AND outcome NOT IN ('prepared', 'voided') ORDER BY send_id",
+            (CAMPAIGN_OWNERSHIP_UNKNOWN,),
+        ).fetchall()
+        return tuple(_as_int(row[0], "send_id") for row in rows)
 
     def _adjust_pending_tx(self, files_delta: int, jobs_delta: int) -> None:
         self._ensure_global_budget_tx()
@@ -2855,13 +4027,11 @@ class StateStore:
         not a file count). ``target_ids`` are the verification triples persisted on the
         send row so a persisted ``verifying`` / hold row can be re-polled/re-inspected
         after a restart (P1-3).
-        Replay protection: an active send with the same request fingerprint
-        (prepared/attempted/accepted-unverified) is refused as
-        ``duplicate_request_fingerprint`` — restarting the same plan never
-        double-counts a budget. Terminal rows (``voided`` from
-        :meth:`void_prepared_send`, closed ``verified``/partial/contradiction outcomes)
-        are NOT active: a voided prepared send never blocks the re-prepare of its
-        replacement (P2-2); sent rows are never resubmitted (no transition edge).
+        Replay protection: a request fingerprint from any possibly-delivered send is
+        refused as ``duplicate_request_fingerprint``, including after explicit operator
+        resolution — a restart or resolution never makes the same mutation reusable.
+        Only a ``voided`` prepared send (definitely not sent) stops blocking its replacement
+        (P2-2); sent rows are never resubmitted (no transition edge).
         """
         _require_iso(iso, "iso")
         _require_hex64(plan_fingerprint, "plan_fingerprint")
@@ -2872,13 +4042,21 @@ class StateStore:
         if jobs < 0:
             raise StateError("expected_episode_jobs must be non-negative")
         with self._transaction():
-            # Replay protection FIRST: an active send with the same request
+            # Quarantine and replay protection precede any slot reservation:
+            # an active send with the same request
             # fingerprint (prepared/attempted/accepted-unverified) never reserves a
             # second budget slot — replaying a plan after a restart is idempotent.
             # Voided/closed rows are excluded (P2-2): voided sends no longer block.
+            if self.mapping_target_quarantined(shoko_file_id):
+                return BudgetRefusal(
+                    False,
+                    "mapping_target_quarantined",
+                    f"file {shoko_file_id} requires target review; no send may be prepared",
+                )
             duplicate = self._conn.execute(
                 "SELECT send_id, plan_fingerprint FROM sends WHERE request_fingerprint = ?"
-                " AND outcome IN ('prepared', 'attempted', 'accepted_unverified') LIMIT 1",
+                " AND outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send',"
+                " 'inspected_review', 'verified', 'resolved') LIMIT 1",
                 (request_fingerprint,),
             ).fetchone()
             if duplicate is not None:
@@ -2898,6 +4076,32 @@ class StateStore:
                     f"request {request_fingerprint[:12]}… already has active send "
                     f"{_as_int(duplicate[0], 'send_id')}; budget is not double-counted",
                 )
+            if campaign_id is not None:
+                campaign_row = self._conn.execute(
+                    "SELECT status FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+                ).fetchone()
+                if campaign_row is None:
+                    raise StateError(f"campaign {campaign_id!r} does not exist: send is refused")
+                status = _as_str(campaign_row[0], "campaign status")
+                if status != CAMPAIGN_STATUS_APPROVED:
+                    return BudgetRefusal(
+                        False,
+                        "campaign_not_approved",
+                        f"campaign {campaign_id!r} is {status}: no send may be prepared",
+                    )
+                if not self._campaign_file_is_approved_tx(campaign_id, shoko_file_id):
+                    raise StateError(
+                        f"file {shoko_file_id} is not in the approved binding for campaign "
+                        f"{campaign_id!r}"
+                    )
+                unresolved = self._unresolved_campaign_send_ids_tx()
+                if unresolved:
+                    return BudgetRefusal(
+                        False,
+                        "legacy_campaign_history_unresolved",
+                        "legacy campaign send history is ambiguous; resolve send(s) "
+                        + ", ".join(str(send_id) for send_id in unresolved),
+                    )
             row = self._conn.execute(
                 "SELECT state, cohort FROM files WHERE shoko_file_id = ?",
                 (shoko_file_id,),
@@ -2916,12 +4120,16 @@ class StateStore:
                 return decision
             cursor = self._conn.execute(
                 "INSERT INTO sends (shoko_file_id, request_fingerprint, plan_fingerprint,"
-                " attempted_iso, outcome, episode_jobs, target_ids_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " campaign_id, campaign_ownership, attempted_iso, outcome, episode_jobs,"
+                " target_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     shoko_file_id,
                     request_fingerprint,
                     plan_fingerprint,
+                    campaign_id,
+                    CAMPAIGN_OWNERSHIP_CAMPAIGN
+                    if campaign_id is not None
+                    else CAMPAIGN_OWNERSHIP_NON_CAMPAIGN,
                     iso,
                     OUTCOME_PREPARED,
                     jobs,
@@ -2966,32 +4174,160 @@ class StateStore:
 
         The row is committed by the time this returns; M6-b calls it immediately
         before handing bytes to HTTP. From here on the item is verify/hold —
-        resubmission is forbidden by the transition table.
+        resubmission is forbidden by the transition table. For campaign rows, this same
+        transaction reconciles prior ledger history, enforces ``max_submissions``, and debits
+        ``total_sent`` before transport can begin. A crash after this commit is conservatively
+        counted, and outcome recording never refunds it.
         """
         _require_iso(iso, "iso")
+        limit_reached: tuple[str, int, int] | None = None
         with self._transaction():
             row = self._conn.execute(
-                "SELECT state FROM files WHERE shoko_file_id = ?",
-                (token.shoko_file_id,),
+                "SELECT state FROM files WHERE shoko_file_id = ?", (token.shoko_file_id,)
             ).fetchone()
             if row is None:
                 raise TransitionError(f"file {token.shoko_file_id} has no tracked row")
             current = FileState(_as_str(row[0], "state"))
+            send_row = self._conn.execute(
+                "SELECT outcome, campaign_id, campaign_ownership"
+                " FROM sends WHERE send_id = ? AND shoko_file_id = ?",
+                (token.send_id, token.shoko_file_id),
+            ).fetchone()
+            if send_row is None:
+                raise TransitionError(
+                    f"send {token.send_id} for file {token.shoko_file_id} does not exist"
+                )
+            if _as_str(send_row[0], "send outcome") != OUTCOME_PREPARED:
+                raise StateError(f"send {token.send_id} is not a prepared, not-yet-attempted send")
             validate_transition(current, FileState.REQUEST_MAY_HAVE_BEEN_SENT)
-            self._conn.execute(
-                "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?"
-                " WHERE shoko_file_id = ?",
-                (
-                    FileState.REQUEST_MAY_HAVE_BEEN_SENT.value,
-                    "handing to transport (mark_sent committed first)",
-                    iso,
-                    token.shoko_file_id,
-                ),
+            campaign_id = self._campaign_owner_for_prepared_send_tx(token, send_row)
+            if campaign_id is not None:
+                limit_reached = self._debit_campaign_attempt_tx(campaign_id, token, iso)
+            if limit_reached is None:
+                self._conn.execute(
+                    "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?"
+                    " WHERE shoko_file_id = ?",
+                    (
+                        FileState.REQUEST_MAY_HAVE_BEEN_SENT.value,
+                        "handing to transport (mark_sent committed first)",
+                        iso,
+                        token.shoko_file_id,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE sends SET outcome = ?, attempted_iso = ? WHERE send_id = ?",
+                    (OUTCOME_ATTEMPTED, iso, token.send_id),
+                )
+        if limit_reached is not None:
+            campaign_id, total, limit = limit_reached
+            raise CampaignSubmissionLimitError(
+                f"campaign {campaign_id!r} reached max_submissions ({limit}) at {total}: "
+                "send was not attempted"
             )
-            self._conn.execute(
-                "UPDATE sends SET outcome = ?, attempted_iso = ? WHERE send_id = ?",
-                (OUTCOME_ATTEMPTED, iso, token.send_id),
+
+    @contextlib.contextmanager
+    def protect_transport(self, token: SendToken) -> Iterator[None]:
+        """Fence transport admission against a concurrent durable write stop.
+
+        ``mark_sent`` remains committed before transport. This fresh, write-serialized check
+        closes the mark-to-transport gap when a stop has already committed. Once this check
+        succeeds, that attempted row is the one already-authorized in-flight operation: a later
+        stop applies to subsequent sends, not retroactively to this operation. Callers must not
+        do unrelated work in this context.
+        """
+        try:
+            with self._transaction():
+                row = self._conn.execute(
+                    "SELECT outcome FROM sends WHERE send_id = ? AND shoko_file_id = ?",
+                    (token.send_id, token.shoko_file_id),
+                ).fetchone()
+                if row is None or _as_str(row[0], "send outcome") != OUTCOME_ATTEMPTED:
+                    raise StateError(f"send {token.send_id} is not durably marked before transport")
+            yield
+        except WriteDisabledError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            self.disable_writes(f"database failure before transport: {exc}")
+            raise WriteDisabledError(f"state writes stopped before transport: {exc}") from exc
+
+    def _campaign_owner_for_prepared_send_tx(self, token: SendToken, send_row: Any) -> str | None:
+        """Validate the captured owner and return it; caller holds the send transaction."""
+        campaign_id = _as_optional_str(send_row[1])
+        ownership = _as_str(send_row[2], "campaign ownership")
+        if ownership == CAMPAIGN_OWNERSHIP_UNKNOWN:
+            raise CampaignSendRefusedError(
+                f"send {token.send_id} has unresolved legacy campaign ownership; "
+                "resolve campaign send history before transport"
             )
+        if ownership == CAMPAIGN_OWNERSHIP_NON_CAMPAIGN:
+            if campaign_id is not None:
+                raise StateError("non-campaign send unexpectedly carries a campaign id")
+            return None
+        if ownership != CAMPAIGN_OWNERSHIP_CAMPAIGN:
+            raise StateError(f"send {token.send_id} has invalid campaign ownership")
+        if campaign_id is None:
+            raise CampaignSendRefusedError(
+                f"send {token.send_id} is marked campaign-owned without a campaign id"
+            )
+        if not self._campaign_file_is_approved_tx(campaign_id, token.shoko_file_id):
+            raise CampaignSendRefusedError(
+                f"send {token.send_id} is for a file outside campaign {campaign_id!r}'s "
+                "approved binding"
+            )
+        unresolved = self._unresolved_campaign_send_ids_tx()
+        if unresolved:
+            raise CampaignSendRefusedError(
+                "legacy campaign send history is ambiguous; resolve send(s) "
+                + ", ".join(str(send_id) for send_id in unresolved)
+                + " before any campaign submission"
+            )
+        return campaign_id
+
+    def _debit_campaign_attempt_tx(
+        self, campaign_id: str, token: SendToken, iso: str
+    ) -> tuple[str, int, int] | None:
+        """Atomically enforce the campaign ceiling and reserve one attempted-send count."""
+        campaign = self._conn.execute(
+            "SELECT total_sent, max_submissions, status FROM campaigns WHERE campaign_id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if campaign is None:
+            raise StateError(
+                f"campaign {campaign_id!r} for file {token.shoko_file_id} does not exist"
+            )
+        total = max(
+            _as_int(campaign[0], "total_sent"),
+            self._campaign_attempt_count_tx(campaign_id),
+        )
+        limit = _as_int(campaign[1], "max_submissions")
+        status = _as_str(campaign[2], "campaign status")
+        if status != CAMPAIGN_STATUS_APPROVED:
+            raise CampaignSendRefusedError(
+                f"campaign {campaign_id!r} is {status}: prepared send is refused"
+            )
+        if total >= limit:
+            self._conn.execute(
+                "UPDATE campaigns SET total_sent = ?, status = 'paused',"
+                " status_reason = 'max_submissions_reached' WHERE campaign_id = ?",
+                (total, campaign_id),
+            )
+            return campaign_id, total, limit
+        self._conn.execute(
+            "UPDATE campaigns SET total_sent = ?, last_batch_iso = ? WHERE campaign_id = ?",
+            (total + 1, iso, campaign_id),
+        )
+        return None
+
+    def _campaign_attempt_count_tx(self, campaign_id: str) -> int:
+        """Count durable campaign sends that crossed mark_sent; caller holds a write txn."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM sends s WHERE s.campaign_ownership = ?"
+            " AND s.campaign_id = ? AND s.outcome NOT IN ('prepared', 'voided')",
+            (CAMPAIGN_OWNERSHIP_CAMPAIGN, campaign_id),
+        ).fetchone()
+        if row is None:
+            raise StateError("campaign attempted-send count query returned no row")
+        return _as_int(row[0], "campaign attempted-send count")
 
     @_mutation
     def record_send_outcome(
@@ -3107,6 +4443,7 @@ class StateStore:
         verdict: VerificationVerdict,
         *,
         iso: str,
+        inspection: SendInspection | None = None,
     ) -> FileState | None:
         """Close the verification loop — the **sole release owner** for a verified send.
 
@@ -3147,11 +4484,26 @@ class StateStore:
                     (new_state.value, detail, iso, shoko_file_id),
                 )
             send_row = self._conn.execute(
-                "SELECT send_id FROM sends WHERE shoko_file_id = ?"
-                " AND outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send')"
+                "SELECT send_id, request_fingerprint, outcome, target_ids_json, slot_released"
+                " FROM sends WHERE shoko_file_id = ?"
+                " AND outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send',"
+                " 'inspected_review')"
                 " ORDER BY send_id DESC LIMIT 1",
                 (shoko_file_id,),
             ).fetchone()
+            if inspection is not None and (
+                send_row is None
+                or _as_int(send_row[0], "send_id") != inspection.send_id
+                or _as_str(send_row[1], "request_fingerprint") != inspection.request_fingerprint
+                or _as_str(send_row[2], "send outcome") != inspection.outcome
+                or _parse_target_ids(_as_optional_str(send_row[3])) != inspection.target_ids
+                or bool(_as_int(send_row[4], "slot_released")) != inspection.slot_released
+                or not inspection.target_ids
+            ):
+                raise StateError(
+                    f"file {shoko_file_id} inspection no longer matches its persisted send "
+                    "identity/fingerprint/targets"
+                )
             # VERIFIED closes the send row (``verified``). PENDING/UNKNOWN/PARTIAL/
             # CONTRADICTION leave the delivery outcome LIVE (the row stays re-pollable /
             # inspectable by the next cycle's recovery consumption, P1-3; the verdict is
@@ -3163,6 +4515,16 @@ class StateStore:
                         "UPDATE sends SET outcome = ?, verification = ?, verified_iso = ?"
                         " WHERE send_id = ?",
                         ("verified", verdict.value, iso, send_id),
+                    )
+                elif (
+                    inspection is not None
+                    and verdict in (VerificationVerdict.PARTIAL, VerificationVerdict.CONTRADICTION)
+                    and _as_str(send_row[2], "send outcome") != OUTCOME_INSPECTED_REVIEW
+                ):
+                    self._conn.execute(
+                        "UPDATE sends SET outcome = ?, verification = ?, verified_iso = ?"
+                        " WHERE send_id = ?",
+                        (OUTCOME_INSPECTED_REVIEW, verdict.value, iso, send_id),
                     )
                 else:
                     self._conn.execute(
@@ -3191,49 +4553,85 @@ class StateStore:
         replacement prepare (dedup covers active outcomes only). Rows that may have
         been sent are NEVER voidable here — verify/hold only (P1 contract unchanged).
         """
+        return self._void_prepared_send(shoko_file_id, request_fingerprint, iso=iso, reason=reason)
+
+    def _void_prepared_send_after_write_stop(
+        self, shoko_file_id: int, request_fingerprint: str, *, iso: str, reason: str
+    ) -> int:
+        """Release only a definitely-unsent reservation after stop fenced ``mark_sent``."""
+        if not self.writes_disabled:
+            raise StateError("stop-only prepared-send cleanup requires a latched write stop")
+        _require_iso(iso, "iso")
+        self._begin_immediate_tx(None)
+        try:
+            send_id = self._void_prepared_send_tx(
+                shoko_file_id, request_fingerprint, iso=iso, reason=reason
+            )
+        except BaseException:
+            self._rollback_tx()
+            raise
+        self._commit_tx()
+        return send_id
+
+    def _void_prepared_send(
+        self,
+        shoko_file_id: int,
+        request_fingerprint: str,
+        *,
+        iso: str,
+        reason: str,
+    ) -> int:
         _require_iso(iso, "iso")
         with self._transaction():
-            row = self._conn.execute(
-                "SELECT send_id, outcome, episode_jobs FROM sends"
-                " WHERE shoko_file_id = ? AND request_fingerprint = ?"
-                " ORDER BY send_id DESC LIMIT 1",
-                (shoko_file_id, request_fingerprint),
-            ).fetchone()
-            if row is None:
-                raise StateError(
-                    f"no send row for file {shoko_file_id} with request "
-                    f"{request_fingerprint[:12]}…: nothing to void"
-                )
-            send_id = _as_int(row[0], "send_id")
-            outcome = _as_str(row[1], "outcome")
-            if outcome != OUTCOME_PREPARED:
-                raise StateError(
-                    f"send {send_id} has outcome {outcome!r}: void is legal only from "
-                    "prepared_not_sent (a possible-delivery row is verify/hold, never voided)"
-                )
-            file_row = self._conn.execute(
-                "SELECT state FROM files WHERE shoko_file_id = ?", (shoko_file_id,)
-            ).fetchone()
-            if file_row is None:
-                raise TransitionError(f"file {shoko_file_id} has no tracked row to void")
-            current = FileState(_as_str(file_row[0], "state"))
-            validate_transition(current, FileState.PLANNED)
-            self._conn.execute(
-                "UPDATE sends SET outcome = ? WHERE send_id = ?", (OUTCOME_VOIDED, send_id)
+            return self._void_prepared_send_tx(
+                shoko_file_id, request_fingerprint, iso=iso, reason=reason
             )
-            self._conn.execute(
-                "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?"
-                " WHERE shoko_file_id = ?",
-                (
-                    FileState.PLANNED.value,
-                    _clip(f"prepared send voided: {reason}"),
-                    iso,
-                    shoko_file_id,
-                ),
+
+    def _void_prepared_send_tx(
+        self, shoko_file_id: int, request_fingerprint: str, *, iso: str, reason: str
+    ) -> int:
+        """Void one known-unsent prepared row while the caller holds its transaction."""
+        row = self._conn.execute(
+            "SELECT send_id, outcome, episode_jobs FROM sends"
+            " WHERE shoko_file_id = ? AND request_fingerprint = ?"
+            " ORDER BY send_id DESC LIMIT 1",
+            (shoko_file_id, request_fingerprint),
+        ).fetchone()
+        if row is None:
+            raise StateError(
+                f"no send row for file {shoko_file_id} with request "
+                f"{request_fingerprint[:12]}…: nothing to void"
             )
-            # P2-4/P1-A: release the stored reservation via the single-owner path (marks the
-            # voided row released atomically; a re-void of the same row is a recorded no-op).
-            self._release_send_slot_tx(send_id, iso, "void")
+        send_id = _as_int(row[0], "send_id")
+        outcome = _as_str(row[1], "outcome")
+        if outcome != OUTCOME_PREPARED:
+            raise StateError(
+                f"send {send_id} has outcome {outcome!r}: void is legal only from "
+                "prepared_not_sent (a possible-delivery row is verify/hold, never voided)"
+            )
+        file_row = self._conn.execute(
+            "SELECT state FROM files WHERE shoko_file_id = ?", (shoko_file_id,)
+        ).fetchone()
+        if file_row is None:
+            raise TransitionError(f"file {shoko_file_id} has no tracked row to void")
+        current = FileState(_as_str(file_row[0], "state"))
+        validate_transition(current, FileState.PLANNED)
+        self._conn.execute(
+            "UPDATE sends SET outcome = ? WHERE send_id = ?", (OUTCOME_VOIDED, send_id)
+        )
+        self._conn.execute(
+            "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?"
+            " WHERE shoko_file_id = ?",
+            (
+                FileState.PLANNED.value,
+                _clip(f"prepared send voided: {reason}"),
+                iso,
+                shoko_file_id,
+            ),
+        )
+        # P2-4/P1-A: release the stored reservation via the single-owner path (marks the
+        # voided row released atomically; a re-void of the same row is a recorded no-op).
+        self._release_send_slot_tx(send_id, iso, "void")
         return send_id
 
     def active_send_details(self, shoko_file_id: int) -> SendInspection | None:
@@ -3264,25 +4662,23 @@ class StateStore:
 
     @_mutation
     def release_send_slot(self, shoko_file_id: int, request_fingerprint: str, *, iso: str) -> int:
-        """Release the held reservation of a live send row (daemon past-deadline partial close).
-
-        Marks the row released **exactly once** (P1-A): a partial close of a NOT-linked
-        past-deadline row frees the slot, and the delivery outcome stays live so a late
-        ``ManualLinkJob`` can still be re-verified — the subsequent VERIFIED close is then a
-        no-op (``slot_released=1``), never a second release. Returns the jobs released (0 when
-        the row was already released).
-        """
+        """Refuse implicit partial-close releases; possible deliveries need explicit resolution."""
         _require_iso(iso, "iso")
         with self._transaction():
             row = self._conn.execute(
-                "SELECT send_id FROM sends WHERE shoko_file_id = ? AND request_fingerprint = ?"
-                " AND outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send')"
+                "SELECT outcome FROM sends WHERE shoko_file_id = ? AND request_fingerprint = ?"
+                " AND outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send',"
+                " 'inspected_review')"
                 " ORDER BY send_id DESC LIMIT 1",
                 (shoko_file_id, request_fingerprint),
             ).fetchone()
             if row is None:
                 return 0
-            return self._release_send_slot_tx(_as_int(row[0], "send_id"), iso, "partial_close")
+            raise StateError(
+                f"send for file {shoko_file_id} has outcome {_as_str(row[0], 'send outcome')!r}: "
+                "a possibly delivered send slot can be released only by VERIFIED or explicit "
+                "resolve_send after terminal inspection"
+            )
 
     @_mutation
     def resolve_send(
@@ -3295,23 +4691,21 @@ class StateStore:
         operator_note: str = "",
         verification_timeout_seconds: float | None = None,
     ) -> int:
-        """Operator-sanctioned close of a live **terminal-review** send (P2-B, M7 CLI).
+        """Operator-sanctioned close of a durable, identity-qualified terminal inspection.
 
-        Legal ONLY from terminal-review send outcomes: ``accepted_unverified`` (verifying /
-        conflict) and ``ambiguous_send`` (indeterminate_write). ``prepared`` rows are owned by
-        :meth:`void_prepared_send` and ``attempted`` (request-may-have-been-sent) rows are
-        owned by the XRef inspection path — closing them here is refused (round-2 review F2;
-        the operator closes a delivery-uncertain row only *after* inspection records it).
-        When ``verification_timeout_seconds`` is supplied for an ``accepted_unverified`` row,
-        the verification deadline (``attempted_iso`` + timeout) must have elapsed. It sets the
-        send row closed (``resolved``), releases exactly the stored
+        Legal ONLY from ``inspected_review``, recorded after the same Shoko file ID's current
+        ED2K and persisted target triples were checked against that send's fingerprint. A
+        ``prepared``, uninspected ``attempted``, ``accepted_unverified`` (including HTTP 202),
+        or ``ambiguous_send`` row is refused. A ``PARTIAL`` inspection additionally requires
+        the verification deadline (``attempted_iso`` + timeout) to have elapsed when supplied.
+        It sets the send row closed (``resolved``), releases exactly the stored
         reservation through the P1-A single-owner path (a no-op when already released), and
         moves the file to ``waiting`` (re-evaluable, ``released_after_review``) or
         ``blocked_safety`` (``operator_closed``). It **never** touches a ``verified`` row and
         never re-enables resubmission of a *sent* request: the same ``request_fingerprint``
-        stays refused while a row is live, and closing the row only lets the file re-plan as a
-        **fresh** ``request_fingerprint`` (the ``resolved`` outcome is closed, so dedup never
-        matches it). Rows that may have been delivered keep the audit note; nothing here
+        stays refused even after close, and the file can re-plan only as a **fresh**
+        ``request_fingerprint``. Rows that may have been delivered keep the inspection verdict
+        and operator note; nothing here
         is reachable from the daemon (operator-only chain, P3-B).
         """
         _require_iso(iso, "iso")
@@ -3320,7 +4714,7 @@ class StateStore:
         )
         with self._transaction():
             row = self._conn.execute(
-                "SELECT send_id, outcome, slot_released FROM sends"
+                "SELECT send_id, outcome, slot_released, verification, attempted_iso FROM sends"
                 " WHERE shoko_file_id = ? AND request_fingerprint = ?"
                 " ORDER BY send_id DESC LIMIT 1",
                 (shoko_file_id, request_fingerprint),
@@ -3340,18 +4734,17 @@ class StateStore:
             if outcome not in RESOLVE_LEGAL_OUTCOMES:
                 raise StateError(
                     f"send {send_id} has outcome {outcome!r}: resolve_send is legal only from "
-                    "accepted_unverified/ambiguous_send — prepared rows are voided via "
-                    "void_prepared_send, attempted rows are closed only after XRef "
-                    "inspection records their delivery state (F2 gate)"
+                    "inspected_review after a durable same-file XRef inspection; prepared, "
+                    "attempted, accepted_unverified, and ambiguous_send rows are not closable "
+                    "before that inspection"
                 )
-            if (
-                outcome == SendOutcome.ACCEPTED_UNVERIFIED.value
-                and verification_timeout_seconds is not None
-            ):
-                attempted = self._conn.execute(
-                    "SELECT attempted_iso FROM sends WHERE send_id = ?", (send_id,)
-                ).fetchone()
-                deadline = _parse_iso(_as_str(attempted[0], "attempted_iso")) + timedelta(
+            if _as_optional_str(row[3]) == VerificationVerdict.PARTIAL.value:
+                if verification_timeout_seconds is None:
+                    raise StateError(
+                        f"send {send_id} has only a partial inspection: resolve_send requires "
+                        "the configured verification timeout"
+                    )
+                deadline = _parse_iso(_as_str(row[4], "attempted_iso")) + timedelta(
                     seconds=verification_timeout_seconds
                 )
                 if _parse_iso(iso) < deadline:
@@ -3370,8 +4763,8 @@ class StateStore:
                 raise StateError(f"file {shoko_file_id} is verified: resolve_send is refused")
             validate_transition(current, target)
             self._conn.execute(
-                "UPDATE sends SET outcome = ?, verification = ? WHERE send_id = ?",
-                (OUTCOME_RESOLVED, f"resolved:{resolution}", send_id),
+                "UPDATE sends SET outcome = ? WHERE send_id = ?",
+                (OUTCOME_RESOLVED, send_id),
             )
             self._release_send_slot_tx(send_id, iso, f"resolve:{resolution}")
             self._conn.execute(
@@ -3379,7 +4772,10 @@ class StateStore:
                 " WHERE shoko_file_id = ?",
                 (
                     target.value,
-                    _clip(f"send resolved ({resolution}): {operator_note}"),
+                    _clip(
+                        f"send resolved ({resolution}) after "
+                        f"{_as_optional_str(row[3]) or 'inspection'}: {operator_note}"
+                    ),
                     iso,
                     shoko_file_id,
                 ),
@@ -3395,7 +4791,8 @@ class StateStore:
         """
         row = self._conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(episode_jobs), 0) FROM sends"
-            " WHERE outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send')"
+            " WHERE outcome IN ('prepared', 'attempted', 'accepted_unverified', 'ambiguous_send',"
+            " 'inspected_review')"
             " AND slot_released = 0",
         ).fetchone()
         assert row is not None
@@ -3437,8 +4834,11 @@ class StateStore:
                 FileState.INDETERMINATE_WRITE,
             ):
                 hold.append(entry)
-            elif record.state in (FileState.VERIFYING, FileState.PARTIAL):
-                polling.append(entry)
+            elif record.state in (FileState.VERIFYING, FileState.PARTIAL, FileState.CONFLICT):
+                if self.active_send_details(record.shoko_file_id) is None:
+                    re_evaluate.append(entry)
+                else:
+                    polling.append(entry)
             elif record.state is FileState.BLOCKED_SAFETY:
                 blocked.append(entry)
             elif record.state is FileState.VERIFIED:
@@ -3480,6 +4880,21 @@ class StateStore:
         anchored = 0 if basis_raw is None else int(basis_raw)
         return max(0, current - anchored)
 
+    def _pending_departures_tx(self, discovered_file_ids: frozenset[int]) -> int:
+        """Count only departed, attempted sends still eligible for bounded recovery.
+
+        No remote reads or speculative link credit: these rows can justify waiting,
+        never acceptance of a drop. Rejected/prepared/conflicting sends cannot defer it.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT files.shoko_file_id FROM files JOIN sends USING (shoko_file_id)"
+            " WHERE files.last_verified_iso IS NULL"
+            " AND files.state IN ('request_may_have_been_sent', 'verifying', 'indeterminate_write')"
+            " AND sends.outcome IN ('attempted', 'accepted_unverified', 'ambiguous_send')"
+            " AND sends.attempted_iso IS NOT NULL"
+        )
+        return sum(_as_int(row[0], "shoko_file_id") not in discovered_file_ids for row in rows)
+
     def _anchor_source_tx(
         self,
         observation: SourceObservation,
@@ -3519,8 +4934,9 @@ class StateStore:
         identity comes from settings, never from invented endpoints; docs §4).
 
         The daemon calls this after every fully-complete, non-truncated, continuity-OK
-        cycle (P1-1): the anchor advances with normal inventory growth and the
-        ``requires_rebaseline`` flag is cleared by a healthy full-scan observation.
+        cycle: the anchor advances with normal inventory growth. Explicit rebaseline
+        callers can also use this recovery path to clear a hard hold; ordinary polls
+        must pass the latched continuity check first.
         """
         _require_iso(iso, "iso")
         with self._transaction():
@@ -3539,9 +4955,8 @@ class StateStore:
     def clear_requires_rebaseline(self, iso: str) -> None:
         """Operator/M7-sanctioned clearing of the persisted rebaseline requirement.
 
-        The daemon also clears the flag implicitly when the triggering
-        conditions are resolved with a fresh full-scan observation
-        (:meth:`record_source_observation`); this is the explicit operator path.
+        Ordinary continuity checks never clear a hard hold. An explicit baseline
+        observation (:meth:`record_source_observation`) is the other recovery path.
         """
         _require_iso(iso, "iso")
         with self._transaction():
@@ -3558,6 +4973,7 @@ class StateStore:
         discovery_total: int | None = None,
         complete: bool = True,
         tolerance: int = 0,
+        discovered_file_ids: frozenset[int] | None = None,
     ) -> ContinuityVerdict:
         """Structured continuity check — ordinary inventory growth is NORMAL (P1-1).
 
@@ -3569,8 +4985,7 @@ class StateStore:
         moving snapshot summary hash with monotonic totals is growth, not discontinuity: the
         observation is re-anchored each evaluated cycle so the check never self-wedges on new
         arrivals. ``requires_rebaseline`` is set only by the triggers, survives restart,
-        and is cleared by the next clean observation (this check clears it when no trigger
-        fires) or by :meth:`clear_requires_rebaseline` (operator/M7).
+        and is cleared only by explicit recovery/rebaseline, never by a clean poll.
 
         **Excess-drop rule (M9-e2e defect):** the ``include_only=Unrecognized`` discovery total
         shrinks as the linker links files (a linked file leaves the unrecognized set). A drop is
@@ -3582,6 +4997,12 @@ class StateStore:
         budget (``±0`` slack by default; ``tolerance`` widens it) is NORMAL: the observation
         re-anchors with the new total and the refreshed accounting basis, so a multi-batch campaign
         never wedges on its own accepted links.
+
+        Async jobs can land between bounded recovery and discovery. If the excess drop
+        could be explained entirely by departed, still-unverified attempted sends,
+        defer writes without advancing ANY anchor until recovery settles them. This
+        never clears a hard hold or defers an identity/root change. A larger unexplained
+        drop still latches immediately; pending sends never count as verified links.
 
         P1-C: anchoring is gated on ``complete``. A **truncated/incomplete** discovery
         (``complete=False``) is not trusted — the check is **neutral**: no anchor, no
@@ -3597,13 +5018,14 @@ class StateStore:
             discovery_total=discovery_total,
         )
         with self._transaction():
+            latched = self.get_meta(META_REQUIRES_REBASELINE) == "1"
             if not complete:
                 # Truncated discovery: neutral, never anchors, never triggers a drop.
-                return ContinuityVerdict(True, ("discovery_incomplete",), False)
+                return ContinuityVerdict(not latched, ("discovery_incomplete",), latched)
             known = self.get_meta(META_SOURCE_INSTANCE)
             if known is None:
-                self._anchor_source_tx(observation, iso, clear_flag=True)
-                return ContinuityVerdict(True, ("first_observation",), False)
+                self._anchor_source_tx(observation, iso, clear_flag=not latched)
+                return ContinuityVerdict(not latched, ("first_observation",), latched)
             reasons: list[str] = []
             if known != current_identity:
                 reasons.append("instance_identity_changed")
@@ -3617,7 +5039,19 @@ class StateStore:
             elif known_total_raw is not None and discovery_total < int(known_total_raw):
                 expected_drop = self._expected_drop_tx(self.get_meta(META_SOURCE_ANCHOR_BASIS))
                 if discovery_total < int(known_total_raw) - expected_drop - tolerance:
+                    deficit = int(known_total_raw) - expected_drop - tolerance - discovery_total
+                    if (
+                        not reasons
+                        and not latched
+                        and discovered_file_ids is not None
+                        and deficit <= self._pending_departures_tx(discovered_file_ids)
+                    ):
+                        return ContinuityVerdict(
+                            False, ("discovery_drop_pending_verification",), False
+                        )
                     reasons.append("discovery_total_drop")
+            if latched:
+                reasons.append("requires_rebaseline")
             requires = bool(reasons)
             # Re-anchor every evaluated cycle: the anchor tracks the source forward, so
             # growth never accumulates as a permanent discontinuity.
@@ -4043,27 +5477,27 @@ class StateStore:
 
     @_mutation
     def record_campaign_send(self, campaign_id: str, iso: str) -> int:
-        """Count one submitted campaign file (bounded by ``max_submissions``)."""
+        """Compatibility sync from the attempted-send ledger; never increments independently.
+
+        Campaign attempts are now atomically debited by :meth:`mark_sent` before transport.
+        Existing callers of this post-outcome hook remain safe and idempotent: it only raises a
+        stale total to the durable ledger count and can never double-count or refund an attempt.
+        """
         _require_iso(iso, "iso")
         with self._transaction():
             row = self._conn.execute(
-                "SELECT total_sent, max_submissions FROM campaigns WHERE campaign_id = ?",
+                "SELECT total_sent FROM campaigns WHERE campaign_id = ?",
                 (campaign_id,),
             ).fetchone()
             if row is None:
                 raise StateError(f"campaign {campaign_id!r} does not exist")
             total = _as_int(row[0], "total_sent")
-            limit = _as_int(row[1], "max_submissions")
-            if total >= limit:
-                raise StateError(
-                    f"campaign {campaign_id!r} reached max_submissions ({limit}): refusing to count"
-                )
+            total = max(total, self._campaign_attempt_count_tx(campaign_id))
             self._conn.execute(
-                "UPDATE campaigns SET total_sent = total_sent + 1, last_batch_iso = ?"
-                " WHERE campaign_id = ?",
-                (iso, campaign_id),
+                "UPDATE campaigns SET total_sent = ?, last_batch_iso = ?" " WHERE campaign_id = ?",
+                (total, iso, campaign_id),
             )
-        return total + 1
+        return total
 
     def campaign_files(self, campaign_id: str) -> tuple[FileRecord, ...]:
         rows = self._conn.execute(_SQL_CAMPAIGN_FILES, (campaign_id,)).fetchall()
@@ -4075,14 +5509,14 @@ class StateStore:
         The durable ``sends`` ledger is the campaign's attempted-send history: rows keep their
         outcome after the file moves on (a REJECTED/REFUSED send's file returns to ``waiting``
         and the row stays), so the drain-authorization gate can account for every attempt.
-        Rows of files unbound by a revoke (``campaign_id`` cleared) are outside the campaign's
-        durable scope; sent rows are never unbound (the revoke never rewinds them)."""
+        Ownership is read from the immutable send ledger, not the mutable current file binding;
+        queued rows unbound by revoke have no attempted sends to report."""
         rows = self._conn.execute(
             "SELECT s.send_id, s.shoko_file_id, s.outcome, s.verification, s.attempted_iso,"
             " s.http_status, f.state FROM sends s"
             " JOIN files f ON f.shoko_file_id = s.shoko_file_id"
-            " WHERE f.campaign_id = ? ORDER BY s.send_id",
-            (campaign_id,),
+            " WHERE s.campaign_ownership = ? AND s.campaign_id = ? ORDER BY s.send_id",
+            (CAMPAIGN_OWNERSHIP_CAMPAIGN, campaign_id),
         ).fetchall()
         return tuple(
             SendHistoryRow(
@@ -4096,6 +5530,147 @@ class StateStore:
             )
             for row in rows
         )
+
+    def unresolved_campaign_send_history(self) -> tuple[SendHistoryRow, ...]:
+        """Return legacy attempted sends whose campaign ownership cannot yet be proven."""
+        rows = self._conn.execute(
+            "SELECT s.send_id, s.shoko_file_id, s.outcome, s.verification, s.attempted_iso,"
+            " s.http_status, f.state FROM sends s"
+            " JOIN files f ON f.shoko_file_id = s.shoko_file_id"
+            " WHERE s.campaign_ownership = ?"
+            " AND s.outcome NOT IN ('prepared', 'voided') ORDER BY s.send_id",
+            (CAMPAIGN_OWNERSHIP_UNKNOWN,),
+        ).fetchall()
+        return tuple(
+            SendHistoryRow(
+                send_id=_as_int(row[0], "send_id"),
+                shoko_file_id=_as_int(row[1], "shoko_file_id"),
+                outcome=_as_str(row[2], "send outcome"),
+                verification=_as_optional_str(row[3]),
+                attempted_iso=_as_str(row[4], "attempted_iso"),
+                http_status=_as_optional_int(row[5]),
+                file_state=FileState(_as_str(row[6], "state")),
+            )
+            for row in rows
+        )
+
+    def _legacy_campaign_resolution_is_proven_tx(
+        self,
+        campaign_id: str,
+        send_row: Any,
+        possible_candidates: Sequence[str],
+    ) -> bool:
+        if campaign_id not in possible_candidates:
+            return False
+        approved = self._conn.execute(
+            "SELECT digest, plan_path, plan_fingerprint_set FROM campaigns"
+            " WHERE campaign_id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if approved is None:
+            return False
+        return _legacy_campaign_identity_scope_matches(
+            campaign_id=campaign_id,
+            campaign_digest=approved[0],
+            plan_path=approved[1],
+            approved_bindings_raw=approved[2],
+            shoko_file_id=send_row[0],
+            plan_fingerprint=send_row[1],
+            request_fingerprint=send_row[2],
+            target_ids_raw=send_row[6],
+        )
+
+    @_mutation
+    def resolve_legacy_send_ownership(
+        self,
+        send_id: int,
+        *,
+        campaign_id: str | None,
+        note: str,
+        iso: str,
+    ) -> None:
+        """Explicitly adjudicate one ambiguous legacy send and restore its immutable owner.
+
+        ``campaign_id=None`` is an explicit non-campaign resolution, distinct from an unknown
+        legacy owner. Campaign choices must match the immutable send tuple against a valid,
+        persisted approved binding and its approval/deadline window. Attempt counters only
+        increase; they are reconciled from the now-resolved immutable ledger row.
+        """
+        _require_iso(iso, "iso")
+        if not isinstance(note, str) or not note.strip():
+            raise StateError("legacy send ownership resolution requires an operator note")
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT shoko_file_id, plan_fingerprint, request_fingerprint, outcome,"
+                " attempted_iso, campaign_ownership, target_ids_json FROM sends WHERE send_id = ?",
+                (send_id,),
+            ).fetchone()
+            if row is None:
+                raise StateError(f"send {send_id} does not exist")
+            outcome = _as_str(row[3], "send outcome")
+            if outcome in (OUTCOME_PREPARED, OUTCOME_VOIDED):
+                raise StateError(
+                    f"send {send_id} has no attempted-send history to resolve; ownership remains "
+                    "unchanged"
+                )
+            ownership = _as_str(row[5], "campaign ownership")
+            if ownership != CAMPAIGN_OWNERSHIP_UNKNOWN:
+                raise StateError(f"send {send_id} ownership is already {ownership!r}")
+            campaign_rows = self._conn.execute(
+                "SELECT campaign_id, digest, attestation_scope, approval_iso, deadline_iso,"
+                " created_iso, plan_fingerprint_set FROM campaigns"
+            ).fetchall()
+            candidates, snapshots_valid = _legacy_campaign_owner_candidates(
+                shoko_file_id=row[0],
+                plan_fingerprint=row[1],
+                request_fingerprint=row[2],
+                attempted_iso=row[4],
+                campaign_rows=campaign_rows,
+            )
+            if campaign_id is not None:
+                if not isinstance(campaign_id, str) or not campaign_id.strip():
+                    raise StateError("campaign_id must be a non-empty string")
+                if not snapshots_valid:
+                    raise StateError(
+                        f"send {send_id} cannot be assigned to campaign {campaign_id!r}: "
+                        "persisted approved campaign evidence or the send timestamp is invalid; "
+                        "ownership remains unresolved"
+                    )
+                if not self._legacy_campaign_resolution_is_proven_tx(campaign_id, row, candidates):
+                    compatible = ", ".join(candidates) if candidates else "none"
+                    raise StateError(
+                        f"send {send_id} cannot be assigned to campaign {campaign_id!r}: no "
+                        "matching persisted approved binding file/identity scope covers this "
+                        "send and "
+                        f"attempt time; compatible campaigns: {compatible}; ownership remains "
+                        "unresolved. Review the immutable send and approved snapshot identities; "
+                        "confirmation cannot authorize an incompatible owner"
+                    )
+                next_ownership = CAMPAIGN_OWNERSHIP_CAMPAIGN
+            else:
+                # This branch is only reachable through the explicit --non-campaign CLI choice
+                # (plus its --confirm and required operator note). It records a human attestation;
+                # migration never makes this inference when any compatible campaign exists.
+                next_ownership = CAMPAIGN_OWNERSHIP_NON_CAMPAIGN
+            self._conn.execute(
+                "UPDATE sends SET campaign_id = ?, campaign_ownership = ?,"
+                " campaign_ownership_resolved_iso = ?, campaign_ownership_note = ?"
+                " WHERE send_id = ?",
+                (campaign_id, next_ownership, iso, _clip(note), send_id),
+            )
+            if campaign_id is not None:
+                campaign = self._conn.execute(
+                    "SELECT total_sent FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+                ).fetchone()
+                assert campaign is not None
+                total = max(
+                    _as_int(campaign[0], "total_sent"),
+                    self._campaign_attempt_count_tx(campaign_id),
+                )
+                self._conn.execute(
+                    "UPDATE campaigns SET total_sent = ? WHERE campaign_id = ?",
+                    (total, campaign_id),
+                )
 
     def campaign_progress(self, campaign_id: str) -> dict[str, int]:
         """Per-state file counts for one campaign (quarantined counted from detail)."""

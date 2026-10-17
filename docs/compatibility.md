@@ -239,6 +239,12 @@ imported), `Created`, `Updated`, `SeriesIDs[]` (**present only with `include=XRe
   series entry required). `AnidbEpisode{ID (AniDB episode ID), AnimeID, Type,
   EpisodeNumber, AirDate, Title, Titles, Description, Rating}` — **contains no Shoko
   IDs** (the "ShokoSeriesID/ShokoEpisodeID fields" claim is UNVERIFIED → absent).
+- At the pinned [v5.3.3 `AnidbEpisode` DTO](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Models/AniDB/AnidbEpisode.cs),
+  `Type` is copied from `ep.AbstractEpisodeType.ToV3Dto()` and `EpisodeNumber` from
+  `ep.EpisodeNumber`; the [AniDB series listing route](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Controllers/SeriesController.cs)
+  filters by the requested wire `type`. Therefore Anime-Lists' synthetic `T1=201`
+  and `O1=401` codes are **not** Shoko `EpisodeNumber` values: resolve them as
+  `(Trailer, 1)` and `(Other, 1)`, respectively.
 - `EpisodeType` wire names (v3): **`Unknown, Other, Episode, Special, Trailer,
   Credits, Parody`** (NOT AniDB UDP codes `ep/cred/par/spe`).
 - Resolution chain `(AniDB anime ID, type, number) → Shoko internal episode ID`:
@@ -279,10 +285,12 @@ imported), `Created`, `Updated`, `SeriesIDs[]` (**present only with `include=XRe
 
 ## 3. Anime-Lists mapping contract
 
-Verified against `Anime-Lists/anime-lists` @ `master` (pushed 2026-10-05), README,
-`transforms/*.xsl`, generation workflows, GitHub API, the live XMLs, and measured
-HTTP behavior — all on 2026-10-08. XML measurements on
-`anime-list-full.xml` (1,715,347 bytes, SHA-256 `492B080C17…`, 10,771 `<anime>`).
+README semantics and the pinned real-data examples below were rechecked against
+`Anime-Lists/anime-lists` commit
+[`996d6a8b98c0c8ba94378875746a83b66dc590d4`](https://github.com/Anime-Lists/anime-lists/commit/996d6a8b98c0c8ba94378875746a83b66dc590d4)
+(2026-10-14). Other XML inventory and HTTP measurements below were recorded on
+2026-10-08 for `anime-list-full.xml` (1,715,347 bytes, SHA-256
+`492B080C17…`, 10,771 `<anime>`).
 
 ### Source, cadence, provenance, fetch
 
@@ -342,20 +350,41 @@ HTTP behavior — all on 2026-10-08. XML measurements on
 - Multi-episode: `;1-1+2;` = one AniDB ep covers TVDB 1 and 2 (valid, 28 bodies);
   `;1-1;2-1;` = AniDB eps 1+2 are parts of TVDB ep 1 (valid; 103 measured keys);
   **`;1+2-1;` IS NOT VALID** → reject at parse.
-- T/O encodings: "trailer episodes with prefix T … >= 201, T1 = 201"; "Other …
-  >= 401, O1 = 401" (observed max 418; **undocumented 101–103 sources observed →
-  UNVERIFIED**, fail closed).
+- T/O encodings (README): "trailer episodes with prefix T … >= 201, T1 = 201";
+  "Other … >= 401, O1 = 401". Decode explicit pair values to Shoko's type-local
+  numbers first: 201→`Trailer` 1, 400→`Trailer` 200, 401→`Other` 1. This applies
+  before the season-0 `Special` rule. These encoded values apply only to individual
+  pair declarations; entry offsets and range rules keep their declared regular or
+  special type and number.
+- Explicit regular `anidbseason="1"` pairs 101–103 are valid regular `Episode`
+  identities, not an unsupported range. Pinned examples in the commit above:
+  Ranma 1/2 Nettou Hen (AniDB 193, TVDB 76932) has regular 103→TVDB S6E10 in
+  its 95–118 offset range ([source lines 948–956](https://github.com/Anime-Lists/anime-lists/blob/996d6a8b98c0c8ba94378875746a83b66dc590d4/anime-list-full.xml#L948-L956));
+  Kirarin Revolution (AniDB 4237, TVDB 103071) explicitly maps 101, 102 and 103
+  ([source lines 11614–11621](https://github.com/Anime-Lists/anime-lists/blob/996d6a8b98c0c8ba94378875746a83b66dc590d4/anime-list-full.xml#L11614-L11621)).
+- Season-0 explicit values 101–103 also occur (for example AniDB 1431 / TVDB
+  79032 maps them to S0E3–E5, alongside T1 and O1 at S0E1–E2; [source lines
+  5323–5328](https://github.com/Anime-Lists/anime-lists/blob/996d6a8b98c0c8ba94378875746a83b66dc590d4/anime-list-full.xml#L5323-L5328)).
+  Their type is undocumented: do not guess `Special`. Record a structured
+  unsupported-type reason and fence only the explicit affected TVDB positions;
+  retain supported mappings in the same entry and allow unrelated mappings and
+  the valid upstream snapshot to proceed. The pinned minimal excerpts are kept in
+  `tests/fixtures/anime_lists_legacy_number_examples.xml`.
 - Split series: the pattern is **many `<anime>` entries sharing one `tvdbid`**
   (1,303 numeric tvdbids multi-claimed; AoT = 8 entries on TVDB 267440) and
   **zero shared `anidbid`** (10,771/10,771 distinct) — season→entry resolution uses
   `defaulttvdbseason` equality. Season 0 is structurally ambiguous (447/6,337
   `(tvdbid,season)` keys multi-claimed; 421 of them season 0) → **fail closed**,
   never resolve season 0 by season alone.
-- **No AniDB episode type in the data** (no `ep/spe/cred/par`; `anidbseason` 0/1/2
-  + 201+/401+ synthetic ranges only). Shoko-side type (wire `Episode/Special/
-  Trailer/Other/Credits/Parody`) must be derived: `anidbseason 1→Episode`,
-  `0→Special`, number 201–400→Trailer, ≥401→Other; everything else UNVERIFIED.
-  Credits/Parody are not expressible by Anime-Lists → not mappable targets.
+- **No AniDB episode type tag in the data** (no `ep/spe/cred/par`): `anidbseason`
+  0/1 plus explicit-pair T/O encodings are the available type signals. Shoko-side
+  type (wire `Episode/Special/Trailer/Other/Credits/Parody`) is source-aware:
+  regular entry offsets, absolute identity, and `anidbseason=1` ranges are
+  `Episode` at every positive number; `anidbseason=0` ranges are `Special` at
+  every positive number. Explicit pair codes `201–400` and `>=401` are T/O in
+  either season; regular explicit 101–103 remain `Episode`, while season-0 explicit
+  101–103 are fenced because their type is unverified. Credits/Parody are not
+  expressible by Anime-Lists → not mappable targets.
 
 ### Real-data regression anchor (M4 gate)
 

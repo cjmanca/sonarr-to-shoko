@@ -546,6 +546,7 @@ class SonarrStub:
                 "id": series_id,
                 "title": f"Series {series_id}",
                 "rootFolderPath": root,
+                "seriesType": "standard" if root.startswith(LIVE_ROOT) else "anime",
                 "tvdbId": tvdb,
             }
             for series_id, (root, tvdb) in sorted(self.series.items())

@@ -21,6 +21,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Barrier, Event, Thread
+from types import SimpleNamespace
 from typing import Any, cast
 
 import hash_fixtures as hf
@@ -43,8 +45,10 @@ from shoko_linker.campaign import (
     CampaignApplyReport,
     CampaignDigestMismatchError,
     CampaignError,
+    CampaignFile,
     CampaignMappingGenerationChangedError,
     CampaignPlanInvalidError,
+    CampaignReconciliationIncompleteError,
     apply_campaign,
     approve_campaign,
     authorize_campaign_drain,
@@ -56,11 +60,27 @@ from shoko_linker.campaign import (
     revoke_campaign_drain,
     select_next_daemon_campaign,
 )
-from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
+from shoko_linker.cli import (
+    EXIT_APPLY_GATE_REFUSAL,
+    EXIT_CONFIG_INVALID,
+    EXIT_OK,
+    EXIT_STATE,
+    main,
+)
 from shoko_linker.config import load_settings
 from shoko_linker.daemon import CycleMode, DaemonDeps, run_cycle
 from shoko_linker.http import ApiEndpoint
-from shoko_linker.linking import EpisodeIdResolver, LinkPlan
+from shoko_linker.linking import (
+    EpisodeIdResolver,
+    EpisodeResolutionStatus,
+    LinkPlan,
+    LinkTarget,
+    PendingTarget,
+    PlanStatus,
+    ResolvedEpisode,
+    SendOutcome,
+    SendResult,
+)
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
@@ -120,6 +140,8 @@ class SpecFile:
     series_id: int
     file_id: int
     shoko_id: int
+    episode_number: int = 1
+    episode_numbers: tuple[int, ...] = ()
 
 
 def _sonarr_path(spec: SpecFile) -> str:
@@ -133,11 +155,16 @@ def _shoko_path(spec: SpecFile) -> str:
 @dataclass
 class Stubs:
     specs: list[SpecFile] = field(default_factory=list)
+    additional_series: list[dict[str, Any]] = field(default_factory=list)
+    series_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
     sizes: dict[int, int] = field(default_factory=dict)
     pending: set[int] = field(default_factory=set)
+    pending_anidb_episode_ids: set[int] = field(default_factory=set)
+    materialize_after_one_pending_response: set[int] = field(default_factory=set)
     divergent: bool = False
     available_anidb_episodes: dict[int, int] = field(default_factory=dict)
     shoko_internal_overrides: dict[int, int] = field(default_factory=dict)
+    source_xml: bytes | None = None
     verify_empty: set[int] = field(default_factory=set)
     blocked_count: int = 0
     posts: list[dict[str, Any]] = field(default_factory=list)
@@ -145,18 +172,24 @@ class Stubs:
     linked: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     ed2k_overrides: dict[int, str] = field(default_factory=dict)
     sonarr_episodefile_failures: set[int] = field(default_factory=set)
+    episode_list_failure_status: int | None = None
+    episode_list_timeout: bool = False
     shoko_page_failures: set[int] = field(default_factory=set)
     shoko_empty_pages: set[int] = field(default_factory=set)
     shoko_malformed_file_ids: set[int] = field(default_factory=set)
     shoko_total_overrides: dict[int, int] = field(default_factory=dict)
     shoko_file_list_calls: int = 0
     malformed_shoko_list_call: int | None = None
+    target_read_failures: dict[str, tuple[int, int | None]] = field(default_factory=dict)
+    target_read_counts: dict[str, int] = field(default_factory=dict)
     sonarr_requests: list[httpx.Request] = field(default_factory=list)
     shoko_requests: list[httpx.Request] = field(default_factory=list)
+    sonarr_hook: Callable[[httpx.Request], None] | None = None
     post_hook: Callable[[int], None] | None = None
     #: F19: when set, every Link POST responds with this status (e.g. 400 → REJECTED with
     #: zero server-side writes) instead of the accepted 200, and nothing is linked.
     post_status: int | None = None
+    post_statuses: list[int] = field(default_factory=list)
     #: P2-1: fired on every Shoko GET with the request path — simulates a slow preflight
     #: network phase (authorization state flips mid-call, before the POST).
     get_hook: Callable[[str], None] | None = None
@@ -177,9 +210,26 @@ class Stubs:
                     }
                 ],
             }
+        episode_numbers = spec.episode_numbers or (spec.episode_number,)
         return {
             "SeriesID": {"ID": None, "AniDB": ANIME_ID, "TMDB": None},
-            "EpisodeIDs": [{"ID": SHOKO_EP, "AniDB": ANIDB_EP, "TMDB": None, "Source": "User"}],
+            "EpisodeIDs": [
+                {
+                    "ID": self.shoko_internal_overrides.get(
+                        anidb_episode_id,
+                        SHOKO_EP + anidb_episode_id - ANIDB_EP,
+                    ),
+                    "AniDB": anidb_episode_id,
+                    "TMDB": None,
+                    "Source": "User",
+                }
+                for episode_number in episode_numbers
+                for anidb_episode_id in (
+                    self.available_anidb_episodes.get(
+                        episode_number, ANIDB_EP + episode_number - 1
+                    ),
+                )
+            ],
         }
 
     def file_row(self, spec: SpecFile) -> dict[str, Any]:
@@ -207,20 +257,25 @@ class Stubs:
 
     def sonarr(self, request: httpx.Request) -> httpx.Response:
         self.sonarr_requests.append(request)
+        if self.sonarr_hook is not None:
+            self.sonarr_hook(request)
         path = request.url.path
         if path == "/api/v3/series":
             series = {spec.series_id: spec for spec in self.specs}
+            rows = [
+                {
+                    "id": spec.series_id,
+                    "title": f"Series {spec.series_id}",
+                    "rootFolderPath": f"{SONARR_ROOT}/series{spec.series_id}",
+                    "seriesType": "anime",
+                    "tvdbId": TVDB,
+                    **self.series_metadata.get(spec.series_id, {}),
+                }
+                for spec in series.values()
+            ]
             return httpx.Response(
                 200,
-                json=[
-                    {
-                        "id": spec.series_id,
-                        "title": f"Series {spec.series_id}",
-                        "rootFolderPath": f"{SONARR_ROOT}/series{spec.series_id}",
-                        "tvdbId": TVDB,
-                    }
-                    for spec in series.values()
-                ],
+                json=[*rows, *self.additional_series],
                 request=request,
             )
         if path == "/api/v3/rootfolder":
@@ -233,16 +288,17 @@ class Stubs:
                 200,
                 json=[
                     {
-                        "id": spec.file_id * 100 + 1,
+                        "id": spec.file_id * 100 + episode_number,
                         "seriesId": series_id,
                         "seasonNumber": 1,
-                        "episodeNumber": 1,
+                        "episodeNumber": episode_number,
                         "title": "S01E01",
-                        "tvdbId": 1,
+                        "tvdbId": episode_number,
                         "episodeFileId": spec.file_id,
                     }
                     for spec in self.specs
                     if spec.series_id == series_id
+                    for episode_number in (spec.episode_numbers or (spec.episode_number,))
                 ],
                 request=request,
             )
@@ -266,7 +322,7 @@ class Stubs:
             )
         return httpx.Response(404, json={}, request=request)
 
-    def shoko(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911
+    def shoko(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911, PLR0912
         self.shoko_requests.append(request)
         path = request.url.path
         if self.get_hook is not None and request.method == "GET":
@@ -275,15 +331,26 @@ class Stubs:
             file_id = int(path.split("/")[4])
             self.posts.append(json.loads(request.content))
             self.posted_files.append(file_id)
-            if self.post_status is not None:
+            status = self.post_statuses.pop(0) if self.post_statuses else self.post_status
+            if status is not None:
                 # F19: the server refuses the request (zero writes assumed).
-                return httpx.Response(self.post_status, json={"title": "problem"}, request=request)
+                return httpx.Response(status, json={"title": "problem"}, request=request)
             spec = next(item for item in self.specs if item.shoko_id == file_id)
             if file_id not in self.verify_empty:
                 self.linked[file_id] = [self.xref(spec)]
             if self.post_hook is not None:
                 self.post_hook(file_id)
             return httpx.Response(200, json={}, request=request)
+        if request.method == "GET" and path in self.target_read_failures:
+            read_number = self.target_read_counts.get(path, 0) + 1
+            self.target_read_counts[path] = read_number
+            failure = self.target_read_failures[path]
+            if read_number == failure[0]:
+                if failure[1] is None:
+                    raise httpx.ReadTimeout("synthetic-api-key-must-not-leak", request=request)
+                if failure[1] == 200:
+                    return httpx.Response(200, content=b"{", request=request)
+                return httpx.Response(failure[1], json={}, request=request)
         if path == "/api/v3/ImportFolder":
             return httpx.Response(
                 200,
@@ -302,6 +369,10 @@ class Stubs:
                 request=request,
             )
         if path.startswith("/api/v3/Series/AniDB/"):
+            if self.episode_list_timeout:
+                raise httpx.ReadTimeout("episode list timed out", request=request)
+            if self.episode_list_failure_status is not None:
+                return httpx.Response(self.episode_list_failure_status, json={}, request=request)
             episode_rows = self.available_anidb_episodes or {
                 1: DIVERGENT_EP if self.divergent else ANIDB_EP
             }
@@ -323,12 +394,22 @@ class Stubs:
             )
         if path.startswith("/api/v3/Episode/AniDB/"):
             queried = int(path.split("/")[5])
-            materialized = DIVERGENT_EP if self.divergent else ANIDB_EP
-            if queried == materialized and not any(
+            materialized_ids = set(self.available_anidb_episodes.values()) or {ANIDB_EP}
+            materialized = (
+                queried == DIVERGENT_EP if self.divergent else queried in materialized_ids
+            )
+            pending_target = queried in self.pending_anidb_episode_ids or any(
                 spec.shoko_id in self.pending for spec in self.specs
-            ):
+            )
+            if pending_target and queried in self.materialize_after_one_pending_response:
+                self.materialize_after_one_pending_response.remove(queried)
+                self.pending_anidb_episode_ids.discard(queried)
+            if materialized and not pending_target:
                 internal = self.shoko_internal_overrides.get(
-                    queried, DIVERGENT_SHOKO_EP if self.divergent else SHOKO_EP
+                    queried,
+                    DIVERGENT_SHOKO_EP
+                    if self.divergent and queried == DIVERGENT_EP
+                    else SHOKO_EP + queried - ANIDB_EP,
                 )
                 return httpx.Response(
                     200,
@@ -522,7 +603,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
                 lambda request: httpx.Response(
                     200,
                     headers={"ETag": '"s"'},
-                    stream=httpx.ByteStream(_source_xml()),
+                    stream=httpx.ByteStream(environment.stubs.source_xml or _source_xml()),
                     request=request,
                 )
             ),
@@ -807,7 +888,7 @@ def _force_shoko_page_size_one(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         daemon_mod,
         "collect_shoko_discovery",
-        lambda endpoint: collect(endpoint, page_size=1),
+        lambda endpoint, **kwargs: collect(endpoint, page_size=1, **kwargs),
     )
 
 
@@ -897,6 +978,197 @@ def test_prepare_approve_apply_three_batches_with_one_approval(
         assert campaign.digest == prepared["approval_digest"]
     finally:
         store.close()
+
+
+def test_campaign_source_episode_drift_after_preflight_is_quarantined(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate = specs(1)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+
+    episode_reads = 0
+
+    def change_source_during_current_source_check(request: httpx.Request) -> None:
+        nonlocal episode_reads
+        if request.url.path == "/api/v3/episode" and request.url.params.get("seriesId") == "1":
+            episode_reads += 1
+            if episode_reads == 2:
+                env.stubs.specs[0] = replace(candidate, episode_number=2)
+
+    env.stubs.sonarr_hook = change_source_during_current_source_check
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == 0
+    assert result["payload"]["quarantined"] == 1
+    assert any("sonarr_source_changed" in reason for reason in result["payload"]["reasons"])
+    assert env.stubs.posts == []
+    assert env.stubs.posted_files == []
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert "sonarr_source_changed" in record.state_detail
+    finally:
+        store.close()
+
+
+def test_campaign_revalidates_series_type_despite_other_anime_in_authorized_root(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate = specs(1)[0]
+    env.seed([candidate])
+    env.stubs.additional_series.append(
+        {
+            "id": 2,
+            "title": "Unrelated anime",
+            "rootFolderPath": f"{SONARR_ROOT}/other-anime",
+            "seriesType": "anime",
+            "tvdbId": TVDB + 1,
+        }
+    )
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    approved_plan = (env.tmp_path / "plan.json").read_bytes()
+
+    def drift_series_during_preflight(path: str) -> None:
+        if path.startswith("/api/v3/Series/AniDB/"):
+            env.stubs.series_metadata[candidate.series_id] = {"seriesType": "standard"}
+
+    env.stubs.get_hook = drift_series_during_preflight
+
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == 0
+    assert result["payload"]["quarantined"] == 1
+    assert any(
+        "sonarr_source_changed" in reason for reason in result["payload"]["reasons"]
+    ), result["payload"]["reasons"]
+    assert env.stubs.posts == []
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan
+    assert not any(
+        request.method == "GET" and request.url.path == f"/api/v3/File/{candidate.shoko_id}"
+        for request in env.stubs.shoko_requests
+    )
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert "sonarr_source_changed" in record.state_detail
+    finally:
+        store.close()
+
+
+def test_manual_link_added_during_sonarr_source_check_blocks_campaign_post(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate = specs(1)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    episode_reads = 0
+
+    def add_manual_association(request: httpx.Request) -> None:
+        nonlocal episode_reads
+        if request.url.path == "/api/v3/episode" and request.url.params.get("seriesId") == "1":
+            episode_reads += 1
+            if episode_reads == 2:
+                env.stubs.linked[candidate.shoko_id] = [
+                    {
+                        "SeriesID": {"ID": None, "AniDB": ANIME_ID, "TMDB": None},
+                        "EpisodeIDs": [
+                            {
+                                "ID": SHOKO_EP + 1,
+                                "AniDB": ANIDB_EP + 1,
+                                "TMDB": None,
+                                "Source": "User",
+                            }
+                        ],
+                    }
+                ]
+
+    env.stubs.sonarr_hook = add_manual_association
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == 0
+    assert episode_reads >= 2
+    assert any("existing_link" in reason for reason in result["payload"]["reasons"])
+    assert env.stubs.posts == []
+
+
+def test_campaign_deadline_at_final_local_guard_leaves_no_send_or_budget_debt(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The campaign's final auth check and Shoko file read share its monotonic send deadline."""
+    _set_campaign(env, max_batch_size=1)
+    candidate = specs(1)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+
+    clock = {"now": 0.0}
+    final_file_read = {"done": False}
+    auth_slept = {"done": False}
+
+    def slow_final_file_read(path: str) -> None:
+        if path == f"/api/v3/File/{candidate.shoko_id}" and not final_file_read["done"]:
+            final_file_read["done"] = True
+            clock["now"] += 8.0
+
+    def slow_final_authorization() -> bool:
+        if final_file_read["done"] and not auth_slept["done"]:
+            auth_slept["done"] = True
+            clock["now"] += 2.0
+        return True
+
+    env.stubs.get_hook = slow_final_file_read
+    store = env.open_store()
+    deps: DaemonDeps | None = None
+    try:
+        base_deps = _campaign_deps(env, store, prepared["campaign_id"])
+        deps = base_deps
+        guarded_deps = replace(
+            base_deps,
+            monotonic=lambda: clock["now"],
+            max_cycle_seconds=10.0,
+            attestation_valid=slow_final_authorization,
+        )
+        deps = guarded_deps
+        report = apply_campaign(
+            guarded_deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            env.now_iso,
+            batch_size=1,
+        )
+        record = store.get_file(candidate.shoko_id)
+        sends = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
+        budget = store.budget_view()
+        last_request = env.stubs.shoko_requests[-1]
+    finally:
+        if deps is not None:
+            for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+                endpoint.client.close()
+        store.close()
+    assert final_file_read["done"]
+    assert auth_slept["done"]
+    assert last_request.method == "GET"
+    assert last_request.url.path == f"/api/v3/File/{candidate.shoko_id}"
+    assert env.stubs.posts == []
+    assert report.submitted == 0
+    assert any("cycle_time_budget_exhausted" in reason for reason in report.reasons)
+    assert int(sends[0]) == 0
+    assert budget.pending_file_requests == 0
+    assert budget.rolling_new_submissions == 0
+    assert record is not None
+    assert record.state is FileState.PLANNED
 
 
 def test_approve_rejects_digest_mismatch_with_both_digests(
@@ -1232,7 +1504,7 @@ def test_pending_quarantine_attribution_completes_across_bounded_batches(
     for expected_claims in range(1, COUNT_THREE + 1):
         result = apply(env, capsys, batch=str(BATCH_ONE))
         assert result["exit"] == EXIT_OK
-        assert result["payload"]["processed"] == expected_claims
+        assert result["payload"]["processed"] == BATCH_ONE
         assert result["payload"]["quarantined"] == BATCH_ONE
         assert result["payload"]["submitted"] == 0
         reopened = env.open_store()
@@ -1997,6 +2269,644 @@ def test_pending_target_applies_only_after_exact_identity_resolution(
         store.close()
 
 
+def test_pending_composite_retry_keeps_resolved_destinations_and_completes_exact_set(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate = specs(COUNT_ONE)[0]
+    env.stubs.source_xml = _source_xml().replace(b";1-1;", b";1-1;2-1;")
+    env.stubs.available_anidb_episodes = {1: ANIDB_EP, 2: DIVERGENT_EP}
+    env.stubs.shoko_internal_overrides = {
+        ANIDB_EP: SHOKO_EP,
+        DIVERGENT_EP: DIVERGENT_SHOKO_EP,
+    }
+    env.stubs.pending_anidb_episode_ids.add(DIVERGENT_EP)
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approved_plan, _ = read_plan_file(env.tmp_path / "plan.json")
+    entry = approved_plan.files[0]
+    assert entry.shoko_episode_ids == ()
+    assert entry.anidb_target_identities == (
+        (ANIME_ID, 1, "Episode", ANIDB_EP),
+        (ANIME_ID, 2, "Episode", DIVERGENT_EP),
+    )
+    approve(env, capsys, prepared["approval_digest"])
+
+    # Apply reconciliation sees target 5502 as pending (404); the pending-target retry
+    # in the same apply invocation sees it materialized and must retain target 5501.
+    env.stubs.materialize_after_one_pending_response.add(DIVERGENT_EP)
+    env.stubs.verify_empty.add(candidate.shoko_id)
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == 1, result["payload"].get("reasons")
+    assert result["payload"]["quarantined"] == 0
+    assert env.stubs.posts == [{"EpisodeIDs": [SHOKO_EP, DIVERGENT_SHOKO_EP]}]
+    assert env.stubs.posted_files == [candidate.shoko_id]
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.VERIFYING
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 0
+    finally:
+        store.close()
+
+    # The asynchronous Shoko job materializes the exact approved destination set.
+    env.stubs.verify_empty.discard(candidate.shoko_id)
+    completed_xref = env.stubs.xref(candidate)
+    completed_xref["EpisodeIDs"] = [
+        {"ID": SHOKO_EP, "AniDB": ANIDB_EP, "TMDB": None, "Source": "User"},
+        {
+            "ID": DIVERGENT_SHOKO_EP,
+            "AniDB": DIVERGENT_EP,
+            "TMDB": None,
+            "Source": "User",
+        },
+    ]
+    env.stubs.linked[candidate.shoko_id] = [completed_xref]
+    verify_code = main(
+        [
+            "campaign",
+            "verify",
+            str(env.config_path),
+            "--campaign-id",
+            prepared["campaign_id"],
+            "--json",
+        ]
+    )
+    assert verify_code == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["verified"] == 1
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 0
+    finally:
+        store.close()
+
+
+def test_resolved_pending_plan_preserves_source_occurrences_and_deduplicates_destinations() -> None:
+    identity = (ANIME_ID, 1, "Episode", ANIDB_EP)
+    existing = LinkTarget(
+        tvdb_series=TVDB,
+        season_number=1,
+        episode_number=1,
+        absolute_episode_number=None,
+        anidb_anime_id=ANIME_ID,
+        anidb_episode_number=1,
+        episode_type="Episode",
+        source_rule="explicit_pair",
+        anidb_episode_id=ANIDB_EP,
+        shoko_episode_id=SHOKO_EP,
+    )
+    shared_destination = replace(existing, episode_number=2)
+    pending = PendingTarget(
+        tvdb_series=TVDB,
+        season_number=1,
+        episode_number=3,
+        absolute_episode_number=None,
+        anidb_anime_id=ANIME_ID,
+        anidb_episode_number=1,
+        episode_type="Episode",
+        source_rule="explicit_pair",
+        anidb_episode_id=ANIDB_EP,
+    )
+    plan = LinkPlan(
+        plan_version="test",
+        policy="backlog",
+        sonarr_series_id=1,
+        sonarr_episode_file_id=10,
+        sonarr_path=f"{SONARR_ROOT}/shared.mkv",
+        sonarr_size=FILE_SIZE,
+        shoko_file_id=500,
+        shoko_size=FILE_SIZE,
+        shoko_ed2k="a" * 32,
+        shoko_paths=(f"{SHOKO_ROOT}/shared.mkv",),
+        episodes=(),
+        targets=(existing, shared_destination),
+        pending_targets=(pending,),
+        episode_ids=(),
+        targets_digest="b" * 64,
+        structure_digest="c" * 64,
+        mapping_revision="1",
+        overrides_active=False,
+        status=PlanStatus.PENDING_TARGETS,
+        fingerprint="",
+    )
+    entry = CampaignFile(
+        shoko_file_id=500,
+        sonarr_series_id=1,
+        sonarr_file_id=10,
+        path=plan.sonarr_path,
+        size=FILE_SIZE,
+        shoko_ed2k=plan.shoko_ed2k,
+        plan_fingerprint="d" * 64,
+        request_fingerprint="e" * 64,
+        mapping_targets_digest="f" * 64,
+        anidb_target_identities=(identity,),
+        shoko_episode_ids=(),
+    )
+
+    class Resolver:
+        def __init__(self, shoko_episode_id: int = SHOKO_EP) -> None:
+            self.shoko_episode_id = shoko_episode_id
+
+        def resolve(self, anime_id: int, episode_type: str, episode_number: int) -> ResolvedEpisode:
+            assert (anime_id, episode_type, episode_number) == (ANIME_ID, "Episode", 1)
+            return ResolvedEpisode(
+                ANIME_ID,
+                "Episode",
+                1,
+                ANIDB_EP,
+                self.shoko_episode_id,
+                EpisodeResolutionStatus.RESOLVED,
+                "resolved fixture",
+            )
+
+    resolved, reason = campaign_mod._resolved_pending_plan(
+        plan, entry, cast(EpisodeIdResolver, Resolver())
+    )
+
+    assert reason is None
+    assert resolved is not None
+    assert resolved.pending_targets == ()
+    assert [target.episode_number for target in resolved.targets] == [1, 2, 3]
+    assert resolved.episode_ids == (SHOKO_EP,)
+
+    missing_entry = replace(
+        entry,
+        anidb_target_identities=(identity, (ANIME_ID, 2, "Episode", DIVERGENT_EP)),
+    )
+    missing, missing_reason = campaign_mod._resolved_pending_plan(
+        plan, missing_entry, cast(EpisodeIdResolver, Resolver())
+    )
+    assert missing is None
+    assert missing_reason == "target_drift"
+
+    contradictory, contradiction_reason = campaign_mod._resolved_pending_plan(
+        plan, entry, cast(EpisodeIdResolver, Resolver(SHOKO_EP + 1))
+    )
+    assert contradictory is None
+    assert contradiction_reason == "target_drift"
+
+    changed_plan = replace(plan, pending_targets=(replace(pending, anidb_episode_number=2),))
+    changed, changed_reason = campaign_mod._resolved_pending_plan(
+        changed_plan, entry, cast(EpisodeIdResolver, Resolver())
+    )
+    assert changed is None
+    assert changed_reason == "target_drift"
+
+
+def test_pending_shared_composite_posts_complete_unique_set_and_verifies(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate = replace(specs(COUNT_ONE)[0], episode_numbers=(1, 2))
+    env.stubs.source_xml = _source_xml().replace(b";1-1;", b";1-1;1-2;2-2;")
+    env.stubs.available_anidb_episodes = {1: ANIDB_EP, 2: DIVERGENT_EP}
+    env.stubs.shoko_internal_overrides = {
+        ANIDB_EP: SHOKO_EP,
+        DIVERGENT_EP: DIVERGENT_SHOKO_EP,
+    }
+    env.stubs.pending_anidb_episode_ids.add(DIVERGENT_EP)
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approved_plan, _ = read_plan_file(env.tmp_path / "plan.json")
+    entry = approved_plan.files[0]
+    assert entry.anidb_target_identities == (
+        (ANIME_ID, 1, "Episode", ANIDB_EP),
+        (ANIME_ID, 2, "Episode", DIVERGENT_EP),
+    )
+    approve(env, capsys, prepared["approval_digest"])
+
+    # The first lookup finds B pending; the pending-target retry sees it materialized.
+    env.stubs.materialize_after_one_pending_response.add(DIVERGENT_EP)
+    env.stubs.verify_empty.add(candidate.shoko_id)
+    result = apply(env, capsys)
+
+    assert result["exit"] == EXIT_OK
+    assert result["payload"]["submitted"] == 1, result["payload"].get("reasons")
+    assert result["payload"]["quarantined"] == 0
+    assert env.stubs.posts == [{"EpisodeIDs": [SHOKO_EP, DIVERGENT_SHOKO_EP]}]
+    assert env.stubs.posted_files == [candidate.shoko_id]
+
+    # Verify the exact unique destination set after the asynchronous Shoko job lands.
+    env.stubs.verify_empty.discard(candidate.shoko_id)
+    completed_xref = env.stubs.xref(candidate)
+    completed_xref["EpisodeIDs"] = [
+        {"ID": SHOKO_EP, "AniDB": ANIDB_EP, "TMDB": None, "Source": "User"},
+        {
+            "ID": DIVERGENT_SHOKO_EP,
+            "AniDB": DIVERGENT_EP,
+            "TMDB": None,
+            "Source": "User",
+        },
+    ]
+    env.stubs.linked[candidate.shoko_id] = [completed_xref]
+    verify_code = main(
+        [
+            "campaign",
+            "verify",
+            str(env.config_path),
+            "--campaign-id",
+            prepared["campaign_id"],
+            "--json",
+        ]
+    )
+    assert verify_code == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["verified"] == 1
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ["http_503", "http_429", "timeout"])
+def test_campaign_transient_episode_resolution_failure_defers_without_quarantine_and_recovers(
+    env: Env, capsys: pytest.CaptureFixture[str], failure: str
+) -> None:
+    candidate = specs(COUNT_ONE)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    approved_plan, _ = read_plan_file(env.tmp_path / "plan.json")
+    approved_entry = approved_plan.files[0]
+    approved_bindings: tuple[Any, ...]
+    if failure == "timeout":
+        env.stubs.episode_list_timeout = True
+    else:
+        env.stubs.episode_list_failure_status = 503 if failure == "http_503" else 429
+
+    first = apply(env, capsys)
+
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["submitted"] == 0
+    assert env.stubs.posts == []
+    store = env.open_store()
+    try:
+        campaign_before = store.get_campaign(prepared["campaign_id"])
+        record = store.get_file(candidate.shoko_id)
+        assert campaign_before is not None
+        assert campaign_before.status == "approved"
+        assert campaign_before.digest == prepared["approval_digest"]
+        approved_bindings = campaign_before.bindings
+        assert record is not None
+        assert record.state is not FileState.BLOCKED_SAFETY
+        assert "plan_no_longer_frozen" not in record.state_detail
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 0
+    finally:
+        store.close()
+
+    # The persistent store is reopened by the second CLI invocation. Recovery may resolve only
+    # the identity already captured in the approved plan; it may not silently rebind the target.
+    env.stubs.episode_list_failure_status = None
+    env.stubs.episode_list_timeout = False
+    second = apply(env, capsys)
+    assert second["exit"] == EXIT_OK
+    assert second["payload"]["submitted"] == COUNT_ONE
+    assert env.stubs.posted_files == [candidate.shoko_id]
+    assert env.stubs.posts == [{"EpisodeIDs": [approved_entry.shoko_episode_ids[0]]}]
+    store = env.open_store()
+    try:
+        campaign_after = store.get_campaign(prepared["campaign_id"])
+        record = store.get_file(candidate.shoko_id)
+        assert campaign_after is not None
+        assert campaign_after.status == "approved"
+        assert campaign_after.digest == prepared["approval_digest"]
+        assert campaign_after.bindings == approved_bindings
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "failure"),
+    [
+        ("series", "http_503"),
+        ("series", "http_429"),
+        ("series", "timeout"),
+        ("episode", "http_503"),
+        ("episode", "http_429"),
+        ("episode", "timeout"),
+    ],
+)
+def test_campaign_second_target_read_unavailability_defers_and_recovers_after_restart(  # noqa: PLR0915
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    endpoint: str,
+    failure: str,
+) -> None:
+    candidate = specs(COUNT_ONE)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    approved_plan, _ = read_plan_file(env.tmp_path / "plan.json")
+    approved_entry = approved_plan.files[0]
+    store = env.open_store()
+    try:
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        approved_bindings = campaign.bindings
+    finally:
+        store.close()
+    target_path = (
+        f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"
+        if endpoint == "series"
+        else f"/api/v3/Episode/AniDB/{ANIDB_EP}/Episode"
+    )
+    failure_status = None if failure == "timeout" else int(failure.removeprefix("http_"))
+    env.stubs.target_read_failures[target_path] = (2, failure_status)
+    approved_plan_bytes = (env.tmp_path / "plan.json").read_bytes()
+
+    first = apply(env, capsys)
+
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["submitted"] == 0
+    assert first["payload"]["quarantined"] == 0
+    assert first["payload"]["deferred"] >= 1
+    assert env.stubs.target_read_counts[target_path] == 2
+    assert env.stubs.posts == []
+    reasons = first["payload"]["reasons"]
+    assert any("preflight_deferred" in reason for reason in reasons), reasons
+    assert any("target_unavailable" in reason for reason in reasons), reasons
+    assert any(
+        "retry" in reason.lower() and "no post" in reason.lower() for reason in reasons
+    ), reasons
+    assert any("Shoko" in reason and "cannot be confirmed" in reason for reason in reasons), reasons
+    assert "synthetic-api-key-must-not-leak" not in repr(first)
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan_bytes
+    store = env.open_store()
+    try:
+        campaign_before = store.get_campaign(prepared["campaign_id"])
+        record = store.get_file(candidate.shoko_id)
+        assert campaign_before is not None
+        assert campaign_before.status == "approved"
+        assert campaign_before.digest == prepared["approval_digest"]
+        assert campaign_before.bindings == approved_bindings
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert not record.state_detail.startswith("campaign_quarantine:")
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 0
+    finally:
+        store.close()
+
+    # Each CLI invocation opens a fresh SQLite connection; recovery is constrained to
+    # the IDs in the unchanged approved plan.
+    env.stubs.target_read_failures.clear()
+    second = apply(env, capsys)
+
+    assert second["exit"] == EXIT_OK
+    assert second["payload"]["submitted"] == COUNT_ONE
+    assert env.stubs.posted_files == [candidate.shoko_id]
+    assert env.stubs.posts == [{"EpisodeIDs": list(approved_entry.shoko_episode_ids)}]
+    store = env.open_store()
+    try:
+        campaign_after = store.get_campaign(prepared["campaign_id"])
+        record = store.get_file(candidate.shoko_id)
+        assert campaign_after is not None
+        assert campaign_after.status == "approved"
+        assert campaign_after.digest == prepared["approval_digest"]
+        assert campaign_after.bindings == approved_bindings
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+    finally:
+        store.close()
+
+
+def _prepare_two_target_campaign(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    episode_ids: tuple[int, int],
+) -> tuple[SpecFile, dict[str, Any], bytes]:
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500, episode_numbers=(1, 2))
+    env.stubs.source_xml = _source_xml().replace(b";1-1;", b";1-1;2-2;")
+    env.stubs.available_anidb_episodes = {1: episode_ids[0], 2: episode_ids[1]}
+    env.stubs.shoko_internal_overrides = {
+        episode_id: SHOKO_EP + episode_id - ANIDB_EP for episode_id in episode_ids
+    }
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    return candidate, prepared, (env.tmp_path / "plan.json").read_bytes()
+
+
+@pytest.mark.parametrize("hard_first", [True, False])
+@pytest.mark.parametrize(
+    ("hard_kind", "soft_status", "hard_reason"),
+    [("drift", 503, "target_drift"), ("malformed", 404, "malformed")],
+)
+def test_campaign_mixed_preflight_reasons_quarantine_hard_failure_and_survive_restart(  # noqa: PLR0915
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    hard_first: bool,
+    hard_kind: str,
+    soft_status: int,
+    hard_reason: str,
+) -> None:
+    hard_target_id, soft_target_id = (
+        (ANIDB_EP, ANIDB_EP + 1) if hard_first else (ANIDB_EP + 1, ANIDB_EP)
+    )
+    candidate, prepared, approved_plan = _prepare_two_target_campaign(
+        env, capsys, (hard_target_id, soft_target_id)
+    )
+    hard_path = f"/api/v3/Episode/AniDB/{hard_target_id}/Episode"
+    soft_path = f"/api/v3/Episode/AniDB/{soft_target_id}/Episode"
+    if hard_kind == "drift":
+
+        def drift_after_sweep(path: str) -> None:
+            if path == "/api/v3/Queue":
+                env.stubs.shoko_internal_overrides[hard_target_id] = 999
+
+        env.stubs.get_hook = drift_after_sweep
+        env.stubs.target_read_failures[soft_path] = (2, soft_status)
+    else:
+        env.stubs.target_read_failures[hard_path] = (2, 200)
+        env.stubs.target_read_failures[soft_path] = (2, soft_status)
+
+    first = apply(env, capsys)
+
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["submitted"] == 0, env.stubs.target_read_counts
+    assert first["payload"]["quarantined"] == 1
+    assert first["payload"]["deferred"] == 0
+    assert any(
+        f"campaign_quarantine:{candidate.shoko_id}:preflight_{hard_reason}" in reason
+        for reason in first["payload"]["reasons"]
+    ), first["payload"]["reasons"]
+    assert env.stubs.posts == []
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith(f"campaign_quarantine:preflight_{hard_reason}")
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 1
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+    finally:
+        store.close()
+
+    # A healthy Shoko read after process/store restart does not clear an operator-review quarantine.
+    env.stubs.target_read_failures.clear()
+    env.stubs.shoko_internal_overrides[hard_target_id] = SHOKO_EP + hard_target_id - ANIDB_EP
+    second = apply(env, capsys)
+    assert second["payload"]["submitted"] == 0
+    assert env.stubs.posts == []
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith(f"campaign_quarantine:preflight_{hard_reason}")
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 1
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+    finally:
+        store.close()
+
+
+def test_campaign_multiple_target_all_soft_preflight_defers_then_recovers(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate, prepared, approved_plan = _prepare_two_target_campaign(
+        env, capsys, (ANIDB_EP, ANIDB_EP + 1)
+    )
+    target_paths = [
+        f"/api/v3/Episode/AniDB/{episode_id}/Episode" for episode_id in (ANIDB_EP, ANIDB_EP + 1)
+    ]
+    env.stubs.target_read_failures = {path: (2, 503) for path in target_paths}
+
+    first = apply(env, capsys)
+
+    assert first["payload"]["submitted"] == 0, env.stubs.target_read_counts
+    assert first["payload"]["quarantined"] == 0
+    assert first["payload"]["deferred"] == 1
+    assert env.stubs.posts == []
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 0
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+    finally:
+        store.close()
+
+    env.stubs.target_read_failures.clear()
+    second = apply(env, capsys)
+    assert second["payload"]["submitted"] == 1
+    assert second["payload"]["quarantined"] == 0
+    assert env.stubs.posts == [{"EpisodeIDs": [SHOKO_EP, SHOKO_EP + 1]}]
+    assert env.stubs.posted_files == [candidate.shoko_id]
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 0
+    finally:
+        store.close()
+
+
+def test_campaign_multiple_target_all_hard_preflight_quarantines_file_atomically(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate, prepared, approved_plan = _prepare_two_target_campaign(
+        env, capsys, (ANIDB_EP, ANIDB_EP + 1)
+    )
+
+    def drift_after_sweep(path: str) -> None:
+        if path == "/api/v3/Queue":
+            env.stubs.shoko_internal_overrides = {
+                ANIDB_EP: 999,
+                ANIDB_EP + 1: 998,
+            }
+
+    env.stubs.get_hook = drift_after_sweep
+
+    result = apply(env, capsys)
+
+    assert result["payload"]["submitted"] == 0
+    assert result["payload"]["quarantined"] == 1
+    assert result["payload"]["deferred"] == 0
+    assert env.stubs.posts == []
+    assert (env.tmp_path / "plan.json").read_bytes() == approved_plan
+    store = env.open_store()
+    try:
+        record = store.get_file(candidate.shoko_id)
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert store.campaign_progress(prepared["campaign_id"])["quarantined"] == 1
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("batch_size", [1, 10])
+def test_campaign_scan_cursor_reaches_ready_file_after_pending_prefix(
+    env: Env, capsys: pytest.CaptureFixture[str], batch_size: int
+) -> None:
+    """A bounded rotating scan reaches an approved ready file past a pending-target prefix."""
+    _set_campaign(env, max_batch_size=batch_size)
+    pending_count = batch_size
+    ready = SpecFile(
+        series_id=pending_count + 1,
+        file_id=10 + pending_count,
+        shoko_id=500 + pending_count,
+        episode_number=2,
+    )
+    files = [
+        SpecFile(series_id=index + 1, file_id=10 + index, shoko_id=500 + index)
+        for index in range(pending_count)
+    ] + [ready]
+    env.stubs.source_xml = _source_xml().replace(b";1-1;", b";1-1;2-2;")
+    env.stubs.available_anidb_episodes = {1: ANIDB_EP, 2: ANIDB_EP + 1}
+    env.stubs.pending_anidb_episode_ids = {ANIDB_EP}
+    env.stubs.shoko_internal_overrides[ANIDB_EP + 1] = SHOKO_EP + 1
+    env.seed(files)
+    prepared = prepare(env, capsys, limit=str(len(files)))
+    approve(env, capsys, prepared["approval_digest"])
+
+    first = apply(env, capsys, batch=str(batch_size))
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["submitted"] == 0
+    assert len(env.stubs.posts) == 0
+
+    # Each CLI invocation reopens SQLite; the second starts from the persisted cursor.
+    second = apply(env, capsys, batch=str(batch_size))
+
+    assert second["exit"] == EXIT_OK
+    assert second["payload"]["submitted"] == 1
+    assert env.stubs.posted_files == [ready.shoko_id]
+
+
 def test_pending_target_divergent_resolution_quarantines_target_drift(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2646,15 +3556,407 @@ def test_apply_campaign_releases_lock_when_a_send_crashes_mid_batch(
         monkeypatch.setattr("shoko_linker.campaign.submit_link", _boom)
         with pytest.raises(RuntimeError, match="mid-apply crash"):
             apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
+        campaign = store.get_campaign(prepared["campaign_id"])
+        assert campaign is not None
+        assert campaign.total_sent == 1  # conservative debit committed before transport handoff
+        history = store.campaign_send_history(prepared["campaign_id"])
+        assert [row.outcome for row in history] == ["attempted"]
+        assert env.stubs.posts == []
         assert store.lock_holder() is None
         monkeypatch.setattr("shoko_linker.campaign.submit_link", real_submit)
         second = apply_campaign(
             deps, settings, store, env.tmp_path / "plan.json", T0, batch_size=BATCH_TWO
         )
         assert second.submitted == 1
-        assert len(env.stubs.posts) == 1
     finally:
         store.close()
+    assert len(env.stubs.posts) == 1
+
+
+def test_rejected_campaign_send_crash_cannot_bypass_submission_ceiling(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attempted-send debit survives outcome persistence failure and a store reopen.
+
+    Before the fix, a rejected POST followed by a crash at the old post-outcome counter update
+    left ``total_sent`` at zero. A later apply could then make three POSTs against a two-send
+    ceiling.
+    """
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys, limit="2")
+    approve(env, capsys, prepared["approval_digest"])
+    settings = load_settings(env.config_path)
+    store = env.open_store()
+    campaign_id = prepared["campaign_id"]
+    env.stubs.post_statuses = [400]
+    real_record_campaign_send = StateStore.record_campaign_send
+
+    def _crash_after_outcome(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("injected campaign count crash")
+
+    monkeypatch.setattr(StateStore, "record_campaign_send", _crash_after_outcome)
+    try:
+        deps = _campaign_deps(env, store, campaign_id)
+        with pytest.raises(RuntimeError, match="injected campaign count crash"):
+            apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0, batch_size=1)
+        assert env.stubs.posted_files == [500]
+        history = store.campaign_send_history(campaign_id)
+        assert [row.outcome for row in history] == ["rejected"]
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == 1
+    finally:
+        store.close()
+
+    monkeypatch.setattr(StateStore, "record_campaign_send", real_record_campaign_send)
+    reopened = env.open_store()
+    try:
+        campaign = reopened.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == 1
+        report = apply_campaign(
+            _campaign_deps(env, reopened, campaign_id),
+            settings,
+            reopened,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert report.submitted == 1
+        assert env.stubs.posted_files == [500, 500]
+        campaign = reopened.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == 2
+        history = reopened.campaign_send_history(campaign_id)
+        assert [(row.outcome, row.shoko_file_id) for row in history] == [
+            ("rejected", 500),
+            ("verified", 500),
+        ]
+        untouched = reopened.get_file(501)
+        assert untouched is not None
+        assert untouched.state in (FileState.PLANNED, FileState.MAPPED)
+    finally:
+        reopened.close()
+
+
+def _prepare_campaign_contender_tokens(env: Env, plan: Any, campaign_id: str) -> list[Any]:
+    store = env.open_store()
+    try:
+        store.connection.execute(
+            "UPDATE campaigns SET max_submissions = 1 WHERE campaign_id = ?", (campaign_id,)
+        )
+        tokens: list[Any] = []
+        for entry in plan.files:
+            token = store.prepare_send(
+                entry.shoko_file_id,
+                entry.plan_fingerprint,
+                entry.request_fingerprint,
+                targets_digest=plan.targets_digest,
+                structure_digest=plan.structure_digest,
+                mapping_revision=plan.mapping_revision,
+                cycle_key="campaign-concurrent-commit",
+                iso=T0,
+                policy=plan.policy,
+                campaign_id=campaign_id,
+                expected_episode_jobs=1,
+            )
+            assert not isinstance(token, BudgetRefusal)
+            tokens.append(token)
+        assert store.budget_view().pending_file_requests == COUNT_THREE
+        return tokens
+    finally:
+        store.close()
+
+
+def _assert_campaign_commit_contenders_finished(
+    workers: list[Thread], failures: list[BaseException], results: list[Any], post_calls: list[int]
+) -> None:
+    assert all(not worker.is_alive() for worker in workers)
+    assert failures == []
+    assert len(results) == COUNT_THREE
+    assert len(post_calls) == 1
+    reasons = [reason for tally, _send in results for reason in tally.reasons]
+    assert sum(reason.startswith("max_submissions_reached:") for reason in reasons) == 1
+    assert sum(reason.startswith("campaign_send_refused:") for reason in reasons) == 1
+
+
+def test_concurrent_prepared_campaign_contenders_are_voided_by_commit_consumer(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three independent commit consumers take one slot; losers release pending, not rolling."""
+    env.seed(specs(COUNT_THREE))
+    prepared_campaign = prepare(env, capsys, limit=str(COUNT_THREE))
+    campaign_id = prepared_campaign["campaign_id"]
+    approve(env, capsys, prepared_campaign["approval_digest"])
+    plan, _digest = read_plan_file(env.tmp_path / "plan.json")
+    tokens = _prepare_campaign_contender_tokens(env, plan, campaign_id)
+
+    post_calls: list[int] = []
+
+    def reject_one(_shoko: Any, link_plan: Any, *, clock: Callable[[], float]) -> SendResult:
+        post_calls.append(link_plan.shoko_file_id)
+        return SendResult(
+            outcome=SendOutcome.REJECTED,
+            shoko_file_id=link_plan.shoko_file_id,
+            episode_ids=(),
+            plan_fingerprint=link_plan.fingerprint,
+            request_fingerprint=next(
+                entry.request_fingerprint
+                for entry in plan.files
+                if entry.shoko_file_id == link_plan.shoko_file_id
+            ),
+            attempted_at=clock(),
+            http_status=400,
+            retry_forbidden=True,
+            detail="fixture rejection",
+        )
+
+    monkeypatch.setattr(campaign_mod, "submit_link", reject_one)
+    barrier = Barrier(COUNT_THREE)
+    results: list[Any] = []
+    failures: list[BaseException] = []
+
+    def commit(entry: CampaignFile, token: Any) -> None:
+        store = env.open_store()
+        deps: DaemonDeps | None = None
+        try:
+            thread_deps = _campaign_deps(env, store, campaign_id)
+            deps = thread_deps
+            link_plan = cast(
+                LinkPlan,
+                SimpleNamespace(
+                    shoko_file_id=entry.shoko_file_id,
+                    fingerprint=entry.plan_fingerprint,
+                ),
+            )
+            barrier.wait(timeout=5.0)
+            results.append(
+                campaign_mod._commit_send(thread_deps, store, link_plan, campaign_id, T0, token)
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            if deps is not None:
+                for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+                    endpoint.client.close()
+            store.close()
+
+    workers = [
+        Thread(target=commit, args=(entry, token))
+        for entry, token in zip(plan.files, tokens, strict=True)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10.0)
+
+    _assert_campaign_commit_contenders_finished(workers, failures, results, post_calls)
+    reopened = env.open_store()
+    try:
+        campaign = reopened.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.total_sent == 1
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "max_submissions_reached"
+        outcomes = reopened.connection.execute(
+            "SELECT outcome, COUNT(*) FROM sends GROUP BY outcome ORDER BY outcome"
+        ).fetchall()
+        assert [tuple(row) for row in outcomes] == [("rejected", 1), ("voided", 2)]
+        budget = reopened.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.rolling_new_submissions == COUNT_THREE
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("non_campaign", [False, True])
+def test_cli_campaign_history_resolve_requires_confirmation_and_restores_owner(
+    env: Env, capsys: pytest.CaptureFixture[str], non_campaign: bool
+) -> None:
+    env.seed(specs(1))
+    campaign = prepare(env, capsys, limit="1")
+    campaign_id = campaign["campaign_id"]
+    approve(env, capsys, campaign["approval_digest"])
+    plan, _digest = read_plan_file(env.tmp_path / "plan.json")
+    entry = plan.files[0]
+    identity = entry.anidb_target_identities[0]
+
+    store = env.open_store()
+    try:
+        token = store.prepare_send(
+            entry.shoko_file_id,
+            entry.plan_fingerprint,
+            entry.request_fingerprint,
+            targets_digest=plan.targets_digest,
+            structure_digest=plan.structure_digest,
+            mapping_revision=plan.mapping_revision,
+            cycle_key="campaign-history-resolve",
+            iso=T0,
+            policy=plan.policy,
+            campaign_id=None if non_campaign else campaign_id,
+            expected_episode_jobs=1,
+            target_ids=((identity[0], identity[3], entry.shoko_episode_ids[0]),),
+        )
+        assert not isinstance(token, BudgetRefusal)
+        store.mark_sent(token, iso=T0)
+        store.record_send_outcome(token, SendOutcome.REJECTED, iso=T0, http_status=400)
+        # Represent a legacy row whose owner was deliberately left unknown by migration.
+        store.connection.execute(
+            "UPDATE sends SET campaign_id = NULL, campaign_ownership = 'unknown'"
+            " WHERE send_id = ?",
+            (token.send_id,),
+        )
+        store.connection.execute(
+            "UPDATE campaigns SET total_sent = 0 WHERE campaign_id = ?", (campaign_id,)
+        )
+        send_id = token.send_id
+    finally:
+        store.close()
+
+    owner_args = ["--non-campaign"] if non_campaign else ["--campaign-id", campaign_id]
+    owner_note = (
+        "operator verified send was outside campaigns"
+        if non_campaign
+        else "operator matched send to approved campaign records"
+    )
+    args = [
+        "campaign",
+        "history-resolve",
+        str(env.config_path),
+        "--send-id",
+        str(send_id),
+        *owner_args,
+        "--note",
+        owner_note,
+        "--json",
+    ]
+    assert main(args) == EXIT_CONFIG_INVALID
+    assert "requires the explicit --confirm flag" in capsys.readouterr().out
+    unresolved_store = env.open_store()
+    try:
+        assert [row.send_id for row in unresolved_store.unresolved_campaign_send_history()] == [
+            send_id
+        ]
+        unresolved_campaign = unresolved_store.get_campaign(campaign_id)
+        assert unresolved_campaign is not None
+        assert unresolved_campaign.total_sent == 0
+    finally:
+        unresolved_store.close()
+
+    assert main([*args, "--confirm"]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    expected_owner = "non_campaign" if non_campaign else f"campaign:{campaign_id}"
+    assert payload["result"] == {
+        "send_id": send_id,
+        "owner": expected_owner,
+        "unresolved_send_ids": [],
+    }
+    resolved_store = env.open_store()
+    try:
+        assert resolved_store.unresolved_campaign_send_history() == ()
+        owner = resolved_store.connection.execute(
+            "SELECT campaign_id, campaign_ownership FROM sends WHERE send_id = ?", (send_id,)
+        ).fetchone()
+        assert tuple(owner) == (
+            None if non_campaign else campaign_id,
+            "non_campaign" if non_campaign else "campaign",
+        )
+        resolved_campaign = resolved_store.get_campaign(campaign_id)
+        assert resolved_campaign is not None
+        assert resolved_campaign.total_sent == (0 if non_campaign else 1)
+    finally:
+        resolved_store.close()
+
+
+def test_cli_history_resolve_rejects_unrelated_campaign_without_clearing_hold(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(1))
+    prepared = prepare(env, capsys, limit="1")
+    approved_id = prepared["campaign_id"]
+    approve(env, capsys, prepared["approval_digest"])
+    plan, _digest = read_plan_file(env.tmp_path / "plan.json")
+    entry = plan.files[0]
+    unrelated_id = "unrelated-campaign-C"
+
+    store = env.open_store()
+    try:
+        token = store.prepare_send(
+            entry.shoko_file_id,
+            entry.plan_fingerprint,
+            entry.request_fingerprint,
+            targets_digest=plan.targets_digest,
+            structure_digest=plan.structure_digest,
+            mapping_revision=plan.mapping_revision,
+            cycle_key="campaign-history-unrelated-resolution",
+            iso=T0,
+            policy=plan.policy,
+            campaign_id=approved_id,
+            expected_episode_jobs=1,
+        )
+        assert not isinstance(token, BudgetRefusal)
+        store.mark_sent(token, iso=T0)
+        store.record_send_outcome(token, SendOutcome.REJECTED, iso=T0, http_status=400)
+        store.create_campaign(
+            unrelated_id,
+            ZERO_DIGEST,
+            max_submissions=1,
+            deadline_iso=None,
+            attestation_scope=f"campaign:{unrelated_id}",
+            approval_iso=T0,
+            iso=T0,
+            bindings=(
+                CampaignBinding(
+                    entry.shoko_file_id + 10_000,
+                    entry.plan_fingerprint,
+                    entry.request_fingerprint,
+                ),
+            ),
+        )
+        store.connection.execute(
+            "UPDATE sends SET campaign_id = NULL, campaign_ownership = 'unknown'"
+            " WHERE send_id = ?",
+            (token.send_id,),
+        )
+        store.connection.execute(
+            "UPDATE campaigns SET total_sent = 0 WHERE campaign_id = ?", (approved_id,)
+        )
+    finally:
+        store.close()
+
+    code = main(
+        [
+            "campaign",
+            "history-resolve",
+            str(env.config_path),
+            "--send-id",
+            str(token.send_id),
+            "--campaign-id",
+            unrelated_id,
+            "--note",
+            "operator reviewed campaign records",
+            "--confirm",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == EXIT_STATE
+    assert "approved binding" in captured.err.lower()
+    assert "remains unresolved" in captured.err.lower()
+
+    reopened = env.open_store()
+    try:
+        assert [row.send_id for row in reopened.unresolved_campaign_send_history()] == [
+            token.send_id
+        ]
+        owner = reopened.connection.execute(
+            "SELECT campaign_id, campaign_ownership FROM sends WHERE send_id = ?",
+            (token.send_id,),
+        ).fetchone()
+        assert tuple(owner) == (None, "unknown")
+        assert reopened.get_campaign(approved_id).total_sent == 0  # type: ignore[union-attr]
+        assert reopened.get_campaign(unrelated_id).total_sent == 0  # type: ignore[union-attr]
+    finally:
+        reopened.close()
 
 
 def test_cli_campaign_apply_with_contended_lock_exits_zero_with_reason(
@@ -3583,12 +4885,14 @@ def test_f9_batch_loop_stops_at_the_wall_time_bound(
         base = _campaign_deps(env, store, campaign_id)
         clock = {"value": 0.0}
 
-        def _fake_monotonic() -> float:
-            current = clock["value"]
-            clock["value"] += 100.0  # every reading crosses the 10s bound
-            return current
+        def expire_batch_after_reconciliation(path: str) -> None:
+            if path == "/api/v3/File":
+                # Let the bounded reconciliation finish, then expire the shared batch budget
+                # before the campaign loop starts its first submission.
+                clock["value"] = 100.0
 
-        deps = replace(base, monotonic=_fake_monotonic, max_cycle_seconds=10.0)
+        env.stubs.get_hook = expire_batch_after_reconciliation
+        deps = replace(base, monotonic=lambda: clock["value"], max_cycle_seconds=10.0)
         posts_before = len(env.stubs.posts)
         report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
         assert report.submitted == 0  # the clock is past the bound before the first submission
@@ -3602,6 +4906,82 @@ def test_f9_batch_loop_stops_at_the_wall_time_bound(
         assert len(planned) == COUNT_TWELVE  # the whole plan stays queueable (no quarantine)
     finally:
         store.close()
+
+
+def test_campaign_apply_resumes_bounded_read_only_sweep_across_restarts(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A large Sonarr library makes bounded inventory progress before campaign sends."""
+    candidates = specs(160)
+    env.seed(candidates)
+    prepared = prepare(env, capsys, limit=str(len(candidates)))
+    approve(env, capsys, prepared["approval_digest"])
+    clock = {"value": 0.0}
+    child_requests = 0
+    first_sweep_requests = 0
+    submitted = 0
+
+    def advance_sonarr_time(request: httpx.Request) -> None:
+        nonlocal child_requests
+        if request.url.path in {"/api/v3/episode", "/api/v3/episodefile"}:
+            child_requests += 1
+            clock["value"] += 1.0
+
+    env.stubs.sonarr_hook = advance_sonarr_time
+    for cycle in range(20):
+        store = env.open_store()
+        deps = replace(
+            _campaign_deps(env, store, prepared["campaign_id"]),
+            monotonic=lambda: clock["value"],
+        )
+        before = child_requests
+        try:
+            try:
+                report = apply_campaign(
+                    deps, load_settings(env.config_path), store, env.tmp_path / "plan.json", T0
+                )
+            except CampaignReconciliationIncompleteError:
+                report = None
+            if cycle == 0:
+                first_sweep_requests = child_requests - before
+                blocked = [
+                    record
+                    for record in store.campaign_files(prepared["campaign_id"])
+                    if record.state is FileState.BLOCKED_SAFETY
+                ]
+                assert blocked == []
+            if report is not None:
+                submitted += report.submitted
+        finally:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+            store.close()
+        if submitted:
+            break
+
+    assert first_sweep_requests <= 150
+    assert submitted > 0
+    assert env.stubs.posts
+
+
+def test_campaign_sweep_prioritizes_approved_files_after_resolution_cursor_advances(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rotating backlog-resolution cursor must not starve the approved campaign head."""
+    _set_campaign(env, max_batch_size=CAP_THREE)
+    env.seed(specs(40))
+    prepared = prepare(env, capsys, limit="4")
+    approve(env, capsys, prepared["approval_digest"])
+
+    first = apply(env, capsys, batch=str(CAP_THREE))
+    assert first["exit"] == EXIT_OK
+    assert first["payload"]["submitted"] == CAP_THREE
+
+    second = apply(env, capsys, batch=str(CAP_THREE))
+    assert second["exit"] == EXIT_OK
+    assert second["payload"]["submitted"] == 1
+    assert len(env.stubs.posts) == 4
 
 
 def test_f9_pending_target_scan_is_bounded_by_batch_size(
@@ -5504,17 +6884,37 @@ def test_f11_shutdown_flag_stops_campaign_batch_without_replaying_the_sent_row(
 def test_f11_mapping_generation_swap_mid_batch_defers_and_stops(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """F11: the guard-time generation identity is re-checked per submission. A concurrent
-    mapping refresh mid-batch stops the batch (defer, queueable) — no POST rides the stale
-    digest equality."""
+    """A queued refresh cannot split a send but its activated generation blocks the next one."""
     _set_campaign(env, max_batch_size=COUNT_TWO)
     env.seed(specs(COUNT_TWO))
     prepared = prepare(env, capsys)
     approve(env, capsys, prepared["approval_digest"])
     campaign_id = prepared["campaign_id"]
     store = env.open_store()
+    swap_started = Event()
+    swap_finished = Event()
+    swap_errors: list[BaseException] = []
+
+    def concurrent_swap() -> None:
+        try:
+            _swap_mapping_generation(env)
+        except BaseException as exc:
+            swap_errors.append(exc)
+        finally:
+            swap_finished.set()
+
+    def wait_until_swap_activates(path: str) -> None:
+        if path == "/api/v3/File/500" and swap_started.is_set():
+            assert swap_finished.wait(5.0)
+
     try:
-        env.stubs.post_hook = lambda file_id: _swap_mapping_generation(env)
+
+        def queue_swap_after_first_post(_file_id: int) -> None:
+            swap_started.set()
+            Thread(target=concurrent_swap, daemon=True).start()
+
+        env.stubs.post_hook = queue_swap_after_first_post
+        env.stubs.get_hook = wait_until_swap_activates
         report = apply_campaign(
             _campaign_deps(env, store, campaign_id),
             load_settings(env.config_path),
@@ -5523,6 +6923,11 @@ def test_f11_mapping_generation_swap_mid_batch_defers_and_stops(
             T0,
             batch_size=COUNT_TWO,
         )
+        assert swap_finished.is_set()
+        assert swap_errors == []
+        active_after = load_active(MappingStore(env.tmp_path / "mappings"))
+        assert active_after is not None
+        assert active_after.revision == 2
         assert env.stubs.posted_files == [500]
         assert report.submitted == 1
         assert report.quarantined == 0
@@ -5773,6 +7178,51 @@ def test_f11_shutdown_during_preflight_network_phase_stops_the_post(
         rows = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
         assert int(rows[0]) == 0
     finally:
+        store.close()
+
+
+def test_campaign_durable_stop_from_second_handle_during_final_file_get_prevents_intent_and_post(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    store = env.open_store()
+    stop_sent = False
+
+    def stop_during_final_file_read(path: str) -> None:
+        nonlocal stop_sent
+        if path == "/api/v3/File/500" and not stop_sent:
+            stop_sent = True
+            stopper = env.open_store()
+            try:
+                stopper.disable_writes("external storage safety stop")
+            finally:
+                stopper.close()
+
+    env.stubs.get_hook = stop_during_final_file_read
+    try:
+        report = apply_campaign(
+            _campaign_deps(env, store, prepared["campaign_id"]),
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=COUNT_TWO,
+        )
+        assert report.submitted == 0
+        assert "writes_disabled" in report.reasons
+        assert store.writes_disabled is True
+        assert env.stubs.posts == []
+        assert store.get_file(500).state is FileState.PLANNED  # type: ignore[union-attr]
+        assert (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM sends WHERE shoko_file_id = 500"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        env.stubs.get_hook = None
         store.close()
 
 

@@ -9,6 +9,7 @@ and every crash/ambiguity/churn path shows the durable ordering.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -20,7 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from urllib.parse import urlencode
 
 import hash_fixtures as hf
@@ -43,6 +44,7 @@ from shoko_linker.config import Settings, parse_settings
 from shoko_linker.daemon import (
     DAEMON_HISTORY_MAXLEN,
     CycleMode,
+    CycleReport,
     DaemonDeps,
     attestation_gate,
     compute_eligibility,
@@ -74,10 +76,12 @@ from shoko_linker.reporting import (
     META_CYCLE_CAMPAIGN_SUBMITTED,
     META_CYCLE_KEY,
     META_CYCLE_SUBMITTED,
+    cycle_report_payload,
 )
 from shoko_linker.service import run_dashboard_worker
 from shoko_linker.state import (
     MAX_DETAIL_CHARS,
+    META_LAST_DISCOVERY_EXCLUSIONS,
     META_LAST_FULL_RECONCILE_ISO,
     META_NEXT_FULL_RECONCILE_ISO,
     BaselineFile,
@@ -85,6 +89,7 @@ from shoko_linker.state import (
     Cohort,
     FileState,
     SendToken,
+    StateError,
     StateStore,
     acquire_apply_lock,
     release_apply_lock,
@@ -162,6 +167,7 @@ class SpecFile:
     episodes: tuple[tuple[int, int, int, int], ...] = ((1, 1, ANIDB_EP, SHOKO_EP),)
     tvdb_series: int = TVDB_SERIES
     anime_id: int = ANIME_ID
+    absolute_episode_numbers: tuple[int, ...] = ()
 
 
 def _sonarr_path(file: SpecFile) -> str:
@@ -191,6 +197,10 @@ class ShokoStub:
         self.on_post: Callable[[], None] | None = None
         self.unmaterialized: set[int] = set()  # AniDB episode ids whose Shoko metadata is not ready
         self.ed2k_overrides: dict[int, str] = {}
+        self.file_id_overrides: dict[int, int] = {}
+        self.target_episode_overrides: dict[int, int] = {}
+        self.target_read_failures: dict[str, tuple[int, int | None]] = {}
+        self.target_read_counts: dict[str, int] = {}
         #: P2-1: fired on every GET with the request path — simulates a slow preflight network
         #: phase (authorization state flips mid-call, before the POST).
         self.on_get: Callable[[str], None] | None = None
@@ -199,6 +209,17 @@ class ShokoStub:
         self.requests.append(request)
         if request.method == "GET" and self.on_get is not None:
             self.on_get(request.url.path)
+        if request.method == "GET" and request.url.path in self.target_read_failures:
+            path = request.url.path
+            read_number = self.target_read_counts.get(path, 0) + 1
+            self.target_read_counts[path] = read_number
+            failure = self.target_read_failures[path]
+            if read_number == failure[0]:
+                if failure[1] is None:
+                    raise httpx.ReadTimeout("synthetic-api-key-must-not-leak", request=request)
+                if failure[1] == 200:
+                    return httpx.Response(200, content=b"{", request=request)
+                return httpx.Response(failure[1], json={}, request=request)
         return self._respond(request)
 
     def _queue(self, request: httpx.Request) -> httpx.Response:
@@ -255,7 +276,13 @@ class ShokoStub:
 
     def _listing(self, request: httpx.Request) -> httpx.Response:
         rows = [self._file_row(shoko_id, xrefs=[]) for shoko_id in sorted(self.files)]
-        return self._json(request, {"Total": len(rows), "List": rows})
+        page = int(request.url.params.get("page", "1"))
+        page_size = int(request.url.params.get("pageSize", "1000"))
+        start = (page - 1) * page_size
+        return self._json(
+            request,
+            {"Total": len(rows), "List": rows[start : start + page_size]},
+        )
 
     def _post(self, request: httpx.Request, path: str) -> httpx.Response:
         shoko_id = int(path.split("/")[4])
@@ -295,7 +322,9 @@ class ShokoStub:
             return httpx.Response(404, json={"message": "gone"}, request=request)
         include = request.url.params.get("include", "")
         if "AbsolutePaths" in include:
-            return self._json(request, self._file_row(shoko_id, xrefs=[]))
+            return self._json(
+                request, self._file_row(shoko_id, xrefs=self.linked.get(shoko_id, []))
+            )
         return self._json(request, self._file_row(shoko_id, xrefs=self.linked.get(shoko_id, [])))
 
     def _file_row(self, shoko_id: int, xrefs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -303,7 +332,7 @@ class ShokoStub:
         hashes = hf.ed2k_hashes(shoko_id, FILE_SIZE, f"{shoko_id}.mkv")
         hashes["ED2K"] = self.ed2k_overrides.get(shoko_id, hashes["ED2K"])
         return {
-            "ID": shoko_id,
+            "ID": self.file_id_overrides.get(shoko_id, shoko_id),
             "Size": FILE_SIZE,
             "IsIgnored": False,
             "IsVariation": False,
@@ -337,10 +366,14 @@ class ShokoStub:
     def _chain_first(self, request: httpx.Request) -> httpx.Response:
         anime_id = int(request.url.path.split("/")[5])
         rows: list[dict[str, Any]] = []
+        seen: set[int] = set()
         for file in self.files.values():
             if file.anime_id != anime_id:
                 continue
             for _season, number, anidb_ep, _shoko in file.episodes:
+                if anidb_ep in seen:
+                    continue
+                seen.add(anidb_ep)
                 rows.append(self._anidb_episode(anidb_ep, anime_id, number))
         return self._json(request, {"Total": len(rows), "List": rows})
 
@@ -366,6 +399,7 @@ class ShokoStub:
             for _season, _number, anidb_ep, file_shoko in file.episodes:
                 if anidb_ep == ep_id:
                     shoko_ep = file_shoko
+        shoko_ep = self.target_episode_overrides.get(ep_id, shoko_ep)
         return self._json(
             request,
             {"IDs": {"ID": shoko_ep, "AniDB": ep_id, "TMDB": None}, "Type": "Episode"},
@@ -416,9 +450,14 @@ class SonarrStub:
         self.series_tvdb = {file.series_id: file.tvdb_series for file in files}
         self.requests: list[httpx.Request] = []
         self.include_extra: SpecFile | None = None
+        self.episodes_status: dict[int, int] = {}
+        self.files_status: dict[int, int] = {}
+        self.on_get: Callable[[httpx.Request], None] | None = None
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911
         self.requests.append(request)
+        if self.on_get is not None:
+            self.on_get(request)
         path = request.url.path
         if path == "/api/v3/series":
             return self._json(request, self._series())
@@ -426,9 +465,15 @@ class SonarrStub:
             return self._json(request, [{"id": 1, "path": SONARR_ROOT, "accessible": True}])
         if path == "/api/v3/episode":
             series_id = int(request.url.params["seriesId"])
+            status = self.episodes_status.get(series_id, 200)
+            if status != 200:
+                return httpx.Response(status, json={"message": "injected"}, request=request)
             return self._json(request, self._episodes(series_id))
         if path == "/api/v3/episodefile":
             series_id = int(request.url.params["seriesId"])
+            status = self.files_status.get(series_id, 200)
+            if status != 200:
+                return httpx.Response(status, json={"message": "injected"}, request=request)
             return self._json(request, self._files(series_id))
         return httpx.Response(404, json={"message": "no route"}, request=request)
 
@@ -441,6 +486,7 @@ class SonarrStub:
                 "id": series_id,
                 "title": f"Series {series_id}",
                 "rootFolderPath": f"{SONARR_ROOT}/series{series_id}",
+                "seriesType": "anime",
                 "tvdbId": self.series_tvdb[series_id],
             }
             for series_id in self.series_ids
@@ -449,18 +495,19 @@ class SonarrStub:
     def _episodes(self, series_id: int) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for file in [item for item in self.files if item.series_id == series_id]:
-            for season, number, _anidb, _shoko in file.episodes:
-                rows.append(
-                    {
-                        "id": file.file_id * 100 + number,
-                        "seriesId": series_id,
-                        "seasonNumber": season,
-                        "episodeNumber": number,
-                        "title": f"S{season}E{number}",
-                        "tvdbId": number,
-                        "episodeFileId": file.file_id,
-                    }
-                )
+            for index, (season, number, _anidb, _shoko) in enumerate(file.episodes):
+                row = {
+                    "id": file.file_id * 100 + number,
+                    "seriesId": series_id,
+                    "seasonNumber": season,
+                    "episodeNumber": number,
+                    "title": f"S{season}E{number}",
+                    "tvdbId": number,
+                    "episodeFileId": file.file_id,
+                }
+                if index < len(file.absolute_episode_numbers):
+                    row["absoluteEpisodeNumber"] = file.absolute_episode_numbers[index]
+                rows.append(row)
         return rows
 
     def _files(self, series_id: int) -> list[dict[str, Any]]:
@@ -639,6 +686,7 @@ def build_deps(
     blocked_over: int | None = 0,
     settings: Settings | None = None,
     shoko: ShokoStub | None = None,
+    sonarr_stub: SonarrStub | None = None,
     mapping_dir: Path | None = None,
     now: Callable[[], str] = lambda: T0,
     shutdown_requested: Callable[[], bool] = lambda: False,
@@ -647,7 +695,7 @@ def build_deps(
     mapping_directory = mapping_dir if mapping_dir is not None else tmp_path / "mappings"
     mapping_store = MappingStore(mapping_directory, source_url=SOURCE_URL)
     shoko_stub = shoko if shoko is not None else ShokoStub(shoko_files)
-    sonarr_stub = SonarrStub(sonarr_files)
+    sonarr_stub = sonarr_stub or SonarrStub(sonarr_files)
     return DaemonDeps(
         settings=settings,
         store=store,
@@ -662,6 +710,7 @@ def build_deps(
         attestation_valid=(
             attestation_valid if attestation_valid is not None else lambda: attestation
         ),
+        service_authorized_local=lambda: True,
         blocked_over=blocked_over,
         verification_timeout_seconds=verification_timeout,
         poll_interval_seconds=poll_interval,
@@ -683,6 +732,350 @@ def open_tmp_store(tmp_path: Path) -> StateStore:
     store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
     store.set_meta("budget_last_cycle_key", "cycle-1")
     return store
+
+
+@pytest.mark.parametrize("service_mode", [False, True])
+def test_unavailable_second_target_read_defers_daemon_and_service_without_send_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mode: bool
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [], T0)
+    shoko = ShokoStub([file])
+    target_path = f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"
+    shoko.target_read_failures[target_path] = (2, 503)
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=mapping_xml(),
+        monotonic=lambda: 0.0,
+        advance=lambda _seconds: None,
+        shoko=shoko,
+    )
+    if service_mode:
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            service_authorized_local=lambda: True,
+        )
+    policy = RunPolicy.SERVICE if service_mode else RunPolicy.NEW_ARRIVAL
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=policy,
+            cycle_key="target-unavailable-first",
+        )
+
+        assert first.counts.submitted == 0
+        assert first.deferred_planned == 1
+        assert shoko.target_read_counts[target_path] == 2
+        assert any("preflight_deferred" in reason for reason in first.reasons), first.reasons
+        assert any("target_unavailable" in reason for reason in first.reasons), first.reasons
+        assert any(
+            "retry" in reason.lower() and "no post" in reason.lower() for reason in first.reasons
+        )
+        assert "synthetic-api-key-must-not-leak" not in repr(first)
+        assert shoko.posts == []
+        record = store.get_file(file.shoko_id)
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+
+        shoko.target_read_failures.clear()
+        second = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=policy,
+            cycle_key="target-unavailable-recovery",
+        )
+
+        assert second.counts.submitted == 1
+        assert shoko.posts == [{"EpisodeIDs": [SHOKO_EP]}]
+        record = store.get_file(file.shoko_id)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+def _two_target_file(hard_first: bool = True) -> tuple[SpecFile, int, int]:
+    hard_id, soft_id = (ANIDB_EP, ANIDB_EP + 1) if hard_first else (ANIDB_EP + 1, ANIDB_EP)
+    episode_ids = (hard_id, soft_id)
+    file = SpecFile(
+        series_id=1,
+        file_id=10,
+        shoko_id=500,
+        episodes=(
+            (1, 1, episode_ids[0], SHOKO_EP + episode_ids[0] - ANIDB_EP),
+            (1, 2, episode_ids[1], SHOKO_EP + episode_ids[1] - ANIDB_EP),
+        ),
+    )
+    return file, hard_id, soft_id
+
+
+@pytest.mark.parametrize("service_mode", [False, True])
+@pytest.mark.parametrize("hard_first", [True, False])
+@pytest.mark.parametrize(
+    ("hard_kind", "soft_status", "hard_reason"),
+    [("drift", 503, "target_drift"), ("malformed", 404, "malformed")],
+)
+def test_mixed_preflight_reasons_quarantine_hard_failure_in_daemon_and_service(  # noqa: PLR0915
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    service_mode: bool,
+    hard_first: bool,
+    hard_kind: str,
+    soft_status: int,
+    hard_reason: str,
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file, hard_target_id, soft_target_id = _two_target_file(hard_first)
+    xml = mapping_xml().replace(";1-1;", ";1-1;2-2;")
+    activate_mapping(tmp_path, xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [], T0)
+    shoko = ShokoStub([file])
+    hard_path = f"/api/v3/Episode/AniDB/{hard_target_id}/Episode"
+    soft_path = f"/api/v3/Episode/AniDB/{soft_target_id}/Episode"
+    target_reads: dict[str, int] = {}
+
+    def drift_frozen_target_on_preflight(path: str) -> None:
+        if path == hard_path:
+            target_reads[path] = target_reads.get(path, 0) + 1
+            if target_reads[path] == 2:
+                expected = SHOKO_EP + hard_target_id - ANIDB_EP
+                shoko.target_episode_overrides[hard_target_id] = expected + 222
+
+    if hard_kind == "drift":
+        shoko.on_get = drift_frozen_target_on_preflight
+        shoko.target_read_failures[soft_path] = (2, soft_status)
+    else:
+        shoko.target_read_failures[hard_path] = (2, 200)
+        shoko.target_read_failures[soft_path] = (2, soft_status)
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=xml,
+        monotonic=lambda: 0.0,
+        advance=lambda _seconds: None,
+        shoko=shoko,
+    )
+    if service_mode:
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            service_authorized_local=lambda: True,
+        )
+    policy = RunPolicy.SERVICE if service_mode else RunPolicy.NEW_ARRIVAL
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=policy,
+            cycle_key="mixed-hard-soft-first",
+        )
+        record = store.get_file(file.shoko_id)
+        assert first.counts.submitted == 0
+        assert first.deferred_planned == 0
+        assert any(f"preflight_{hard_reason}" in reason for reason in first.reasons), first.reasons
+        assert shoko.posts == []
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith(f"preflight_quarantine:{hard_reason}")
+        target_snapshot = store.get_meta(f"file_mapping_targets:v1:{file.shoko_id}")
+        assert target_snapshot is not None
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+
+        store.close()
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        deps = replace(deps, store=store)
+        shoko.on_get = None
+        shoko.target_read_failures.clear()
+        shoko.target_episode_overrides.clear()
+        second = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=policy,
+            cycle_key="mixed-hard-soft-healthy-restart",
+        )
+        record = store.get_file(file.shoko_id)
+        assert second.counts.submitted == 0
+        assert shoko.posts == []
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith(f"preflight_quarantine:{hard_reason}")
+        assert store.get_meta(f"file_mapping_targets:v1:{file.shoko_id}") == target_snapshot
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+@pytest.mark.parametrize("service_mode", [False, True])
+def test_multiple_target_all_soft_preflight_defers_and_recovers_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mode: bool
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file, _hard_target_id, _soft_target_id = _two_target_file()
+    xml = mapping_xml().replace(";1-1;", ";1-1;2-2;")
+    activate_mapping(tmp_path, xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [], T0)
+    shoko = ShokoStub([file])
+    target_paths = [
+        f"/api/v3/Episode/AniDB/{episode_id}/Episode" for episode_id in (ANIDB_EP, ANIDB_EP + 1)
+    ]
+    shoko.target_read_failures = {path: (2, 503) for path in target_paths}
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=xml,
+        monotonic=lambda: 0.0,
+        advance=lambda _seconds: None,
+        shoko=shoko,
+    )
+    if service_mode:
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            service_authorized_local=lambda: True,
+        )
+    policy = RunPolicy.SERVICE if service_mode else RunPolicy.NEW_ARRIVAL
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=policy,
+            cycle_key="multiple-soft-first",
+        )
+        record = store.get_file(file.shoko_id)
+        assert first.counts.submitted == 0
+        assert first.deferred_planned == 1
+        assert record is not None
+        assert record.state is FileState.PLANNED
+        assert shoko.posts == []
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+
+        store.close()
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        deps = replace(deps, store=store)
+        shoko.target_read_failures.clear()
+        second = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=policy,
+            cycle_key="multiple-soft-recovered",
+        )
+        record = store.get_file(file.shoko_id)
+        assert second.counts.submitted == 1
+        assert second.counts.verified == 1
+        assert shoko.posts == [{"EpisodeIDs": [SHOKO_EP, SHOKO_EP + 1]}]
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+def test_multiple_target_all_hard_preflight_quarantines_without_partial_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file, _hard_target_id, _soft_target_id = _two_target_file()
+    xml = mapping_xml().replace(";1-1;", ";1-1;2-2;")
+    activate_mapping(tmp_path, xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [], T0)
+    shoko = ShokoStub([file])
+    target_reads: dict[str, int] = {}
+    target_paths = {
+        f"/api/v3/Episode/AniDB/{episode_id}/Episode": episode_id
+        for episode_id in (ANIDB_EP, ANIDB_EP + 1)
+    }
+
+    def drift_each_target_on_preflight(path: str) -> None:
+        episode_id = target_paths.get(path)
+        if episode_id is None:
+            return
+        target_reads[path] = target_reads.get(path, 0) + 1
+        if target_reads[path] == 2:
+            expected = SHOKO_EP + episode_id - ANIDB_EP
+            shoko.target_episode_overrides[episode_id] = expected + 222
+
+    shoko.on_get = drift_each_target_on_preflight
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=xml,
+        monotonic=lambda: 0.0,
+        advance=lambda _seconds: None,
+        shoko=shoko,
+    )
+    try:
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="multiple-hard",
+        )
+        record = store.get_file(file.shoko_id)
+        assert report.counts.submitted == 0
+        assert report.deferred_planned == 0
+        assert any("preflight_target_drift" in reason for reason in report.reasons)
+        assert shoko.posts == []
+        assert record is not None
+        assert record.state is FileState.BLOCKED_SAFETY
+        assert record.state_detail.startswith("preflight_quarantine:target_drift")
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        budget = store.budget_view()
+        assert budget.pending_file_requests == 0
+        assert budget.pending_episode_jobs == 0
+        assert budget.rolling_new_submissions == 0
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
 
 
 # ------------------------------------------------------------------ gate: first-run backlog
@@ -879,6 +1272,7 @@ def test_service_rechecks_onboarding_after_preflight_before_post(
             deps,
             service_mode=True,
             service_authorized=lambda: authorization["current"],
+            service_authorized_local=lambda: authorization["current"],
         )
         report = run_cycle(
             deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="svc"
@@ -887,6 +1281,928 @@ def test_service_rechecks_onboarding_after_preflight_before_post(
         store.close()
     assert shoko.posts_count() == 0
     assert any("service_authorization_changed" in reason for reason in report.reasons)
+
+
+def test_service_apply_without_local_guard_fails_closed_after_final_shoko_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([file])
+    final_file_read = False
+    deps_ref: list[DaemonDeps] = []
+
+    daemon = cast(Any, daemon_module)
+    original_preflight_file = daemon.preflight_file
+
+    def observe_final_read(*args: Any, **kwargs: Any) -> Any:
+        nonlocal final_file_read
+        verdict = original_preflight_file(*args, **kwargs)
+        final_file_read = True
+        return verdict
+
+    monkeypatch.setattr(daemon, "preflight_file", observe_final_read)
+
+    def remote_authorization() -> bool:
+        if final_file_read:
+            # Simulate a remote setup refresh that issues a Sonarr GET and discovers a new
+            # manual association after the protected-link read. A remote fallback here would
+            # authorize a POST using a stale Shoko snapshot.
+            sonarr = deps_ref[0].sonarr
+            sonarr.client.get("api/v3/series", headers=sonarr.headers_factory())
+            shoko.link_unrelated(500)
+        return True
+
+    try:
+        sonarr_stub = SonarrStub([file])
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[file],
+            shoko_files=[file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            sonarr_stub=sonarr_stub,
+        )
+        deps_ref.append(deps)
+        # Deliberately omit service_authorized_local: applying must fail closed rather than
+        # repeat a remote authorization check after the final protected-link GET.
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=remote_authorization,
+            service_authorized_local=None,
+        )
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="missing-local-guard",
+        )
+    finally:
+        store.close()
+
+    assert final_file_read
+    assert shoko.posts == []
+    assert report.counts.submitted == 0
+    assert "service_authorization_changed" in report.reasons
+
+
+def test_manual_link_added_during_sonarr_source_check_blocks_daemon_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final Shoko association read follows Sonarr's slower current-source checks."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([file])
+    sonarr = SonarrStub([file])
+    episode_reads = 0
+
+    def add_manual_association(request: httpx.Request) -> None:
+        nonlocal episode_reads
+        if request.url.path == "/api/v3/episode" and request.url.params.get("seriesId") == "1":
+            episode_reads += 1
+            if episode_reads == 2:
+                shoko.link_unrelated(500)
+
+    sonarr.on_get = add_manual_association
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[file],
+            shoko_files=[file],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            sonarr_stub=sonarr,
+        )
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="manual"
+        )
+    finally:
+        store.close()
+    assert episode_reads >= 2
+    assert shoko.posts == []
+    assert report.counts.submitted == 0
+    assert any("existing_link" in reason for reason in report.reasons)
+
+
+@pytest.mark.parametrize(
+    "source_failure", ["changed", "episodes_unavailable", "episode_file_unavailable"]
+)
+def test_source_episode_change_during_shoko_preflight_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_failure: str
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    original = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    current_sonarr_files = [original]
+    sonarr = SonarrStub(current_sonarr_files)
+    xml = mapping_xml().replace(";1-1;", ";1-1;2-2;")
+    activate_mapping(tmp_path, xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([original])
+
+    def change_sonarr_during_preflight(path: str) -> None:
+        if path.startswith("/api/v3/Episode/AniDB/"):
+            if source_failure == "changed":
+                current_sonarr_files[:] = [
+                    replace(original, episodes=((1, 2, ANIDB_EP, SHOKO_EP),))
+                ]
+            elif source_failure == "episodes_unavailable":
+                sonarr.episodes_status[1] = 503
+            else:
+                sonarr.files_status[1] = 503
+
+    shoko.on_get = change_sonarr_during_preflight
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=current_sonarr_files,
+        shoko_files=[original],
+        xml=xml,
+        monotonic=Clock([MONO_ZERO]),
+        advance=Sleeper().advance,
+        shoko=shoko,
+        sonarr_stub=sonarr,
+        max_submissions=1,
+    )
+    try:
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="sonarr-source-drift",
+        )
+        record = store.get_file(500)
+        frozen_targets = store.get_meta("file_mapping_targets:v1:500")
+        assert report.counts.submitted == 0
+        assert shoko.posts == []
+        assert record is not None
+        assert frozen_targets is not None
+        frozen_document = json.loads(frozen_targets)
+        assert frozen_document == {
+            json.dumps((TVDB_SERIES, 1, 1, None, ANIME_ID, 1, "Episode")): [ANIDB_EP, SHOKO_EP]
+        }
+        if source_failure == "changed":
+            assert record.state is FileState.CONFLICT
+            assert record.state_detail == "sonarr_source_changed"
+            assert store.mapping_target_quarantined(500)
+            assert any("sonarr_source_changed" in reason for reason in report.reasons)
+        else:
+            assert record.state is FileState.PLANNED
+            assert not store.mapping_target_quarantined(500)
+            assert any("sonarr_source_unavailable" in reason for reason in report.reasons)
+    finally:
+        deps.sonarr.client.close()
+        deps.shoko.client.close()
+        deps.mapping_source.client.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "series_change",
+    [
+        "standard",
+        "daily",
+        "unknown",
+        "tvdb_id",
+        "root",
+        "path",
+        "series_id",
+        "unavailable",
+        "malformed",
+    ],
+)
+def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, series_change: str
+) -> None:
+    """A still-authorized root and a second anime cannot mask candidate series drift."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    current_sonarr_files = [candidate]
+
+    class MutableSeriesSonarrStub(SonarrStub):
+        series_reads = 0
+        candidate_metadata: ClassVar[dict[str, Any]] = {}
+        candidate_path_changed = False
+        malformed_candidate = False
+
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v3/series":
+                self.series_reads += 1
+                if self.series_reads == 2:
+                    if series_change in {"standard", "daily", "unknown"}:
+                        self.candidate_metadata["seriesType"] = {
+                            "standard": "standard",
+                            "daily": "daily",
+                            "unknown": None,
+                        }[series_change]
+                    elif series_change == "tvdb_id":
+                        self.candidate_metadata["tvdbId"] = 999_999
+                    elif series_change == "root":
+                        self.candidate_metadata["rootFolderPath"] = f"{SONARR_ROOT}-old/series1"
+                    elif series_change == "series_id":
+                        self.candidate_metadata["id"] = 77
+                    elif series_change == "path":
+                        self.candidate_path_changed = True
+                    elif series_change == "unavailable":
+                        self.requests.append(request)
+                        if self.on_get is not None:
+                            self.on_get(request)
+                        return httpx.Response(503, json={"message": "injected"}, request=request)
+                    elif series_change == "malformed":
+                        self.malformed_candidate = True
+            return super().handler(request)
+
+        def _series(self) -> list[dict[str, Any]]:
+            rows = super()._series()
+            row = next(item for item in rows if item["id"] == 1)
+            row.update(self.candidate_metadata)
+            if self.malformed_candidate:
+                row["id"] = "1"
+            # This positively identified anime shares the authorized root, but is not the
+            # candidate's frozen Sonarr/TVDB identity and must never be substituted for it.
+            rows.append(
+                {
+                    "id": 2,
+                    "title": "Unrelated anime",
+                    "rootFolderPath": f"{SONARR_ROOT}/other-anime",
+                    "seriesType": "anime",
+                    "tvdbId": 999_999,
+                }
+            )
+            return rows
+
+        def _files(self, series_id: int) -> list[dict[str, Any]]:
+            rows = super()._files(series_id)
+            if self.candidate_path_changed and series_id == 1 and rows:
+                rows[0]["path"] = f"{SONARR_ROOT}/series1/replaced.mkv"
+            return rows
+
+    sonarr = MutableSeriesSonarrStub(current_sonarr_files)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=current_sonarr_files,
+        shoko_files=[candidate],
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO]),
+        advance=Sleeper().advance,
+        shoko=shoko,
+        sonarr_stub=sonarr,
+    )
+    try:
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key=f"series-{series_change}",
+        )
+        record = store.get_file(candidate.shoko_id)
+        final_shoko_reads = [
+            request
+            for request in shoko.requests
+            if request.method == "GET" and request.url.path == "/api/v3/File/500"
+        ]
+        frozen_targets = store.get_meta("file_mapping_targets:v1:500")
+        quarantined = store.mapping_target_quarantined(candidate.shoko_id)
+    finally:
+        deps.sonarr.client.close()
+        deps.shoko.client.close()
+        deps.mapping_source.client.close()
+        store.close()
+
+    assert report.counts.submitted == 0
+    assert shoko.posts == []
+    assert final_shoko_reads == []
+    assert record is not None
+    assert frozen_targets is not None
+    if series_change in {"unavailable", "malformed"}:
+        assert record.state is FileState.PLANNED
+        assert not quarantined
+        assert any("sonarr_source_unavailable" in reason for reason in report.reasons)
+    else:
+        assert record.state is FileState.CONFLICT
+        assert quarantined
+        assert any("sonarr_source_changed" in reason for reason in report.reasons)
+
+
+def test_ninety_day_inventory_cache_cannot_complete_before_expired_series_is_refetched(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = [
+        SpecFile(series_id=series_id, file_id=10 + series_id, shoko_id=500 + series_id)
+        for series_id in (1, 2, 3, 4)
+    ]
+    current_sonarr_files = list(files)
+    sonarr = SonarrStub(current_sonarr_files)
+    shoko = ShokoStub(files)
+    elapsed = [0.0]
+    wall_time = [T0]
+    mapping = mapping_xml().replace(";1-1;", ";1-1;2-2;")
+    settings = make_settings(tmp_path, sync_extra={"full_reconcile_interval_hours": 24})
+
+    def advance_for_child_gets(request: httpx.Request) -> None:
+        if request.url.path in ("/api/v3/episode", "/api/v3/episodefile"):
+            elapsed[0] += 1.0
+
+    sonarr.on_get = advance_for_child_gets
+    activate_mapping(tmp_path, mapping)
+    original_targets: str | None = None
+    series_one_child_gets_before_expiry = 0
+
+    def child_gets(series_id: int) -> int:
+        return sum(
+            request.url.path in ("/api/v3/episode", "/api/v3/episodefile")
+            and request.url.params.get("seriesId") == str(series_id)
+            for request in sonarr.requests
+        )
+
+    def cache_snapshot() -> tuple[int, frozenset[int]]:
+        store = open_tmp_store(tmp_path)
+        try:
+            _manifest, cursor, swept, _fragments = store.load_sonarr_inventory_cache()
+            return cursor, swept
+        finally:
+            store.close()
+
+    def mapping_snapshot(file_id: int) -> str | None:
+        store = open_tmp_store(tmp_path)
+        try:
+            return store.get_meta(f"file_mapping_targets:v1:{file_id}")
+        finally:
+            store.close()
+
+    def run_slice(cycle: int, *, max_cycle_seconds: float, authorized: bool) -> Any:
+        elapsed[0] = 0.0
+        store = open_tmp_store(tmp_path)
+        if cycle == 0:
+            seed_baseline(store, files)
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=current_sonarr_files,
+            sonarr_stub=sonarr,
+            shoko_files=files,
+            shoko=shoko,
+            xml=mapping,
+            settings=settings,
+            monotonic=lambda: elapsed[0],
+            advance=Sleeper().advance,
+            now=lambda: wall_time[0],
+            max_cycle_seconds=max_cycle_seconds,
+            max_submissions=1,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: authorized,
+        )
+        try:
+            return run_cycle(
+                deps,
+                now_iso=wall_time[0],
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key=f"inventory-age-{cycle}",
+            )
+        finally:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+            store.close()
+
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    initial = run_slice(0, max_cycle_seconds=100.0, authorized=False)
+    assert initial.reconciliation_ready
+    original_targets = mapping_snapshot(501)
+    assert original_targets is not None
+
+    wall_time[0] = (_parse(T0) + timedelta(minutes=5)).isoformat()
+    partial = run_slice(1, max_cycle_seconds=4.0, authorized=False)
+    assert not partial.reconciliation_ready
+    cursor, swept = cache_snapshot()
+    assert cursor == 1
+    assert swept == frozenset({1})
+
+    current_sonarr_files[0] = replace(files[0], episodes=((1, 2, ANIDB_EP, SHOKO_EP),))
+    series_one_child_gets_before_expiry = child_gets(1)
+    stale_start = _parse(T0) + timedelta(days=90)
+    reports = []
+    for offset in range(4):
+        wall_time[0] = (stale_start + timedelta(minutes=5 * offset)).isoformat()
+        reports.append(
+            run_slice(
+                2 + offset,
+                max_cycle_seconds=5.0 if offset == 3 else 4.0,
+                authorized=True,
+            )
+        )
+        if offset < 3:
+            assert not reports[-1].reconciliation_ready
+            assert reports[-1].counts.submitted == 0
+            assert child_gets(1) == series_one_child_gets_before_expiry
+
+    assert reports[-1].reconciliation_ready
+    assert child_gets(1) > series_one_child_gets_before_expiry
+    assert reports[-1].counts.submitted == 1
+    assert [
+        int(request.url.path.split("/")[4])
+        for request in shoko.requests
+        if request.method == "POST" and request.url.path.endswith("/Link")
+    ] == [502]
+    store = open_tmp_store(tmp_path)
+    try:
+        stale_record = store.get_file(501)
+        assert stale_record is not None
+        assert stale_record.state is FileState.CONFLICT
+        assert store.mapping_target_quarantined(501)
+        assert store.get_meta("file_mapping_targets:v1:501") == original_targets
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [None, "page_failure", "page_change", "endpoint_change", "folder_change", "cache_expired"],
+)
+def test_shoko_discovery_resumes_across_restarts_within_cycle_budget(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None
+) -> None:
+    from shoko_linker.shoko import ShokoDiscovery, collect_shoko_discovery
+
+    files = [
+        SpecFile(
+            series_id=1,
+            file_id=10 + index,
+            shoko_id=500 + index,
+            episodes=((1, index + 1, ANIDB_EP + index, SHOKO_EP + index),),
+        )
+        for index in range(13)
+    ]
+    elapsed = [0.0]
+    wall_time = [T0]
+    xml = (
+        "<anime-list><anime anidbid='1234' tvdbid='267440' defaulttvdbseason='1'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1' start='1' end='13' "
+        "offset='0'/></mapping-list></anime></anime-list>"
+    )
+
+    class PagedShokoStub(ShokoStub):
+        def __init__(self, files: list[SpecFile]) -> None:
+            super().__init__(files)
+            self.fail_pages: set[int] = set()
+            self.changed_page_one = False
+            self.changed_folder = False
+
+        def _folder(self) -> dict[str, Any]:
+            result = super()._folder()
+            if self.changed_folder:
+                result["Name"] = "Sonarr updated"
+            return result
+
+        def _listing(self, request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params["page"])
+            page_size = int(request.url.params["pageSize"])
+            if page in self.fail_pages:
+                return httpx.Response(503, request=request)
+            rows = [self._file_row(file_id, xrefs=[]) for file_id in sorted(self.files)]
+            rows = rows[(page - 1) * page_size : page * page_size]
+            if page == 1 and self.changed_page_one:
+                rows[0] = {**rows[0], "Imported": "2026-01-02T00:00:00"}
+            return self._json(request, {"Total": len(self.files), "List": rows})
+
+    shoko = PagedShokoStub(files)
+    shoko.on_get = lambda path: elapsed.__setitem__(
+        0, elapsed[0] + (25.0 if path == "/api/v3/File" else 0.0)
+    )
+    sonarr = SonarrStub(files)
+    activate_mapping(tmp_path, xml)
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+
+    def one_row_per_page(endpoint: ApiEndpoint, **kwargs: Any) -> ShokoDiscovery:
+        kwargs.setdefault("page_size", 1)
+        return collect_shoko_discovery(endpoint, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "collect_shoko_discovery", one_row_per_page)
+
+    def run_slice(cycle: int, store: StateStore) -> Any:
+        elapsed[0] = 0.0
+        age_minutes = 25 * 60 if fault == "cache_expired" and cycle > 0 else 5 * cycle
+        wall_time[0] = (_parse(T0) + timedelta(minutes=age_minutes)).isoformat()
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            sonarr_stub=sonarr,
+            shoko_files=files,
+            shoko=shoko,
+            xml=xml,
+            monotonic=lambda: elapsed[0],
+            advance=Sleeper().advance,
+            now=lambda: wall_time[0],
+            max_cycle_seconds=120.0,
+        )
+        if fault == "endpoint_change" and cycle > 0:
+            deps.shoko.client.base_url = httpx.URL("http://shoko-updated:8111/")
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        try:
+            report = run_cycle(
+                deps,
+                now_iso=wall_time[0],
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key=f"shoko-pages-{cycle}",
+            )
+            assert elapsed[0] <= 120.0
+            return report
+        finally:
+            deps.sonarr.client.close()
+            deps.shoko.client.close()
+            deps.mapping_source.client.close()
+
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    first = run_slice(0, store)
+    assert not first.reconciliation_ready
+    assert first.counts.submitted == 0
+    assert shoko.posts == []
+    store.close()
+
+    if fault is not None:
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        if fault == "page_failure":
+            shoko.fail_pages = {4}
+        elif fault == "page_change":
+            shoko.changed_page_one = True
+        else:
+            shoko.fail_pages = {2}
+            shoko.changed_folder = fault == "folder_change"
+        request_start = len(shoko.requests)
+        second = run_slice(1, store)
+        second_pages = [
+            request.url.params.get("page")
+            for request in shoko.requests[request_start:]
+            if request.url.path == "/api/v3/File"
+        ]
+        store.close()
+        assert not second.reconciliation_ready
+        assert second.counts.submitted == 0
+        assert shoko.posts == []
+        if fault in {"page_failure", "endpoint_change", "folder_change", "cache_expired"}:
+            assert any(
+                "shoko_snapshot_incomplete:transport_failure" in item for item in second.reasons
+            )
+            expected_failed_page = "4" if fault == "page_failure" else "2"
+            assert expected_failed_page in second_pages
+        else:
+            assert any(
+                item.startswith("shoko_snapshot_incomplete:") for item in second.reasons
+            ), second.reasons
+        return
+
+    report = first
+    for cycle in range(1, 8):
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        report = run_slice(cycle, store)
+        store.close()
+        if report.reconciliation_ready:
+            break
+        assert report.counts.submitted == 0
+        assert shoko.posts == []
+
+    assert report.reconciliation_ready
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    record = store.get_file(500)
+    store.close()
+    assert report.counts.submitted == 1, (
+        f"counts={report.counts}; reasons={report.reasons}; eligible={report.apply_eligible}; "
+        f"suppressed={report.writes_suppressed}; exclusions={report.exclusion_counts}; "
+        f"state={None if record is None else record.state}; "
+        f"detail={None if record is None else record.state_detail}"
+    )
+    assert shoko.posts == [{"EpisodeIDs": [SHOKO_EP]}]
+    posted_ids = [
+        int(request.url.path.split("/")[4])
+        for request in shoko.requests
+        if request.method == "POST" and request.url.path.endswith("/Link")
+    ]
+    assert posted_ids == [500]
+    assert elapsed[0] <= 120.0
+
+
+@pytest.mark.parametrize("existing_state", [None, FileState.PLANNED, FileState.AMBIGUOUS])
+def test_duplicate_shoko_correspondences_are_durable_skips_without_plans(
+    tmp_path: Path, existing_state: FileState | None
+) -> None:
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    duplicate = replace(file, shoko_id=501)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [file, duplicate])
+    if existing_state is not None:
+        store.record_file(
+            500,
+            sonarr_series_id=1,
+            sonarr_file_id=10,
+            sonarr_path=_sonarr_path(file),
+            sonarr_size=FILE_SIZE,
+            cohort=Cohort.BACKLOG,
+            iso=T0,
+            state=existing_state,
+        )
+        if existing_state is FileState.PLANNED:
+            # A current planned row has durable destinations. Missing-snapshot
+            # legacy plans are separately covered by upgrade quarantine regressions.
+            store.remember_mapping_targets_bulk(
+                {
+                    500: {
+                        json.dumps((TVDB_SERIES, 1, 1, None, ANIME_ID, 1, "Episode")): (
+                            ANIDB_EP,
+                            SHOKO_EP,
+                        )
+                    }
+                }
+            )
+
+    class DuplicateShokoStub(ShokoStub):
+        def _location(self, spec: SpecFile) -> dict[str, Any]:
+            location = super()._location(spec)
+            location["RelativePath"] = "series1/500.mkv"
+            location["AbsolutePath"] = f"{SHOKO_ROOT}/series1/500.mkv"
+            return location
+
+    shoko = DuplicateShokoStub([file, duplicate])
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file, duplicate],
+        xml=mapping_xml(),
+        monotonic=Clock([0.0]),
+        advance=lambda _: None,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    try:
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="duplicates"
+        )
+        assert report.plans == {}
+        assert shoko.posts == []
+        for file_id in (500, 501):
+            row = store.get_file(file_id)
+            assert row is not None
+            assert row.state is FileState.AMBIGUOUS
+            assert "ambiguous_multiple_shoko_candidates" in row.state_detail
+            assert "500, 501" in row.state_detail
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+def test_size_mismatch_exclusion_is_durable_reported_and_retried_when_resolved(  # noqa: PLR0915
+    tmp_path: Path,
+) -> None:
+    files = [
+        SpecFile(series_id=1, file_id=10, shoko_id=500),
+        SpecFile(series_id=1, file_id=11, shoko_id=501),
+    ]
+
+    class SizeMismatchShokoStub(ShokoStub):
+        mismatched: ClassVar[set[int]] = {501}
+
+        def _file_row(self, shoko_id: int, xrefs: list[dict[str, Any]]) -> dict[str, Any]:
+            row = super()._file_row(shoko_id, xrefs)
+            if shoko_id in self.mismatched:
+                row["Size"] = FILE_SIZE + 1
+            return row
+
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = SizeMismatchShokoStub(files)
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=mapping_xml(),
+        monotonic=Clock([0.0]),
+        advance=lambda _: None,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="size-mismatch",
+        )
+        assert first.counts.verified == 1
+        assert shoko.posts == [{"EpisodeIDs": [777]}]
+        excluded = store.get_file(501)
+        assert excluded is not None
+        assert excluded.state is FileState.AMBIGUOUS
+        assert excluded.state_detail.startswith("source_exclusion:size_mismatch:")
+        assert "skip:501:exclusion:size_mismatch:" in " ".join(first.reasons)
+        assert first.exclusion_counts["size_mismatch"] == 1
+        assert cycle_report_payload(first)["discovery_exclusions"]["counts"]["size_mismatch"] == 1
+
+        summary = json.loads(store.get_meta(META_LAST_DISCOVERY_EXCLUSIONS) or "null")
+        assert summary["counts"]["size_mismatch"] == 1
+        store.close()
+        store = open_tmp_store(tmp_path)
+        excluded = store.get_file(501)
+        assert excluded is not None
+        assert excluded.state is FileState.AMBIGUOUS
+        assert excluded.state_detail.startswith("source_exclusion:size_mismatch:")
+        assert (
+            json.loads(store.get_meta(META_LAST_DISCOVERY_EXCLUSIONS) or "null")["counts"][
+                "size_mismatch"
+            ]
+            == 1
+        )
+
+        shoko.mismatched.clear()
+        deps = replace(deps, store=store)
+        second = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="size-restored",
+        )
+        recovered = store.get_file(501)
+        assert second.counts.verified == 2
+        assert recovered is not None
+        assert recovered.state is FileState.VERIFIED
+        assert [request.url.path for request in shoko.requests if request.method == "POST"] == [
+            "/api/v3/File/500/Link",
+            "/api/v3/File/501/Link",
+        ]
+
+        verified_before = store.get_file(500)
+        assert verified_before is not None
+        shoko.mismatched.add(500)
+        third = run_cycle(
+            deps,
+            now_iso=T2,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="verified-excluded",
+        )
+        verified_after = store.get_file(500)
+        assert "skip:500:exclusion:size_mismatch:" in " ".join(third.reasons)
+        assert verified_after is not None
+        assert verified_after.state is FileState.VERIFIED
+        assert verified_after.state_detail == verified_before.state_detail
+        assert verified_after.last_verified_iso == verified_before.last_verified_iso
+        assert len(shoko.posts) == 2
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+def test_path_exclusion_recovers_after_path_is_corrected_without_posting_early(
+    tmp_path: Path,
+) -> None:
+    file = SpecFile(series_id=1, file_id=10, shoko_id=501)
+
+    class PathMismatchShokoStub(ShokoStub):
+        bad_path = False
+
+        def _location(self, source: SpecFile) -> dict[str, Any]:
+            location = super()._location(source)
+            if self.bad_path and source.shoko_id == 501:
+                location["AbsolutePath"] = f"{SHOKO_ROOT}/different/501.mkv"
+            return location
+
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [file])
+    shoko = PathMismatchShokoStub([file])
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=mapping_xml(),
+        monotonic=Clock([0.0]),
+        advance=lambda _: None,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    try:
+        planned = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.SERVICE,
+            cycle_key="path-good-dry-run",
+        )
+        assert planned.plans
+        assert shoko.posts == []
+
+        shoko.bad_path = True
+        excluded = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="path-mismatch",
+        )
+        record = store.get_file(501)
+        assert record is not None
+        assert record.state is FileState.AMBIGUOUS
+        assert record.state_detail.startswith("source_exclusion:location_path_mismatch:")
+        assert "skip:501:exclusion:location_path_mismatch:" in " ".join(excluded.reasons)
+        assert shoko.posts == []
+
+        shoko.bad_path = False
+        recovered = run_cycle(
+            deps,
+            now_iso=T2,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="path-restored",
+        )
+        record = store.get_file(501)
+        assert recovered.counts.verified == 1
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+        assert shoko.posts == [{"EpisodeIDs": [777]}]
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+def test_scope_exclusion_is_counted_separately_and_never_tracked_for_writes(
+    tmp_path: Path,
+) -> None:
+    files = [
+        SpecFile(series_id=1, file_id=10, shoko_id=500),
+        SpecFile(series_id=2, file_id=20, shoko_id=501),
+    ]
+    settings = make_settings(tmp_path)
+    settings = replace(settings, shoko=replace(settings.shoko, allowed_roots=("/anime/series1",)))
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=mapping_xml(),
+        monotonic=Clock([0.0]),
+        advance=lambda _: None,
+        shoko=shoko,
+        settings=settings,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    try:
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="scope-excluded",
+        )
+        assert report.exclusion_counts["outside_allowed_root"] == 1
+        assert report.scope_excluded_count == 1
+        assert "skip:501:exclusion:outside_allowed_root:" in " ".join(report.reasons)
+        assert store.get_file(501) is None
+        assert [request.url.path for request in shoko.requests if request.method == "POST"] == [
+            "/api/v3/File/500/Link"
+        ]
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
 
 
 @pytest.mark.parametrize("blocked_stage", ["preflight", "verification"])
@@ -969,7 +2285,12 @@ def test_dashboard_pause_during_slow_service_request_prevents_next_post(  # noqa
                 shoko=shoko,
                 attestation=False,
             )
-            deps = replace(deps, service_mode=True, service_authorized=currently_authorized)
+            deps = replace(
+                deps,
+                service_mode=True,
+                service_authorized=currently_authorized,
+                service_authorized_local=currently_authorized,
+            )
             reports.append(
                 run_cycle(
                     deps,
@@ -1193,7 +2514,7 @@ def test_service_canary_holds_expansion_until_async_verification_is_complete(
     assert second_file.state is FileState.PLANNED
 
 
-def test_rejected_service_canary_stops_expansion_across_cycles(
+def test_rejected_service_canary_retries_same_file_before_expansion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
@@ -1206,6 +2527,7 @@ def test_rejected_service_canary_stops_expansion_across_cycles(
     seed_baseline(store, files)
     shoko = ShokoStub(files)
     shoko.post_status = 400
+    shoko.link_on_post = False
     try:
         deps = build_deps(
             tmp_path,
@@ -1226,18 +2548,192 @@ def test_rejected_service_canary_stops_expansion_across_cycles(
         first = run_cycle(
             deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
         )
+        first_canary = store.get_service_canary()
+        first_file = store.get_file(500)
         shoko.post_status = None
+        shoko.link_on_post = True
         second = run_cycle(
             deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
         )
         canary = store.get_service_canary()
+        second_file = store.get_file(500)
+        untried_file = store.get_file(501)
+        rolling_submissions = store.budget_view().rolling_new_submissions
     finally:
         store.close()
     assert first.counts.submitted == 1
-    assert "service_canary_failed" in first.reasons
-    assert second.counts.submitted == 0
+    assert first_canary == (500, "pending")
+    assert first_file is not None
+    assert first_file.state is FileState.WAITING
+    assert second.counts.submitted == 1, second.reasons
+    assert shoko.posts_count() == 2
+    posted_file_ids = [
+        int(request.url.path.split("/")[4])
+        for request in shoko.requests
+        if request.method == "POST"
+    ]
+    assert posted_file_ids == [500, 500]
+    assert canary == (500, "verified")
+    assert second_file is not None
+    assert second_file.state is FileState.VERIFIED
+    assert untried_file is not None
+    assert untried_file.state is FileState.PLANNED
+    assert rolling_submissions == 2  # the definite rejection still consumes budget debt
+
+
+def test_rejected_service_canary_is_prioritized_across_rotating_window_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    files = [
+        SpecFile(
+            series_id=1,
+            file_id=10 + index,
+            shoko_id=500 + index,
+            episodes=((1, index + 1, ANIDB_EP + index, SHOKO_EP + index),),
+        )
+        for index in range(41)
+    ]
+    xml = (
+        "<anime-list>"
+        f"<anime anidbid='{ANIME_ID}' tvdbid='{TVDB_SERIES}' defaulttvdbseason='1'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1' "
+        "start='1' end='41' offset='0'/></mapping-list></anime></anime-list>"
+    )
+    activate_mapping(tmp_path, xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    shoko.post_status = 400
+    shoko.link_on_post = False
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=xml,
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            max_submissions=20,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        first_canary = store.get_service_canary()
+        first_record = store.get_file(500)
+        assert first.counts.submitted == 1
+        assert first_canary == (500, "pending")
+        assert first_record is not None
+        assert first_record.state is FileState.WAITING
+        assert [
+            int(request.url.path.split("/")[4])
+            for request in shoko.requests
+            if request.method == "POST"
+        ] == [500]
+    finally:
+        store.close()
+
+    # The canary ledger and resolution cursor survive restart; a definite rejection may be
+    # retried once as that same file before the bounded cursor resumes the rest of the backlog.
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    shoko.post_status = None
+    shoko.link_on_post = True
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=xml,
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            max_submissions=20,
+        )
+        deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        second = run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
+        )
+        canary = store.get_service_canary()
+        retry_record = store.get_file(500)
+        assert second.counts.submitted == 1
+        assert canary == (500, "verified")
+        assert retry_record is not None
+        assert retry_record.state is FileState.VERIFIED
+        assert [
+            int(request.url.path.split("/")[4])
+            for request in shoko.requests
+            if request.method == "POST"
+        ] == [500, 500]
+
+        third = run_cycle(
+            deps, now_iso=T2, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-3"
+        )
+        beyond_window = store.get_file(540)
+        assert beyond_window is not None
+        assert beyond_window.state in {FileState.PLANNED, FileState.VERIFIED}
+        assert third.reconciliation_ready
+    finally:
+        store.close()
+
+
+def test_rejected_service_canary_retry_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    files = [
+        SpecFile(series_id=1, file_id=10, shoko_id=500),
+        SpecFile(series_id=1, file_id=11, shoko_id=501),
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    shoko.post_status = 400
+    shoko.link_on_post = False
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            max_submissions=20,
+        )
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
+        )
+        second = run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-2"
+        )
+        shoko.post_status = None
+        shoko.link_on_post = True
+        third = run_cycle(
+            deps,
+            now_iso=T2,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="svc-3",
+        )
+        canary = store.get_service_canary()
+    finally:
+        store.close()
+    assert first.counts.submitted == second.counts.submitted == 1
     assert "service_canary_failed" in second.reasons
-    assert shoko.posts_count() == 1
+    assert third.counts.submitted == 0
+    assert "service_canary_failed" in third.reasons
+    assert shoko.posts_count() == 2
     assert canary == (500, "failed")
 
 
@@ -1706,6 +3202,90 @@ def test_pending_verification_keeps_file_verifying(
     assert view.pending_file_requests == 1
 
 
+@pytest.mark.parametrize("service_mode", [False, True])
+def test_async_departure_between_recovery_and_discovery_defers_without_latching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mode: bool
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    files = [SpecFile(1, 10, 500), SpecFile(1, 11, 501)]
+
+    class AsyncShokoStub(ShokoStub):
+        def _listing(self, request: httpx.Request) -> httpx.Response:
+            rows = [
+                self._file_row(file_id, xrefs=[])
+                for file_id in sorted(self.files)
+                if file_id not in self.linked
+            ]
+            return self._json(request, {"Total": len(rows), "List": rows})
+
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(99, 990, 999)])
+    shoko = AsyncShokoStub(files)
+    shoko.link_on_post = False
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=mapping_xml(),
+        monotonic=Clock([MONO_ZERO]),
+        advance=Sleeper().advance,
+        shoko=shoko,
+        max_submissions=1,
+        verification_timeout=10_000,
+    )
+    deps = replace(deps, service_mode=service_mode, service_authorized=lambda: True)
+    policy = RunPolicy.SERVICE if service_mode else RunPolicy.NEW_ARRIVAL
+    try:
+        first = run_cycle(deps, now_iso=T0, mode=CycleMode.APPLY, policy=policy, cycle_key="c1")
+        assert first.counts.submitted == 1
+        row = store.get_file(500)
+        assert row is not None
+        assert row.state is FileState.VERIFYING
+        assert store.get_meta("requires_rebaseline") == "0"
+        anchor = store.get_meta("source_last_discovery_total")
+        basis = store.get_meta("source_anchor_verified_basis")
+
+        def materialize_after_recovery(path: str) -> None:
+            if path == "/api/v3/ImportFolder":
+                shoko.materialize(500)
+
+        shoko.on_get = materialize_after_recovery
+        second = run_cycle(deps, now_iso=T1, mode=CycleMode.APPLY, policy=policy, cycle_key="c2")
+        assert store.get_meta("requires_rebaseline") == "0"
+        assert "discovery_drop_pending_verification" in second.reasons
+        assert not second.reconciliation_ready
+        assert not second.apply_eligible
+        assert second.counts.submitted == 0
+        assert second.writes_suppressed
+        assert store.get_meta("source_last_discovery_total") == anchor
+        assert store.get_meta("source_anchor_verified_basis") == basis
+
+        store.close()
+        store = open_tmp_store(tmp_path)
+        deps = replace(deps, store=store)
+        shoko.on_get = None
+        third = run_cycle(deps, now_iso=T2, mode=CycleMode.APPLY, policy=policy, cycle_key="c3")
+        row = store.get_file(500)
+        assert row is not None
+        assert row.state is FileState.VERIFIED
+        assert store.get_meta("requires_rebaseline") == "0"
+        assert third.reconciliation_ready
+        assert third.counts.submitted == 1
+        assert (
+            sum(
+                request.method == "POST" and request.url.path == "/api/v3/File/500/Link"
+                for request in shoko.requests
+            )
+            == 1
+        )
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
 def test_partial_past_deadline_keeps_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     # A two-episode file so a non-empty proper subset is representable.
@@ -1719,13 +3299,14 @@ def test_partial_past_deadline_keeps_slot(tmp_path: Path, monkeypatch: pytest.Mo
     store = open_tmp_store(tmp_path)
     seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
     shoko = _PartialStub([multi])
+    monotonic_ticks = iter(range(0, 10_000, 100))
     deps = build_deps(
         tmp_path,
         store=store,
         sonarr_files=[multi],
         shoko_files=[multi],
         xml=mapping_xml(),
-        monotonic=Clock([0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0]),
+        monotonic=lambda: next(monotonic_ticks),
         advance=Sleeper().advance,
         shoko=shoko,
         verification_timeout=VERIFICATION_TIMEOUT,
@@ -2068,6 +3649,451 @@ def test_verified_service_file_mapping_drift_is_persisted_without_link_changes(
     assert drift_records[0].active_targets_digest != old_mapping
 
 
+def _positional_fence_case(identity_rule: str) -> tuple[str, str, list[SpecFile]]:
+    identity_attribute = (
+        "defaulttvdbseason='1' episodeoffset='0'"
+        if identity_rule == "offset"
+        else "defaulttvdbseason='a'"
+    )
+    old_entry = f"<anime anidbid='{ANIME_ID}' tvdbid='{TVDB_SERIES}' {identity_attribute}/>"
+    fenced_entry = (
+        f"<anime anidbid='{ANIME_ID}' tvdbid='{TVDB_SERIES}' {identity_attribute}>"
+        "<mapping-list><mapping anidbseason='0' tvdbseason='1'>"
+        ";101-1;102-3;</mapping></mapping-list></anime>"
+    )
+    old_xml = f"<anime-list>{old_entry}</anime-list>"
+    fenced_xml = f"<anime-list>{fenced_entry}</anime-list>"
+    files = [
+        SpecFile(
+            series_id=1,
+            file_id=10 * number,
+            shoko_id=500 + number,
+            episodes=((1, number, number, 776 + number),),
+            absolute_episode_numbers=(number,) if identity_rule == "absolute" else (),
+        )
+        for number in (1, 2, 3)
+    ]
+    return old_xml, fenced_xml, files
+
+
+def _build_positional_fence_service(
+    tmp_path: Path, old_xml: str, files: list[SpecFile]
+) -> tuple[StateStore, ShokoStub, DaemonDeps]:
+    activate_mapping(tmp_path, old_xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=old_xml,
+        monotonic=Clock([MONO_ZERO]),
+        advance=Sleeper().advance,
+        shoko=shoko,
+        max_submissions=1,
+    )
+    return store, shoko, replace(deps, service_mode=True, service_authorized=lambda: True)
+
+
+def _assert_positional_fence_restart_result(
+    reopened: StateStore,
+    report: CycleReport,
+    shoko: ShokoStub,
+    identity_rule: str,
+    legacy_snapshot_missing: bool,
+    file_ids: tuple[int, int, int],
+    before_links: dict[int, list[dict[str, Any]]],
+) -> None:
+    first_file_id, unaffected_file_id, unsent_file_id = file_ids
+    affected = reopened.get_file(first_file_id)
+    unaffected = reopened.get_file(unaffected_file_id)
+    unsent = reopened.get_file(unsent_file_id)
+    drifts = reopened.get_service_mapping_drifts()
+    assert report.mapping_outcome is RefreshOutcome.NOT_DUE
+    expected_drift_ids = [first_file_id]
+    if legacy_snapshot_missing:
+        expected_drift_ids.append(unaffected_file_id)
+    expected_drift: tuple[str, ...] = (
+        f"existing_link drift: verified file {first_file_id} changed mapping at "
+        f"TVDB {TVDB_SERIES} S1E1"
+        + (" (absolute 1)" if identity_rule == "absolute" else "")
+        + " (never unlinked)",
+    )
+    if legacy_snapshot_missing:
+        expected_drift += (
+            f"existing_link drift: verified file {unaffected_file_id} frozen target evidence "
+            "unavailable after an affected mapping change (never unlinked)",
+        )
+    assert report.existing_link_drift == expected_drift
+    assert affected is not None
+    assert affected.state is FileState.VERIFIED
+    assert unaffected is not None
+    assert unaffected.state is FileState.VERIFIED
+    assert unsent is not None
+    assert unsent.state is FileState.CONFLICT
+    assert not reopened.mapping_target_quarantined(first_file_id)
+    assert not reopened.mapping_target_quarantined(unaffected_file_id)
+    assert reopened.mapping_target_quarantined(unsent_file_id)
+    assert [item.shoko_file_id for item in drifts] == expected_drift_ids
+    frozen_semantics = json.loads(reopened.get_meta("reconciled_mapping_semantics:v1") or "null")
+    assert "F|1|1" in frozen_semantics[str(TVDB_SERIES)]
+    assert "F|1|3" in frozen_semantics[str(TVDB_SERIES)]
+    assert drifts[0].previous_targets_digest != drifts[0].active_targets_digest
+    after_links = {file_id: list(shoko.linked[file_id]) for file_id in file_ids[:2]}
+    assert after_links == before_links
+    assert shoko.posts_count() == 2
+
+
+@pytest.mark.parametrize("identity_rule", ["offset", "absolute"])
+@pytest.mark.parametrize(
+    "legacy_snapshot_missing", [False, True], ids=["frozen-targets", "legacy-unfrozen-targets"]
+)
+def test_service_restart_reconciles_positional_fence_drift_only_for_affected_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_rule: str,
+    legacy_snapshot_missing: bool,
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    old_xml, fenced_xml, files = _positional_fence_case(identity_rule)
+    store, shoko, deps = _build_positional_fence_service(tmp_path, old_xml, files)
+    first = run_cycle(
+        deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="fence-1"
+    )
+    second = run_cycle(
+        deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="fence-2"
+    )
+    before_links = {file.shoko_id: list(shoko.linked[file.shoko_id]) for file in files[:2]}
+    first_file_id, unaffected_file_id, unsent_file_id = (file.shoko_id for file in files)
+    assert first.counts.verified == 1
+    assert second.counts.verified == 2
+    assert store.get_file(first_file_id).state is FileState.VERIFIED  # type: ignore[union-attr]
+    assert store.get_file(unaffected_file_id).state is FileState.VERIFIED  # type: ignore[union-attr]
+    assert store.get_file(unsent_file_id).state is FileState.PLANNED  # type: ignore[union-attr]
+    if legacy_snapshot_missing:
+        # Historical verified rows without per-file destination snapshots must stay
+        # conservative because their positions cannot be compared against the old mapping.
+        store.clear_meta(f"file_mapping_targets:v1:{unaffected_file_id}")
+
+    # Mapping activation occurs between process cycles; the next process must compare its
+    # complete persisted semantic snapshot rather than relying on the refresh outcome.
+    _activate_new_generation(deps, fenced_xml, _due_iso())
+    store.close()
+    reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    try:
+        restarted_deps = build_deps(
+            tmp_path,
+            store=reopened,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=fenced_xml,
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            max_submissions=0,
+        )
+        restarted_deps = replace(restarted_deps, service_mode=True, service_authorized=lambda: True)
+        report = run_cycle(
+            restarted_deps,
+            now_iso=_due_iso(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="fence-after-restart",
+        )
+        _assert_positional_fence_restart_result(
+            reopened,
+            report,
+            shoko,
+            identity_rule,
+            legacy_snapshot_missing,
+            (first_file_id, unaffected_file_id, unsent_file_id),
+            before_links,
+        )
+    finally:
+        reopened.close()
+
+
+def test_partial_discovery_still_reports_legacy_verified_mapping_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_xml, fenced_xml, files = _positional_fence_case("offset")
+    store, shoko, deps = _build_positional_fence_service(tmp_path, old_xml, files)
+    run_cycle(
+        deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="partial-1"
+    )
+    run_cycle(
+        deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="partial-2"
+    )
+    legacy_file_id = files[1].shoko_id
+    assert store.get_file(legacy_file_id).state is FileState.VERIFIED  # type: ignore[union-attr]
+    store.clear_meta(f"file_mapping_targets:v1:{legacy_file_id}")
+    _activate_new_generation(deps, fenced_xml, _due_iso())
+    store.close()
+
+    reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    try:
+        restarted_deps = build_deps(
+            tmp_path,
+            store=reopened,
+            sonarr_files=files,
+            shoko_files=files,
+            xml=fenced_xml,
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            max_submissions=0,
+        )
+        restarted_deps = replace(restarted_deps, service_mode=True, service_authorized=lambda: True)
+        collect_discovery = daemon_module._collect_bounded_shoko_discovery
+
+        def omit_legacy_file(deps: DaemonDeps, cycle_start_mono: float, now_iso: str) -> Any:
+            discovery = collect_discovery(deps, cycle_start_mono, now_iso)
+            return replace(
+                discovery,
+                files=tuple(file for file in discovery.files if file.id != legacy_file_id),
+                verdict=replace(discovery.verdict, complete=False),
+            )
+
+        monkeypatch.setattr(daemon_module, "_collect_bounded_shoko_discovery", omit_legacy_file)
+        report = run_cycle(
+            restarted_deps,
+            now_iso=_due_iso(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="partial-after-activation",
+        )
+
+        assert report.reconciliation_ready is False
+        assert report.existing_link_drift == (
+            f"existing_link drift: verified file {files[0].shoko_id} changed mapping at "
+            f"TVDB {TVDB_SERIES} S1E1 (never unlinked)",
+            f"existing_link drift: verified file {legacy_file_id} frozen target evidence "
+            "unavailable after an affected mapping change (never unlinked)",
+        )
+        assert [item.shoko_file_id for item in reopened.get_service_mapping_drifts()] == [
+            files[0].shoko_id,
+            legacy_file_id,
+        ]
+        assert reopened.get_meta(f"file_mapping_targets:v1:{legacy_file_id}") is None
+        assert shoko.posts_count() == 2
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("identity_rule", ["offset", "absolute"])
+def test_service_reports_mapping_drift_for_linked_file_omitted_from_unrecognized_listing(
+    tmp_path: Path, identity_rule: str
+) -> None:
+    old_xml, fenced_xml, files = _positional_fence_case(identity_rule)
+    source = files[0]
+    store, shoko, deps = _build_positional_fence_service(tmp_path, old_xml, [source])
+    try:
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="linked-1"
+        )
+        assert first.counts.verified == 1
+        record = store.get_file(source.shoko_id)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+        frozen_key = f"file_mapping_targets:v1:{source.shoko_id}"
+        frozen_targets = store.get_meta(frozen_key)
+        assert frozen_targets is not None
+        before_links = list(shoko.linked[source.shoko_id])
+        assert shoko.posts_count() == 1
+
+        # Shoko's Unrecognized listing correctly drops a file once it has XRefs.
+        shoko.files.clear()
+        _activate_new_generation(deps, fenced_xml, T1)
+        store.close()
+
+        reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        try:
+            restarted_deps = build_deps(
+                tmp_path,
+                store=reopened,
+                sonarr_files=[source],
+                shoko_files=[],
+                xml=fenced_xml,
+                monotonic=Clock([MONO_ZERO]),
+                advance=Sleeper().advance,
+                shoko=shoko,
+                max_submissions=0,
+            )
+            restarted_deps = replace(
+                restarted_deps, service_mode=True, service_authorized=lambda: True
+            )
+            report = run_cycle(
+                restarted_deps,
+                now_iso=T2,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key="linked-after-restart",
+            )
+
+            assert report.existing_link_drift == (
+                f"existing_link drift: verified file {source.shoko_id} changed mapping at "
+                f"TVDB {TVDB_SERIES} S1E1"
+                + (" (absolute 1)" if identity_rule == "absolute" else "")
+                + " (never unlinked)",
+            )
+            drifts = reopened.get_service_mapping_drifts()
+            assert [item.shoko_file_id for item in drifts] == [source.shoko_id]
+            assert drifts[0].reason == report.existing_link_drift[0].removeprefix(
+                f"existing_link drift: verified file {source.shoko_id} "
+            ).removesuffix(" (never unlinked)")
+            assert reopened.get_meta(frozen_key) == frozen_targets
+            assert reopened.get_file(source.shoko_id).state is FileState.VERIFIED  # type: ignore[union-attr]
+            assert shoko.linked[source.shoko_id] == before_links
+            assert shoko.posts_count() == 1
+
+            repeated = run_cycle(
+                restarted_deps,
+                now_iso="2026-01-01T00:30:00+00:00",
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key="linked-repeat",
+            )
+            assert repeated.existing_link_drift == report.existing_link_drift
+            assert reopened.get_meta(frozen_key) == frozen_targets
+            assert reopened.get_service_mapping_drifts() == drifts
+            assert shoko.linked[source.shoko_id] == before_links
+            assert shoko.posts_count() == 1
+        finally:
+            reopened.close()
+    finally:
+        with contextlib.suppress(Exception):
+            store.close()
+
+
+def test_service_reports_only_changed_position_for_omitted_composite_file(tmp_path: Path) -> None:
+    old_xml, fenced_xml, _files = _positional_fence_case("offset")
+    composite = SpecFile(
+        series_id=1,
+        file_id=10,
+        shoko_id=500,
+        episodes=((1, 1, 776, 777), (1, 2, 777, 778)),
+    )
+    store, shoko, deps = _build_positional_fence_service(tmp_path, old_xml, [composite])
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="composite-linked-1",
+        )
+        assert first.counts.verified == 1
+        frozen_key = f"file_mapping_targets:v1:{composite.shoko_id}"
+        frozen_targets = store.get_meta(frozen_key)
+        assert frozen_targets is not None
+        assert len(json.loads(frozen_targets)) == 2
+        before_links = list(shoko.linked[composite.shoko_id])
+        assert shoko.posts_count() == 1
+
+        shoko.files.clear()
+        _activate_new_generation(deps, fenced_xml, T1)
+        store.close()
+        reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        try:
+            restarted_deps = build_deps(
+                tmp_path,
+                store=reopened,
+                sonarr_files=[composite],
+                shoko_files=[],
+                xml=fenced_xml,
+                monotonic=Clock([MONO_ZERO]),
+                advance=Sleeper().advance,
+                shoko=shoko,
+                max_submissions=0,
+            )
+            restarted_deps = replace(
+                restarted_deps, service_mode=True, service_authorized=lambda: True
+            )
+            report = run_cycle(
+                restarted_deps,
+                now_iso=T2,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key="composite-linked-after-restart",
+            )
+
+            assert report.existing_link_drift == (
+                f"existing_link drift: verified file {composite.shoko_id} changed mapping at "
+                f"TVDB {TVDB_SERIES} S1E1 (never unlinked)",
+            )
+            assert "S1E2" not in report.existing_link_drift[0]
+            assert reopened.get_meta(frozen_key) == frozen_targets
+            assert reopened.get_file(composite.shoko_id).state is FileState.VERIFIED  # type: ignore[union-attr]
+            assert shoko.linked[composite.shoko_id] == before_links
+            assert shoko.posts_count() == 1
+        finally:
+            reopened.close()
+    finally:
+        with contextlib.suppress(Exception):
+            store.close()
+
+
+@pytest.mark.parametrize("malformed_snapshot", ["not-json", "{}", '{"broken": [true]}'])
+def test_malformed_verified_mapping_snapshot_reports_conservatively_without_stalling(
+    tmp_path: Path, malformed_snapshot: str
+) -> None:
+    old_xml, fenced_xml, files = _positional_fence_case("offset")
+    source = files[0]
+    store, shoko, deps = _build_positional_fence_service(tmp_path, old_xml, [source])
+    try:
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="bad-1"
+        )
+        assert first.counts.verified == 1
+        frozen_key = f"file_mapping_targets:v1:{source.shoko_id}"
+        store.set_meta(frozen_key, malformed_snapshot)
+        shoko.files.clear()
+        _activate_new_generation(deps, fenced_xml, T1)
+        store.close()
+
+        reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        try:
+            restarted_deps = build_deps(
+                tmp_path,
+                store=reopened,
+                sonarr_files=[source],
+                shoko_files=[],
+                xml=fenced_xml,
+                monotonic=Clock([MONO_ZERO]),
+                advance=Sleeper().advance,
+                shoko=shoko,
+                max_submissions=0,
+            )
+            restarted_deps = replace(
+                restarted_deps, service_mode=True, service_authorized=lambda: True
+            )
+            report = run_cycle(
+                restarted_deps,
+                now_iso=T2,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key="bad-after-restart",
+            )
+            assert report.existing_link_drift == (
+                f"existing_link drift: verified file {source.shoko_id} frozen target evidence "
+                "unavailable after an affected mapping change (never unlinked)",
+            )
+            drift = reopened.get_service_mapping_drifts()
+            assert len(drift) == 1
+            assert drift[0].reason == (
+                "frozen target evidence unavailable after an affected mapping change"
+            )
+            assert reopened.get_meta(frozen_key) == malformed_snapshot
+            assert shoko.posts_count() == 1
+        finally:
+            reopened.close()
+    finally:
+        with contextlib.suppress(Exception):
+            store.close()
+
+
 def _activate_new_generation(deps: DaemonDeps, xml: str, now_iso: str) -> None:
     endpoint = source_endpoint(source_handler(xml))
     try:
@@ -2175,8 +4201,7 @@ def test_inflight_plan_mapping_change_blocks_post(
     store.close()
     # In-flight plan drift: quarantined out of planned, no POST, drift reported.
     assert record is not None
-    assert record.state in (FileState.WAITING, FileState.AMBIGUOUS)
-    assert record.state is not FileState.PLANNED
+    assert record.state is FileState.CONFLICT
     assert shoko.posts_count() == 0
     assert any("mapping_changed" in item for item in report.drift)
 
@@ -2270,6 +4295,130 @@ def test_mapping_unavailable_writes_zero(tmp_path: Path, monkeypatch: pytest.Mon
         store.close()
     assert "mapping_unavailable" in report.reasons
     assert shoko.posts_count() == 0
+
+
+def test_invalid_split_entry_cannot_expand_ownership_into_verified_service_post(
+    tmp_path: Path,
+) -> None:
+    """A malformed split owner must not let another AniDB entry claim its TVDB episodes."""
+    file = SpecFile(
+        series_id=1,
+        file_id=10,
+        shoko_id=500,
+        episodes=((1, 17, 17, SHOKO_EP),),
+        tvdb_series=267440,
+        anime_id=100,
+    )
+    invalid_xml = (
+        "<anime-list>"
+        "<anime anidbid='100' tvdbid='267440' defaulttvdbseason='1' episodeoffset='0'/>"
+        "<anime anidbid='200' tvdbid='267440' defaulttvdbseason='1' episodeoffset='16'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1'>;1-2oops;</mapping>"
+        "</mapping-list></anime></anime-list>"
+    )
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [file])
+    shoko = ShokoStub([file])
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=invalid_xml,
+        monotonic=Clock([MONO_ZERO]),
+        advance=Sleeper().advance,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    try:
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="invalid-split-entry",
+        )
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+    assert report.counts.submitted == 0
+    assert "mapping_unavailable" in report.reasons
+    assert shoko.posts == []
+
+
+def test_new_known_unsupported_scope_quarantines_frozen_file_and_links_unrelated_service_file(
+    tmp_path: Path,
+) -> None:
+    affected = SpecFile(series_id=1, file_id=10, shoko_id=500, tvdb_series=267440, anime_id=100)
+    healthy = SpecFile(series_id=2, file_id=20, shoko_id=501, tvdb_series=999, anime_id=300)
+    supported_xml = (
+        "<anime-list>"
+        "<anime anidbid='100' tvdbid='267440' defaulttvdbseason='1' episodeoffset='0'/>"
+        + _entry(999, 300)
+        + "</anime-list>"
+    )
+    fenced_xml = supported_xml.replace(
+        "</anime-list>",
+        "<anime anidbid='200' tvdbid='267440' defaulttvdbseason='a' episodeoffset='4'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1' start='1' end='4' offset='0'/>"
+        "</mapping-list></anime></anime-list>",
+    )
+
+    activate_mapping(tmp_path, supported_xml)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [affected, healthy])
+    shoko = ShokoStub([affected, healthy])
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[affected, healthy],
+        shoko_files=[affected, healthy],
+        xml=supported_xml,
+        monotonic=Clock([MONO_ZERO]),
+        advance=Sleeper().advance,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True, max_submissions=0)
+    next_source = source_endpoint(source_handler(fenced_xml))
+    try:
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="fence-1"
+        )
+        affected_before = store.get_file(affected.shoko_id)
+        healthy_before = store.get_file(healthy.shoko_id)
+        deps = replace(deps, mapping_source=next_source, max_submissions=20)
+        updated = run_cycle(
+            deps,
+            now_iso=_due_iso(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="fence-2",
+        )
+        affected_after = store.get_file(affected.shoko_id)
+        healthy_after = store.get_file(healthy.shoko_id)
+        post_paths = [request.url.path for request in shoko.requests if request.method == "POST"]
+        assert not deps.mapping_store.invalid_source_hold()
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+    assert first.counts.submitted == 0
+    assert affected_before is not None
+    assert affected_before.state is FileState.PLANNED
+    assert healthy_before is not None
+    assert healthy_before.state is FileState.PLANNED
+    assert updated.mapping_outcome is RefreshOutcome.ACTIVATED
+    assert updated.counts.submitted == 1
+    assert affected_after is not None
+    assert affected_after.state is FileState.CONFLICT
+    assert affected_after.state_detail == "service_mapping_target_changed"
+    assert affected_after.mapping_targets_digest == affected_before.mapping_targets_digest
+    assert healthy_after is not None
+    assert healthy_after.state is FileState.VERIFIED
+    assert post_paths == ["/api/v3/File/501/Link"]
 
 
 def test_restart_does_not_disable_refresh_or_tight_loop(
@@ -3052,9 +5201,7 @@ def make_settings_shifted(tmp_path: Path) -> Settings:
 def test_identity_change_suppresses_apply_until_reanchored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P1-1 regression: source identity change → requires_rebaseline + apply suppressed
-    for that cycle; the next fresh full-scan cycle with the stable new identity re-anchors
-    and clears the flag, and apply resumes."""
+    """A source identity change holds writes across clean polls until operator recovery."""
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     a = SpecFile(series_id=1, file_id=10, shoko_id=500)
     b = SpecFile(series_id=2, file_id=20, shoko_id=501)
@@ -3126,6 +5273,14 @@ def test_identity_change_suppresses_apply_until_reanchored(
             cycle_key="c3",
         )
         flag_after_reanchor = store.get_meta("requires_rebaseline")
+        store.clear_requires_rebaseline(_iso_offset(minutes=25))
+        recovered = run_cycle(
+            deps_stable,
+            now_iso=_iso_offset(minutes=30),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="c4",
+        )
     finally:
         store.close()
     assert r1.counts.submitted == 1
@@ -3135,9 +5290,9 @@ def test_identity_change_suppresses_apply_until_reanchored(
     assert "source_unstable" in r2.reasons
     assert flag_after_change == "1"
     assert posts_after_change_cycle == POSTS_ONE
-    # Fresh full-scan observation with the stable new identity clears the flag.
-    assert flag_after_reanchor == "0"
-    assert r3.counts.submitted == 1
+    assert flag_after_reanchor == "1"
+    assert r3.counts.submitted == 0
+    assert recovered.counts.submitted == 1
     assert shoko.posts_count() == POSTS_TWO
 
 
@@ -3281,11 +5436,11 @@ def test_restart_verifying_row_repolls_to_verified(
     assert all(request.method != "DELETE" for request in shoko.requests)
 
 
-def test_mark_sent_crash_past_deadline_closes_partial_and_releases_slot(
+def test_mark_sent_crash_past_deadline_records_partial_and_holds_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P1-3 probe P2: crash after mark_sent (request_may_have_been_sent), XRefs show
-    NOT linked, deadline past → PARTIAL close, slot released, posts stay 1 — no resubmit."""
+    NOT linked, deadline past → durable PARTIAL review, slot held, posts stay 1 — no resubmit."""
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     a = SpecFile(series_id=1, file_id=10, shoko_id=500)
     activate_mapping(tmp_path, mapping_xml())
@@ -3333,11 +5488,22 @@ def test_mark_sent_crash_past_deadline_closes_partial_and_releases_slot(
         )
         record = store.get_file(500)
         view = store.budget_view()
+        live_counts = store.live_send_counts()
+        recovery = store.recover_after_restart()
     finally:
         store.close()
     assert record is not None
     assert record.state is FileState.PARTIAL
-    assert view.pending_file_requests == 0
+    assert view.pending_file_requests == 1
+    assert live_counts == (COUNT_ONE, COUNT_ONE)
+    assert _raw_read(
+        store.path,
+        "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = ?",
+        (500,),
+    ) == [("inspected_review", "partial", 0)]
+    assert 500 not in {
+        row.shoko_file_id for row in (*recovery.hold_for_verification, *recovery.continue_polling)
+    }
     assert shoko.posts_count() == 1
     assert any("recovery_hold:500:partial" in reason for reason in report.reasons)
     assert all(request.method != "DELETE" for request in shoko.requests)
@@ -3403,6 +5569,249 @@ def test_may_have_been_sent_unrelated_link_is_contradiction(
     assert shoko.posts_count() == 1
     assert view.pending_file_requests == 1  # held for operator review, never auto-repaired
     assert all(request.method != "DELETE" for request in shoko.requests)
+
+
+def test_http_202_pending_send_is_held_until_restart_xref_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HTTP 202 is accepted, not terminal; restart recovery inspects without reposting."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, budget_limits=WIDE_LIMITS)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    shoko.post_status = 202
+    shoko.link_on_post = False
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[candidate],
+        shoko_files=[candidate],
+        xml=mapping_xml(),
+        monotonic=_rising_clock(0.0, 30),
+        advance=Sleeper().advance,
+        shoko=shoko,
+    )
+    deps = replace(deps, max_verify_polls=1)
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="accepted-202",
+        )
+        inspection = store.active_send_details(candidate.shoko_id)
+        assert inspection is not None
+        assert inspection.outcome == "accepted_unverified"
+        assert store.budget_view().pending_file_requests == 1
+        assert _raw_read(
+            path,
+            "SELECT http_status, verification, outcome FROM sends WHERE send_id = ?",
+            (inspection.send_id,),
+        ) == [(202, "pending", "accepted_unverified")]
+        assert first.counts.submitted == 1
+        with pytest.raises(StateError, match="inspected_review"):
+            store.resolve_send(
+                candidate.shoko_id,
+                inspection.request_fingerprint,
+                resolution="released_after_review",
+                iso=T1,
+                verification_timeout_seconds=VERIFICATION_TIMEOUT,
+            )
+    finally:
+        store.close()
+
+    reopened = StateStore(path, budget_limits=WIDE_LIMITS)
+    deps_after_restart = build_deps(
+        tmp_path,
+        store=reopened,
+        sonarr_files=[candidate],
+        shoko_files=[candidate],
+        xml=mapping_xml(),
+        monotonic=_rising_clock(100.0, 30),
+        advance=Sleeper().advance,
+        shoko=shoko,
+    )
+    try:
+        run_cycle(
+            deps_after_restart,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="recovery-after-202",
+        )
+        row = _raw_read(
+            path,
+            "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = ?",
+            (candidate.shoko_id,),
+        )
+        record = reopened.get_file(candidate.shoko_id)
+        assert row == [("inspected_review", "contradiction", 0)]
+        assert record is not None
+        assert record.state is FileState.CONFLICT
+        assert reopened.budget_view().pending_file_requests == 1
+        assert reopened.active_send_details(candidate.shoko_id) is None
+    finally:
+        reopened.close()
+        for deps_to_close in (deps, deps_after_restart):
+            for endpoint in (
+                deps_to_close.sonarr,
+                deps_to_close.shoko,
+                deps_to_close.mapping_source,
+            ):
+                endpoint.client.close()
+
+    assert shoko.posts_count() == 1
+    assert all(request.method != "DELETE" for request in shoko.requests)
+
+
+@pytest.mark.parametrize(
+    "inspection_case",
+    ["empty", "contradictory", "partial", "exact", "wrong_ed2k", "wrong_file_id"],
+)
+def test_crash_send_inspection_is_durable_and_terminal_without_repost(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inspection_case: str
+) -> None:
+    """A reopened crash-after-mark-sent row is resolved only by same-file XRef inspection.
+
+    Empty, partial, and contradictory observations become durable operator-review outcomes,
+    retain the pending slot, and leave no polling work after restart. Exact target XRefs alone
+    close as verified. Recovery never POSTs in any case.
+    """
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    episodes = (
+        ((1, 1, ANIDB_EP, SHOKO_EP), (1, 2, ANIDB_EP + 1, SHOKO_EP + 1))
+        if inspection_case == "partial"
+        else ((1, 1, ANIDB_EP, SHOKO_EP),)
+    )
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500, episodes=episodes)
+    xml = mapping_xml().replace(";1-1;", ";1-1;2-2;") if len(episodes) > 1 else mapping_xml()
+    activate_mapping(tmp_path, xml)
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, budget_limits=WIDE_LIMITS)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    shoko.link_on_post = False
+    shoko.fail_post = RuntimeError("unknown HTTP outcome after mark_sent")
+    try:
+        deps1 = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=xml,
+            monotonic=_rising_clock(0.0, 20),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        with pytest.raises(RuntimeError, match="unknown HTTP outcome"):
+            run_cycle(
+                deps1,
+                now_iso=T0,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.NEW_ARRIVAL,
+                cycle_key="crash",
+            )
+    finally:
+        store.close()
+
+    shoko.fail_post = None
+    if inspection_case == "contradictory":
+        shoko.link_unrelated(candidate.shoko_id)
+    elif inspection_case == "partial":
+        shoko.materialize(candidate.shoko_id, episodes=(episodes[0],))
+    elif inspection_case == "exact":
+        shoko.materialize(candidate.shoko_id)
+    elif inspection_case in {"wrong_ed2k", "wrong_file_id"}:
+        shoko.link_unrelated(candidate.shoko_id)
+        if inspection_case == "wrong_ed2k":
+            shoko.ed2k_overrides[candidate.shoko_id] = "f" * 32
+        else:
+            shoko.file_id_overrides[candidate.shoko_id] = candidate.shoko_id + 1
+
+    reopened = StateStore(path, budget_limits=WIDE_LIMITS)
+    release_apply_lock(reopened, pid=4242, iso=T1)
+    try:
+        deps2 = build_deps(
+            tmp_path,
+            store=reopened,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=xml,
+            monotonic=_rising_clock(100.0, 20),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        run_cycle(
+            deps2,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="recovery",
+        )
+        record = reopened.get_file(candidate.shoko_id)
+        recovery = reopened.recover_after_restart()
+        pending = reopened.budget_view().pending_file_requests
+        active_send = reopened.active_send_details(candidate.shoko_id)
+        if inspection_case in {"wrong_ed2k", "wrong_file_id"}:
+            assert active_send is not None
+            with pytest.raises(StateError):
+                reopened.resolve_send(
+                    candidate.shoko_id,
+                    active_send.request_fingerprint,
+                    resolution="released_after_review",
+                    iso=T2,
+                    operator_note="identity-mismatched XRef response",
+                )
+        send_rows = _raw_read(
+            path,
+            "SELECT sends.outcome, sends.verification, sends.slot_released, files.state"
+            " FROM sends JOIN files USING (shoko_file_id) WHERE sends.shoko_file_id = ?",
+            (candidate.shoko_id,),
+        )
+    finally:
+        reopened.close()
+
+    assert shoko.posts_count() == 1
+    assert all(request.method != "DELETE" for request in shoko.requests)
+    assert record is not None
+    assert send_rows == [
+        (
+            "verified"
+            if inspection_case == "exact"
+            else "attempted"
+            if inspection_case in {"wrong_ed2k", "wrong_file_id"}
+            else "inspected_review",
+            "verified"
+            if inspection_case == "exact"
+            else None
+            if inspection_case in {"wrong_ed2k", "wrong_file_id"}
+            else "contradiction"
+            if inspection_case == "contradictory"
+            else "partial",
+            1 if inspection_case == "exact" else 0,
+            {
+                "exact": FileState.VERIFIED.value,
+                "contradictory": FileState.CONFLICT.value,
+                "partial": FileState.PARTIAL.value,
+                "empty": FileState.PARTIAL.value,
+                "wrong_ed2k": FileState.REQUEST_MAY_HAVE_BEEN_SENT.value,
+                "wrong_file_id": FileState.REQUEST_MAY_HAVE_BEEN_SENT.value,
+            }[inspection_case],
+        )
+    ]
+    assert pending == (0 if inspection_case == "exact" else 1)
+    assert (active_send is not None) == (inspection_case in {"wrong_ed2k", "wrong_file_id"})
+    if inspection_case in {"wrong_ed2k", "wrong_file_id"}:
+        assert candidate.shoko_id in {row.shoko_file_id for row in recovery.hold_for_verification}
+    else:
+        assert candidate.shoko_id not in {
+            row.shoko_file_id
+            for row in (*recovery.hold_for_verification, *recovery.continue_polling)
+        }
 
 
 def test_prepared_crash_row_voided_and_reprepared(
@@ -3929,12 +6338,10 @@ ONE_FILE_LIMITS = BudgetLimits(
 )
 
 
-def test_late_delivery_does_not_double_release_slot(
+def test_partial_inspection_holds_slot_until_operator_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P1-A probe (reviewer p1b, daemon level, ceiling 1): a partial close releases A's slot;
-    a late ManualLinkJob lands A VERIFIED → NO second release; pending never exceeds the
-    ceiling; file B is admitted only after A's true release."""
+    """A terminal PARTIAL review holds the ceiling until explicit operator resolution."""
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     a = SpecFile(series_id=1, file_id=10, shoko_id=500)
     b = SpecFile(series_id=2, file_id=20, shoko_id=501)
@@ -3967,18 +6374,18 @@ def test_late_delivery_does_not_double_release_slot(
             )
         assert store.budget_view().pending_file_requests == 1  # A holds the only slot
         shoko.fail_post = None
-        # Cycle 2 past the deadline: NOT-linked → partial close, release (slot_released=1).
+        # Cycle 2 past the deadline: NOT-linked → terminal PARTIAL review, still held.
         deps2 = build_deps(
             tmp_path,
             store=store,
-            sonarr_files=[a],
-            shoko_files=[a],
+            sonarr_files=[a, b],
+            shoko_files=[a, b],
             xml=mapping_xml(),
             monotonic=Clock([MONO_ZERO]),
             advance=sleeper.advance,
             shoko=shoko,
         )
-        run_cycle(
+        r2 = run_cycle(
             deps2,
             now_iso=_iso_offset(minutes=5),
             mode=CycleMode.APPLY,
@@ -3988,41 +6395,33 @@ def test_late_delivery_does_not_double_release_slot(
         file_500 = store.get_file(500)
         assert file_500 is not None
         assert file_500.state is FileState.PARTIAL
+        assert r2.counts.submitted == 0
+        assert store.budget_view().pending_file_requests == 1
+        assert store.live_send_counts() == (COUNT_ONE, COUNT_ONE)
+        assert _raw_read(
+            store.path,
+            "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = ?",
+            (500,),
+        ) == [("inspected_review", "partial", 0)]
+        row = store.connection.execute(
+            "SELECT request_fingerprint FROM sends WHERE shoko_file_id = ?"
+            " ORDER BY send_id DESC LIMIT 1",
+            (500,),
+        ).fetchone()
+        assert row is not None
+
+        # Only an explicit review resolution releases the pending slot for B.
+        store.resolve_send(
+            500,
+            str(row[0]),
+            resolution="released_after_review",
+            iso=_iso_offset(minutes=10),
+            operator_note="reviewed terminal same-file XRefs",
+            verification_timeout_seconds=VERIFICATION_TIMEOUT,
+        )
         assert store.budget_view().pending_file_requests == 0
-        inspection = store.active_send_details(500)
-        assert inspection is not None
-        assert inspection.slot_released is True
-
-        # Late ManualLinkJob lands: A materializes server-side.
-        shoko.materialize(500)
-        shoko.link_on_post = True  # the server now materializes XRefs on the wire
-        # Cycle 3: A (partial) re-polls to VERIFIED → NO second release (pending stays 0).
+        shoko.link_on_post = True
         deps3 = build_deps(
-            tmp_path,
-            store=store,
-            sonarr_files=[a],
-            shoko_files=[a],
-            xml=mapping_xml(),
-            monotonic=Clock([MONO_ZERO]),
-            advance=sleeper.advance,
-            shoko=shoko,
-        )
-        run_cycle(
-            deps3,
-            now_iso=_iso_offset(minutes=10),
-            mode=CycleMode.APPLY,
-            policy=RunPolicy.NEW_ARRIVAL,
-            cycle_key="c3",
-        )
-        record_a = store.get_file(500)
-        view_after_verify = store.budget_view()
-        assert record_a is not None
-        assert record_a.state is FileState.VERIFIED
-        assert view_after_verify.pending_file_requests == 0  # never -1 / never re-released
-        assert store.live_send_counts() == (0, 0)
-
-        # Cycle 4: B (new arrival) is admitted only because A's slot is truly released.
-        deps4 = build_deps(
             tmp_path,
             store=store,
             sonarr_files=[a, b],
@@ -4033,8 +6432,8 @@ def test_late_delivery_does_not_double_release_slot(
             shoko=shoko,
             max_submissions=1,
         )
-        r4 = run_cycle(
-            deps4,
+        r3 = run_cycle(
+            deps3,
             now_iso=_iso_offset(minutes=15),
             mode=CycleMode.APPLY,
             policy=RunPolicy.NEW_ARRIVAL,
@@ -4043,7 +6442,7 @@ def test_late_delivery_does_not_double_release_slot(
         record_b = store.get_file(501)
     finally:
         store.close()
-    assert r4.counts.submitted == 1
+    assert r3.counts.submitted == 1
     assert shoko.posts_count() == POSTS_TWO  # A (crashed) + B
     assert record_b is not None
     assert record_b.state is FileState.VERIFIED
@@ -4052,9 +6451,11 @@ def test_late_delivery_does_not_double_release_slot(
 def test_recovery_pending_deadline_terminates_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P1-B probe (reviewer p2d): a persisted PENDING row must not slide its deadline with
-    every poll. With interval 20 s and timeout 50 s, 11 cycles take it past the deadline to a
-    PARTIAL terminal (slot released per P1-A), GETs stay bounded, posts stay 0."""
+    """A persisted PENDING row keeps its anchored deadline and holds after terminal PARTIAL.
+
+    With interval 20 s and timeout 50 s, recovery becomes terminal after the deadline without
+    sliding it, while retaining the reservation for explicit operator resolution.
+    """
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     a = SpecFile(series_id=1, file_id=10, shoko_id=500)
     activate_mapping(tmp_path, mapping_xml())
@@ -4108,12 +6509,21 @@ def test_recovery_pending_deadline_terminates_partial(
         record = store.get_file(500)
         view = store.budget_view()
         get_count = sum(1 for request in shoko.requests if request.method == "GET")
+        live_counts = store.live_send_counts()
+        active_send = store.active_send_details(500)
     finally:
         store.close()
     assert record is not None
     assert record.state in (FileState.PARTIAL, FileState.CONFLICT)  # terminal, not PENDING
     assert record.state is not FileState.VERIFYING
-    assert view.pending_file_requests == 0  # slot released exactly once (P1-A)
+    assert view.pending_file_requests == 1  # terminal review retains its reservation
+    assert live_counts == (COUNT_ONE, COUNT_ONE)
+    assert active_send is None
+    assert _raw_read(
+        store.path,
+        "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = ?",
+        (500,),
+    ) == [("inspected_review", "partial", 0)]
     assert (
         shoko.posts_count() == POSTS_ONE
     )  # the single crash-cycle submit; recovery adds zero POSTs
@@ -4249,6 +6659,103 @@ def test_recovery_row_cap_bounds_cycle_and_terminates(
     assert elapsed < DRAIN_WALL_SECONDS
 
 
+def test_recovery_cursor_rotates_after_unknown_row_across_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistent unknown read must not starve later verifying rows when the cap is one."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    activate_mapping(tmp_path, mapping_xml())
+    store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+    store.set_meta("budget_last_cycle_key", "c0")
+    _seed_verifying_rows(store, 2)
+
+    class OneUnknownRecoveryStub(_EmptyXRefStub):
+        def _file(self, request: httpx.Request, path: str) -> httpx.Response:
+            file_id = int(path.split("/")[4])
+            if file_id == 1:
+                return httpx.Response(503, request=request)
+            response = super()._file(request, path)
+            payload = response.json()
+            response.close()
+            payload["SeriesIDs"] = [
+                {
+                    "SeriesID": {"ID": None, "AniDB": ANIME_ID, "TMDB": None},
+                    "EpisodeIDs": [
+                        {
+                            "ID": SHOKO_EP,
+                            "AniDB": ANIDB_EP,
+                            "TMDB": None,
+                            "Source": "User",
+                        }
+                    ],
+                }
+            ]
+            return self._json(request, payload)
+
+    shoko = OneUnknownRecoveryStub([])
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[],
+            shoko_files=[],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            max_recovery_rows_per_cycle=1,
+        )
+        first = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="recovery-1",
+        )
+        first_file = store.get_file(1)
+        assert first_file is not None
+        assert first_file.state is FileState.VERIFYING
+        assert any("recovery_poll_unknown:1" in reason for reason in first.reasons)
+        deps.sonarr.client.close()
+        deps.shoko.client.close()
+        deps.mapping_source.client.close()
+        store.close()
+
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[],
+            shoko_files=[],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+            max_recovery_rows_per_cycle=1,
+        )
+        second = run_cycle(
+            deps,
+            now_iso=T1,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="recovery-2",
+        )
+        first_file = store.get_file(1)
+        second_file = store.get_file(2)
+        attempted = store._conn.execute(
+            "SELECT shoko_file_id, attempted_iso FROM sends ORDER BY shoko_file_id"
+        ).fetchall()
+    finally:
+        store.close()
+    assert any("recovery_poll:2:verified" in reason for reason in second.reasons)
+    assert first_file is not None
+    assert first_file.state is FileState.VERIFYING
+    assert second_file is not None
+    assert second_file.state is FileState.VERIFIED
+    assert [(int(row[0]), str(row[1])) for row in attempted] == [(1, T0), (2, T0)]
+    assert shoko.posts_count() == 0
+
+
 def test_recovery_respects_monotonic_budget_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4328,11 +6835,19 @@ def test_conflict_row_starvation_released_by_resolve_send(
             cycle_key="seed",
             iso=T0,
             expected_episode_jobs=1,
+            target_ids=((ANIME_ID, ANIDB_EP, SHOKO_EP),),
         )
         assert isinstance(token, SendToken)
         store.mark_sent(token, iso=T0)
         store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T0)
-        store.record_verification(spec.shoko_id, VerificationVerdict.CONTRADICTION, iso=T0)
+        inspection = store.active_send_details(spec.shoko_id)
+        assert inspection is not None
+        store.record_verification(
+            spec.shoko_id,
+            VerificationVerdict.CONTRADICTION,
+            iso=T0,
+            inspection=inspection,
+        )
         return format(spec.shoko_id, "064x")
 
     req_a = seed_conflict(a)
@@ -5846,3 +8361,78 @@ def test_lease_expiry_during_preflight_network_phase_defers_daemon_post(
     assert record.state is FileState.PLANNED
     assert int(rows[0]) == 0
     assert any("attestation_expired" in reason for reason in report.reasons)
+
+
+@pytest.mark.parametrize("service_mode", [False, True])
+def test_cycle_deadline_at_final_local_guard_leaves_no_send_or_budget_debt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mode: bool
+) -> None:
+    """Slow final authorization plus the last Shoko read cannot reserve at the exact deadline."""
+    if service_mode:
+        monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    else:
+        monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    file = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([file])
+    clock = {"now": 0.0}
+    final_file_read = {"done": False}
+    auth_slept = {"done": False}
+
+    def slow_final_file_read(path: str) -> None:
+        if path == "/api/v3/File/500" and not final_file_read["done"]:
+            final_file_read["done"] = True
+            clock["now"] += 8.0
+
+    def slow_final_authorization() -> bool:
+        if final_file_read["done"] and not auth_slept["done"]:
+            auth_slept["done"] = True
+            clock["now"] += 2.0
+        return True
+
+    shoko.on_get = slow_final_file_read
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[file],
+            shoko_files=[file],
+            xml=mapping_xml(),
+            monotonic=lambda: clock["now"],
+            advance=Sleeper().advance,
+            attestation_valid=slow_final_authorization,
+            shoko=shoko,
+            max_submissions=2,
+            max_cycle_seconds=10.0,
+        )
+        policy = RunPolicy.NEW_ARRIVAL
+        if service_mode:
+            deps = replace(
+                deps,
+                service_mode=True,
+                service_authorized=lambda: True,
+                service_authorized_local=slow_final_authorization,
+            )
+            policy = RunPolicy.SERVICE
+        report = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=policy, cycle_key="deadline-final-guard"
+        )
+        record = store.get_file(500)
+        sends = store._conn.execute("SELECT COUNT(*) FROM sends").fetchone()
+        budget = store.budget_view()
+        last_request = shoko.requests[-1]
+    finally:
+        store.close()
+    assert final_file_read["done"]
+    assert auth_slept["done"]
+    assert last_request.method == "GET"
+    assert last_request.url.path == "/api/v3/File/500"
+    assert shoko.posts_count() == 0
+    assert int(sends[0]) == 0
+    assert budget.pending_file_requests == 0
+    assert budget.rolling_new_submissions == 0
+    assert record is not None
+    assert record.state is FileState.PLANNED
+    assert any("cycle_time_budget_exhausted" in reason for reason in report.reasons)

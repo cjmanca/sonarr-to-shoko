@@ -42,8 +42,11 @@ hash values are media file hashes, not credentials.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
@@ -92,6 +95,9 @@ class SnapshotReason(Enum):
     PAGE_OVERSHOOT = "page_overshoot"
     ABSOLUTE_PATHS_MISSING = "absolute_paths_missing"
     XREFS_MISSING = "xrefs_missing"
+    DISCOVERY_IN_PROGRESS = "discovery_in_progress"
+    PAGE_BUDGET_EXHAUSTED = "page_budget_exhausted"
+    PAGE_CHANGED = "page_changed"
 
 
 class ExclusionReason(Enum):
@@ -116,6 +122,7 @@ class ExclusionReason(Enum):
     NO_SIZE_MATCH = "no_size_match"
     SIZE_MISMATCH = "size_mismatch"
     AMBIGUOUS_MULTIPLE_SONARR_CANDIDATES = "ambiguous_multiple_sonarr_candidates"
+    AMBIGUOUS_MULTIPLE_SHOKO_CANDIDATES = "ambiguous_multiple_shoko_candidates"
 
 
 class IdentityChange(Enum):
@@ -194,6 +201,22 @@ class ShokoDiscovery:
     pages_fetched: int
     total_reported: int | None
     page_size: int
+    progress: ShokoDiscoveryProgress | None = None
+    refresh_sweep_complete: bool = False
+
+
+@dataclass(frozen=True)
+class ShokoDiscoveryProgress:
+    """Persistable pages and rotation state for a bounded Shoko discovery sweep."""
+
+    endpoint_identity: str
+    folders_fingerprint: str
+    total: int
+    page_size: int
+    cursor: int
+    swept_pages: frozenset[int]
+    pages: Mapping[int, tuple[Any, ...]]
+    fetched_at: Mapping[int, str]
 
 
 @dataclass(frozen=True)
@@ -213,6 +236,7 @@ class ShokoExclusion:
     shoko_file_id: int
     reason: ExclusionReason
     detail: str
+    sonarr_file: SonarrFile | None = None
 
 
 @dataclass(frozen=True)
@@ -433,7 +457,7 @@ def join_location_path(folder_path: str, relative_path: str) -> str:
         PathError: when the relative path is empty, absolute, backslashed, or
             contains ``..`` (a cross-check input must never be guessable).
     """
-    candidate = relative_path.strip()
+    candidate = relative_path
     if not candidate:
         raise PathError("RelativePath must be a non-empty string")
     if "\\" in candidate:
@@ -535,8 +559,7 @@ def match_shoko_files(
     file ``path`` (full normalized path equality; basename equality alone never
     matches) **and** the byte sizes are equal **and** every location of the Shoko
     file resolves to that same single Sonarr identity. Multiple Shoko files matching
-    one Sonarr file are all reported as matches with a ``shoko_duplicate_size``
-    warning (Shoko-side duplicates/variations of the same media).
+    one Sonarr file are an ambiguous correspondence; the entire group is excluded.
     """
     if not discovery.verdict.complete:
         return ShokoMatchResult(
@@ -572,7 +595,9 @@ def match_shoko_files(
         assert translated
         sonarr_file, correspondence = _correspond(translated, item.size, index)
         if correspondence is not None:
-            exclusions.append(ShokoExclusion(item.id, correspondence[0], correspondence[1]))
+            exclusions.append(
+                ShokoExclusion(item.id, correspondence[0], correspondence[1], sonarr_file)
+            )
             continue
         assert sonarr_file is not None
         matches.append(
@@ -583,7 +608,13 @@ def match_shoko_files(
                 hashes=item.hashes,
             )
         )
-    matches.sort(key=lambda match: match.shoko_file_id)
+    duplicates = _duplicate_exclusions(matches)
+    exclusions.extend(duplicates)
+    excluded_ids = {item.shoko_file_id for item in duplicates}
+    matches = sorted(
+        (match for match in matches if match.shoko_file_id not in excluded_ids),
+        key=lambda match: match.shoko_file_id,
+    )
     exclusions.sort(key=lambda exclusion: (exclusion.shoko_file_id, exclusion.reason.value))
     identities.sort(key=lambda identity: identity.shoko_file_id)
     return ShokoMatchResult(
@@ -591,7 +622,7 @@ def match_shoko_files(
         matches=tuple(matches),
         exclusions=tuple(exclusions),
         identities=tuple(identities),
-        warnings=_duplicate_warnings(matches),
+        warnings=(),
     )
 
 
@@ -603,6 +634,11 @@ def collect_shoko_discovery(
     *,
     page_size: int = PAGE_SIZE,
     max_pages: int = MAX_FILE_PAGES,
+    cached_progress: ShokoDiscoveryProgress | None = None,
+    endpoint_identity: str | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    observed_at: str | None = None,
 ) -> ShokoDiscovery:
     """Fetch import folders once, then page through ``include_only=Unrecognized`` files.
 
@@ -613,6 +649,23 @@ def collect_shoko_discovery(
     ``AbsolutePath`` and every file carries ``SeriesIDs``. Violations are recorded
     as verdict reasons — never raised, never guessed around.
     """
+    if (
+        cached_progress is not None
+        or endpoint_identity is not None
+        or deadline is not None
+        or observed_at is not None
+    ):
+        return _collect_resumable_shoko_discovery(
+            endpoint,
+            page_size=page_size,
+            max_pages=max_pages,
+            cached_progress=cached_progress,
+            endpoint_identity=endpoint_identity or str(endpoint.client.base_url).rstrip("/"),
+            deadline=deadline,
+            monotonic=monotonic,
+            observed_at=observed_at or "",
+        )
+
     reasons: list[SnapshotReason] = []
     details: list[str] = []
     effective_size = _effective_page_size(page_size, details)
@@ -643,7 +696,363 @@ def collect_shoko_discovery(
         pages_fetched=pages_fetched,
         total_reported=total,
         page_size=effective_size,
+        refresh_sweep_complete=not deduped,
     )
+
+
+def _collect_resumable_shoko_discovery(  # noqa: PLR0911, PLR0912, PLR0915
+    endpoint: ApiEndpoint,
+    *,
+    page_size: int,
+    max_pages: int,
+    cached_progress: ShokoDiscoveryProgress | None,
+    endpoint_identity: str,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+    observed_at: str,
+) -> ShokoDiscovery:
+    """Refresh a bounded page slice while retaining only a fail-closed full-sweep view."""
+    reasons: list[SnapshotReason] = []
+    details: list[str] = []
+    effective_size = _effective_page_size(page_size, details)
+    folders, folder_reasons, folder_details = _fetch_import_folders(endpoint)
+    reasons.extend(folder_reasons)
+    details.extend(folder_details)
+    if folder_reasons:
+        return ShokoDiscovery(
+            (),
+            folders,
+            ShokoVerdict(False, tuple(dict.fromkeys(reasons)), tuple(details)),
+            0,
+            cached_progress.total if cached_progress is not None else None,
+            effective_size,
+            cached_progress,
+        )
+
+    folders_fingerprint = _folders_fingerprint(folders)
+    progress = cached_progress
+    if progress is not None and (
+        progress.endpoint_identity != endpoint_identity
+        or progress.folders_fingerprint != folders_fingerprint
+        or progress.page_size != effective_size
+    ):
+        details.append("cached Shoko pages invalidated by endpoint, folder, or page-size drift")
+        progress = None
+    pages = {} if progress is None else dict(progress.pages)
+    fetched_at = {} if progress is None else dict(progress.fetched_at)
+    swept = set() if progress is None else set(progress.swept_pages)
+    cursor = 0 if progress is None else progress.cursor
+    total = None if progress is None else progress.total
+    pages_fetched = 0
+
+    if max_pages <= 0:
+        reasons.append(SnapshotReason.MAX_PAGES_EXCEEDED)
+        details.append("page cap of zero prevents Shoko discovery")
+        return _finish_resumable_discovery(
+            folders,
+            pages,
+            fetched_at,
+            swept,
+            cursor,
+            total,
+            effective_size,
+            endpoint_identity,
+            folders_fingerprint,
+            pages_fetched,
+            reasons,
+            details,
+        )
+    if deadline is not None and monotonic() >= deadline:
+        reasons.append(SnapshotReason.PAGE_BUDGET_EXHAUSTED)
+        details.append("Shoko discovery reached its cycle time budget before page 1")
+        return _finish_resumable_discovery(
+            folders,
+            pages,
+            fetched_at,
+            swept,
+            cursor,
+            total,
+            effective_size,
+            endpoint_identity,
+            folders_fingerprint,
+            pages_fetched,
+            reasons,
+            details,
+        )
+
+    first = _fetch_page(endpoint, effective_size, 1)
+    pages_fetched += 1
+    if first.rows is None or first.total is None:
+        _append(reasons, first.reason or SnapshotReason.MALFORMED_ENVELOPE)
+        details.append(first.detail or "page 1 response has no validated Total/List envelope")
+        return _finish_resumable_discovery(
+            folders,
+            pages,
+            fetched_at,
+            swept,
+            cursor,
+            total,
+            effective_size,
+            endpoint_identity,
+            folders_fingerprint,
+            pages_fetched,
+            reasons,
+            details,
+        )
+    if total is not None and first.total != total:
+        details.append(
+            f"cached Shoko Total changed from {total} to {first.total}; restarting sweep"
+        )
+        pages.clear()
+        fetched_at.clear()
+        swept.clear()
+        cursor = 0
+    elif 1 in pages and pages[1] != tuple(first.rows):
+        details.append("Shoko page 1 changed since its cached observation; restarting sweep")
+        pages.clear()
+        fetched_at.clear()
+        swept.clear()
+        cursor = 0
+    total = first.total
+
+    expected_first_rows = _expected_page_rows(total, effective_size, 1)
+    if len(first.rows) != expected_first_rows:
+        _append(reasons, SnapshotReason.PAGES_EXHAUSTED)
+        details.append(f"page 1 returned {len(first.rows)} rows; expected {expected_first_rows}")
+        pages.clear()
+        fetched_at.clear()
+        swept.clear()
+        cursor = 0
+        return _finish_resumable_discovery(
+            folders,
+            pages,
+            fetched_at,
+            swept,
+            cursor,
+            total,
+            effective_size,
+            endpoint_identity,
+            folders_fingerprint,
+            pages_fetched,
+            reasons,
+            details,
+        )
+    _parsed, entry_reasons, entry_details, _paths_missing, _xrefs_missing = parse_file_entries(
+        first.rows, 1
+    )
+    if entry_reasons:
+        reasons.extend(entry_reasons)
+        details.extend(entry_details)
+        pages.clear()
+        fetched_at.clear()
+        swept.clear()
+        cursor = 0
+        return _finish_resumable_discovery(
+            folders,
+            pages,
+            fetched_at,
+            swept,
+            cursor,
+            total,
+            effective_size,
+            endpoint_identity,
+            folders_fingerprint,
+            pages_fetched,
+            reasons,
+            details,
+        )
+    pages[1] = tuple(first.rows)
+    fetched_at[1] = observed_at
+    swept.add(1)
+    expected_pages = max(1, (total + effective_size - 1) // effective_size)
+    if cursor <= 0 or cursor >= expected_pages:
+        cursor = 1
+
+    rotation = [
+        *range(cursor + 1, expected_pages + 1),
+        *range(1, cursor + 1),
+    ]
+    order = [page for page in rotation if page not in swept]
+    for page in order:
+        if pages_fetched >= max_pages:
+            _append(reasons, SnapshotReason.MAX_PAGES_EXCEEDED)
+            details.append(f"page cap of {max_pages} reached before page {page}")
+            break
+        if deadline is not None and monotonic() >= deadline:
+            _append(reasons, SnapshotReason.PAGE_BUDGET_EXHAUSTED)
+            details.append(f"Shoko discovery reached its cycle time budget before page {page}")
+            break
+        outcome = _fetch_page(endpoint, effective_size, page)
+        pages_fetched += 1
+        if outcome.rows is None or outcome.total is None:
+            _append(reasons, outcome.reason or SnapshotReason.MALFORMED_ENVELOPE)
+            details.append(
+                outcome.detail or f"page {page} response has no validated Total/List envelope"
+            )
+            pages.pop(page, None)
+            fetched_at.pop(page, None)
+            swept.discard(page)
+            break
+        if outcome.total != total:
+            _append(reasons, SnapshotReason.TOTAL_CHANGED)
+            details.append(
+                f"Total changed from {total} to {outcome.total} on page {page} "
+                "(Shoko recomputes the total per request: snapshot unstable)"
+            )
+            pages.clear()
+            fetched_at.clear()
+            swept.clear()
+            cursor = 0
+            return _finish_resumable_discovery(
+                folders,
+                pages,
+                fetched_at,
+                swept,
+                cursor,
+                total,
+                effective_size,
+                endpoint_identity,
+                folders_fingerprint,
+                pages_fetched,
+                reasons,
+                details,
+            )
+        expected_rows = _expected_page_rows(total, effective_size, page)
+        if len(outcome.rows) != expected_rows:
+            reason = (
+                SnapshotReason.PAGE_OVERSHOOT
+                if len(outcome.rows) > expected_rows
+                else SnapshotReason.PAGES_EXHAUSTED
+            )
+            _append(reasons, reason)
+            details.append(
+                f"page {page} returned {len(outcome.rows)} rows; expected {expected_rows}"
+            )
+            pages.pop(page, None)
+            fetched_at.pop(page, None)
+            swept.discard(page)
+            break
+        if page in pages and pages[page] != tuple(outcome.rows):
+            _append(reasons, SnapshotReason.PAGE_CHANGED)
+            details.append(f"page {page} changed since its cached observation; restarting sweep")
+            pages = {1: tuple(first.rows)}
+            fetched_at = {1: observed_at}
+            swept = {1}
+            cursor = 1
+            break
+        _parsed, entry_reasons, entry_details, _paths_missing, _xrefs_missing = parse_file_entries(
+            outcome.rows, page
+        )
+        if entry_reasons:
+            reasons.extend(entry_reasons)
+            details.extend(entry_details)
+            pages.pop(page, None)
+            fetched_at.pop(page, None)
+            swept.discard(page)
+            break
+        pages[page] = tuple(outcome.rows)
+        fetched_at[page] = observed_at
+        swept.add(page)
+        cursor = page
+
+    return _finish_resumable_discovery(
+        folders,
+        pages,
+        fetched_at,
+        swept,
+        cursor,
+        total,
+        effective_size,
+        endpoint_identity,
+        folders_fingerprint,
+        pages_fetched,
+        reasons,
+        details,
+    )
+
+
+def _finish_resumable_discovery(
+    folders: Mapping[int, ImportFolder],
+    pages: dict[int, tuple[Any, ...]],
+    fetched_at: dict[int, str],
+    swept: set[int],
+    cursor: int,
+    total: int | None,
+    page_size: int,
+    endpoint_identity: str,
+    folders_fingerprint: str,
+    pages_fetched: int,
+    reasons: list[SnapshotReason],
+    details: list[str],
+) -> ShokoDiscovery:
+    files: list[ShokoFile] = []
+    seen: set[int] = set()
+    absolute_paths_missing = False
+    xrefs_missing = False
+    expected_pages = None if total is None else max(1, (total + page_size - 1) // page_size)
+    if expected_pages is not None:
+        for page in range(1, expected_pages + 1):
+            raw_rows = pages.get(page)
+            if raw_rows is None:
+                continue
+            parsed, entry_reasons, entry_details, paths_missing, xrefs_missing_page = (
+                parse_file_entries(raw_rows, page)
+            )
+            reasons.extend(entry_reasons)
+            details.extend(entry_details)
+            absolute_paths_missing |= paths_missing
+            xrefs_missing |= xrefs_missing_page
+            _merge_page(parsed, page, seen, files, reasons, details)
+    _include_flags_verdict(absolute_paths_missing, xrefs_missing, reasons, details)
+    required = set(range(1, expected_pages + 1)) if expected_pages is not None else set()
+    complete = bool(required) and required.issubset(pages) and required.issubset(swept)
+    complete = complete and len(files) == total and not reasons
+    if not complete and not reasons:
+        _append(reasons, SnapshotReason.DISCOVERY_IN_PROGRESS)
+        details.append(
+            f"Shoko page sweep refreshed {len(swept)} of {expected_pages or '?'} pages; "
+            "continuity, baseline, and sends wait for a complete refresh"
+        )
+    progress = (
+        None
+        if total is None
+        else ShokoDiscoveryProgress(
+            endpoint_identity,
+            folders_fingerprint,
+            total,
+            page_size,
+            cursor,
+            frozenset() if complete else frozenset(swept),
+            dict(pages),
+            dict(fetched_at),
+        )
+    )
+    deduped: list[SnapshotReason] = []
+    for reason in reasons:
+        _append(deduped, reason)
+    return ShokoDiscovery(
+        tuple(files),
+        folders,
+        ShokoVerdict(complete, tuple(deduped), tuple(details)),
+        pages_fetched,
+        total,
+        page_size,
+        progress,
+        complete,
+    )
+
+
+def _expected_page_rows(total: int, page_size: int, page: int) -> int:
+    return max(0, min(page_size, total - (page - 1) * page_size))
+
+
+def _folders_fingerprint(folders: Mapping[int, ImportFolder]) -> str:
+    manifest = [
+        [item.id, item.name, item.path, item.drop_folder_type, item.path_usable]
+        for item in sorted(folders.values(), key=lambda folder: folder.id)
+    ]
+    encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _walk_file_pages(
@@ -1080,8 +1489,12 @@ def _correspond(
             candidates[(item.series_id, item.episode_file_id)] = item
     if not all(size_hits):
         if len(unique_paths) == 1:
+            path_candidates = {
+                (item.series_id, item.episode_file_id): item for item in index[unique_paths[0]]
+            }
+            source = next(iter(path_candidates.values())) if len(path_candidates) == 1 else None
             sizes = sorted({item.size for item in index[unique_paths[0]]})
-            return None, (
+            return source, (
                 ExclusionReason.SIZE_MISMATCH,
                 f"Sonarr file at {unique_paths[0]!r} has size(s) {sizes}, Shoko reports {size}",
             )
@@ -1100,22 +1513,32 @@ def _correspond(
     return candidates[key], None
 
 
-def _duplicate_warnings(matches: Sequence[FileMatch]) -> tuple[str, ...]:
+def _duplicate_exclusions(matches: Sequence[FileMatch]) -> tuple[ShokoExclusion, ...]:
     """Shoko-side duplicates: several Shoko files matching one Sonarr file."""
     by_sonarr: dict[tuple[int, int], list[int]] = {}
     for match in matches:
         key = (match.sonarr_file.series_id, match.sonarr_file.episode_file_id)
         by_sonarr.setdefault(key, []).append(match.shoko_file_id)
-    warnings: list[str] = []
+    exclusions: list[ShokoExclusion] = []
+    by_id = {match.shoko_file_id: match for match in matches}
     for key in sorted(by_sonarr):
         ids = sorted(by_sonarr[key])
         if len(ids) > 1:
-            warnings.append(
-                f"shoko_duplicate_size: Shoko files {ids} all match Sonarr file "
-                f"{key[1]} of series {key[0]} at the same path and size "
-                "(Shoko-side duplicates)"
+            detail = (
+                f"ambiguous correspondence: Shoko files {ids} all match Sonarr file "
+                f"{key[1]} of series {key[0]} at the same path and size; "
+                "review duplicate Shoko records before linking"
             )
-    return tuple(sorted(warnings))
+            exclusions.extend(
+                ShokoExclusion(
+                    file_id,
+                    ExclusionReason.AMBIGUOUS_MULTIPLE_SHOKO_CANDIDATES,
+                    detail,
+                    by_id[file_id].sonarr_file,
+                )
+                for file_id in ids
+            )
+    return tuple(exclusions)
 
 
 def _parse_hashes(entry: Mapping[str, Any]) -> tuple[ShokoHashes, bool, str]:

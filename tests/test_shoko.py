@@ -285,6 +285,74 @@ def test_stable_pagination_walks_all_pages_and_uses_contract_params(
     }
 
 
+def test_resumable_discovery_finishes_a_paged_sweep_across_calls() -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    rows = [
+        shoko_file(i, 100 + i, [location(i, i, 1, f"{i}.mkv", f"{SHOKO_ROOT}/{i}.mkv")])
+        for i in range(1, 4)
+    ]
+    stub.pages = {1: envelope(rows[:2], 3), 2: envelope(rows[2:], 3)}
+    endpoint = shoko_endpoint(stub.handler)
+    try:
+        first = collect_shoko_discovery(
+            endpoint,
+            page_size=2,
+            max_pages=1,
+            endpoint_identity=SHOKO_BASE,
+            observed_at="2026-01-01T00:00:00+00:00",
+        )
+        assert first.verdict.complete is False
+        assert first.progress is not None
+        assert first.progress.swept_pages == frozenset({1})
+
+        resumed = collect_shoko_discovery(
+            endpoint,
+            page_size=2,
+            max_pages=2,
+            cached_progress=first.progress,
+            endpoint_identity=SHOKO_BASE,
+            observed_at="2026-01-01T00:05:00+00:00",
+        )
+    finally:
+        endpoint.client.close()
+
+    assert resumed.verdict.complete is True
+    assert resumed.refresh_sweep_complete is True
+    assert [item.id for item in resumed.files] == [1, 2, 3]
+    assert [request.url.params["page"] for request in stub.file_requests()] == ["1", "1", "2"]
+
+
+@pytest.mark.parametrize("failure", ["changed_total", "failed_page"])
+def test_resumable_discovery_rejects_changing_or_failing_pages(failure: str) -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    rows = [
+        shoko_file(i, 100 + i, [location(i, i, 1, f"{i}.mkv", f"{SHOKO_ROOT}/{i}.mkv")])
+        for i in range(1, 4)
+    ]
+    stub.pages = {
+        1: envelope(rows[:2], 3),
+        2: envelope(rows[2:], 4 if failure == "changed_total" else 3),
+    }
+    if failure == "failed_page":
+        stub.transport_error = httpx.ConnectError("injected")
+        stub.fail_pages = {2}
+    discovery = discover(
+        stub,
+        page_size=2,
+        max_pages=2,
+        endpoint_identity=SHOKO_BASE,
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert discovery.verdict.complete is False
+    if failure == "changed_total":
+        assert SnapshotReason.TOTAL_CHANGED in discovery.verdict.reasons
+    else:
+        assert SnapshotReason.TRANSPORT_FAILURE in discovery.verdict.reasons
+
+
 def test_total_change_between_pages_marks_snapshot_unstable(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
@@ -737,6 +805,10 @@ def test_join_location_path_requires_relative_posix_paths() -> None:
             join_location_path("/anime", relative)
 
 
+def test_join_location_path_preserves_meaningful_component_whitespace() -> None:
+    assert join_location_path("/anime", "Series / file.mkv ") == "/anime/Series / file.mkv "
+
+
 # ------------------------------------------------------------------ exclusions
 
 
@@ -1058,7 +1130,7 @@ def test_shoko_copy_at_an_unknown_path_is_not_in_inventory(
     ]
 
 
-def test_two_shoko_files_at_the_same_path_and_size_both_match_with_warning(
+def test_two_shoko_files_at_the_same_path_and_size_are_both_excluded(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
     stub = ShokoStub()
@@ -1073,8 +1145,11 @@ def test_two_shoko_files_at_the_same_path_and_size_both_match_with_warning(
     discovery = discover(stub)
     files = sonarr_files((7, 40, f"{SONARR_ROOT}/Show A/S01E01.mkv", 1000))
     result = reconcile(discovery, files, shoko_settings(base_document, write_document))
-    assert [match.shoko_file_id for match in result.matches] == [310, 311]
-    assert any("shoko_duplicate_size" in warning for warning in result.warnings)
+    assert result.matches == ()
+    assert [item.shoko_file_id for item in result.exclusions] == [310, 311]
+    assert all(
+        "ambiguous" in item.detail and "310, 311" in item.detail for item in result.exclusions
+    )
 
 
 def test_multi_location_matching_distinct_sonarr_files_is_ambiguous(

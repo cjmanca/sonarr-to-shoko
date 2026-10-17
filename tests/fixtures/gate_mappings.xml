@@ -8,7 +8,7 @@
   <anime anidbid="100" tvdbid="1000" defaulttvdbseason="1"><name>Split A Season 1</name></anime>
   <anime anidbid="101" tvdbid="1000" defaulttvdbseason="2"><name>Split B Season 2</name></anime>
 
-  <anime anidbid="110" tvdbid="1100" defaulttvdbseason="1" episodeoffset="0" epoffset="4" weird="x">
+  <anime anidbid="110" tvdbid="1100" defaulttvdbseason="1" episodeoffset="0">
     <name>Explicit pair beats offset</name>
     <mapping-list>
       <mapping anidbseason="1" tvdbseason="1">;3-9;</mapping>
@@ -123,9 +123,9 @@
   </anime>
 
   <anime anidbid="240" tvdbid="2400" defaulttvdbseason="1">
-    <name>Unverified 101 range</name>
+    <name>Unverified season-0 101 identity</name>
     <mapping-list>
-      <mapping anidbseason="1" tvdbseason="1">;101-1;2-2;</mapping>
+      <mapping anidbseason="0" tvdbseason="0">;101-1;2-2;</mapping>
     </mapping-list>
   </anime>
 

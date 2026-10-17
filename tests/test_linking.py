@@ -49,6 +49,7 @@ from shoko_linker.linking import (
     verify_link,
 )
 from shoko_linker.linking import EpisodeResolutionStatus as EpiStatus
+from shoko_linker.logging_setup import register_secret
 from shoko_linker.mappings import ResolutionStatus, build_mapping_index, parse_anime_lists
 from shoko_linker.policies import RunPolicy
 from shoko_linker.shoko import FileMatch, ImportFolder, ShokoHashes
@@ -349,6 +350,12 @@ def linkable_plan(**kwargs: Any) -> LinkPlan:
 
 def preflight_ok_routes() -> dict[tuple[str, str], Any]:
     return {
+        ("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"): anidb_list(
+            [
+                anidb_episode(5501, ANIME_ID, "Episode", 10),
+                anidb_episode(5502, ANIME_ID, "Episode", 11),
+            ]
+        ),
         ("GET", f"/api/v3/File/{SHOKO_FILE_ID}"): file_json(),
         ("GET", "/api/v3/Episode/AniDB/5501/Episode"): shoko_episode(777, 5501),
         ("GET", "/api/v3/Episode/AniDB/5502/Episode"): shoko_episode(778, 5502),
@@ -463,6 +470,98 @@ def test_id_chain_number_type_mismatch_is_episode_not_found() -> None:
     assert resolved.status is EpiStatus.EPISODE_NOT_FOUND
 
 
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"ID": 5001, "AnimeID": 1.0, "Type": "Episode", "EpisodeNumber": 1}],
+        [{"ID": 5001, "AnimeID": 1, "Type": "Episode", "EpisodeNumber": True}],
+        [{"ID": 5001, "AnimeID": 1, "Type": "Episode", "EpisodeNumber": 1.0}],
+        [{"ID": 5001, "AnimeID": 1, "Type": "Episode", "EpisodeNumber": 0}],
+        [{"ID": 5001, "AnimeID": 1, "Type": "UnknownType", "EpisodeNumber": 1}],
+        [
+            {"ID": 5001, "AnimeID": 1, "Type": "Episode", "EpisodeNumber": 1},
+            {"ID": 5001, "AnimeID": 1, "Type": "Episode", "EpisodeNumber": 1},
+        ],
+    ],
+)
+def test_id_chain_rejects_malformed_or_duplicate_source_identity_rows(
+    rows: list[dict[str, Any]],
+) -> None:
+    stub = LinkStub()
+    listing_path = "/api/v3/Series/AniDB/1/Episode"
+    stub.routes[("GET", listing_path)] = {"Total": len(rows), "List": rows}
+
+    result = with_endpoint(
+        stub,
+        lambda endpoint: EpisodeIdResolver(endpoint, clock=lambda: 0.0).resolve(1, "Episode", 1),
+    )
+
+    assert result.status is EpiStatus.MALFORMED
+    assert stub.paths() == [listing_path]
+
+
+def test_id_chain_accepts_positive_special_episode_identity() -> None:
+    stub = LinkStub()
+    stub.routes[("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode")] = anidb_list(
+        [anidb_episode(5503, ANIME_ID, "Special", 1)]
+    )
+    stub.routes[("GET", "/api/v3/Episode/AniDB/5503/Episode")] = shoko_episode(779, 5503)
+
+    result = with_endpoint(
+        stub,
+        lambda endpoint: EpisodeIdResolver(endpoint, clock=lambda: 0.0).resolve(
+            ANIME_ID, "Special", 1
+        ),
+    )
+
+    assert result.status is EpiStatus.RESOLVED
+    assert result.shoko_episode_id == 779
+
+
+def test_pinned_upstream_t_and_o_codes_resolve_shoko_type_local_episode_numbers() -> None:
+    from shoko_linker.mappings import build_mapping_index, parse_anime_lists, resolve
+
+    fixture = Path(__file__).parent / "fixtures" / "anime_lists_legacy_number_examples.xml"
+    index = build_mapping_index(parse_anime_lists(fixture.read_bytes()))
+    trailer = resolve(index, 79032, 0, 1).target
+    other = resolve(index, 79032, 0, 2).target
+    assert trailer is not None
+    assert other is not None
+
+    stub = LinkStub()
+    stub.routes[("GET", "/api/v3/Series/AniDB/1431/Episode")] = anidb_list(
+        [
+            anidb_episode(5601, 1431, "Trailer", 1),
+            anidb_episode(5602, 1431, "Other", 1),
+        ]
+    )
+    stub.routes[("GET", "/api/v3/Episode/AniDB/5601/Episode")] = shoko_episode(780, 5601)
+    stub.routes[("GET", "/api/v3/Episode/AniDB/5602/Episode")] = shoko_episode(781, 5602)
+
+    resolved = with_endpoint(
+        stub,
+        lambda endpoint: resolve_episode_ids(
+            endpoint,
+            [
+                (trailer.anidb_id, trailer.episode_type.value, trailer.anidb_episode_number),
+                (other.anidb_id, other.episode_type.value, other.anidb_episode_number),
+            ],
+            clock=lambda: 0.0,
+        ),
+    )
+
+    assert resolved[(1431, "Trailer", 1)].status is EpiStatus.RESOLVED
+    assert resolved[(1431, "Other", 1)].status is EpiStatus.RESOLVED
+    assert resolved[(1431, "Trailer", 1)].shoko_episode_id == 780
+    assert resolved[(1431, "Other", 1)].shoko_episode_id == 781
+    listing_requests = [
+        request
+        for request in stub.requests
+        if request.url.path == "/api/v3/Series/AniDB/1431/Episode"
+    ]
+    assert {request.url.params["type"] for request in listing_requests} == {"Trailer", "Other"}
+
+
 def test_id_chain_cache_hit_performs_no_second_request() -> None:
     stub = LinkStub()
     stub.routes = chain_routes(include_b=False)
@@ -472,6 +571,18 @@ def test_id_chain_cache_hit_performs_no_second_request() -> None:
     assert first.status is EpiStatus.RESOLVED
     assert second.shoko_episode_id == SHOKO_EP_A
     assert len(stub.requests) == CHAIN_GETS
+
+
+def test_id_chain_reuses_anime_type_listing_for_distinct_episode_numbers() -> None:
+    stub = LinkStub()
+    stub.routes = chain_routes()
+    stub.routes[("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode")] = anidb_list(
+        [anidb_episode(5501, ANIME_ID, "Episode", 10), anidb_episode(5502, ANIME_ID, "Episode", 11)]
+    )
+    resolver = EpisodeIdResolver(link_endpoint(stub), clock=lambda: 0.0)
+    assert resolver.resolve(ANIME_ID, "Episode", 10).shoko_episode_id == SHOKO_EP_A
+    assert resolver.resolve(ANIME_ID, "Episode", 11).shoko_episode_id == SHOKO_EP_B
+    assert stub.paths().count(f"/api/v3/Series/AniDB/{ANIME_ID}/Episode") == 1
 
 
 def test_id_chain_negative_result_is_invalidated_and_re_read() -> None:
@@ -594,10 +705,44 @@ def test_preflight_ok_reads_file_fresh_and_revalidates_targets(
     stub.routes = preflight_ok_routes()
     verdict = run_preflight(stub, plan, settings, queue=BENIGN_QUEUE)
     assert verdict.ok
-    assert stub.methods() == ["GET", "GET", "GET"]
-    file_request = stub.requests[0]
+    assert stub.methods() == ["GET", "GET", "GET", "GET"]
+    file_request = stub.requests[-1]
     assert file_request.url.params["include"] == "XRefs,AbsolutePaths"
+    assert stub.requests[-1].url.path == f"/api/v3/File/{SHOKO_FILE_ID}"
+    assert all(
+        request.url.path != f"/api/v3/File/{SHOKO_FILE_ID}" for request in stub.requests[:-1]
+    )
     assert all(request.headers["apikey"] == FAKE_KEY for request in stub.requests)
+
+
+@pytest.mark.parametrize(
+    "bad_identity",
+    [
+        {"ID": 5501, "AnimeID": ANIME_ID * 1.0, "Type": "Episode", "EpisodeNumber": 10},
+        {"ID": 5501, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": True},
+        {"ID": 5501, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 10.0},
+        {"ID": 5501, "AnimeID": ANIME_ID, "Type": "Episode", "EpisodeNumber": 0},
+    ],
+)
+def test_preflight_revalidates_source_identity_before_file_read_or_post(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    bad_identity: dict[str, Any],
+) -> None:
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode")] = anidb_list([bad_identity])
+
+    verdict = run_preflight(stub, plan, settings)
+
+    assert not verdict.ok
+    assert verdict.reasons == (PreflightReason.TARGET_DRIFT,)
+    assert ("GET", f"/api/v3/File/{SHOKO_FILE_ID}") not in {
+        (request.method, request.url.path) for request in stub.requests
+    }
+    assert stub.posts() == []
 
 
 def test_preflight_blocks_a_freshly_appeared_user_link(
@@ -761,7 +906,7 @@ def test_preflight_target_drift_when_internal_id_changed(
     assert verdict.reasons == (PreflightReason.TARGET_DRIFT,)
 
 
-def test_preflight_target_drift_when_the_target_404s(
+def test_preflight_missing_episode_metadata_is_retryable_not_target_drift(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
     settings = base_settings(base_document, write_document)
@@ -771,7 +916,50 @@ def test_preflight_target_drift_when_the_target_404s(
     del stub.routes[("GET", "/api/v3/Episode/AniDB/5502/Episode")]
     verdict = run_preflight(stub, plan, settings)
     assert not verdict.ok
-    assert verdict.reasons == (PreflightReason.TARGET_DRIFT,)
+    assert verdict.reasons == (PreflightReason.TARGET_UNAVAILABLE,)
+    assert any("not materialized in Shoko yet" in detail for detail in verdict.details)
+    assert any(
+        "retry" in detail.lower() and "no post" in detail.lower() for detail in verdict.details
+    )
+    assert ("GET", f"/api/v3/File/{SHOKO_FILE_ID}") not in {
+        (request.method, request.url.path) for request in stub.requests
+    }
+
+
+def test_preflight_missing_anidb_listing_is_retryable_not_target_drift(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    del stub.routes[("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode")]
+
+    verdict = run_preflight(stub, plan, settings)
+
+    assert not verdict.ok
+    assert verdict.reasons == (PreflightReason.TARGET_UNAVAILABLE,)
+    assert any("not available in Shoko yet" in detail for detail in verdict.details)
+    assert not any(path.startswith("/api/v3/Episode/AniDB/") for path in stub.paths())
+    assert not any(path == f"/api/v3/File/{SHOKO_FILE_ID}" for path in stub.paths())
+
+
+def test_preflight_malformed_target_response_is_not_retryable(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode")] = None
+
+    verdict = run_preflight(stub, plan, settings)
+
+    assert not verdict.ok
+    assert verdict.reasons == (PreflightReason.MALFORMED,)
+    assert any("malformed" in detail.lower() for detail in verdict.details)
+    assert any("operator review" in detail.lower() for detail in verdict.details)
+    assert not any(path == f"/api/v3/File/{SHOKO_FILE_ID}" for path in stub.paths())
 
 
 def test_preflight_candidate_set_change_is_detected(
@@ -940,6 +1128,40 @@ def test_post_validation_problem_is_rejected_with_one_attempt() -> None:
     assert "ValidationProblem" in result.detail
     assert "unknown episode id" in result.detail
     assert len(stub.posts()) == 1
+
+
+@pytest.mark.parametrize("kind", ["problem", "text", "transport", "redirect"])
+def test_send_diagnostics_never_expose_registered_secrets(kind: str) -> None:
+    sentinel = "synthetic-error-diagnostic-secret-0000"
+    register_secret(sentinel)
+    plan = linkable_plan()
+    stub = LinkStub()
+    key = ("POST", f"/api/v3/File/{SHOKO_FILE_ID}/Link")
+    stub.statuses[key] = STATUS_VALIDATION
+    # Put a secret across the old 200-character clipping boundary as well.
+    raw = "x" * 190 + sentinel
+    stub.routes[key] = {"title": sentinel, "detail": raw, "errors": {sentinel: [sentinel]}}
+    if kind == "text":
+        stub.routes[key] = raw
+    elif kind == "transport":
+        stub.errors[key] = httpx.ReadTimeout(sentinel)
+    elif kind == "redirect":
+        stub.redirects[key] = "http://elsewhere/" + sentinel
+    result = with_endpoint(stub, lambda endpoint: submit_link(endpoint, plan))
+    assert sentinel not in result.detail
+    assert sentinel[:5] not in result.detail
+
+
+def test_read_failure_diagnostics_never_expose_registered_secrets(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    sentinel = "synthetic-read-diagnostic-secret-0000"
+    register_secret(sentinel)
+    stub = LinkStub()
+    stub.errors[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = httpx.ReadTimeout(sentinel)
+    result = run_preflight(stub, linkable_plan(), base_settings(base_document, write_document))
+    assert not result.ok
+    assert sentinel not in repr(result)
 
 
 def test_post_server_error_is_ambiguous_and_never_retried() -> None:

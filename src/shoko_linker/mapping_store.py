@@ -21,7 +21,9 @@ Policy (``docs/compatibility.md`` sections 1 and 3):
   answers ``Vary: Accept-Encoding``, so the validator is stored **with** the exact
   ``Accept-Encoding`` we send — always ``identity`` — and is only reused for that
   encoding. The ETag is opaque; content identity is our SHA-256.
-* Every 200 body is parsed and indexed **before** activation; size cap,
+* Every 200 body is parsed and indexed **before** activation; malformed entries fail the update
+  and the last-known-good remains selected. The documented absolute-season+episodeoffset case
+  is retained only as a TVDB ownership fence, never as a usable target. Size cap,
   :class:`~shoko_linker.mappings.MappingError` and :class:`~shoko_linker.config.ConfigError`
   failures leave the last-known-good untouched.
 * Successes reschedule at ``refresh_hours``; failures advance a bounded exponential
@@ -43,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import time
 import uuid
@@ -73,6 +76,7 @@ from .mappings import (
     Overrides,
     build_mapping_index,
     content_digest,
+    legacy_targets_digest,
     load_overrides,
     parse_anime_lists,
     structure_digest,
@@ -109,6 +113,8 @@ _STATE_FIELDS: Final[frozenset[str]] = frozenset(
         "refresh_attempt_id",
         "source_change_pending",
         "last_outcome",
+        "invalid_source_hold",
+        "invalid_source_observation_id",
     }
 )
 _REQUIRED_STATE_FIELDS: Final[frozenset[str]] = frozenset(
@@ -223,6 +229,8 @@ class _State:
     refresh_attempt_id: str | None = None
     source_change_pending: bool = False
     last_outcome: str | None = None
+    invalid_source_hold: bool = False
+    invalid_source_observation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +238,12 @@ class _SourceTransition:
     source_url: str
     source_epoch: str
     scheduler_state: _State
+
+
+@dataclass(frozen=True)
+class _InvalidSourceObservation:
+    observation_id: str
+    observed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -289,6 +303,7 @@ class MappingStatus:
     next_due_iso: str | None
     last_outcome: RefreshOutcome | None
     consecutive_failures: int
+    invalid_source_hold: bool
     entries_indexed: int | None
     mapping_rules: int | None
     explicit_pairs: int | None
@@ -305,6 +320,29 @@ def _atomic_write(path: Path, payload: bytes | bytearray) -> None:
     finally:
         if temp.exists():
             temp.unlink()
+
+
+def _atomic_write_durable(path: Path, payload: bytes) -> None:
+    """Durably publish a small safety marker using a unique same-directory temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.parent / f"{path.name}.{uuid.uuid4().hex}.new"
+    try:
+        with temp.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(path)
+        if os.name != "nt":
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            with suppress(OSError):
+                directory_fd = os.open(path.parent, flags)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+    finally:
+        with suppress(OSError):
+            temp.unlink(missing_ok=True)
 
 
 def _json_bytes(payload: dict[str, Any]) -> bytes:
@@ -351,6 +389,22 @@ def _generation_id(meta_bytes: bytes) -> str:
     return hashlib.sha256(meta_bytes).hexdigest()
 
 
+def _invalid_source_hold_from_document(document: dict[str, Any], last_outcome: str | None) -> bool:
+    if "invalid_source_hold" not in document:
+        return last_outcome == RefreshOutcome.FAILED_INVALID.value
+    hold = document["invalid_source_hold"]
+    if not isinstance(hold, bool):
+        raise ValueError("invalid_source_hold must be a boolean")
+    return hold
+
+
+def _invalid_source_observation_id_from_document(document: dict[str, Any]) -> str | None:
+    observation_id = document.get("invalid_source_observation_id")
+    if observation_id is not None and not _is_hex32(observation_id):
+        raise ValueError("invalid_source_observation_id must be a lowercase 128-bit hex token")
+    return observation_id
+
+
 def _state_from_document(document: dict[str, Any]) -> _State:
     if set(document) - _STATE_FIELDS:
         raise ValueError("unknown state fields")
@@ -381,6 +435,8 @@ def _state_from_document(document: dict[str, Any]) -> _State:
     last_outcome = document.get("last_outcome")
     if last_outcome is not None and not isinstance(last_outcome, str):
         raise ValueError("last_outcome must be a string")
+    invalid_source_hold = _invalid_source_hold_from_document(document, last_outcome)
+    invalid_source_observation_id = _invalid_source_observation_id_from_document(document)
     source_change_pending = document.get("source_change_pending", False)
     if not isinstance(source_change_pending, bool):
         raise ValueError("source_change_pending must be a boolean")
@@ -404,6 +460,8 @@ def _state_from_document(document: dict[str, Any]) -> _State:
         refresh_attempt_id=refresh_attempt_id,
         source_change_pending=source_change_pending,
         last_outcome=last_outcome,
+        invalid_source_hold=invalid_source_hold,
+        invalid_source_observation_id=invalid_source_observation_id,
     )
 
 
@@ -482,6 +540,7 @@ class MappingStore:
     ) -> None:
         self._source = parse_source_url(source_url)
         self.directory = Path(directory)
+        self._verified_active_identity: tuple[int, str, str, str, str | None] | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> MappingStore:
@@ -574,6 +633,14 @@ class MappingStore:
     def generation_lock_path(self) -> Path:
         return self.directory / "generation.lock"
 
+    @property
+    def invalid_source_hold_path(self) -> Path:
+        return self.directory / "invalid-source-hold.json"
+
+    @property
+    def invalid_source_hold_lock_path(self) -> Path:
+        return self.directory / "invalid-source-hold.lock"
+
     @contextmanager
     def generation_lock(self, *, wait_seconds: float = 0.0) -> Iterator[bool]:
         """Serialize mapping activation with campaign decisions that must use one generation.
@@ -597,6 +664,89 @@ class MappingStore:
         finally:
             lock.release()
 
+    @contextmanager
+    def _invalid_source_hold_lock(self) -> Iterator[None]:
+        """Serialize only latch-file mutations, never waiting on the generation lease.
+
+        Invalid observations take and release this short independent OS lock before they try
+        the generation lock. Successful refreshes may take it while holding the generation
+        lock, so there is no lock-order cycle with a protected POST.
+        """
+        lock = ApplyProcessLock(self.invalid_source_hold_lock_path)
+        while not lock.acquire():
+            time.sleep(GENERATION_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def _invalid_source_latch_snapshot_unlocked(self) -> tuple[tuple[str, bytes], ...]:
+        """Capture the marker and any interrupted atomic-write temporaries."""
+        snapshot: list[tuple[str, bytes]] = []
+        paths = [self.invalid_source_hold_path]
+        paths.extend(
+            sorted(
+                self.directory.glob(f"{self.invalid_source_hold_path.name}.*.new"),
+                key=lambda path: path.name,
+            )
+        )
+        for path in paths:
+            try:
+                snapshot.append((path.name, path.read_bytes()))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Unreadable evidence must remain a hold. It cannot compare equal to an
+                # ordinary empty snapshot and therefore cannot be cleared by a stale read.
+                snapshot.append((path.name, b"\x00unreadable"))
+        return tuple(snapshot)
+
+    def _invalid_source_latch_snapshot(self) -> tuple[tuple[str, bytes], ...]:
+        with self._invalid_source_hold_lock():
+            return self._invalid_source_latch_snapshot_unlocked()
+
+    def _persist_invalid_source_observation(self, now: datetime) -> str:
+        """Atomically latch a malformed-source observation before scheduler lock contention."""
+        observation_id = uuid.uuid4().hex
+        payload = _json_bytes({"observation_id": observation_id, "observed_iso": _iso(now)})
+        with self._invalid_source_hold_lock():
+            _atomic_write_durable(self.invalid_source_hold_path, payload)
+        return observation_id
+
+    def _clear_invalid_source_observation(self, expected: tuple[tuple[str, bytes], ...]) -> bool:
+        """Clear only the exact invalid evidence seen by a validated 200 response."""
+        with self._invalid_source_hold_lock():
+            if self._invalid_source_latch_snapshot_unlocked() != expected:
+                return False
+            for name, _payload in expected:
+                with suppress(OSError):
+                    (self.directory / name).unlink(missing_ok=True)
+            return True
+
+    def _pending_invalid_source_observation(
+        self, now: datetime
+    ) -> _InvalidSourceObservation | None:
+        snapshot = self._invalid_source_latch_snapshot()
+        if not snapshot:
+            return None
+        if len(snapshot) == 1 and snapshot[0][0] == self.invalid_source_hold_path.name:
+            try:
+                document = json.loads(snapshot[0][1])
+                if (
+                    isinstance(document, dict)
+                    and set(document) == {"observation_id", "observed_iso"}
+                    and _is_hex32(document.get("observation_id"))
+                ):
+                    observed_at = _parse_iso(document.get("observed_iso"))
+                    if observed_at is not None:
+                        return _InvalidSourceObservation(document["observation_id"], observed_at)
+            except (UnicodeDecodeError, ValueError):
+                pass
+        identity = hashlib.sha256(
+            b"".join(name.encode("utf-8") + b"\0" + payload for name, payload in snapshot)
+        ).hexdigest()[:_HEX32]
+        return _InvalidSourceObservation(identity, _as_utc(now))
+
     def request_headers(self) -> dict[str, str]:
         """Headers for source requests: ``Accept-Encoding: identity`` plus the stored ETag.
 
@@ -619,6 +769,7 @@ class MappingStore:
             )
             and state.etag is not None
             and state.accept_encoding == ACCEPT_ENCODING
+            and not self.invalid_source_hold()
         ):
             headers["If-None-Match"] = state.etag
         return headers
@@ -629,6 +780,35 @@ class MappingStore:
 
     def _load_state(self) -> _State:
         return self._load_state_with_validity()[0]
+
+    def invalid_source_hold(self) -> bool:
+        """Return the durable invalid-source write hold without consulting the network.
+
+        Pointer and transition snapshots are included so a crash between their atomic
+        update and the scheduler-state update cannot temporarily reopen writes. A corrupt
+        existing scheduler file also fails closed until a validated refresh repairs it.
+        """
+        try:
+            if self.invalid_source_hold_path.exists() or any(
+                self.directory.glob(f"{self.invalid_source_hold_path.name}.*.new")
+            ):
+                return True
+        except OSError:
+            return True
+        state, valid = self._load_state_with_validity()
+        if state.invalid_source_hold:
+            return True
+        pointer = self._load_active_pointer()
+        if pointer is not None and pointer[1].invalid_source_hold:
+            return True
+        transition, transition_valid = self._load_source_transition_with_validity()
+        if (
+            transition_valid
+            and transition is not None
+            and transition.scheduler_state.invalid_source_hold
+        ):
+            return True
+        return not valid and self.state_path.exists()
 
     def _load_state_with_validity(self) -> tuple[_State, bool]:
         try:
@@ -808,7 +988,10 @@ class MappingStore:
                 raise ValueError("active metadata must be an object")
             meta = _meta_from_document(cast("dict[str, Any]", meta_document))
             body = files[0].read_bytes()
-            index = build_mapping_index(parse_anime_lists(body), overrides)
+            parsed = parse_anime_lists(body)
+            if parsed.invalid_entries:
+                raise MappingError("active generation contains malformed Anime-Lists entries")
+            index = build_mapping_index(parsed, overrides)
         except (OSError, ValueError, ConfigError, MappingError):
             return None
         pointer_state: _State | None = None
@@ -843,7 +1026,10 @@ class MappingStore:
         )
         if (
             content_digest(body) != meta.content_sha256
-            or targets_digest(index) != meta.targets_digest
+            or (
+                targets_digest(index) != meta.targets_digest
+                and legacy_targets_digest(index) != meta.targets_digest
+            )
             or structure_digest(index) != meta.structure_digest
             or index.entries_indexed != meta.entries_indexed
             or index.mapping_rules != meta.mapping_rules
@@ -984,6 +1170,8 @@ class MappingStore:
             return
         try:
             parsed = parse_anime_lists(body)
+            if parsed.invalid_entries:
+                raise MappingError("legacy generation contains malformed Anime-Lists entries")
             upstream_index = build_mapping_index(parsed)
             index = build_mapping_index(parsed, overrides)
         except (MappingError, ConfigError):
@@ -996,8 +1184,8 @@ class MappingStore:
             return
         index_matches = (
             targets_digest(index) == meta.targets_digest
-            and structure_digest(index) == meta.structure_digest
-        )
+            or legacy_targets_digest(index) == meta.targets_digest
+        ) and structure_digest(index) == meta.structure_digest
         if not index_matches and transition_state is None:
             return
 
@@ -1020,6 +1208,7 @@ class MappingStore:
                 structure_digest=meta.structure_digest,
                 revision=meta.revision,
                 last_success_iso=meta.activated_iso,
+                invalid_source_hold=self.invalid_source_hold(),
             )
         if transition_state is not None:
             state = transition_state
@@ -1067,10 +1256,10 @@ class MappingStore:
         ):
             return False
         try:
-            parse_anime_lists(body)
+            parsed = parse_anime_lists(body)
         except (MappingError, ConfigError):
             return False
-        return True
+        return parsed.invalid_entries == 0
 
     def _state_matches_active(self, state: _State) -> bool:
         meta = self._load_meta()
@@ -1087,7 +1276,7 @@ class MappingStore:
         )
 
     def active_identity(self) -> tuple[int, str, str, str, str | None] | None:
-        """Read the selected verified generation identity without parsing or indexing XML."""
+        """Read a verified active identity, validating XML once per unseen generation."""
         while True:
             with self.generation_lock(
                 wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS
@@ -1096,7 +1285,7 @@ class MappingStore:
                     return self.active_identity_locked()
 
     def active_identity_locked(self) -> tuple[int, str, str, str, str | None] | None:
-        """Read identity without reacquiring the generation lock held by the caller."""
+        """Read identity under the caller's lock, parsing only an unverified generation."""
         files = self._active_files()
         meta = self._load_meta()
         body = self._read_active_bytes()
@@ -1126,13 +1315,18 @@ class MappingStore:
             )
         ):
             return None
-        return (
+        identity = (
             meta.revision,
             meta.content_sha256,
             meta.targets_digest,
             meta.structure_digest,
             meta.source_epoch,
         )
+        if self._verified_active_identity != identity:
+            if not self._active_verified():
+                return None
+            self._verified_active_identity = identity
+        return identity
 
 
 def make_source_endpoint(
@@ -1211,6 +1405,7 @@ def _begin_from_pointer_transition(
             source_url=store.source_url,
             source_epoch=uuid.uuid4().hex,
             source_change_pending=True,
+            invalid_source_hold=store.invalid_source_hold(),
         )
         pointer_state = state
     state = pointer_state
@@ -1281,6 +1476,7 @@ def _resume_transition_state(
                     source_url=store.source_url,
                     source_epoch=uuid.uuid4().hex,
                     source_change_pending=True,
+                    invalid_source_hold=store.invalid_source_hold(),
                 )
                 store._migrate_legacy_active_generation(overrides, transition_state=state)
                 store._save_pointer_transition(state)
@@ -1312,6 +1508,7 @@ def _resume_invalid_source_state(
             source_url=store.source_url,
             source_epoch=uuid.uuid4().hex,
             source_change_pending=True,
+            invalid_source_hold=store.invalid_source_hold(),
         )
     else:
         return None
@@ -1338,6 +1535,7 @@ def _start_source_transition(
             source_url=store.source_url,
             source_epoch=uuid.uuid4().hex,
             source_change_pending=True,
+            invalid_source_hold=store.invalid_source_hold(),
         )
     )
     store._migrate_legacy_active_generation(overrides, transition_state=state)
@@ -1351,6 +1549,9 @@ def _begin_refresh_state_locked(store: MappingStore, overrides: Overrides | None
     state, valid = store._load_state_with_validity()
     transition, transition_valid = store._load_source_transition_with_validity()
     state, valid = _recover_refresh_state_if_missing(store, state, valid, overrides)
+    _reconcile_pending_invalid_source_locked(store)
+    state, valid = store._load_state_with_validity()
+    transition, transition_valid = store._load_source_transition_with_validity()
     if (
         not valid
         and transition_valid
@@ -1475,6 +1676,7 @@ def _state_for_source(store: MappingStore, state: _State) -> tuple[_State, bool]
             source_url=store.source_url,
             source_epoch=uuid.uuid4().hex,
             source_change_pending=True,
+            invalid_source_hold=state.invalid_source_hold or store.invalid_source_hold(),
         ),
         True,
     )
@@ -1503,6 +1705,8 @@ def _same_scheduler_snapshot(current: _State, expected: _State) -> bool:
         and current.consecutive_failures == expected.consecutive_failures
         and current.refresh_attempt_id == expected.refresh_attempt_id
         and current.last_outcome == expected.last_outcome
+        and current.invalid_source_hold == expected.invalid_source_hold
+        and current.invalid_source_observation_id == expected.invalid_source_observation_id
     )
 
 
@@ -1527,6 +1731,11 @@ def _record_failure(
     now: datetime,
     outcome: RefreshOutcome,
 ) -> RefreshOutcome:
+    invalid_observation_id = (
+        store._persist_invalid_source_observation(now)
+        if outcome is RefreshOutcome.FAILED_INVALID
+        else None
+    )
     with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
         if not acquired:
             return RefreshOutcome.FAILED_LOCKED
@@ -1534,7 +1743,13 @@ def _record_failure(
         if not _same_refresh_generation(current, state):
             return RefreshOutcome.FAILED_STALE
         current.last_attempted_iso = state.last_attempted_iso or current.last_attempted_iso
-        return _record_failure_locked(store, current, now, outcome)
+        return _record_failure_locked(
+            store,
+            current,
+            now,
+            outcome,
+            invalid_observation_id=invalid_observation_id,
+        )
 
 
 def _record_failure_locked(
@@ -1542,15 +1757,70 @@ def _record_failure_locked(
     state: _State,
     now: datetime,
     outcome: RefreshOutcome,
+    *,
+    invalid_observation_id: str | None = None,
 ) -> RefreshOutcome:
-    state.consecutive_failures += 1
-    state.next_due_iso = _iso(now + timedelta(hours=_backoff_hours(state.consecutive_failures)))
+    already_recorded = (
+        outcome is RefreshOutcome.FAILED_INVALID
+        and invalid_observation_id is not None
+        and state.invalid_source_observation_id == invalid_observation_id
+    )
+    if not already_recorded:
+        state.consecutive_failures += 1
+        state.next_due_iso = _iso(now + timedelta(hours=_backoff_hours(state.consecutive_failures)))
     state.last_outcome = outcome.value
+    if outcome is RefreshOutcome.FAILED_INVALID:
+        state.invalid_source_hold = True
+        if invalid_observation_id is not None:
+            state.invalid_source_observation_id = invalid_observation_id
     store._save_pointer_scheduler_state(state)
     store._save_state(state)
     if store._active_verified():
         return outcome
     return RefreshOutcome.NO_ACTIVE_BUT_FAILED
+
+
+def _reconcile_pending_invalid_source_locked(
+    store: MappingStore, now: datetime | None = None
+) -> None:
+    """Merge a durable lock-independent invalid observation into scheduler snapshots.
+
+    Called only while the generation lock is held. The standalone latch protects writes
+    immediately; this serialized merge records bounded retry timing after a competing
+    protected operation releases its lease.
+    """
+    observed_at = _as_utc(now or datetime.now(UTC))
+    observation = store._pending_invalid_source_observation(observed_at)
+    if observation is None:
+        return
+    state, _valid = store._load_state_with_validity()
+    if state.invalid_source_observation_id == observation.observation_id:
+        if state.invalid_source_hold:
+            return
+        # A crash may have landed after success bookkeeping but before clearing the latch.
+        # Reassert the hold and retry soon without charging the same observation twice.
+        state.invalid_source_hold = True
+        state.consecutive_failures = max(1, state.consecutive_failures)
+        retry_at = observation.observed_at + timedelta(
+            hours=_backoff_hours(state.consecutive_failures)
+        )
+        try:
+            current_due = _parse_iso(state.next_due_iso)
+        except ValueError:
+            current_due = None
+        if current_due is None or current_due > retry_at:
+            state.next_due_iso = _iso(retry_at)
+        state.last_outcome = RefreshOutcome.FAILED_INVALID.value
+        store._save_pointer_scheduler_state(state)
+        store._save_state(state)
+        return
+    _record_failure_locked(
+        store,
+        state,
+        observation.observed_at,
+        RefreshOutcome.FAILED_INVALID,
+        invalid_observation_id=observation.observation_id,
+    )
 
 
 def _record_success(
@@ -1564,6 +1834,9 @@ def _record_success(
     structure: str,
     revision: int,
     outcome: RefreshOutcome,
+    *,
+    validated_source: bool = True,
+    invalid_latch_snapshot: tuple[tuple[str, bytes], ...] | None = None,
 ) -> RefreshOutcome:
     state = _successful_state(
         store,
@@ -1576,9 +1849,12 @@ def _record_success(
         structure,
         revision,
         outcome,
+        validated_source=validated_source,
     )
     store._save_pointer_scheduler_state(state)
     store._save_state(state)
+    if validated_source and invalid_latch_snapshot is not None:
+        store._clear_invalid_source_observation(invalid_latch_snapshot)
     return outcome
 
 
@@ -1593,6 +1869,8 @@ def _successful_state(
     structure: str,
     revision: int,
     outcome: RefreshOutcome,
+    *,
+    validated_source: bool = True,
 ) -> _State:
     state = replace(state)
     etag = response.headers.get("etag")
@@ -1608,6 +1886,8 @@ def _successful_state(
     state.next_due_iso = _iso(now + timedelta(hours=refresh_hours))
     state.consecutive_failures = 0
     state.last_outcome = outcome.value
+    if validated_source:
+        state.invalid_source_hold = False
     return state
 
 
@@ -1652,6 +1932,19 @@ def _activate(
     _atomic_write(store.active_generation_path, _json_bytes(pointer))
 
 
+def _parse_accepted_index(
+    body: bytes | bytearray, overrides_text: str | None
+) -> MappingIndex | None:
+    try:
+        overrides = load_overrides(overrides_text) if overrides_text is not None else None
+        parsed = parse_anime_lists(body)
+        if parsed.invalid_entries:
+            return None
+        return build_mapping_index(parsed, overrides)
+    except (MappingError, ConfigError):
+        return None
+
+
 def _accept_content(
     store: MappingStore,
     state: _State,
@@ -1661,24 +1954,18 @@ def _accept_content(
     overrides_text: str | None,
     body: bytes | bytearray,
 ) -> RefreshOutcome:
-    overrides: Overrides | None = None
-    if overrides_text is not None:
-        try:
-            overrides = load_overrides(overrides_text)
-        except ConfigError:
-            return _record_failure(store, state, now, RefreshOutcome.FAILED_INVALID)
-    try:
-        parsed = parse_anime_lists(body)
-        index = build_mapping_index(parsed, overrides)
-    except (MappingError, ConfigError):
+    index = _parse_accepted_index(body, overrides_text)
+    if index is None:
         return _record_failure(store, state, now, RefreshOutcome.FAILED_INVALID)
 
+    invalid_latch_snapshot = store._invalid_source_latch_snapshot()
     content_sha256 = content_digest(body)
     targets = targets_digest(index)
     structure = structure_digest(index)
     with store.generation_lock(wait_seconds=GENERATION_LOCK_REFRESH_WAIT_SECONDS) as acquired:
         if not acquired:
             return _record_failure(store, state, now, RefreshOutcome.FAILED_LOCKED)
+        _reconcile_pending_invalid_source_locked(store, now)
         current_state = store._load_state()
         if not _source_url_matches(store, current_state.source_url) or not _same_refresh_generation(
             current_state, state
@@ -1707,6 +1994,7 @@ def _accept_content(
                 structure,
                 meta.revision,
                 RefreshOutcome.UNCHANGED,
+                invalid_latch_snapshot=invalid_latch_snapshot,
             )
         revision = meta.revision + 1 if meta is not None else 1
         successful_state = _successful_state(
@@ -1739,6 +2027,7 @@ def _accept_content(
             store._save_source_transition(successful_state)
         store._save_state(successful_state)
         store._cleanup_generations()
+        store._clear_invalid_source_observation(invalid_latch_snapshot)
         return RefreshOutcome.ACTIVATED
 
 
@@ -1758,9 +2047,11 @@ def refresh(
     ``NOT_DUE`` with zero requests. On a 200 the body is size-capped, parsed, indexed
     (with ``overrides_text`` applied) and digest-compared **before** atomic activation;
     :class:`~shoko_linker.mappings.MappingError` or
-    :class:`~shoko_linker.config.ConfigError` from overrides/parsing are
-    ``FAILED_INVALID`` with the cache untouched. ``ACTIVATED`` requires a change of the
-    effective target/structure digests (overrides are part of the digests: same bytes +
+    :class:`~shoko_linker.config.ConfigError` from overrides/parsing, or any malformed semantic
+    entry, are ``FAILED_INVALID`` with the cache untouched. The documented unsupported
+    absolute-season+episodeoffset case is retained only as an ownership fence. ``ACTIVATED``
+    requires a change of the effective target/structure digests (overrides and ownership fences
+    are part of the digests: same bytes +
     different overrides is a new effective generation); validators and timing refresh on
     every success. Raises :class:`~shoko_linker.errors.HttpPolicyError` when the
     endpoint is not bound to the source origin with ``Accept-Encoding: identity`` — a
@@ -1837,7 +2128,7 @@ def _read_capped(response: httpx.Response, max_bytes: int) -> tuple[bytearray, b
     return body, overflow
 
 
-def _handle_not_modified(
+def _handle_not_modified(  # noqa: PLR0911
     store: MappingStore,
     state: _State,
     now_utc: datetime,
@@ -1883,6 +2174,10 @@ def _handle_not_modified(
         current.last_attempted_iso = (
             attempted_state.last_attempted_iso or current.last_attempted_iso
         )
+        if store.invalid_source_hold():
+            # A 304 cannot validate the bytes that previously failed parsing. Treat an
+            # unsolicited conditional hit as a failed recovery and keep bounded backoff.
+            return _record_failure_locked(store, current, now_utc, RefreshOutcome.FAILED_TRANSPORT)
         return _record_success(
             store,
             current,
@@ -1894,6 +2189,7 @@ def _handle_not_modified(
             cast("str", current.structure_digest),
             current.revision,
             RefreshOutcome.UNCHANGED,
+            validated_source=False,
         )
 
 
@@ -1910,6 +2206,7 @@ def due(store: MappingStore, now: datetime, overrides: Overrides | None = None) 
                 continue
             store._recover_pending_transition_scheduler(None)
             active = _load_active_locked(store, overrides)
+            _reconcile_pending_invalid_source_locked(store, now_utc)
             state = store._load_state()
             if not _source_url_matches(store, state.source_url):
                 return True
@@ -1929,6 +2226,7 @@ def next_refresh_due(store: MappingStore, now: datetime, refresh_hours: float) -
                 continue
             store._recover_pending_transition_scheduler(None)
             active = _load_active_locked(store, None)
+            _reconcile_pending_invalid_source_locked(store, now_utc)
             state, source_changed = _state_for_source(store, store._load_state())
             if source_changed:
                 return now_utc
@@ -1964,6 +2262,7 @@ def status(
             if acquired:
                 active = _load_active_locked(store, overrides) if overrides_valid else None
                 store._recover_pending_transition_scheduler(active)
+                _reconcile_pending_invalid_source_locked(store, _as_utc(now))
                 return _status_locked(store, now, active)
 
 
@@ -2017,6 +2316,7 @@ def _status_locked(
         next_due_iso=state.next_due_iso,
         last_outcome=last_outcome,
         consecutive_failures=state.consecutive_failures,
+        invalid_source_hold=store.invalid_source_hold(),
         entries_indexed=meta.entries_indexed if meta is not None else None,
         mapping_rules=meta.mapping_rules if meta is not None else None,
         explicit_pairs=meta.explicit_pairs if meta is not None else None,
@@ -2068,6 +2368,13 @@ def _load_active_locked(
         or state.revision != meta.revision
     ):
         return None
+    store._verified_active_identity = (
+        meta.revision,
+        meta.content_sha256,
+        meta.targets_digest,
+        meta.structure_digest,
+        meta.source_epoch,
+    )
     return ActiveMappings(
         index=verified.index,
         content_sha256=meta.content_sha256,

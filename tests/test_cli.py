@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import signal
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -11,6 +12,7 @@ from typing import Any
 
 import httpx
 import pytest
+import state_v1_fixture as v1fx
 
 from shoko_linker import cli
 from shoko_linker.bootstrap import BootstrapSettings
@@ -24,7 +26,7 @@ from shoko_linker.cli import (
 from shoko_linker.config import SecretRef
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.service import SERVICE_POLL_SECONDS, ConnectionReport
-from shoko_linker.state import StateStore
+from shoko_linker.state import SCHEMA_VERSION, StateStore
 
 EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
@@ -66,6 +68,42 @@ def test_ordinary_controls_persist_pause_and_refuse_resume_without_setup(
     store = StateStore(state_path)
     try:
         assert store.get_service_pause() == (True, "user_paused")
+    finally:
+        store.close()
+
+
+def test_status_opens_stopped_legacy_database_without_remote_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_path = tmp_path / "legacy-state.sqlite3"
+    v1fx.build_v1_database(state_path)
+    connection = sqlite3.connect(state_path)
+    try:
+        connection.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            (("writes_disabled", "1"), ("writes_disabled_reason", "operator repair required")),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(cli, "DEFAULT_DATABASE_PATH", state_path)
+    monkeypatch.setattr(
+        cli,
+        "bootstrap_endpoints",
+        lambda *_args, **_kwargs: pytest.fail("offline status must not contact Sonarr or Shoko"),
+    )
+
+    assert main(["status"]) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "Automatic linking: waiting for setup confirmation" in output
+
+    store = StateStore(state_path)
+    try:
+        assert store.schema_version() == SCHEMA_VERSION
+        assert store.writes_disabled is True
+        assert store.get_meta("writes_disabled_reason") == "operator repair required"
     finally:
         store.close()
 

@@ -9,12 +9,14 @@ Semantics implemented verbatim:
 
 * Offsets are AniDB→TVDB additions (``tvdb = anidb + offset``), reversed as
   ``anidb = tvdb - offset``.
-* Precedence: individual ``;a-b;`` pairs > mapping range ``offset`` > entry
-  ``episodeoffset``; ``start``/``end`` without ``offset`` is inert.
+* Precedence is applied to forward AniDB identities before inversion: individual
+  ``;a-b;`` pairs > mapping range ``offset`` > entry ``episodeoffset``;
+  ``start``/``end`` without ``offset`` is inert. A higher-precedence declaration
+  suppresses lower-precedence reverse positions for the same AniDB identity.
 * TVDB ``0`` in a target position means "AniDB episode has no TVDB counterpart"
   and is never registered as a reverse key.
 * ``;1-1+2;`` registers both TVDB keys for one AniDB episode; ``;1-1;2-1;``
-  registers one TVDB key with two candidate AniDB episodes; ``;1+2-1;`` is
+  resolves one TVDB key to the complete AniDB parts declared in that rule; ``;1+2-1;`` is
   invalid and excludes the whole entry.
 * ``defaulttvdbseason="a"`` means absolute identity (Sonarr absolute == AniDB
   number) only for episodes the entry's mapping-lists do not cover;
@@ -25,18 +27,26 @@ Semantics implemented verbatim:
   queried episode resolves to the entry with the greatest offset strictly below
   it (AoT TVDB 267440 season 4: offsets 0/16/28 partition episodes 1-16/17-28/
   29+). Equal offsets collide → ambiguous.
-* Episode type is derived (number wins over season): ``>=401`` → Other,
-  ``201-400`` → Trailer, ``anidbseason 1`` → Episode, ``0`` → Special;
-  ``101-103`` is UNVERIFIED and fails closed; Credits/Parody are not
-  expressible by Anime-Lists and are never produced.
+ * Episode type follows the mapping source: regular entry-offset, absolute-identity,
+   and ``anidbseason=1`` range rules remain ``Episode`` regardless of number;
+   ``anidbseason=0`` range rules remain ``Special`` regardless of number. Explicit
+   ``;a-b;`` pairs decode documented T/O number encodings first (``201-400`` →
+   Trailer numbers 1-200, ``>=401`` → Other numbers 1+), then use season 0 as
+   ``Special`` or season 1 as ``Episode``. Season-0 explicit 101-103 identities
+   have unverified types and fence only their TVDB positions.
+   Credits/Parody are not expressible by Anime-Lists and are never produced.
 
 Recorded fail-closed interpretations (reported as problems, never guessed):
 
-* A ``<mapping>`` without ``tvdbseason``/``anidbseason`` has no defined season
-  pair → rule excluded. ``offset`` without ``[start,end]`` is unbounded →
-  excluded. ``anidbseason`` ``2`` **or higher** is UNVERIFIED → the whole rule
-  (pairs and range) is excluded. Pair numbers in ``101-103`` are excluded.
-  Unknown attributes are recorded, never interpreted.
+* A malformed or unsupported ``<mapping>`` declaration invalidates its entire
+  ``<anime>`` entry, so an entry offset cannot silently replace the rejected
+  mapping. This includes missing/invalid season attributes, unknown mapping
+  attributes, malformed pair tokens/ranges, and ``anidbseason`` ``2`` or higher
+  (UNVERIFIED). ``start``/``end`` without ``offset`` remains the documented inert
+  declaration. Such an entry contributes no targets and fences its known TVDB
+  series; if its TVDB ID cannot be identified, all queries fail closed. Other valid
+  entries for unrelated series remain usable for offline inspection. Download refresh
+  rejects any snapshot with an excluded entry, preserving the last-known-good generation.
 * A reverse query for TVDB episode ``0`` answers ``NO_EQUIVALENT`` (the
   Anime-Lists no-counterpart sentinel), never ``UNMAPPED``.
 * A mapping body above ``MAX_PAIRS_PER_RULE`` excludes the entry: a partially
@@ -46,8 +56,8 @@ Recorded fail-closed interpretations (reported as problems, never guessed):
   ``add-no-counterpart`` conflicts — upstream explicit declarations outrank
   operator additions for the exact declared identity.
 
-The reverse map is not 1:1: candidate lists are retained; more than one
-unresolvable candidate answers ``AMBIGUOUS`` (writes prohibited). Candidate
+The reverse map is not 1:1: explicit composite parts resolve together, while
+competing declarations answer ``AMBIGUOUS`` (writes prohibited). Candidate
 ordering is deterministic: sorted by AniDB id, then episode number, then type.
 """
 
@@ -56,7 +66,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, cast
@@ -107,14 +117,40 @@ _METADATA_CHILDREN: Final[frozenset[str]] = frozenset(
         "webmaster",
     }
 )
-_PAIR_RE: Final[re.Pattern[str]] = re.compile(r"^(\d+)-(\d+(?:\+\d+)*)$")
-_LEFT_MULTI_RE: Final[re.Pattern[str]] = re.compile(r"^\d+\+\d+")
-_INT_RE: Final[re.Pattern[str]] = re.compile(r"^\d+$")
-_SIGNED_INT_RE: Final[re.Pattern[str]] = re.compile(r"^-?\d+$")
+_PAIR_RE: Final[re.Pattern[str]] = re.compile(r"(\d+)-(\d+(?:\+\d+)*)")
+_LEFT_MULTI_RE: Final[re.Pattern[str]] = re.compile(r"\d+\+\d+")
+_INT_RE: Final[re.Pattern[str]] = re.compile(r"\d+")
+_SIGNED_INT_RE: Final[re.Pattern[str]] = re.compile(r"-?\d+")
 
 
 class MappingError(LinkerError):
     """The document as a whole is unusable: root, XML syntax, entry cap, defused XML threats."""
+
+
+class EntryIssueKind(Enum):
+    """Structured severity for a recorded per-entry parser issue."""
+
+    MALFORMED = "malformed"
+    KNOWN_UNSUPPORTED = "known_unsupported"
+    WARNING = "warning"
+
+
+class EntryIssueCode(Enum):
+    """Stable machine-readable categories; diagnostics are never parsed as control flow."""
+
+    MALFORMED_ENTRY = "malformed_entry"
+    ABSOLUTE_SEASON_WITH_EPISODE_OFFSET = "absolute_season_with_episode_offset"
+    UNVERIFIED_SEASON_ZERO_EPISODE_TYPE = "unverified_season_zero_episode_type"
+    ENTRY_WARNING = "entry_warning"
+
+
+@dataclass(frozen=True)
+class EntryParseIssue:
+    """One typed parser finding alongside its human-readable explanation."""
+
+    kind: EntryIssueKind
+    code: EntryIssueCode
+    detail: str
 
 
 class EpisodeType(Enum):
@@ -198,13 +234,22 @@ class AnimeEntry:
 
 @dataclass(frozen=True)
 class EntryProblem:
-    """Recorded problems for one ``<anime>`` element; ``excluded`` entries contribute nothing."""
+    """Recorded issues for one ``<anime>`` element; excluded entries contribute no targets."""
 
     index: int
     anidbid: int | None
     tvdbid: int | None
     excluded: bool
     problems: tuple[str, ...]
+    issues: tuple[EntryParseIssue, ...]
+    fenced_tvdb_keys: tuple[QueryKey, ...] = ()
+
+    @property
+    def known_unsupported(self) -> bool:
+        """True only for the documented unsupported case, never for malformed declarations."""
+        return any(
+            issue.kind is EntryIssueKind.KNOWN_UNSUPPORTED for issue in self.issues
+        ) and not any(issue.kind is EntryIssueKind.MALFORMED for issue in self.issues)
 
 
 @dataclass(frozen=True)
@@ -219,6 +264,15 @@ class ParsedMappings:
     @property
     def excluded_entries(self) -> int:
         return sum(1 for problem in self.entry_problems if problem.excluded)
+
+    @property
+    def invalid_entries(self) -> int:
+        """Excluded entries other than the one explicitly recognized unsupported construct."""
+        return sum(
+            1
+            for problem in self.entry_problems
+            if problem.excluded and not problem.known_unsupported
+        )
 
     @property
     def problem_count(self) -> int:
@@ -236,6 +290,9 @@ class MappingTarget:
     source_rule: SourceRule
     precedence_rank: int
     origin: str
+
+    # Only explicit parts declared together authorize a composite destination set.
+    composite_claim: int | None = None
 
     @property
     def identity(self) -> tuple[int, int, EpisodeType]:
@@ -255,6 +312,11 @@ class Resolution:
     target: MappingTarget | None
     candidates: tuple[MappingTarget, ...]
     detail: str
+
+    @property
+    def targets(self) -> tuple[MappingTarget, ...]:
+        """Complete authorized destinations; rejected candidates are never targets."""
+        return self.candidates if self.status is ResolutionStatus.RESOLVED else ()
 
 
 @dataclass(frozen=True)
@@ -319,8 +381,8 @@ class _OffsetClaim:
 @dataclass(frozen=True)
 class _AbsoluteClaim:
     anidb_id: int
-    covered: frozenset[int]
-    intervals: tuple[tuple[int, int], ...]
+    covered: frozenset[tuple[int, EpisodeType]]
+    intervals: tuple[tuple[int, int, int], ...]
     entry_index: int
 
 
@@ -341,10 +403,14 @@ class MappingIndex:
     entry_offsets: Mapping[SeasonKey, tuple[_OffsetClaim, ...]]
     absolute: Mapping[int, tuple[_AbsoluteClaim, ...]]
     no_counterpart: Mapping[SeasonKey, frozenset[TargetIdentity]]
-    forward: Mapping[tuple[int, int, int], tuple[_ForwardTarget, ...]]
+    forward: Mapping[TargetIdentity, tuple[_ForwardTarget, ...]]
+    forward_precedence: Mapping[TargetIdentity, int]
     override_adds: Mapping[QueryKey, tuple[MappingTarget, ...]]
     override_removes: Mapping[QueryKey, frozenset[int] | None]
     override_conflicts: tuple[OverrideConflict, ...]
+    unsafe_tvdb_ids: frozenset[int]
+    unsafe_tvdb_keys: frozenset[QueryKey]
+    unsafe_all: bool
     entries_indexed: int
     entries_excluded: int
     entries_with_problems: int
@@ -382,12 +448,22 @@ def parse_anime_lists(
         )
     entries: list[AnimeEntry] = []
     entry_problems: list[EntryProblem] = []
-    seen_anidbid: dict[int, int] = {}
+    declared_anidbids: dict[int, list[int]] = {}
     for index, element in enumerate(anime_elements):
-        entry, problem = _parse_anime_element(index, element, seen_anidbid)
+        raw_anidbid = element.attrib.get("anidbid")
+        if raw_anidbid is not None and _INT_RE.fullmatch(raw_anidbid):
+            anidbid = int(raw_anidbid)
+            if anidbid > 0:
+                declared_anidbids.setdefault(anidbid, []).append(index)
+    duplicate_anidbids = {
+        anidbid: tuple(indices)
+        for anidbid, indices in declared_anidbids.items()
+        if len(indices) > 1
+    }
+    for index, element in enumerate(anime_elements):
+        entry, problem = _parse_anime_element(index, element, duplicate_anidbids)
         if entry is not None:
             entries.append(entry)
-            seen_anidbid[entry.anidbid] = index
         if problem is not None:
             entry_problems.append(problem)
     return ParsedMappings(
@@ -413,33 +489,110 @@ def _parse_root(xml_text: str | bytes | bytearray) -> Element:
 
 
 def _parse_anime_element(
-    index: int, element: Element, seen_anidbid: Mapping[int, int]
+    index: int, element: Element, duplicate_anidbids: Mapping[int, tuple[int, ...]]
 ) -> tuple[AnimeEntry | None, EntryProblem | None]:
     fatal: list[str] = []
     problems: list[str] = []
+    known_unsupported: list[str] = []
+    fenced_tvdb_keys: set[QueryKey] = set()
+    issues: list[EntryParseIssue] = []
     attributes = dict(element.attrib)
     allowed = _ANIME_ENTRY_ATTRIBUTES | _ANIME_UNUSED_ATTRIBUTES
     unknown = tuple(name for name in sorted(attributes) if name not in allowed)
     for name in unknown:
-        problems.append(f"unknown attribute {name!r} on <anime> (recorded, not used)")
+        fatal.append(f"unknown attribute {name!r} on <anime> (entry excluded, not guessed)")
 
     anidbid = _positive_int(attributes.get("anidbid"), "anidbid", fatal)
     tvdbid = _positive_int(attributes.get("tvdbid"), "tvdbid", fatal)
     season = _season_attr(attributes.get("defaulttvdbseason"), fatal)
     episodeoffset = _offset_attr(attributes.get("episodeoffset"), fatal)
 
-    if season == "a" and "episodeoffset" in attributes:
-        fatal.append("defaulttvdbseason='a' with episodeoffset is UNVERIFIED (fail closed)")
+    unsupported_absolute_offset = season == "a" and episodeoffset is not None
+    unsupported_detail = (
+        "defaulttvdbseason='a' with episodeoffset is UNVERIFIED; TVDB ownership is fenced"
+    )
+    if unsupported_absolute_offset:
+        problems.append(unsupported_detail)
 
-    rules = _parse_entry_rules(element, problems, fatal)
+    rules = _parse_entry_rules(
+        element,
+        problems,
+        fatal,
+        known_unsupported,
+        fenced_tvdb_keys,
+        tvdbid=tvdbid,
+    )
 
-    if anidbid is not None and anidbid in seen_anidbid:
-        fatal.append(f"anidbid {anidbid} already claimed by entry {seen_anidbid[anidbid]}")
+    if anidbid is not None and anidbid in duplicate_anidbids:
+        entries = ", ".join(str(item) for item in duplicate_anidbids[anidbid])
+        fatal.append(f"anidbid {anidbid} is duplicated by entries {entries}")
 
     if fatal:
-        return None, EntryProblem(index, anidbid, tvdbid, True, tuple(fatal + problems))
+        issues = [
+            EntryParseIssue(
+                EntryIssueKind.MALFORMED, EntryIssueCode.MALFORMED_ENTRY, "; ".join(fatal)
+            )
+        ]
+        if known_unsupported:
+            issues.append(
+                EntryParseIssue(
+                    EntryIssueKind.KNOWN_UNSUPPORTED,
+                    EntryIssueCode.UNVERIFIED_SEASON_ZERO_EPISODE_TYPE,
+                    "; ".join(known_unsupported),
+                )
+            )
+        if unsupported_absolute_offset:
+            issues.append(
+                EntryParseIssue(
+                    EntryIssueKind.KNOWN_UNSUPPORTED,
+                    EntryIssueCode.ABSOLUTE_SEASON_WITH_EPISODE_OFFSET,
+                    unsupported_detail,
+                )
+            )
+        return None, EntryProblem(
+            index,
+            anidbid,
+            tvdbid,
+            True,
+            tuple(fatal + problems + known_unsupported),
+            tuple(issues),
+            tuple(sorted(fenced_tvdb_keys)),
+        )
     if anidbid is None or tvdbid is None or not isinstance(season, int | str):
-        return None, EntryProblem(index, anidbid, tvdbid, True, tuple(fatal + problems))
+        detail = "; ".join(problems) or "entry identity or season is incomplete"
+        return None, EntryProblem(
+            index,
+            anidbid,
+            tvdbid,
+            True,
+            tuple(fatal + problems + known_unsupported),
+            (EntryParseIssue(EntryIssueKind.MALFORMED, EntryIssueCode.MALFORMED_ENTRY, detail),),
+            tuple(sorted(fenced_tvdb_keys)),
+        )
+    if unsupported_absolute_offset:
+        issue = EntryParseIssue(
+            EntryIssueKind.KNOWN_UNSUPPORTED,
+            EntryIssueCode.ABSOLUTE_SEASON_WITH_EPISODE_OFFSET,
+            unsupported_detail,
+        )
+        issues = [issue]
+        if known_unsupported:
+            issues.append(
+                EntryParseIssue(
+                    EntryIssueKind.KNOWN_UNSUPPORTED,
+                    EntryIssueCode.UNVERIFIED_SEASON_ZERO_EPISODE_TYPE,
+                    "; ".join(known_unsupported),
+                )
+            )
+        return None, EntryProblem(
+            index,
+            anidbid,
+            tvdbid,
+            True,
+            tuple(problems + known_unsupported),
+            tuple(issues),
+            tuple(sorted(fenced_tvdb_keys)),
+        )
     entry = AnimeEntry(
         index=index,
         anidbid=anidbid,
@@ -450,7 +603,29 @@ def _parse_anime_element(
         unknown_attributes=unknown,
     )
     if problems:
-        return entry, EntryProblem(index, anidbid, tvdbid, False, tuple(problems))
+        issues.append(
+            EntryParseIssue(
+                EntryIssueKind.WARNING, EntryIssueCode.ENTRY_WARNING, "; ".join(problems)
+            )
+        )
+    if known_unsupported:
+        issues.append(
+            EntryParseIssue(
+                EntryIssueKind.KNOWN_UNSUPPORTED,
+                EntryIssueCode.UNVERIFIED_SEASON_ZERO_EPISODE_TYPE,
+                "; ".join(known_unsupported),
+            )
+        )
+    if issues:
+        return entry, EntryProblem(
+            index,
+            anidbid,
+            tvdbid,
+            False,
+            tuple(problems + known_unsupported),
+            tuple(issues),
+            tuple(sorted(fenced_tvdb_keys)),
+        )
     return entry, None
 
 
@@ -458,7 +633,7 @@ def _positive_int(raw: str | None, name: str, fatal: list[str]) -> int | None:
     if raw is None:
         fatal.append(f"missing {name}")
         return None
-    if not _INT_RE.match(raw):
+    if _INT_RE.fullmatch(raw) is None:
         fatal.append(f"invalid {name} {raw!r}")
         return None
     value = int(raw)
@@ -474,7 +649,7 @@ def _season_attr(raw: str | None, fatal: list[str]) -> int | str | None:
         return None
     if raw == "a":
         return "a"
-    if not _INT_RE.match(raw):
+    if _INT_RE.fullmatch(raw) is None:
         fatal.append(f"invalid defaulttvdbseason {raw!r}")
         return None
     return int(raw)
@@ -483,14 +658,20 @@ def _season_attr(raw: str | None, fatal: list[str]) -> int | str | None:
 def _offset_attr(raw: str | None, fatal: list[str]) -> int | None:
     if raw is None:
         return None
-    if not _SIGNED_INT_RE.match(raw):
+    if _SIGNED_INT_RE.fullmatch(raw) is None:
         fatal.append(f"invalid episodeoffset {raw!r}")
         return None
     return int(raw)
 
 
 def _parse_entry_rules(
-    element: Element, problems: list[str], fatal: list[str]
+    element: Element,
+    problems: list[str],
+    fatal: list[str],
+    known_unsupported: list[str],
+    fenced_tvdb_keys: set[QueryKey],
+    *,
+    tvdbid: int | None,
 ) -> tuple[MappingRule, ...]:
     rules: list[MappingRule] = []
     for child in element:
@@ -498,36 +679,84 @@ def _parse_entry_rules(
         if tag in _METADATA_CHILDREN:
             continue
         if tag in ("mapping-list", "before"):
-            rules.extend(_parse_rule_container(tag, child, problems, fatal))
+            rules.extend(
+                _parse_rule_container(
+                    tag,
+                    child,
+                    problems,
+                    fatal,
+                    known_unsupported,
+                    fenced_tvdb_keys,
+                    tvdbid=tvdbid,
+                )
+            )
+        elif isinstance(tag, str) and "mapping" in tag.casefold():
+            detail = f"unsupported mapping element <{tag}> inside <anime> (entry excluded)"
+            fatal.append(detail)
         else:
             problems.append(f"unknown element <{tag}> inside <anime> (ignored)")
     return tuple(rules)
 
 
 def _parse_rule_container(
-    origin: str, container: Element, problems: list[str], fatal: list[str]
+    origin: str,
+    container: Element,
+    problems: list[str],
+    fatal: list[str],
+    known_unsupported: list[str],
+    fenced_tvdb_keys: set[QueryKey],
+    *,
+    tvdbid: int | None,
 ) -> Iterable[MappingRule]:
+    if container.attrib:
+        detail = f"unexpected attributes on <{origin}> (entry excluded)"
+        fatal.append(detail)
+    if container.text and container.text.strip():
+        detail = f"unmapped text inside <{origin}> (entry excluded)"
+        fatal.append(detail)
     for mapping in container:
+        if mapping.tail and mapping.tail.strip():
+            detail = f"unmapped text inside <{origin}> (entry excluded)"
+            fatal.append(detail)
         if not isinstance(mapping.tag, str) or mapping.tag != "mapping":
-            problems.append(f"non-<mapping> element inside <{origin}> (ignored)")
+            detail = f"non-<mapping> element inside <{origin}> (entry excluded)"
+            fatal.append(detail)
             continue
-        rule = _parse_mapping_element(origin, mapping, problems, fatal)
+        rule = _parse_mapping_element(
+            origin,
+            mapping,
+            problems,
+            fatal,
+            known_unsupported,
+            fenced_tvdb_keys,
+            tvdbid=tvdbid,
+        )
         if rule is not None:
             yield rule
 
 
 def _parse_mapping_element(
-    origin: str, mapping: Element, problems: list[str], fatal: list[str]
+    origin: str,
+    mapping: Element,
+    problems: list[str],
+    fatal: list[str],
+    known_unsupported: list[str],
+    fenced_tvdb_keys: set[QueryKey],
+    *,
+    tvdbid: int | None,
 ) -> MappingRule | None:
     attributes = dict(mapping.attrib)
     rule_problems: list[str] = []
+    invalid = False
     unknown = sorted(set(attributes) - _MAPPING_ATTRIBUTES)
     for name in unknown:
         rule_problems.append(
-            f"unknown attribute {name!r} on <mapping> (rule excluded, not guessed)"
+            f"unknown attribute {name!r} on <mapping> (entry excluded, not guessed)"
         )
+    invalid = bool(unknown)
     if len(mapping) > 0:
-        rule_problems.append("nested element inside <mapping> (rule excluded)")
+        rule_problems.append("nested element inside <mapping> (entry excluded)")
+        invalid = True
 
     anidbseason = _mapping_int(attributes.get("anidbseason"), "anidbseason", rule_problems)
     tvdbseason = _mapping_int(attributes.get("tvdbseason"), "tvdbseason", rule_problems)
@@ -535,22 +764,50 @@ def _parse_mapping_element(
     end = _optional_mapping_int(attributes.get("end"), "end", rule_problems)
     offset = _mapping_signed_int(attributes.get("offset"), "offset", rule_problems)
 
-    pairs, pair_fatal = _parse_pair_body("".join(mapping.itertext()), rule_problems)
+    if anidbseason is None or tvdbseason is None:
+        invalid = True
+    if ("start" in attributes and start is None) or ("end" in attributes and end is None):
+        invalid = True
+    if "offset" in attributes and offset is None:
+        invalid = True
+
+    pairs, pair_fatal, unsupported_pairs = _parse_pair_body(
+        "".join(mapping.itertext()), rule_problems, anidbseason=anidbseason
+    )
     if pair_fatal:
-        fatal.extend(rule_problems)
-        fatal.append(f"<mapping> in <{origin}> has an invalid pair (entry excluded)")
-        return None
+        invalid = True
+
+    _record_unsupported_pair_fences(
+        unsupported_pairs,
+        known_unsupported,
+        fenced_tvdb_keys,
+        tvdbid=tvdbid,
+        tvdbseason=tvdbseason,
+    )
 
     bounds = _validated_range(anidbseason, start, end, offset, rule_problems)
-    problems.extend(rule_problems)
-    if unknown or anidbseason is None or tvdbseason is None:
-        return None
-    if anidbseason >= UNVERIFIED_ANIDBSEASON:
-        problems.append(
-            f"mapping anidbseason={anidbseason} semantics are UNVERIFIED (whole rule excluded)"
+    if anidbseason is not None and anidbseason >= UNVERIFIED_ANIDBSEASON:
+        rule_problems.append(
+            f"mapping anidbseason={anidbseason} semantics are UNVERIFIED (entry excluded)"
+        )
+        invalid = True
+    if anidbseason is not None and anidbseason < 0:
+        invalid = True
+    if offset is not None and bounds == (None, None, None):
+        invalid = True
+
+    if invalid:
+        fatal.extend(rule_problems)
+        fatal.append(
+            f"<mapping> in <{origin}> has a malformed or unsupported declaration (entry excluded)"
         )
         return None
     start_ok, end_ok, offset_ok = bounds
+    problems.extend(rule_problems)
+    if anidbseason is None or tvdbseason is None:
+        return None
+    if anidbseason >= UNVERIFIED_ANIDBSEASON:
+        return None
     return MappingRule(
         origin=origin,
         anidbseason=anidbseason,
@@ -560,6 +817,27 @@ def _parse_mapping_element(
         offset=offset_ok,
         pairs=pairs,
     )
+
+
+def _record_unsupported_pair_fences(
+    pairs: Sequence[EpisodePair],
+    known_unsupported: list[str],
+    fenced_tvdb_keys: set[QueryKey],
+    *,
+    tvdbid: int | None,
+    tvdbseason: int | None,
+) -> None:
+    for pair in pairs:
+        known_unsupported.append(
+            f"AniDB season 0 episode {pair.anidb_episode} has unverified type; "
+            "only its explicit TVDB positions are fenced"
+        )
+        if tvdbid is not None and tvdbseason is not None:
+            fenced_tvdb_keys.update(
+                (tvdbid, tvdbseason, tvdb_episode)
+                for tvdb_episode in pair.tvdb_episodes
+                if tvdb_episode >= 1
+            )
 
 
 def _validated_range(
@@ -605,7 +883,7 @@ def _mapping_int(raw: str | None, name: str, problems: list[str]) -> int | None:
     if raw is None:
         problems.append(f"mapping missing {name}")
         return None
-    if not _INT_RE.match(raw):
+    if _INT_RE.fullmatch(raw) is None:
         problems.append(f"mapping invalid {name} {raw!r}")
         return None
     return int(raw)
@@ -614,7 +892,7 @@ def _mapping_int(raw: str | None, name: str, problems: list[str]) -> int | None:
 def _optional_mapping_int(raw: str | None, name: str, problems: list[str]) -> int | None:
     if raw is None:
         return None
-    if not _INT_RE.match(raw):
+    if _INT_RE.fullmatch(raw) is None:
         problems.append(f"mapping invalid {name} {raw!r}")
         return None
     return int(raw)
@@ -623,14 +901,17 @@ def _optional_mapping_int(raw: str | None, name: str, problems: list[str]) -> in
 def _mapping_signed_int(raw: str | None, name: str, problems: list[str]) -> int | None:
     if raw is None:
         return None
-    if not _SIGNED_INT_RE.match(raw):
+    if _SIGNED_INT_RE.fullmatch(raw) is None:
         problems.append(f"mapping invalid {name} {raw!r}")
         return None
     return int(raw)
 
 
-def _parse_pair_body(body: str, problems: list[str]) -> tuple[tuple[EpisodePair, ...], bool]:
+def _parse_pair_body(
+    body: str, problems: list[str], *, anidbseason: int | None
+) -> tuple[tuple[EpisodePair, ...], bool, tuple[EpisodePair, ...]]:
     pairs: list[EpisodePair] = []
+    unsupported: list[EpisodePair] = []
     seen: set[EpisodePair] = set()
     tokens = [item.strip() for item in body.split(";") if item.strip()]
     if len(tokens) > MAX_PAIRS_PER_RULE:
@@ -638,34 +919,39 @@ def _parse_pair_body(body: str, problems: list[str]) -> tuple[tuple[EpisodePair,
             f"mapping body has {len(tokens)} pairs, above the cap of {MAX_PAIRS_PER_RULE} "
             "(entry excluded: a partially applied pair set is never trusted)"
         )
-        return (), True
+        return (), True, ()
     for token in tokens:
-        if _LEFT_MULTI_RE.match(token):
+        left_side = token.partition("-")[0]
+        if _LEFT_MULTI_RE.fullmatch(left_side):
             problems.append(f"pair {token!r}: AniDB-side multi-episode invalid (entry rejected)")
-            return tuple(pairs), True
+            return tuple(pairs), True, tuple(unsupported)
         pair = _parse_pair_token(token, problems)
-        if pair is None or pair in seen:
+        if pair is None:
+            return tuple(pairs), True, tuple(unsupported)
+        if pair in seen:
             continue
         seen.add(pair)
+        if anidbseason == SPECIAL_SEASON and UNVERIFIED_MIN <= pair.anidb_episode <= UNVERIFIED_MAX:
+            unsupported.append(pair)
+            continue
         pairs.append(pair)
-    return tuple(pairs), False
+    return tuple(pairs), False, tuple(unsupported)
 
 
 def _parse_pair_token(token: str, problems: list[str]) -> EpisodePair | None:
     match = _PAIR_RE.fullmatch(token)
     if match is None:
-        problems.append(f"invalid pair token {token!r} (ignored)")
+        problems.append(f"invalid pair token {token!r} (entry excluded)")
         return None
     anidb = int(match.group(1))
     parts = [int(item) for item in match.group(2).split("+")]
     if anidb < 1:
-        problems.append(f"pair {token!r}: AniDB episode below 1 (ignored)")
-        return None
-    if UNVERIFIED_MIN <= anidb <= UNVERIFIED_MAX:
-        problems.append(f"pair {token!r}: AniDB {anidb} in 101-103 range (UNVERIFIED, excluded)")
+        problems.append(f"pair {token!r}: AniDB episode below 1 (entry excluded)")
         return None
     if len(parts) > 1 and 0 in parts:
-        problems.append(f"pair {token!r}: TVDB 0 cannot combine with other episodes (ignored)")
+        problems.append(
+            f"pair {token!r}: TVDB 0 cannot combine with other episodes (entry excluded)"
+        )
         return None
     tvdb = () if parts == [0] else tuple(sorted(set(parts)))
     return EpisodePair(anidb, tvdb)
@@ -687,7 +973,8 @@ def build_mapping_index(parsed: ParsedMappings, overrides: Overrides | None = No
     entry_offsets: dict[SeasonKey, list[_OffsetClaim]] = {}
     absolute: dict[int, list[_AbsoluteClaim]] = {}
     no_counterpart: dict[SeasonKey, set[TargetIdentity]] = {}
-    forward: dict[tuple[int, int, int], list[_ForwardTarget]] = {}
+    forward: dict[TargetIdentity, list[_ForwardTarget]] = {}
+    forward_precedence: dict[TargetIdentity, int] = {}
     counters = {
         "rules": 0,
         "pairs": 0,
@@ -706,6 +993,7 @@ def build_mapping_index(parsed: ParsedMappings, overrides: Overrides | None = No
             absolute,
             no_counterpart,
             forward,
+            forward_precedence,
             counters,
         )
     if counters["range_keys"] > MAX_AGGREGATE_RANGE_KEYS:
@@ -724,9 +1012,21 @@ def build_mapping_index(parsed: ParsedMappings, overrides: Overrides | None = No
             {key: frozenset(value) for key, value in no_counterpart.items()}
         ),
         forward=MappingProxyType({key: tuple(value) for key, value in forward.items()}),
+        forward_precedence=MappingProxyType(dict(forward_precedence)),
         override_adds=MappingProxyType({}),
         override_removes=MappingProxyType({}),
         override_conflicts=(),
+        unsafe_tvdb_ids=frozenset(
+            problem.tvdbid
+            for problem in parsed.entry_problems
+            if problem.excluded and problem.tvdbid is not None
+        ),
+        unsafe_tvdb_keys=frozenset(
+            key for problem in parsed.entry_problems for key in problem.fenced_tvdb_keys
+        ),
+        unsafe_all=any(
+            problem.excluded and problem.tvdbid is None for problem in parsed.entry_problems
+        ),
         entries_indexed=len(parsed.entries),
         entries_excluded=parsed.excluded_entries,
         entries_with_problems=len(parsed.entry_problems),
@@ -749,20 +1049,29 @@ def _index_entry(
     entry_offsets: dict[SeasonKey, list[_OffsetClaim]],
     absolute: dict[int, list[_AbsoluteClaim]],
     no_counterpart: dict[SeasonKey, set[TargetIdentity]],
-    forward: dict[tuple[int, int, int], list[_ForwardTarget]],
+    forward: dict[TargetIdentity, list[_ForwardTarget]],
+    forward_precedence: dict[TargetIdentity, int],
     counters: dict[str, int],
 ) -> None:
-    covered: set[int] = set()
-    intervals: list[tuple[int, int]] = []
+    covered: set[tuple[int, EpisodeType]] = set()
+    intervals: list[tuple[int, int, int]] = []
     for rule in entry.rules:
         counters["rules"] += 1
         _index_rule_pairs(
-            entry, rule, explicit, season_zero, no_counterpart, forward, covered, counters
+            entry,
+            rule,
+            explicit,
+            season_zero,
+            no_counterpart,
+            forward,
+            forward_precedence,
+            covered,
+            counters,
         )
         if rule.offset is not None and rule.start is not None and rule.end is not None:
             counters["ranges"] += 1
             counters["range_keys"] += rule.end - rule.start + 1
-            intervals.append((rule.start, rule.end))
+            intervals.append((rule.start, rule.end, rule.anidbseason))
             ranges.setdefault((entry.tvdbid, rule.tvdbseason), []).append(
                 _RangeRule(
                     anidb_id=entry.anidbid,
@@ -778,8 +1087,14 @@ def _index_entry(
             )
             for anidb in range(rule.start, rule.end + 1):
                 tvdb = anidb + rule.offset
-                if tvdb >= 1 and _episode_type(rule.anidbseason, anidb) is not None:
-                    forward.setdefault((entry.anidbid, rule.anidbseason, anidb), []).append(
+                episode_type = _episode_type(rule.anidbseason, anidb)
+                if tvdb >= 1 and episode_type is not None:
+                    _record_forward_precedence(
+                        forward_precedence,
+                        (entry.anidbid, anidb, episode_type),
+                        _PRECEDENCE_RANK[SourceRule.MAPPING_RANGE_OFFSET],
+                    )
+                    forward.setdefault((entry.anidbid, anidb, episode_type), []).append(
                         _ForwardTarget(entry.tvdbid, rule.tvdbseason, (tvdb,))
                     )
 
@@ -808,23 +1123,13 @@ def _index_rule_pairs(
     explicit: dict[QueryKey, list[MappingTarget]],
     season_zero: dict[QueryKey, list[MappingTarget]],
     no_counterpart: dict[SeasonKey, set[TargetIdentity]],
-    forward: dict[tuple[int, int, int], list[_ForwardTarget]],
-    covered: set[int],
+    forward: dict[TargetIdentity, list[_ForwardTarget]],
+    forward_precedence: dict[TargetIdentity, int],
+    covered: set[tuple[int, EpisodeType]],
     counters: dict[str, int],
 ) -> None:
     for pair in rule.pairs:
         counters["pairs"] += 1
-        covered.add(pair.anidb_episode)
-        if not pair.tvdb_episodes:
-            counters["no_counterpart"] += 1
-            no_counterpart.setdefault((entry.tvdbid, rule.tvdbseason), set()).add(
-                (
-                    entry.anidbid,
-                    pair.anidb_episode,
-                    _episode_type(rule.anidbseason, pair.anidb_episode) or EpisodeType.EPISODE,
-                )
-            )
-            continue
         target = _target(
             entry.anidbid,
             pair.anidb_episode,
@@ -835,14 +1140,34 @@ def _index_rule_pairs(
         )
         if target is None:
             continue
+        identity = target.identity
+        covered.add((target.anidb_episode_number, target.episode_type))
+        _record_forward_precedence(
+            forward_precedence,
+            identity,
+            _PRECEDENCE_RANK[SourceRule.EXPLICIT_PAIR],
+        )
+        if not pair.tvdb_episodes:
+            counters["no_counterpart"] += 1
+            no_counterpart.setdefault((entry.tvdbid, rule.tvdbseason), set()).add(identity)
+            continue
+        target = replace(target, composite_claim=counters["rules"])
         for tvdb_episode in pair.tvdb_episodes:
             key = (entry.tvdbid, rule.tvdbseason, tvdb_episode)
             explicit.setdefault(key, []).append(target)
             if rule.tvdbseason == SPECIAL_SEASON and rule.anidbseason == SPECIAL_SEASON:
                 season_zero.setdefault(key, []).append(target)
-        forward.setdefault((entry.anidbid, rule.anidbseason, pair.anidb_episode), []).append(
+        forward.setdefault(identity, []).append(
             _ForwardTarget(entry.tvdbid, rule.tvdbseason, pair.tvdb_episodes)
         )
+
+
+def _record_forward_precedence(
+    precedence: dict[TargetIdentity, int], identity: TargetIdentity, rank: int
+) -> None:
+    previous = precedence.get(identity)
+    if previous is None or rank < previous:
+        precedence[identity] = rank
 
 
 # ------------------------------------------------------------------- querying
@@ -863,6 +1188,24 @@ def _resolve(
     index: MappingIndex, key: QueryKey, absolute: int | None, apply_overrides: bool
 ) -> Resolution:
     tvdb_series, season, episode = key
+    if index.unsafe_all or tvdb_series in index.unsafe_tvdb_ids:
+        scope = "all TVDB series" if index.unsafe_all else f"TVDB {tvdb_series}"
+        return Resolution(
+            status=ResolutionStatus.UNMAPPED,
+            target=None,
+            candidates=(),
+            detail=f"{scope} is fenced because an excluded Anime-Lists entry may own its mapping",
+        )
+    if key in index.unsafe_tvdb_keys:
+        return Resolution(
+            status=ResolutionStatus.UNMAPPED,
+            target=None,
+            candidates=(),
+            detail=(
+                f"TVDB {tvdb_series} S{season}E{episode} is fenced because its explicit "
+                "Anime-Lists source episode has an unverified type"
+            ),
+        )
     if episode == 0:
         declared = index.no_counterpart.get((tvdb_series, season), frozenset())
         listed = ", ".join(
@@ -881,14 +1224,19 @@ def _resolve(
 
     notes: list[str] = []
     candidates = _upstream_candidates(index, key, absolute, notes)
+    kept_candidates = [
+        target
+        for target in candidates
+        if target.precedence_rank
+        <= index.forward_precedence.get(target.identity, target.precedence_rank)
+    ]
+    if len(kept_candidates) < len(candidates):
+        notes.append("lower-precedence reverse position suppressed by forward AniDB mapping")
+    candidates = kept_candidates
     declared = index.no_counterpart.get((tvdb_series, season), frozenset())
     if declared:
-        suppressed = {(anidb, episode) for anidb, episode, _ in declared}
-        candidates = [
-            target
-            for target in candidates
-            if (target.anidb_id, target.anidb_episode_number) not in suppressed
-        ]
+        suppressed = set(declared)
+        candidates = [target for target in candidates if target.identity not in suppressed]
     if apply_overrides:
         candidates.extend(index.override_adds.get(key, ()))
         if key in index.override_removes:
@@ -899,6 +1247,13 @@ def _resolve(
                 candidates = [target for target in candidates if target.anidb_id not in removed]
             notes.append("operator removals applied")
 
+    return _resolve_candidates(key, candidates, notes)
+
+
+def _resolve_candidates(
+    key: QueryKey, candidates: Sequence[MappingTarget], notes: Sequence[str]
+) -> Resolution:
+    tvdb_series, season, episode = key
     if not candidates:
         suffix = f" ({'; '.join(notes)})" if notes else ""
         return Resolution(
@@ -907,7 +1262,6 @@ def _resolve(
             candidates=(),
             detail=f"no mapping resolves TVDB {tvdb_series} S{season}E{episode}{suffix}",
         )
-
     best = min(target.precedence_rank for target in candidates)
     deduped: dict[TargetIdentity, MappingTarget] = {}
     for target in sorted(
@@ -921,7 +1275,6 @@ def _resolve(
     ):
         deduped.setdefault(target.identity, target)
     kept = tuple(deduped.values())
-    identities = {(target.anidb_id, target.anidb_episode_number) for target in kept}
     if len(kept) == 1:
         target = kept[0]
         return Resolution(
@@ -930,7 +1283,16 @@ def _resolve(
             candidates=(target,),
             detail=f"{target.source_rule.value} via {target.origin}",
         )
-    if len(identities) == 1:
+    # Preserve the real Episode/Special contradiction for one AniDB number. Trailer/Other
+    # and Special/Trailer number collisions are type-local and resolve only when one explicit
+    # source declaration authorizes the complete typed composite.
+    same_number_identities = {(target.anidb_id, target.anidb_episode_number) for target in kept}
+    episode_types = {target.episode_type for target in kept}
+    if (
+        len(same_number_identities) == 1
+        and EpisodeType.EPISODE in episode_types
+        and EpisodeType.SPECIAL in episode_types
+    ):
         return Resolution(
             status=ResolutionStatus.CONFLICT,
             target=None,
@@ -941,6 +1303,13 @@ def _resolve(
                 f"{[target.episode_type.value for target in kept]}"
             ),
         )
+    if _is_explicit_composite(candidates, kept, best):
+        return Resolution(
+            status=ResolutionStatus.RESOLVED,
+            target=None,
+            candidates=kept,
+            detail="explicit composite parts via " + "; ".join(t.origin for t in kept),
+        )
     return Resolution(
         status=ResolutionStatus.AMBIGUOUS,
         target=None,
@@ -949,6 +1318,26 @@ def _resolve(
             f"TVDB {tvdb_series} S{season}E{episode} has {len(kept)} unresolvable candidates "
             f"at precedence rank {best}; writes prohibited"
         ),
+    )
+
+
+def _is_explicit_composite(
+    candidates: Sequence[MappingTarget], kept: Sequence[MappingTarget], best: int
+) -> bool:
+    claims: dict[int, set[TargetIdentity]] = {}
+    for candidate in candidates:
+        if candidate.precedence_rank != best:
+            continue
+        if candidate.composite_claim is None:
+            return False
+        claims.setdefault(candidate.composite_claim, set()).add(candidate.identity)
+    # Independent declarations must agree on the ENTIRE typed composite, not merely
+    # overlap. Cross-anime and competing type-local claims remain ambiguous.
+    return (
+        bool(claims)
+        and all(values == {target.identity for target in kept} for values in claims.values())
+        and len({target.anidb_id for target in kept}) == 1
+        and len({target.identity for target in kept}) == len(kept)
     )
 
 
@@ -1041,7 +1430,8 @@ def _absolute_candidates(
 ) -> list[MappingTarget]:
     targets: list[MappingTarget] = []
     for claim in index.absolute.get(tvdb_series, ()):
-        if _covers(claim, absolute):
+        fallback_type = _episode_type(REGULAR_SEASON, absolute)
+        if fallback_type is not None and _covers(claim, absolute, fallback_type):
             notes.append(
                 f"absolute identity for entry {claim.entry_index} suppressed by its mapping-list"
             )
@@ -1058,10 +1448,13 @@ def _absolute_candidates(
     return targets
 
 
-def _covers(claim: _AbsoluteClaim, anidb_episode: int) -> bool:
-    if anidb_episode in claim.covered:
+def _covers(claim: _AbsoluteClaim, anidb_episode: int, episode_type: EpisodeType) -> bool:
+    if (anidb_episode, episode_type) in claim.covered:
         return True
-    return any(start <= anidb_episode <= end for start, end in claim.intervals)
+    return any(
+        start <= anidb_episode <= end and _episode_type(anidbseason, anidb_episode) is episode_type
+        for start, end, anidbseason in claim.intervals
+    )
 
 
 def _target(
@@ -1071,12 +1464,17 @@ def _target(
     source_rule: SourceRule,
     origin: str,
 ) -> MappingTarget | None:
-    episode_type = _episode_type(anidbseason, anidb_episode)
-    if episode_type is None:
+    identity = _episode_identity(
+        anidbseason,
+        anidb_episode,
+        explicit_pair=source_rule is SourceRule.EXPLICIT_PAIR,
+    )
+    if identity is None:
         return None
+    episode_number, episode_type = identity
     return MappingTarget(
         anidb_id=anidb_id,
-        anidb_episode_number=anidb_episode,
+        anidb_episode_number=episode_number,
         episode_type=episode_type,
         source_rule=source_rule,
         precedence_rank=_PRECEDENCE_RANK[source_rule],
@@ -1084,18 +1482,28 @@ def _target(
     )
 
 
-def _episode_type(anidbseason: int, anidb_episode: int) -> EpisodeType | None:
-    if UNVERIFIED_MIN <= anidb_episode <= UNVERIFIED_MAX:
+def _episode_identity(
+    anidbseason: int, anidb_episode: int, *, explicit_pair: bool = False
+) -> tuple[int, EpisodeType] | None:
+    if anidb_episode < 1 or anidbseason not in (SPECIAL_SEASON, REGULAR_SEASON):
         return None
-    if anidb_episode >= OTHER_MIN:
-        return EpisodeType.OTHER
-    if TRAILER_MIN <= anidb_episode <= TRAILER_MAX:
-        return EpisodeType.TRAILER
-    if anidbseason == 1:
-        return EpisodeType.EPISODE
-    if anidbseason == 0:
-        return EpisodeType.SPECIAL
-    return None
+    if explicit_pair and anidb_episode >= OTHER_MIN:
+        return anidb_episode - OTHER_MIN + 1, EpisodeType.OTHER
+    if explicit_pair and TRAILER_MIN <= anidb_episode <= TRAILER_MAX:
+        return anidb_episode - TRAILER_MIN + 1, EpisodeType.TRAILER
+    if anidbseason == SPECIAL_SEASON:
+        if explicit_pair and UNVERIFIED_MIN <= anidb_episode <= UNVERIFIED_MAX:
+            return None
+        return anidb_episode, EpisodeType.SPECIAL
+    return anidb_episode, EpisodeType.EPISODE
+
+
+def _episode_type(
+    anidbseason: int, anidb_episode: int, *, explicit_pair: bool = False
+) -> EpisodeType | None:
+    """Return the Shoko type while keeping the documented T/O encoding source-aware."""
+    identity = _episode_identity(anidbseason, anidb_episode, explicit_pair=explicit_pair)
+    return None if identity is None else identity[1]
 
 
 # ------------------------------------------------------------------- overrides
@@ -1300,9 +1708,13 @@ def _apply_overrides(index: MappingIndex, overrides: Overrides) -> MappingIndex:
         absolute=index.absolute,
         no_counterpart=index.no_counterpart,
         forward=index.forward,
+        forward_precedence=index.forward_precedence,
         override_adds=MappingProxyType({key: tuple(value) for key, value in adds.items()}),
         override_removes=MappingProxyType(dict(removes)),
         override_conflicts=tuple(conflicts),
+        unsafe_tvdb_ids=index.unsafe_tvdb_ids,
+        unsafe_tvdb_keys=index.unsafe_tvdb_keys,
+        unsafe_all=index.unsafe_all,
         entries_indexed=index.entries_indexed,
         entries_excluded=index.entries_excluded,
         entries_with_problems=index.entries_with_problems,
@@ -1359,13 +1771,55 @@ def effective_targets(index: MappingIndex) -> Mapping[int, frozenset[TargetIdent
 
 
 def targets_digest(index: MappingIndex) -> str:
-    """SHA-256 of the canonical effective target set; formatting-only changes never move it."""
+    """SHA-256 of canonical source→target semantics (including composite parts)."""
     lines: list[str] = []
-    for series, identities in sorted(effective_targets(index).items()):
-        for anidb_id, episode, episode_type in sorted(
+    for key in sorted(_enumerable_keys(index)):
+        for target in resolve(index, *key).targets:
+            lines.append(
+                f"{key[0]}|{key[1]}|{key[2]}|{target.anidb_id}|"
+                f"{target.anidb_episode_number}|{target.episode_type.value}"
+            )
+    lines.extend(f"X|{tvdb_series}" for tvdb_series in sorted(index.unsafe_tvdb_ids))
+    lines.extend(
+        f"F|{tvdb_series}|{season}|{episode}"
+        for tvdb_series, season, episode in sorted(index.unsafe_tvdb_keys)
+    )
+    if index.unsafe_all:
+        lines.append("X|ALL")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def effective_source_targets(index: MappingIndex) -> Mapping[int, frozenset[str]]:
+    """Enumerable source→target semantics per series, retaining source positions."""
+    result: dict[int, set[str]] = {}
+    for key in sorted(_enumerable_keys(index)):
+        for target in resolve(index, *key).targets:
+            result.setdefault(key[0], set()).add(
+                f"{key[1]}|{key[2]}|{target.anidb_id}|"
+                f"{target.anidb_episode_number}|{target.episode_type.value}"
+            )
+    return MappingProxyType({series: frozenset(lines) for series, lines in result.items()})
+
+
+def legacy_targets_digest(index: MappingIndex) -> str:
+    """Validate existing cache metadata written before source-aware digests.
+
+    The old algorithm excluded composites and discarded source positions. It is
+    accepted only as cache provenance alongside the full content/structure checks;
+    drift decisions use source-aware semantics and immutable file destinations.
+    """
+    per_series: dict[int, set[TargetIdentity]] = {}
+    for key in _enumerable_keys(index):
+        answer = resolve(index, *key)
+        if len(answer.targets) == 1:
+            per_series.setdefault(key[0], set()).add(answer.targets[0].identity)
+    lines = [
+        f"{series}|{anime}|{episode}|{episode_type.value}"
+        for series, identities in sorted(per_series.items())
+        for anime, episode, episode_type in sorted(
             identities, key=lambda item: (item[0], item[1], item[2].value)
-        ):
-            lines.append(f"{series}|{anidb_id}|{episode}|{episode_type.value}")
+        )
+    ]
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
@@ -1419,8 +1873,16 @@ def _structure_identity_lines(index: MappingIndex) -> list[str]:
             lines.append(f"O|{tvdb_series}|{season}|{offset_claim.anidb_id}|{offset_claim.offset}")
     for tvdb_series, absolute_claims in index.absolute.items():
         for absolute_claim in absolute_claims:
-            covered = ",".join(str(item) for item in sorted(absolute_claim.covered))
-            spans = ",".join(f"{start}-{end}" for start, end in sorted(absolute_claim.intervals))
+            covered = ",".join(
+                f"{episode}:{episode_type.value}"
+                for episode, episode_type in sorted(
+                    absolute_claim.covered, key=lambda item: (item[0], item[1].value)
+                )
+            )
+            spans = ",".join(
+                f"{start}-{end}@{anidbseason}"
+                for start, end, anidbseason in sorted(absolute_claim.intervals)
+            )
             lines.append(f"A|{tvdb_series}|{absolute_claim.anidb_id}|{covered}|{spans}")
     return lines
 
@@ -1431,6 +1893,13 @@ def _structure_declaration_lines(index: MappingIndex) -> list[str]:
         ordered = sorted(declared, key=lambda item: (item[0], item[1], item[2].value))
         for anidb_id, episode, episode_type in ordered:
             lines.append(f"N|{tvdb_series}|{season}|{anidb_id}|{episode}|{episode_type.value}")
+    lines.extend(f"X|{tvdb_series}" for tvdb_series in sorted(index.unsafe_tvdb_ids))
+    lines.extend(
+        f"F|{tvdb_series}|{season}|{episode}"
+        for tvdb_series, season, episode in sorted(index.unsafe_tvdb_keys)
+    )
+    if index.unsafe_all:
+        lines.append("X|ALL")
     return lines
 
 

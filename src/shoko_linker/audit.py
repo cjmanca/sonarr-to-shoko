@@ -33,7 +33,7 @@ import httpx
 from .config import Settings
 from .errors import HttpPolicyError, PathError
 from .http import ApiEndpoint, resolve_and_send
-from .linking import ShokoFileXRefs, parse_file_xrefs
+from .linking import EpisodeResolutionStatus, ShokoFileXRefs, _match_anidb_episode, parse_file_xrefs
 from .mapping_store import ActiveMappings
 from .mappings import ResolutionStatus
 from .mappings import resolve as resolve_mapping
@@ -90,7 +90,7 @@ class AuditFinding:
 
 @dataclass(frozen=True)
 class AuditReport:
-    """The bounded audit outcome: findings, request accounting, completeness."""
+    """The bounded audit outcome, with linked_examined counting filter-eligible files."""
 
     findings: tuple[AuditFinding, ...]
     examined: int
@@ -156,7 +156,13 @@ class _AuditContext:
     sonarr_index: dict[str, list[SonarrFile]]
     series_tvdb: Mapping[int, int]
     budget: _Budget
-    cache: dict[tuple[int, str, int], tuple[int, int] | None]
+    cache: dict[tuple[int, str, int], _EpisodeIdLookup]
+
+
+@dataclass(frozen=True)
+class _EpisodeIdLookup:
+    identity: tuple[int, int] | None
+    reason: str | None = None
 
 
 def run_audit(
@@ -177,8 +183,10 @@ def run_audit(
     (and, when ``series_anidb`` is given, only files whose XRefs name that AniDB series),
     translate each file's locations through the configured path mappings (M3 ownership,
     all locations), match the Sonarr inventory by exact path+size, resolve the
-    verified mapping targets, and classify the observed link set. At most ``limit``
-    linked files are examined and at most ``max_requests`` Shoko GETs are issued.
+    verified mapping targets, and classify the observed link set. At most ``limit`` linked
+    files matching the optional AniDB series filter are examined; ``linked_examined`` counts
+    only those eligible files. File enumeration remains paged and bounded by
+    ``max_requests``, which also caps Shoko GETs for target resolution.
     """
     budget = _Budget(max_requests)
     failures: list[str] = []
@@ -209,14 +217,14 @@ def run_audit(
             continue
         if parsed.file_id <= 0 or not parsed.xrefs:
             continue  # unlinked files are the normal linking path, not an audit finding
-        if linked_examined >= limit:
-            truncated = True
-            break
-        linked_examined += 1
         if series_anidb is not None and not any(
             xref.series_anidb_id == series_anidb for xref in parsed.xrefs
         ):
             continue
+        if linked_examined >= limit:
+            truncated = True
+            break
+        linked_examined += 1
         findings.append(_audit_entry(context, entry, parsed))
     findings.sort(key=lambda item: (item.shoko_file_id, item.classification.value))
     counts: dict[str, int] = {item.value: 0 for item in AuditClass}
@@ -241,7 +249,7 @@ def _index_sonarr(sonarr_files: Sequence[SonarrFile]) -> dict[str, list[SonarrFi
     return index
 
 
-def _fetch_file_rows(
+def _fetch_file_rows(  # noqa: PLR0912, PLR0915 - each pagination guard fails closed
     shoko: ApiEndpoint, budget: _Budget, *, enabled: bool
 ) -> tuple[list[dict[str, Any]], list[str], bool]:
     """Paged ``GET File`` enumeration within the budget: ``(rows, failures, truncated)``."""
@@ -251,6 +259,7 @@ def _fetch_file_rows(
     if not enabled:
         return rows, failures, truncated
     total: int | None = None
+    seen_ids: set[int] = set()
     page = 1
     while True:
         if budget.exhausted:
@@ -264,13 +273,69 @@ def _fetch_file_rows(
             {"include": AUDIT_INCLUDE_FLAGS, "pageSize": PAGE_SIZE, "page": page},
         )
         if outcome is None:
-            failures.append(f"listing_page_{page}_failed")
+            truncated = True
+            failures.append(f"listing_page_{page}_failed_or_malformed")
             break
         page_total, entries = outcome
         if total is None:
             total = page_total
+        elif page_total != total:
+            truncated = True
+            failures.append(
+                f"listing_total_changed_page_{page}: total changed from {total} to {page_total}"
+            )
+            break
+        if len(entries) > PAGE_SIZE:
+            truncated = True
+            failures.append(
+                f"listing_page_overshoot_{page}: {len(entries)} rows exceeds pageSize {PAGE_SIZE}"
+            )
+            break
+        page_ids: list[int] = []
+        malformed_id = False
+        duplicate_id: int | None = None
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                malformed_id = True
+                break
+            file_id = entry.get("ID")
+            if isinstance(file_id, bool) or not isinstance(file_id, int) or file_id <= 0:
+                malformed_id = True
+                break
+            if file_id in seen_ids or file_id in page_ids:
+                duplicate_id = file_id
+                break
+            page_ids.append(file_id)
+        if malformed_id:
+            truncated = True
+            failures.append(f"listing_malformed_file_id_page_{page}")
+            break
+        if duplicate_id is not None:
+            truncated = True
+            failures.append(f"listing_duplicate_file_id_{duplicate_id}_page_{page}")
+            break
+        if len(rows) + len(entries) > total:
+            truncated = True
+            failures.append(
+                f"listing_page_overshoot_{page}: collected {len(rows) + len(entries)} rows "
+                f"exceeds reported Total {total}"
+            )
+            break
+        if not entries and len(rows) < total:
+            truncated = True
+            failures.append(
+                f"listing_premature_empty_page_{page}: collected {len(rows)} of {total} rows"
+            )
+            break
+        if len(rows) + len(entries) < total and len(entries) < PAGE_SIZE:
+            truncated = True
+            failures.append(
+                f"listing_short_page_{page}: collected {len(rows) + len(entries)} of {total} rows"
+            )
+            break
+        seen_ids.update(page_ids)
         rows.extend(entries)
-        if not entries or len(rows) >= total:
+        if len(rows) == total:
             break
         page += 1
     return rows, failures, truncated
@@ -323,7 +388,7 @@ def _audit_entry(
     if blocked is not None:
         classification = (
             AuditClass.AUDIT_INCOMPLETE
-            if blocked == "budget_exhausted"
+            if blocked == "budget_exhausted" or blocked.startswith("target_episode_listing_")
             else AuditClass.AMBIGUOUS_MATCH
         )
         return AuditFinding(
@@ -368,15 +433,21 @@ def _target_identities(
             episode.episode_number,
             episode.absolute_episode_number,
         )
-        if answer.status is not ResolutionStatus.RESOLVED or answer.target is None:
+        if answer.status is not ResolutionStatus.RESOLVED or not answer.targets:
             return target_ids, first_episode, f"target_{answer.status.value}"
-        target = answer.target
         if episode.season_number == SEASON_ONE and episode.episode_number == EPISODE_ONE:
             first_episode = True
-        resolved = _resolve_anidb_episode_id(context.shoko, target, context.budget, context.cache)
-        if resolved is None:
-            return target_ids, first_episode, "budget_exhausted"
-        target_ids.add(resolved)
+        for target in answer.targets:
+            resolved = _resolve_anidb_episode_id(
+                context.shoko, target, context.budget, context.cache
+            )
+            if resolved.identity is None:
+                return (
+                    target_ids,
+                    first_episode,
+                    resolved.reason or "target_episode_listing_malformed",
+                )
+            target_ids.add(resolved.identity)
     return target_ids, first_episode, None
 
 
@@ -402,37 +473,36 @@ def _resolve_anidb_episode_id(
     shoko: ApiEndpoint,
     target: Any,
     budget: _Budget,
-    cache: dict[tuple[int, str, int], tuple[int, int] | None],
-) -> tuple[int, int] | None:
-    """``(anime id, type, number) -> (anime id, AniDB episode id)`` with one GET per key."""
+    cache: dict[tuple[int, str, int], _EpisodeIdLookup],
+) -> _EpisodeIdLookup:
+    """Resolve one identity with the linker's strict AniDB listing validation rules."""
     key = (target.anidb_id, target.episode_type.value, target.anidb_episode_number)
     if key in cache:
         return cache[key]
     if not budget.spend():
-        return None
+        return _EpisodeIdLookup(None, "budget_exhausted")
     outcome = _get(
         shoko, f"api/v3/Series/AniDB/{target.anidb_id}/Episode", {"type": target.episode_type.value}
     )
-    resolved: tuple[int, int] | None = None
+    result = _EpisodeIdLookup(None, "target_episode_listing_unavailable")
     if outcome is not None:
-        _total, entries = outcome
-        for raw in entries:
-            if not isinstance(raw, dict):
-                continue
-            row = raw
-            if row.get("AnimeID") != target.anidb_id:
-                continue
-            if (
-                row.get("EpisodeNumber") != target.anidb_episode_number
-                or row.get("Type") != target.episode_type.value
-            ):
-                continue
-            value = row.get("ID")
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                resolved = (target.anidb_id, value)
-                break
-    cache[key] = resolved
-    return resolved
+        total, entries = outcome
+        found = _match_anidb_episode(
+            {"Total": total, "List": entries},
+            target.anidb_id,
+            target.episode_type.value,
+            target.anidb_episode_number,
+        )
+        if isinstance(found, int) and not isinstance(found, bool):
+            result = _EpisodeIdLookup((target.anidb_id, found))
+        elif found is EpisodeResolutionStatus.EPISODE_NOT_FOUND:
+            result = _EpisodeIdLookup(None, "target_episode_not_found")
+        elif found is EpisodeResolutionStatus.LIST_TRUNCATED:
+            result = _EpisodeIdLookup(None, "target_episode_listing_truncated")
+        else:
+            result = _EpisodeIdLookup(None, "target_episode_listing_malformed")
+    cache[key] = result
+    return result
 
 
 def _fetch_import_folders(

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode
 
 import e2e_harness as eh
@@ -24,6 +26,7 @@ from shoko_linker.bootstrap import (
 )
 from shoko_linker.dashboard import DashboardApplication, DashboardResponse
 from shoko_linker.http import ApiEndpoint
+from shoko_linker.onboarding import OnboardingManager
 from shoko_linker.paths import PathMapping
 from shoko_linker.service_setup import ServiceSetupController
 from shoko_linker.state import FileState, open_state
@@ -34,13 +37,17 @@ DASHBOARD_HOST = "linker.test"
 
 
 class ServiceSonarrStub(eh.SonarrStub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.version = "4.0.0"
+
     def _series_payload(self) -> list[dict[str, Any]]:
         return [{**item, "seriesType": "anime"} for item in super()._series_payload()]
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v3/system/status":
             self.requests.append((request.url.path, -1))
-            return httpx.Response(200, json={"version": "4.0.0"}, request=request)
+            return httpx.Response(200, json={"version": self.version}, request=request)
         return super().handler(request)
 
 
@@ -78,6 +85,34 @@ def _csrf(body: bytes) -> str:
     match = re.search(rb'name="csrf_token" value="([^"]+)"', body)
     assert match is not None
     return match.group(1).decode("ascii")
+
+
+def _setup_digest(body: bytes) -> str:
+    match = re.search(rb'name="setup_digest" value="([0-9a-f]{64})"', body)
+    assert match is not None
+    return match.group(1).decode("ascii")
+
+
+def _confirmation_form(body: bytes) -> dict[str, str]:
+    match = re.search(rb'<form method="post" action="/setup/confirm">(.*?)</form>', body, re.DOTALL)
+    assert match is not None
+    form = match.group(1)
+    csrf = re.search(rb'name="csrf_token" value="([^"]+)"', form)
+    digest = re.search(rb'name="setup_digest" value="([0-9a-f]{64})"', form)
+    consent = re.search(rb'name="automatic_link_consent" value="([^"]+)"', form)
+    assert csrf is not None
+    assert digest is not None
+    assert consent is not None
+    assert consent.group(1) == b"1"
+    return {
+        "csrf_token": csrf.group(1).decode("ascii"),
+        "setup_digest": digest.group(1).decode("ascii"),
+        "automatic_link_consent": consent.group(1).decode("ascii"),
+        **{
+            name.decode("ascii"): value.decode("ascii")
+            for name, value in re.findall(rb'name="(confirm_\d+)" value="([0-9a-f]{64})"', form)
+        },
+    }
 
 
 def _response_header(response: DashboardResponse, name: str) -> str:
@@ -160,6 +195,160 @@ def _service_world(tmp_path: Path) -> eh.World:
     return world
 
 
+def _confirm_setup(controller: ServiceSetupController) -> None:
+    initial = controller.refresh_view()
+    assert initial is not None
+    assert initial.snapshot_digest
+    assert SONARR_ROOT in initial.root_options
+    root_index = initial.root_options.index(SONARR_ROOT)
+    assert (
+        "selected"
+        in controller.action(
+            "scope",
+            {"setup_digest": initial.snapshot_digest, f"root_{root_index}": SONARR_ROOT},
+        ).lower()
+    )
+    selected = controller.refresh_view()
+    assert selected is not None
+    assert selected.confirmation_enabled
+    form = {
+        "setup_digest": selected.snapshot_digest,
+        "automatic_link_consent": "1",
+        **{
+            f"confirm_{index}": hashlib.sha256(fact.encode("utf-8")).hexdigest()
+            for index, fact in enumerate(selected.required_confirmations)
+        },
+    }
+    assert "saved" in controller.action("confirm", form).lower()
+
+
+def test_real_setup_controller_latches_supported_version_drift_until_fresh_confirmation(
+    tmp_path: Path,
+) -> None:
+    """Fresh current facts invalidate saved consent even when the cycle digest is stale."""
+    environ = {
+        SONARR_URL_ENV: "http://sonarr:8989",
+        SONARR_API_KEY_ENV: "service-e2e-sonarr-key-never-real",
+        SHOKO_URL_ENV: "http://shoko:8111",
+        SHOKO_API_KEY_ENV: "service-e2e-shoko-key-never-real",
+    }
+    bootstrap = replace(
+        load_bootstrap_settings(environ=environ), database_path=tmp_path / "state.sqlite3"
+    )
+    world = _service_world(tmp_path)
+    sonarr = _endpoint(world.sonarr.handler, eh.SONARR_BASE)
+    shoko = _endpoint(world.shoko.handler, eh.SHOKO_BASE)
+    runtime = cli._NormalServiceRuntime(bootstrap, sonarr, shoko, cli.StopState())
+    controller = runtime.setup
+    service_sonarr = cast(ServiceSonarrStub, world.sonarr)
+    try:
+        _confirm_setup(controller)
+        with open_state(bootstrap.database_path) as store:
+            manager = OnboardingManager(store)
+            saved = manager.record()
+            assert saved is not None
+            expected_cycle_digest = saved.binding_digest
+            assert runtime._service_authorized(store, manager, expected_cycle_digest)
+
+            service_sonarr.version = "4.0.1"  # Supported, but not covered by the saved consent.
+            current = controller.current_context(store)
+            assert current is not None
+            assert current[0].sonarr_version == "4.0.1"
+            assert not runtime._service_authorized(store, manager, expected_cycle_digest)
+            assert store.get_service_pause() == (True, "setup_changed")
+            assert manager.reconfirmation_required()
+
+        # Restart after the changed observation and restore the old version. The hard
+        # reconfirmation requirement is persisted independently of the current version.
+        service_sonarr.version = "4.0.0"
+        with open_state(bootstrap.database_path) as reopened:
+            manager = OnboardingManager(reopened)
+            assert not runtime._service_authorized(reopened, manager, expected_cycle_digest)
+            assert reopened.get_service_pause() == (True, "setup_changed")
+            assert manager.reconfirmation_required()
+
+        _confirm_setup(controller)
+        with open_state(bootstrap.database_path) as store:
+            manager = OnboardingManager(store)
+            refreshed = manager.record()
+            assert refreshed is not None
+            assert refreshed.binding_digest == expected_cycle_digest
+            assert not manager.reconfirmation_required()
+            assert store.get_service_pause() == (False, "")
+            assert runtime._service_authorized(store, manager, expected_cycle_digest)
+        assert world.shoko.posts_count() == 0
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+def test_unavailable_scope_check_blocks_posts_and_cannot_clear_reconfirmation(  # noqa: PLR0915 - outage and hard-hold recovery
+    tmp_path: Path,
+) -> None:
+    environ = {
+        SONARR_URL_ENV: "http://sonarr:8989",
+        SONARR_API_KEY_ENV: "service-e2e-sonarr-key-never-real",
+        SHOKO_URL_ENV: "http://shoko:8111",
+        SHOKO_API_KEY_ENV: "service-e2e-shoko-key-never-real",
+    }
+    bootstrap = replace(
+        load_bootstrap_settings(environ=environ), database_path=tmp_path / "state.sqlite3"
+    )
+    world = _service_world(tmp_path)
+    sonarr = _endpoint(world.sonarr.handler, eh.SONARR_BASE)
+    shoko = _endpoint(world.shoko.handler, eh.SHOKO_BASE)
+    runtime = cli._NormalServiceRuntime(bootstrap, sonarr, shoko, cli.StopState())
+    service_sonarr = cast(ServiceSonarrStub, world.sonarr)
+    try:
+        _confirm_setup(runtime.setup)
+        with open_state(bootstrap.database_path) as store:
+            record = OnboardingManager(store).record()
+            assert record is not None
+            expected_digest = record.binding_digest
+
+        service_sonarr.down = True
+        runtime.worker_tick()
+        with open_state(bootstrap.database_path) as store:
+            manager = OnboardingManager(store)
+            assert store.get_service_pause() == (True, "setup_unavailable")
+            assert not manager.reconfirmation_required()
+        assert world.shoko.posts_count() == 0
+
+        service_sonarr.down = False
+        with open_state(bootstrap.database_path) as store:
+            current = runtime.setup.current_context(store)
+            assert current is not None
+            decision = OnboardingManager(store).resume(*current, iso="2026-10-16T00:00:00Z")
+            assert decision.status.value == "authorized"
+            assert store.get_service_pause() == (False, "")
+
+        service_sonarr.version = "4.0.1"
+        with open_state(bootstrap.database_path) as store:
+            manager = OnboardingManager(store)
+            assert not runtime._service_authorized(store, manager, expected_digest)
+            assert store.get_service_pause() == (True, "setup_changed")
+            assert manager.reconfirmation_required()
+
+        service_sonarr.down = True
+        runtime.worker_tick()
+        with open_state(bootstrap.database_path) as store:
+            manager = OnboardingManager(store)
+            assert store.get_service_pause() == (True, "setup_changed")
+            assert manager.reconfirmation_required()
+
+        service_sonarr.down = False
+        service_sonarr.version = "4.0.0"
+        with open_state(bootstrap.database_path) as store:
+            manager = OnboardingManager(store)
+            assert not runtime._service_authorized(store, manager, expected_digest)
+            assert store.get_service_pause() == (True, "setup_changed")
+            assert manager.reconfirmation_required()
+        assert world.shoko.posts_count() == 0
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
 def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_restart(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -203,6 +392,29 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
     dashboard_setup = ServiceSetupController(
         bootstrap, dashboard_sonarr, dashboard_shoko, bootstrap.database_path
     )
+    background_refresh_started = threading.Event()
+    background_refresh_finished = threading.Event()
+    selected_inventory_started = threading.Event()
+    release_selected_inventory = threading.Event()
+    background_refresh_pending = False
+    original_inventory = dashboard_setup._inventory
+    original_background_refresh = dashboard_setup._refresh_in_background
+
+    def held_selected_inventory(roots: tuple[str, ...]) -> Any:
+        if roots == (SONARR_ROOT,):
+            selected_inventory_started.set()
+            assert release_selected_inventory.wait(timeout=10)
+        return original_inventory(roots)
+
+    def tracked_background_refresh() -> None:
+        background_refresh_started.set()
+        try:
+            original_background_refresh()
+        finally:
+            background_refresh_finished.set()
+
+    monkeypatch.setattr(dashboard_setup, "_inventory", held_selected_inventory)
+    monkeypatch.setattr(dashboard_setup, "_refresh_in_background", tracked_background_refresh)
 
     def dashboard_onboarding_context() -> tuple[Any, Any] | None:
         if not bootstrap.database_path.exists():
@@ -232,32 +444,58 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         assert setup.status == 303
         cookie = _response_header(setup, "Set-Cookie").split(";", 1)[0]
 
+        background_refresh_pending = True
         scope_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
         assert scope_page.status == 200
+        assert b"Checking current Sonarr and Shoko setup" in scope_page.body
+        discovery_deadline = time.monotonic() + 10.0
+        while SONARR_ROOT.encode() not in scope_page.body and time.monotonic() < discovery_deadline:
+            time.sleep(0.01)
+            scope_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
         assert SONARR_ROOT.encode() in scope_page.body
+        assert background_refresh_started.wait(timeout=5)
+        assert background_refresh_finished.wait(timeout=5)
+        background_refresh_pending = False
+
+        background_refresh_started.clear()
+        background_refresh_finished.clear()
+        selected_inventory_started.clear()
+        release_selected_inventory.clear()
+        background_refresh_pending = True
         scope_result = _dashboard_request(
             application,
             "POST",
             "/setup/scope",
             cookie=cookie,
-            form={"csrf_token": _csrf(scope_page.body), "root_0": SONARR_ROOT},
+            form={
+                "csrf_token": _csrf(scope_page.body),
+                "setup_digest": _setup_digest(scope_page.body),
+                "root_0": SONARR_ROOT,
+            },
         )
         assert scope_result.status == 200
         cookie = _response_header(scope_result, "Set-Cookie").split(";", 1)[0]
+        assert b"Checking current Sonarr and Shoko setup" in scope_result.body
+        assert b'action="/setup/confirm"' not in scope_result.body
+        assert background_refresh_started.wait(timeout=5)
+        assert selected_inventory_started.wait(timeout=5)
 
+        loading_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
+        assert loading_page.status == 200
+        assert b"Checking current Sonarr and Shoko setup" in loading_page.body
+        assert b'action="/setup/confirm"' not in loading_page.body
+
+        release_selected_inventory.set()
+        assert background_refresh_finished.wait(timeout=10)
+        background_refresh_pending = False
         confirm_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
         assert confirm_page.status == 200
-        setup_view = dashboard_setup.view()
-        assert setup_view is not None
-        assert setup_view.confirmation_enabled
-        confirm_form = {
-            "csrf_token": _csrf(confirm_page.body),
-            "automatic_link_consent": "1",
-            **{
-                f"confirm_{index}": hashlib.sha256(fact.encode("utf-8")).hexdigest()
-                for index, fact in enumerate(setup_view.required_confirmations)
-            },
-        }
+        assert b'action="/setup/confirm"' in confirm_page.body
+        confirm_form = _confirmation_form(confirm_page.body)
+
+        background_refresh_started.clear()
+        background_refresh_finished.clear()
+        background_refresh_pending = True
         confirmation = _dashboard_request(
             application,
             "POST",
@@ -266,6 +504,9 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
             form=confirm_form,
         )
         assert confirmation.status == 200
+        assert background_refresh_started.wait(timeout=5)
+        assert background_refresh_finished.wait(timeout=10)
+        background_refresh_pending = False
         with open_state(bootstrap.database_path) as store:
             saved = dashboard_setup.onboarding(store).record()
             assert saved is not None
@@ -308,6 +549,9 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         restarted_sonarr.client.close()
         restarted_shoko.client.close()
     finally:
+        release_selected_inventory.set()
+        if background_refresh_pending and background_refresh_started.wait(timeout=5):
+            background_refresh_finished.wait(timeout=10)
         dashboard_sonarr.client.close()
         dashboard_shoko.client.close()
         sonarr.client.close()

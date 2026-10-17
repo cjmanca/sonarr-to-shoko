@@ -34,7 +34,7 @@ from shoko_linker.attestation import (
     write_attestation,
 )
 from shoko_linker.cli import EXIT_APPLY_GATE_REFUSAL, EXIT_CONFIG_INVALID, EXIT_OK, main
-from shoko_linker.config import Settings, load_settings
+from shoko_linker.config import Settings, load_settings, normalize_service_url
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.mapping_store import MappingStore
 from shoko_linker.mapping_store import refresh as mapping_refresh
@@ -105,6 +105,51 @@ def test_valid_lease_roundtrip(tmp_path: Path) -> None:
     assert verdict.valid_for_apply is True
     assert verdict.digest == digest
     assert verdict.expires_in_seconds == SECONDS_24H
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "equivalent_endpoint", "canonical"),
+    [
+        ("http://127.0.0.1:8111/", "HTTP://127.0.0.1:8111", "http://127.0.0.1:8111"),
+        (
+            "HTTPS://SHOKO.EXAMPLE:8443/shoko/",
+            "https://shoko.example:8443/shoko",
+            "https://shoko.example:8443/shoko",
+        ),
+        (
+            "http://SHOKO.EXAMPLE:80/",
+            "http://shoko.example:80",
+            "http://shoko.example:80",
+        ),
+        ("http://[::1]:8111/", "http://[::1]:8111", "http://[::1]:8111"),
+        ("http://[::1]/", "http://[::1]", "http://[::1]"),
+        (
+            "http://[fe80::1%25Eth0]:8111/",
+            "http://[fe80::1%25Eth0]:8111",
+            "http://[fe80::1%25Eth0]:8111",
+        ),
+    ],
+)
+def test_attestation_url_canonicalization_roundtrips_ipv4_dns_and_ipv6(
+    tmp_path: Path, endpoint: str, equivalent_endpoint: str, canonical: str
+) -> None:
+    record = _record(endpoint=endpoint)
+    assert normalize_service_url(endpoint) == canonical
+    path, digest, _warning = write_attestation(tmp_path / "lease.yaml", record)
+    parsed = parse_attestation_document(path.read_text(encoding="utf-8"))
+
+    assert parsed == record
+    assert parsed.endpoint == canonical
+    assert record_digest(parsed) == digest
+    verdict = load_attestation(
+        path,
+        shoko_url=equivalent_endpoint,
+        now_iso=T0,
+        scope="daemon",
+        warn_lead_seconds=WARM,
+    )
+    assert verdict.status == "valid"
+    assert verdict.digest == digest
 
 
 def test_absent_and_missing_file(tmp_path: Path) -> None:
@@ -404,6 +449,7 @@ def _sonarr_handler() -> Any:
                         "id": 1,
                         "title": "S1",
                         "rootFolderPath": f"{SONARR_ROOT}/series1",
+                        "seriesType": "anime",
                         "tvdbId": 267440,
                     }
                 ],

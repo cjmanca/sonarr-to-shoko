@@ -152,8 +152,20 @@ def service_budget_limits(configured: BudgetLimits) -> BudgetLimits:
             configured.max_pending_episode_jobs, MAX_SERVICE_PENDING_EPISODE_JOBS
         ),
         per_cycle_new=min(configured.per_cycle_new, MAX_SERVICE_CYCLE_SUBMISSIONS),
-        rolling_new=min(configured.rolling_new, MAX_SERVICE_ROLLING_SUBMISSIONS),
-        rolling_window_hours=min(configured.rolling_window_hours, MAX_SERVICE_ROLLING_WINDOW_HOURS),
+        # Keep the configured rolling ceiling as-is. The immutable service week is
+        # enforced independently below, so clamping this window would silently
+        # shorten a stricter operator-configured window longer than seven days.
+        rolling_new=configured.rolling_new,
+        rolling_window_hours=configured.rolling_window_hours,
+        # A configured short window is additive, never a replacement for the hard week.
+        additional_rolling_limits=tuple(
+            dict.fromkeys(
+                (
+                    *configured.additional_rolling_limits,
+                    (MAX_SERVICE_ROLLING_SUBMISSIONS, MAX_SERVICE_ROLLING_WINDOW_HOURS),
+                )
+            )
+        ),
     )
 
 

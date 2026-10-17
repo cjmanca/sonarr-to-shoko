@@ -11,7 +11,9 @@ All I/O goes through :func:`shoko_linker.http.resolve_and_send` with relative AP
 paths, so urlBase preservation, the manual same-origin redirect walk, the no-retry
 policy and origin binding stay enforced. Decision logic (selection, parsing,
 indexing, root validation, baselining, comparison) is pure and I/O-free;
-:func:`collect_sonarr_inventory` is the only function that talks to Sonarr.
+:func:`collect_sonarr_inventory` reads the inventory and
+:func:`check_current_file_relationship` revalidates one chosen source file immediately
+before an apply write.
 
 An inventory is ``complete`` only when the series enumeration and every eligible
 series' episode/file responses succeeded and were internally consistent.
@@ -28,7 +30,10 @@ id and size, new path) and title-only changes are reported as drift/churn.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import hashlib
+import json
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final, cast
@@ -46,6 +51,7 @@ EPISODE_FILE_PATH: Final[str] = "api/v3/episodefile"
 ROOTFOLDER_PATH: Final[str] = "api/v3/rootfolder"
 MIN_SUCCESS_STATUS: Final[int] = 200
 MAX_SUCCESS_STATUS: Final[int] = 300
+SERIES_CHILD_RESPONSE_COUNT: Final[int] = 2
 
 ROOTFOLDER_UNAVAILABLE_DETAIL: Final[str] = "root folder listing unavailable"
 ROOTFOLDER_NOT_LISTED_SUFFIX: Final[str] = "is not listed by Sonarr /rootfolder"
@@ -60,6 +66,7 @@ class VerdictReason(Enum):
     MALFORMED_RESPONSE = "malformed_response"
     FILE_ID_COLLISION = "file_id_collision"
     INCONSISTENT_ENUMERATION = "inconsistent_enumeration"
+    INCOMPLETE_SNAPSHOT = "incomplete_snapshot"
 
 
 class FileRejectReason(Enum):
@@ -197,6 +204,20 @@ class InventoryVerdict:
     details: tuple[str, ...]
 
 
+class SourceRelationshipStatus(Enum):
+    """Outcome of a fresh pre-write check of one Sonarr file relationship."""
+
+    CURRENT = "current"
+    CHANGED = "changed"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class SourceRelationshipVerdict:
+    status: SourceRelationshipStatus
+    detail: str
+
+
 @dataclass(frozen=True)
 class SonarrInventory:
     """One read-only pass over the eligible Sonarr collection."""
@@ -209,6 +230,33 @@ class SonarrInventory:
     unlinked_file_ids: tuple[tuple[int, int], ...]
     warnings: tuple[str, ...]
     verdict: InventoryVerdict
+    series_manifest_hash: str | None = None
+    series_cursor: int = 0
+    swept_series_ids: frozenset[int] = frozenset()
+    refreshed_series_ids: frozenset[int] = frozenset()
+    fetched_series_children: Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]] | None = None
+    refresh_sweep_complete: bool = False
+    invalidated_series_ids: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True)
+class _SeriesChildrenSnapshot:
+    manifest_hash: str
+    cursor: int
+    cache: Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]
+    fetched: Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]
+    swept_series_ids: frozenset[int]
+    refreshed_series_ids: frozenset[int]
+    complete: bool
+    invalidated_series_ids: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _IndexedSeriesChildren:
+    episodes: tuple[SonarrEpisode, ...]
+    files: tuple[SonarrFile, ...]
+    rejected: tuple[RejectedSonarrFile, ...]
+    unlinked: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -261,20 +309,20 @@ def select_eligible_series(
     series: Sequence[SonarrSeries],
     allowed_roots: Sequence[str],
     *,
-    anime_only: bool = False,
+    anime_only: bool = True,  # noqa: ARG001 - compatibility; scope cannot be widened
 ) -> tuple[tuple[EligibleSeries, ...], tuple[SonarrSeries, ...]]:
     """Split series by exact component-aware root containment.
 
-    When ``anime_only`` is true, only the positively identified Sonarr type ``anime``
-    is admitted, even when a live-action series shares the same allowed root. Otherwise
-    the explicit-root-only legacy behavior is retained. A series whose root is unusable
+    Only the positively identified Sonarr type ``anime`` is admitted, even when a
+    live-action series shares the same allowed root. ``anime_only`` is retained for
+    caller compatibility and cannot disable this invariant. A series whose root is unusable
     as a POSIX path (or absent from the allowlist) is excluded. Output order is by series
     ID, independent of API enumeration order.
     """
     eligible: list[EligibleSeries] = []
     excluded: list[SonarrSeries] = []
     for item in series:
-        if anime_only and item.series_type != "anime":
+        if item.series_type != "anime":
             excluded.append(item)
             continue
         root = _matching_root(item.root_folder_path, allowed_roots)
@@ -652,6 +700,12 @@ def collect_sonarr_inventory(
     *,
     allowed_roots: Sequence[str] | None = None,
     anime_only: bool | None = None,
+    cached_manifest_hash: str | None = None,
+    cached_series_children: Mapping[int, tuple[Sequence[Any], Sequence[Any]]] | None = None,
+    series_cursor: int = 0,
+    swept_series_ids: frozenset[int] = frozenset(),
+    series_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> SonarrInventory:
     """Read the eligible Sonarr collection once (series, episodes, files, rootfolders).
 
@@ -661,22 +715,13 @@ def collect_sonarr_inventory(
     stop at that series.
     """
     if settings is None:
-        if not allowed_roots or anime_only is not True:
-            raise ValueError("setup inventory requires explicit roots and anime-only selection")
-        try:
-            effective_roots = tuple(normalize_posix(root) for root in allowed_roots)
-        except (PathError, TypeError):
-            raise ValueError("setup inventory roots are invalid") from None
-        if len(set(effective_roots)) != len(effective_roots):
-            raise ValueError("setup inventory roots must be unique")
-        effective_anime_only = True
+        effective_roots = _setup_inventory_roots(allowed_roots, anime_only)
     else:
         effective_roots = (
             settings.sonarr.allowed_roots
             if allowed_roots is None
             else tuple(normalize_posix(root) for root in allowed_roots)
         )
-        effective_anime_only = settings.anime_only if anime_only is None else anime_only
     warnings: list[str] = []
     reasons: list[VerdictReason] = []
     details: list[str] = []
@@ -689,24 +734,347 @@ def collect_sonarr_inventory(
     series_result = parse_series_entries(outcome.payload)
     reasons.extend(series_result.reasons)
     details.extend(series_result.details)
+    manifest_hash = _inventory_manifest_hash(endpoint, effective_roots, series_result.series)
     eligible, excluded = select_eligible_series(
         series_result.series,
         effective_roots,
-        anime_only=effective_anime_only,
+        anime_only=True,
     )
 
     warnings.extend(_collect_root_folder_warnings(endpoint, effective_roots))
+    children = _collect_series_children(
+        endpoint,
+        eligible,
+        manifest_hash=manifest_hash,
+        cached_manifest_hash=cached_manifest_hash,
+        cached_series_children=cached_series_children,
+        series_cursor=series_cursor,
+        swept_series_ids=swept_series_ids,
+        series_deadline=series_deadline,
+        monotonic=monotonic,
+        reasons=reasons,
+        details=details,
+    )
+    indexed = _index_series_children(eligible, children.cache, reasons, details)
+    _mark_incomplete_inventory(eligible, children, reasons, details)
 
+    episodes = tuple(sorted(indexed.episodes, key=lambda episode: (episode.series_id, episode.id)))
+    files = tuple(sorted(indexed.files, key=lambda item: (item.series_id, item.episode_file_id)))
+    rejected = tuple(sorted(indexed.rejected, key=_reject_key))
+    unlinked = tuple(sorted(indexed.unlinked))
+    return SonarrInventory(
+        eligible_series=eligible,
+        excluded_series=excluded,
+        episodes=episodes,
+        files=files,
+        rejected_files=rejected,
+        unlinked_file_ids=unlinked,
+        warnings=tuple(warnings),
+        verdict=make_verdict(reasons, details),
+        series_manifest_hash=children.manifest_hash,
+        series_cursor=children.cursor,
+        swept_series_ids=children.swept_series_ids,
+        refreshed_series_ids=children.refreshed_series_ids,
+        fetched_series_children=children.fetched,
+        refresh_sweep_complete=children.complete,
+        invalidated_series_ids=children.invalidated_series_ids,
+    )
+
+
+def check_current_file_relationship(  # noqa: PLR0911, PLR0912
+    endpoint: ApiEndpoint,
+    *,
+    series_id: int,
+    episode_file_id: int,
+    path: str,
+    size: int,
+    episode_identities: Sequence[tuple[int, int | None, int, int, int | None]],
+    tvdb_series_id: int,
+    allowed_roots: Sequence[str],
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> SourceRelationshipVerdict:
+    """Freshly verify one candidate's Sonarr series, file, and episode relationship.
+
+    These uncached reads are intentionally made for only the already-selected series
+    immediately before a write, even when its resumable inventory fragment is still fresh.
+    The candidate must still be the same positively identified anime series in the authorized
+    root, and the frozen file/episode relationship must still match. A changed source is
+    distinct from an unavailable/malformed read: the former must be quarantined against its
+    frozen targets, while the latter is a retryable no-write deferral.
+    """
+    if deadline is not None and monotonic() >= deadline:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "Sonarr source check deferred by the apply time budget",
+        )
+    series = _check_current_series_identity(
+        endpoint,
+        series_id=series_id,
+        path=path,
+        tvdb_series_id=tvdb_series_id,
+        allowed_roots=allowed_roots,
+        deadline=deadline,
+        monotonic=monotonic,
+    )
+    if series.status is not SourceRelationshipStatus.CURRENT:
+        return series
+
+    if deadline is not None and monotonic() >= deadline:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "Sonarr source check deferred before episode read by the apply time budget",
+        )
+    episodes_outcome = _fetch_json_list(endpoint, EPISODE_PATH, {"seriesId": series_id})
+    if episodes_outcome.payload is None:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"current Sonarr episode list unavailable: {episodes_outcome.detail}",
+        )
+    if deadline is not None and monotonic() >= deadline:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "Sonarr source check deferred before episode-file read by the apply time budget",
+        )
+    files_outcome = _fetch_json_list(endpoint, EPISODE_FILE_PATH, {"seriesId": series_id})
+    if files_outcome.payload is None:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"current Sonarr episode-file list unavailable: {files_outcome.detail}",
+        )
+    if deadline is not None and monotonic() >= deadline:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "Sonarr source check exceeded the apply time budget",
+        )
+
+    parsed_episodes = parse_episode_entries(episodes_outcome.payload, series_id)
+    parsed_files = parse_file_entries(files_outcome.payload, series_id)
+    if parsed_episodes.reasons or parsed_files.reasons or parsed_episodes.file_reference_tainted:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "current Sonarr source relationship is malformed or inconsistent",
+        )
+    if episode_file_id in parsed_episodes.tainted_file_ids:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"current Sonarr episode membership for file {episode_file_id} is malformed",
+        )
+
+    current_files = [item for item in parsed_files.records if item.id == episode_file_id]
+    if not current_files:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr no longer reports episode file {episode_file_id} in series {series_id}",
+        )
+    if len(current_files) != 1:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"Sonarr reports duplicate episode-file id {episode_file_id}",
+        )
+    current_file = current_files[0]
+    try:
+        current_path = _normalize(current_file.path)
+        expected_path = _normalize(path)
+    except PathError:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"Sonarr episode-file path for file {episode_file_id} is invalid",
+        )
+    if current_path != expected_path or current_file.size != size:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr episode-file path or size changed for file {episode_file_id}",
+        )
+
+    expected = tuple(sorted(episode_identities))
+    current = tuple(
+        sorted(
+            (
+                item.id,
+                item.tvdb_id,
+                item.season_number,
+                item.episode_number,
+                item.absolute_episode_number,
+            )
+            for item in parsed_episodes.episodes
+            if item.episode_file_id == episode_file_id
+        )
+    )
+    if current != expected:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr episode membership changed for file {episode_file_id}",
+        )
+    return SourceRelationshipVerdict(SourceRelationshipStatus.CURRENT, "")
+
+
+def _check_current_series_identity(  # noqa: PLR0911
+    endpoint: ApiEndpoint,
+    *,
+    series_id: int,
+    path: str,
+    tvdb_series_id: int,
+    allowed_roots: Sequence[str],
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> SourceRelationshipVerdict:
+    """Verify that this exact current series is still eligible for the frozen source file."""
+    series_outcome = _fetch_json_list(endpoint, SERIES_PATH)
+    if series_outcome.payload is None:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"current Sonarr series list unavailable: {series_outcome.detail}",
+        )
+    if deadline is not None and monotonic() >= deadline:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "Sonarr source check exceeded the apply time budget after series read",
+        )
+    parsed_series = parse_series_entries(series_outcome.payload)
+    if parsed_series.reasons:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "current Sonarr series list is malformed or inconsistent",
+        )
+    matching_series = [item for item in parsed_series.series if item.id == series_id]
+    if not matching_series:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr no longer reports series {series_id}",
+        )
+    if len(matching_series) != 1:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            f"Sonarr reports duplicate series id {series_id}",
+        )
+    current_series = matching_series[0]
+    if current_series.series_type != "anime":
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr series {series_id} is no longer positively identified as anime",
+        )
+    if current_series.tvdb_id != tvdb_series_id:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr series {series_id} TVDB identity changed from {tvdb_series_id} "
+            f"to {current_series.tvdb_id}",
+        )
+    eligible, _excluded = select_eligible_series((current_series,), allowed_roots)
+    if not eligible:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr series {series_id} root is no longer within an authorized anime root",
+        )
+    try:
+        current_root = _normalize(current_series.root_folder_path)
+        expected_path = _normalize(path)
+    except PathError:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"Sonarr series {series_id} root or frozen file path is invalid",
+        )
+    if not is_within_root(expected_path, current_root):
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.CHANGED,
+            f"frozen Sonarr file path is outside current series {series_id} root",
+        )
+    return SourceRelationshipVerdict(SourceRelationshipStatus.CURRENT, "")
+
+
+def _setup_inventory_roots(
+    allowed_roots: Sequence[str] | None, anime_only: bool | None
+) -> tuple[str, ...]:
+    if not allowed_roots or anime_only is not True:
+        raise ValueError("setup inventory requires explicit roots and anime-only selection")
+    try:
+        roots = tuple(normalize_posix(root) for root in allowed_roots)
+    except (PathError, TypeError):
+        raise ValueError("setup inventory roots are invalid") from None
+    if len(set(roots)) != len(roots):
+        raise ValueError("setup inventory roots must be unique")
+    return roots
+
+
+def _collect_series_children(
+    endpoint: ApiEndpoint,
+    eligible: Sequence[EligibleSeries],
+    *,
+    manifest_hash: str,
+    cached_manifest_hash: str | None,
+    cached_series_children: Mapping[int, tuple[Sequence[Any], Sequence[Any]]] | None,
+    series_cursor: int,
+    swept_series_ids: frozenset[int],
+    series_deadline: float | None,
+    monotonic: Callable[[], float],
+    reasons: list[VerdictReason],
+    details: list[str],
+) -> _SeriesChildrenSnapshot:
+    cache_is_current = cached_manifest_hash == manifest_hash
+    cache = {
+        series_id: (tuple(children[0]), tuple(children[1]))
+        for series_id, children in (cached_series_children or {}).items()
+        if cache_is_current and len(children) == SERIES_CHILD_RESPONSE_COUNT
+    }
+    cursor = series_cursor if cache_is_current else 0
+    swept = set(swept_series_ids if cache_is_current else ())
+    fetched: dict[int, tuple[tuple[Any, ...], tuple[Any, ...]]] = {}
+    refreshed: set[int] = set()
+    invalidated: set[int] = set()
+    eligible_ids = {item.series.id for item in eligible}
+    ordered = sorted(eligible, key=lambda item: (item.series.id <= cursor, item.series.id))
+    for item in ordered:
+        if series_deadline is not None and monotonic() >= series_deadline:
+            break
+        cursor = item.series.id
+        episodes, files = _fetch_series_children(
+            endpoint,
+            item,
+            reasons,
+            details,
+            deadline=series_deadline,
+            monotonic=monotonic,
+        )
+        if episodes is None or files is None:
+            cache.pop(item.series.id, None)
+            swept.discard(item.series.id)
+            invalidated.add(item.series.id)
+            continue
+        children = (tuple(episodes), tuple(files))
+        cache[item.series.id] = children
+        fetched[item.series.id] = children
+        refreshed.add(item.series.id)
+        swept.add(item.series.id)
+        if eligible_ids.issubset(swept):
+            break
+    return _SeriesChildrenSnapshot(
+        manifest_hash=manifest_hash,
+        cursor=cursor,
+        cache=cache,
+        fetched=fetched,
+        swept_series_ids=frozenset(swept),
+        refreshed_series_ids=frozenset(refreshed),
+        complete=eligible_ids.issubset(swept),
+        invalidated_series_ids=frozenset(invalidated),
+    )
+
+
+def _index_series_children(
+    eligible: Sequence[EligibleSeries],
+    cache: Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]],
+    reasons: list[VerdictReason],
+    details: list[str],
+) -> _IndexedSeriesChildren:
     episodes_all: list[SonarrEpisode] = []
     files_all: list[SonarrFile] = []
     rejected_all: list[RejectedSonarrFile] = []
     unlinked_all: list[tuple[int, int]] = []
     for item in eligible:
-        episodes, files = _fetch_series_children(endpoint, item, reasons, details)
-        if episodes is None or files is None:
+        payloads = cache.get(item.series.id)
+        if payloads is None:
             continue
-        episode_result = parse_episode_entries(episodes, item.series.id)
-        file_result = parse_file_entries(files, item.series.id)
+        episode_result = parse_episode_entries(payloads[0], item.series.id)
+        file_result = parse_file_entries(payloads[1], item.series.id)
         index = index_series_files(item, episode_result, file_result)
         for result in (episode_result, file_result, index):
             reasons.extend(result.reasons)
@@ -715,21 +1083,48 @@ def collect_sonarr_inventory(
         files_all.extend(index.files)
         rejected_all.extend(index.rejected)
         unlinked_all.extend(index.unlinked)
-
-    episodes_all.sort(key=lambda episode: (episode.series_id, episode.id))
-    files_all.sort(key=lambda indexed: (indexed.series_id, indexed.episode_file_id))
-    rejected_all.sort(key=_reject_key)
-    unlinked_all.sort()
-    return SonarrInventory(
-        eligible_series=eligible,
-        excluded_series=excluded,
-        episodes=tuple(episodes_all),
-        files=tuple(files_all),
-        rejected_files=tuple(rejected_all),
-        unlinked_file_ids=tuple(unlinked_all),
-        warnings=tuple(warnings),
-        verdict=make_verdict(reasons, details),
+    return _IndexedSeriesChildren(
+        tuple(episodes_all), tuple(files_all), tuple(rejected_all), tuple(unlinked_all)
     )
+
+
+def _mark_incomplete_inventory(
+    eligible: Sequence[EligibleSeries],
+    children: _SeriesChildrenSnapshot,
+    reasons: list[VerdictReason],
+    details: list[str],
+) -> None:
+    eligible_ids = {item.series.id for item in eligible}
+    missing = eligible_ids - set(children.cache)
+    if missing:
+        details.append(f"series child data unavailable for {len(missing)} eligible series")
+    if not children.complete:
+        pending = len(eligible_ids - children.swept_series_ids)
+        details.append(f"full inventory refresh pending for {pending} eligible series")
+    if missing or not children.complete:
+        _append(reasons, VerdictReason.INCOMPLETE_SNAPSHOT)
+
+
+def _inventory_manifest_hash(
+    endpoint: ApiEndpoint, allowed_roots: Sequence[str], series: Sequence[SonarrSeries]
+) -> str:
+    """Bind cached children to the exact Sonarr scope and relevant series identities."""
+    scope_series = (
+        item
+        for item in series
+        if item.series_type == "anime"
+        or _matching_root(item.root_folder_path, allowed_roots) is not None
+    )
+    manifest = {
+        "endpoint": str(endpoint.base_url).rstrip("/"),
+        "roots": sorted(allowed_roots),
+        "series": [
+            (item.id, item.root_folder_path, item.tvdb_id, item.series_type)
+            for item in sorted(scope_series, key=lambda item: item.id)
+        ],
+    }
+    encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def make_verdict(reasons: Sequence[VerdictReason], details: Sequence[str]) -> InventoryVerdict:
@@ -796,6 +1191,9 @@ def _fetch_series_children(
     item: EligibleSeries,
     reasons: list[VerdictReason],
     details: list[str],
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[list[Any] | None, list[Any] | None]:
     series_id = item.series.id
     episodes = _fetch_json_list(endpoint, EPISODE_PATH, {"seriesId": series_id})
@@ -803,6 +1201,10 @@ def _fetch_series_children(
         _append(reasons, episodes.reason or VerdictReason.TRANSPORT_FAILURE)
         details.append(f"series {series_id} episodes: {episodes.detail}")
         # The series is already unusable; skip the file read it cannot be joined with.
+        return None, None
+    if deadline is not None and monotonic() >= deadline:
+        _append(reasons, VerdictReason.INCOMPLETE_SNAPSHOT)
+        details.append(f"series {series_id} episode-file fetch deferred by inventory time budget")
         return None, None
     files = _fetch_json_list(endpoint, EPISODE_FILE_PATH, {"seriesId": series_id})
     if files.payload is None:

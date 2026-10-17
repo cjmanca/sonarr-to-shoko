@@ -26,8 +26,9 @@ Enumeration semantics (see AGENTS/PROJECT §6 delivery policy):
   historical ``git ls-remote`` / ``gh`` forms are still accepted). Injected as
   ``known_tags`` so tests need no network. ``unverified`` lists SHAs whose
   ``sha-`` tag exists in the registry but whose provenance could not be
-  verified: they are re-scheduled (a ``sha-`` tag is content-addressed, so a
-  re-push is safe) instead of being skipped as already published.
+  verified: they are re-scheduled instead of being skipped as already
+  published. A full-history backfill starts at the inclusive first-buildable
+  boundary; an explicit ``since`` range remains exclusive and takes precedence.
 
 Ordering and capping: results are chronological, **oldest first**. When
 ``max_shas`` caps the list, the oldest prefix is kept and the remainder is
@@ -56,6 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_MAX_SHAS = 10
+DEFAULT_FIRST_BUILDABLE = "aa6b85ea71192d9c94c7f3c8a58d715c6c37db42"
 TAG_PREFIX = "sha-"
 ZERO_SHA = "0" * 40
 
@@ -132,12 +134,7 @@ def _apply_cap(result: EnumerationResult, max_shas: int) -> EnumerationResult:
     instead of silently bypassing the cap, so a malformed dispatch input can
     never widen the per-run publish matrix.
     """
-    if max_shas <= 0:
-        msg = (
-            f"max_shas must be a positive integer (got {max_shas}); "
-            "refusing to enumerate under a non-positive cap"
-        )
-        raise ValueError(msg)
+    _validate_max_shas(max_shas)
     if len(result.shas) > max_shas:
         result.overflow = result.shas[max_shas:]
         result.shas = result.shas[:max_shas]
@@ -147,6 +144,15 @@ def _apply_cap(result: EnumerationResult, max_shas: int) -> EnumerationResult:
             "(workflow_dispatch backfill=true / weekly schedule)"
         )
     return result
+
+
+def _validate_max_shas(max_shas: int) -> None:
+    if max_shas <= 0:
+        msg = (
+            f"max_shas must be a positive integer (got {max_shas}); "
+            "refusing to enumerate under a non-positive cap"
+        )
+        raise ValueError(msg)
 
 
 def _enumerate_range(
@@ -276,6 +282,7 @@ def enumerate_missing(
     since: str | None = None,
     max_shas: int = DEFAULT_MAX_SHAS,
     unverified: set[str] | None = None,
+    first_buildable: str | None = DEFAULT_FIRST_BUILDABLE,
 ) -> EnumerationResult:
     """SHAs reachable from ``upto`` lacking a verified ``sha-<fullsha>`` tag.
 
@@ -287,19 +294,51 @@ def enumerate_missing(
     ``unverified`` carries SHAs whose registry tag exists but whose provenance
     could not be confirmed. Those SHAs are scheduled for publication instead of
     being skipped, so backfill never trusts an unverified tag as "published".
-    ``since`` (exclusive) restricts the scan to ``since..upto`` for targeted
-    range-gap backfill; default scans the whole history up to ``upto``.
+    With no explicit ``since``, scan starts at ``first_buildable`` inclusively
+    and records older history as skipped. An explicit ``since`` restricts the
+    scan to ``since..upto`` (exclusive of ``since``) and takes precedence over
+    the default buildable boundary for targeted recovery.
     """
     repo = Path(repo_dir)
+    _validate_max_shas(max_shas)
     upto_full = _resolve_commit(repo, upto)
     published = {
         name.strip().lower().removeprefix("refs/tags/").removeprefix(tag_prefix).split("^")[0]
         for name in known_tags
     }
     unverified_set = {sha.strip().lower() for sha in (unverified or set())}
-    scan = f"{_resolve_commit(repo, since)}..{upto_full}" if since else upto_full
     result = EnumerationResult()
-    for sha in _rev_list(repo, scan):
+    if since:
+        since_full = _resolve_commit(repo, since)
+        scan = f"{since_full}..{upto_full}"
+        commits = _rev_list(repo, scan)
+        result.notes.append(
+            f"explicit backfill range {scan}: since is exclusive; "
+            "first-buildable boundary not applied"
+        )
+    elif first_buildable:
+        boundary_full = _resolve_commit(repo, first_buildable)
+        if not _is_ancestor(repo, boundary_full, upto_full):
+            result.skipped.append(SkippedCommit(boundary_full, "boundary-not-ancestor"))
+            result.notes.append(
+                f"backfill boundary {boundary_full} is not an ancestor of {upto_full}; "
+                "no default history scanned (use an explicit --since range for targeted recovery)"
+            )
+            return _apply_cap(result, max_shas)
+        earlier = [sha for sha in _rev_list(repo, boundary_full) if sha != boundary_full]
+        result.skipped.extend(SkippedCommit(sha, "pre-boundary") for sha in earlier)
+        commits = [boundary_full, *_rev_list(repo, f"{boundary_full}..{upto_full}")]
+        scan = f"{boundary_full} (inclusive)..{upto_full}"
+        result.notes.append(
+            f"backfill starts at first-buildable boundary {boundary_full} (inclusive); "
+            f"{len(earlier)} earlier commit(s) skipped as pre-boundary"
+        )
+    else:
+        scan = upto_full
+        commits = _rev_list(repo, scan)
+        result.notes.append("full-history backfill: no first-buildable boundary configured")
+
+    for sha in commits:
         if sha in published and sha not in unverified_set:
             result.skipped.append(SkippedCommit(sha, "already-tagged"))
         elif sha in unverified_set:
@@ -339,6 +378,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(missing)
     missing.add_argument("--upto", required=True)
     missing.add_argument("--since", default=None)
+    missing.add_argument(
+        "--first-buildable",
+        default=DEFAULT_FIRST_BUILDABLE,
+        help="inclusive boundary for a default full-history backfill (default: recorded boundary)",
+    )
     missing.add_argument("--known-tags-file", required=True, help="file of tag names, one per line")
     missing.add_argument(
         "--unverified-file",
@@ -380,6 +424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             since=args.since,
             max_shas=args.max_shas,
             unverified=set(unverified),
+            first_buildable=args.first_buildable,
         )
     json.dump(result.to_dict(), sys.stdout, indent=2)
     sys.stdout.write("\n")

@@ -113,7 +113,7 @@ from .daemon import (
 from .dashboard import DashboardApplication, DashboardStatus, create_dashboard_server
 from .errors import ConfigError, HttpPolicyError, LinkerError, PolicyError
 from .http import ApiEndpoint, make_shoko_client, make_sonarr_client
-from .logging_setup import configure_logging
+from .logging_setup import configure_logging, register_secret
 from .mapping_store import MappingStore, load_active, make_source_endpoint
 from .mapping_store import (
     refresh as mapping_refresh,
@@ -151,6 +151,7 @@ from .reporting import (
     cycle_report_payload,
     cycle_summary_line,
     daemon_report_payload,
+    discovery_exclusion_payload,
     health_payload,
     json_payload,
     mapping_status_payload,
@@ -176,7 +177,6 @@ from .state import (
     META_WRITES_DISABLED_REASON,
     BudgetLimits,
     EligibilityVerdict,
-    FileState,
     StateError,
     StateStore,
     WriteDisabledError,
@@ -928,28 +928,28 @@ class _NormalServiceRuntime:
         store = StateStore(path)
         try:
             paused, _reason = store.get_service_pause()
-            waiting = sum(
-                len(store.files_in_state(item))
-                for item in (
-                    FileState.MATCHED,
-                    FileState.MAPPED,
-                    FileState.PLANNED,
-                    FileState.WAITING,
-                )
-            )
-            review = sum(
-                len(store.files_in_state(item))
-                for item in (FileState.AMBIGUOUS, FileState.CONFLICT, FileState.BLOCKED_SAFETY)
+            counts = store.service_file_counts()
+            exclusions = discovery_exclusion_payload(store)
+            exclusion_counts = tuple(sorted(exclusions["counts"].items()))
+            exclusion_diagnostics = tuple(
+                f"Excluded Shoko file {item['shoko_file_id']}: {item['reason']}: {item['detail']}"
+                for item in exclusions["examples"][:5]
             )
             return DashboardStatus(
                 message,
-                len(store.files_in_state(FileState.VERIFIED)),
-                waiting,
-                review,
+                counts.verified_files,
+                counts.waiting_files,
+                counts.review_files,
                 bool(latest["authorized"]) and not paused,
                 cast(str, latest["next_action"]),
-                cast(tuple[str, ...], latest["diagnostics"]),
-                cast(str, latest["mapping_cache"]),
+                diagnostics=(
+                    *cast(tuple[str, ...], latest["diagnostics"]),
+                    *exclusion_diagnostics,
+                ),
+                mapping_cache_status=cast(str, latest["mapping_cache"]),
+                excluded_files=exclusions["total"],
+                scope_excluded_files=exclusions["scope_excluded"],
+                exclusion_counts=exclusion_counts,
             )
         finally:
             store.close()
@@ -994,14 +994,30 @@ class _NormalServiceRuntime:
         finally:
             store.close()
 
-    def _service_authorized(self, store: StateStore, manager: OnboardingManager) -> bool:
-        context = self.setup.current_context(store)
+    def _service_authorized(
+        self, store: StateStore, manager: OnboardingManager, expected_binding_digest: str
+    ) -> bool:
+        context = self._service_authorization_context(store)
+        return self._service_context_authorized(manager, context, expected_binding_digest)
+
+    def _service_authorization_context(self, store: StateStore) -> tuple[Any, Any] | None:
+        """Refresh remote facts before onboarding compares them with persisted consent."""
+        return self.setup.current_context(store)
+
+    @staticmethod
+    def _service_context_authorized(
+        manager: OnboardingManager,
+        context: tuple[Any, Any] | None,
+        expected_binding_digest: str,
+    ) -> bool:
+        """Evaluate current facts against consent before rejecting a stale cycle digest."""
         if context is None:
             return False
         binding, assessment = context
+        decision = manager.evaluate(binding, assessment, iso=current_iso())
         return (
-            manager.evaluate(binding, assessment, iso=current_iso()).status
-            is OnboardingStatus.AUTHORIZED
+            decision.status is OnboardingStatus.AUTHORIZED
+            and binding.digest == expected_binding_digest
         )
 
     def _run_authorized_cycle(
@@ -1021,10 +1037,32 @@ class _NormalServiceRuntime:
             shutdown_requested=self.state.should_stop,
         )
         endpoints = (deps.sonarr, deps.shoko, deps.mapping_source)
+        expected_binding_digest = binding.digest
+
+        authorization_context: list[tuple[Any, Any] | None] = [None]
+
+        def service_authorized() -> bool:
+            context = self._service_authorization_context(store)
+            authorization_context[0] = context
+            return self._service_context_authorized(manager, context, expected_binding_digest)
+
+        def service_authorized_local() -> bool:
+            context = authorization_context[0]
+            if context is None:
+                return False
+            # The remote callback already evaluated this context. If an operator confirms a
+            # different scope while the final Shoko read is in flight, the cached facts are
+            # stale; refuse this old cycle without misclassifying the new consent as drift.
+            record = manager.record()
+            if record is None or context[0].digest != record.binding_digest:
+                return False
+            return self._service_context_authorized(manager, context, expected_binding_digest)
+
         deps = replace(
             deps,
             service_mode=True,
-            service_authorized=lambda: self._service_authorized(store, manager),
+            service_authorized=service_authorized,
+            service_authorized_local=service_authorized_local,
         )
         try:
             self._run_daemon_cycle(deps, store, effective)
@@ -1181,17 +1219,15 @@ def _run_status(_args: argparse.Namespace) -> int:
             linking = "setup confirmed; current worker state is available in the dashboard"
         print(f"Dashboard account: {'created' if account is not None else 'not created'}")
         print(f"Automatic linking: {linking}")
-        print(f"Verified files: {len(store.files_in_state(FileState.VERIFIED))}")
-        waiting = sum(
-            len(store.files_in_state(state))
-            for state in (FileState.MATCHED, FileState.MAPPED, FileState.PLANNED, FileState.WAITING)
+        counts = store.service_file_counts()
+        print(f"Verified files: {counts.verified_files}")
+        print(f"Waiting files: {counts.waiting_files}")
+        print("  Work is being prepared or waiting for Shoko to confirm a link.")
+        print(f"Files needing review: {counts.review_files}")
+        print(
+            "  Partial or uncertain link results need attention; conflicts and safety issues "
+            "are included."
         )
-        review = sum(
-            len(store.files_in_state(state))
-            for state in (FileState.AMBIGUOUS, FileState.CONFLICT, FileState.BLOCKED_SAFETY)
-        )
-        print(f"Waiting files: {waiting}")
-        print(f"Files needing review: {review}")
         return EXIT_OK
     except (StateError, OSError, ValueError) as exc:
         print(f"state unavailable: {exc}", file=sys.stderr)
@@ -1268,6 +1304,10 @@ def _signal_name(number: int) -> str:
 def _run_report(args: argparse.Namespace) -> int:
     """Read-only rollup from the state DB and mapping store. Makes no network request."""
     settings = load_settings(cast(str, args.config))
+    # Offline reporting never constructs clients (which normally register these).
+    # Legacy diagnostics still need redaction against the configured runtime keys.
+    for service in (settings.sonarr, settings.shoko):
+        register_secret(service.api_key.resolve())
     now = datetime.fromisoformat(current_iso())
     mapping_store = open_mapping_store(settings)
     status = mapping_status(mapping_store, now, overrides_text=read_overrides_text(settings))
@@ -1304,7 +1344,8 @@ def _print_report(payload: Mapping[str, Any]) -> None:
     print(f"mapping: source={mapping['source_url']}")
     print(
         f"  generation: {generation}, next_due={mapping['next_due_iso']}, "
-        f"last_outcome={mapping['last_outcome']}"
+        f"last_outcome={mapping['last_outcome']}, "
+        f"invalid_source_hold={mapping['invalid_source_hold']}"
     )
     if state["present"]:
         print(
@@ -1551,7 +1592,7 @@ def _run_resolve_send(args: argparse.Namespace) -> int:
         "released_after_review" if cast(bool, args.release) else "operator_closed"
     )
 
-    def action(_settings: Settings, store: StateStore, iso: str) -> Mapping[str, Any]:
+    def action(settings: Settings, store: StateStore, iso: str) -> Mapping[str, Any]:
         file_id = int(args.file_id)
         send_id = store.resolve_send(
             file_id,
@@ -1559,6 +1600,7 @@ def _run_resolve_send(args: argparse.Namespace) -> int:
             resolution=resolution,
             iso=iso,
             operator_note=cast(str, args.note),
+            verification_timeout_seconds=settings.sync.verification_timeout_seconds,
         )
         record = store.get_file(file_id)
         return {
@@ -2055,6 +2097,17 @@ def _run_campaign_report(args: argparse.Namespace) -> int:
     remaining = len(attempted) - ATTEMPTED_SEND_DISPLAY_LIMIT
     if remaining > 0:
         print(f"    +{remaining} more")
+    unresolved = payload["unresolved_legacy_sends"]
+    if unresolved:
+        print(
+            f"  legacy history hold: {len(unresolved)} ambiguous send(s); resolve with "
+            "campaign history-resolve before submitting or authorizing a drain"
+        )
+        for row in unresolved[:ATTEMPTED_SEND_DISPLAY_LIMIT]:
+            print(
+                f"    file {row['shoko_file_id']} send {row['send_id']}: "
+                f"outcome={row['outcome']} state={row['state']}"
+            )
     # F18: recoverable budget-cooldown deferral (campaign stays approved; auto-resumes).
     if payload["deferred_until"] is not None:
         print(f"  drain deferral: retry at {payload['deferred_until']} (campaign stays approved)")
@@ -2063,6 +2116,35 @@ def _run_campaign_report(args: argparse.Namespace) -> int:
             f"  plan file digest: {payload['plan_file_digest']} "
             f"(matches: {payload['plan_matches_file']})"
         )
+    return EXIT_OK
+
+
+def _run_campaign_history_resolve(args: argparse.Namespace) -> int:
+    if not cast(bool, args.confirm):
+        print(f"campaign history-resolve: {_CONFIRM_REQUIRED}")
+        return EXIT_CONFIG_INVALID
+    settings = load_settings(cast(str, args.config))
+    send_id = cast(int, args.send_id)
+    campaign_id = None if cast(bool, args.non_campaign) else cast(str, args.campaign_id)
+    note = cast(str, args.note)
+    iso = current_iso()
+    store = open_state_store(settings)
+    try:
+        store.resolve_legacy_send_ownership(send_id, campaign_id=campaign_id, note=note, iso=iso)
+        unresolved = [row.send_id for row in store.unresolved_campaign_send_history()]
+    finally:
+        store.close()
+    owner = "non_campaign" if campaign_id is None else f"campaign:{campaign_id}"
+    payload = operator_action_payload(
+        "campaign-history-resolve",
+        note,
+        iso=iso,
+        result={"send_id": send_id, "owner": owner, "unresolved_send_ids": unresolved},
+    )
+    if cast(bool, args.json):
+        print(json_payload(payload))
+    else:
+        print(f"send {send_id} ownership resolved as {owner}; unresolved sends: {len(unresolved)}")
     return EXIT_OK
 
 
@@ -2226,6 +2308,7 @@ _CAMPAIGN_HANDLERS: Final[dict[str, CommandHandler]] = {
     "apply": _run_campaign_apply,
     "verify": _run_campaign_verify,
     "report": _run_campaign_report,
+    "history-resolve": _run_campaign_history_resolve,
     "pause": _run_campaign_pause,
     "resume": _run_campaign_resume,
     "revoke": _run_campaign_revoke,
@@ -2603,7 +2686,7 @@ def _add_campaign(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
         "campaign",
         help=(
             "Backlog campaign: prepare / approve / apply / verify / report / "
-            "pause / resume / revoke / authorize-drain / revoke-drain."
+            "history-resolve / pause / resume / revoke / authorize-drain / revoke-drain."
         ),
     )
     campaign_sub = parser.add_subparsers(
@@ -2664,6 +2747,7 @@ def _add_campaign(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
         "--plan", default=None, metavar="FILE", help="also check the plan file digest"
     )
     _add_json_argument(report)
+    _add_campaign_history_resolve(campaign_sub)
     pause = campaign_sub.add_parser("pause", help="Persist a campaign pause with a reason.")
     _add_config_argument(pause)
     pause.add_argument("--campaign-id", required=True, metavar="ID")
@@ -2685,6 +2769,30 @@ def _add_campaign(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
     _add_confirm_note_arguments(revoke)
     _add_json_argument(revoke)
     _add_campaign_drain_subcommands(campaign_sub)
+
+
+def _add_campaign_history_resolve(
+    campaign_sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    history_resolve = campaign_sub.add_parser(
+        "history-resolve",
+        help="Resolve one ambiguous legacy send owner after operator review.",
+    )
+    _add_config_argument(history_resolve)
+    history_resolve.add_argument("--send-id", type=_whole_number_at_least_one, required=True)
+    owner = history_resolve.add_mutually_exclusive_group(required=True)
+    owner.add_argument(
+        "--campaign-id",
+        metavar="ID",
+        help="attribute only when the immutable send matches this campaign's approved binding",
+    )
+    owner.add_argument(
+        "--non-campaign",
+        action="store_true",
+        help="explicitly attest the send was outside every campaign (requires --confirm and note)",
+    )
+    _add_confirm_note_arguments(history_resolve)
+    _add_json_argument(history_resolve)
 
 
 def _add_campaign_drain_subcommands(

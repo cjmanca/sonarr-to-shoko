@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, cast
 
 import e2e_harness as eh
@@ -826,9 +827,9 @@ def test_f_campaign_restart_halfway_never_replays_pending_or_sent_rows(
         )
         assert progress[-1] == FILES_HUNDRED
         assert plan_complete_seen
-        # The campaign counter counts durably recorded sends; the row whose outcome commit
-        # crashed is verified from its ledger row and never counted twice (99 < 100).
-        assert env.total_sent(reopened, campaign_id) == FILES_HUNDRED - N_ONE
+        # The row whose outcome commit crashed was debited at the pre-transport attempted-send
+        # transition, then verified from its ledger row without being POSTed a second time.
+        assert env.total_sent(reopened, campaign_id) == FILES_HUNDRED
         assert env.posts_for(sent_file) == N_ONE  # the sent row never re-POSTed
         assert env.posts_for(prepared_file) == N_ONE  # the pending row completed once
         assert env.world.shoko.posts_count() == posts_before + (FILES_HUNDRED - progress_before)
@@ -1067,20 +1068,51 @@ def test_f_campaign_shutdown_stops_new_submissions_and_restart_completes(
 # ---------------------------------------------------------------- 7. mapping swap
 
 
-def _swap_mid_batch(env: CampEnv, store: StateStore, swapped_xml: str) -> Any:
-    """Run one daemon cycle whose FIRST POST triggers a concurrent generation swap."""
-    fired = {"done": False}
+def _swap_mid_batch(
+    env: CampEnv, store: StateStore, swapped_xml: str, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """Refresh concurrently during the first POST, before the next candidate is sent."""
+    swap_started = Event()
+    swap_finished = Event()
+    swap_outcomes: list[RefreshOutcome] = []
+    swap_errors: list[BaseException] = []
+    swap_thread: Thread | None = None
+    original_respond_get = env.world.shoko._respond_get
+
+    def wait_for_swap_before_verification(request: Any, path: str) -> Any:
+        if path.startswith("/api/v3/File/") and swap_started.is_set():
+            assert swap_finished.wait(5.0), "mapping refresh did not finish before verification"
+        return original_respond_get(request, path)
+
+    def refresh_concurrently() -> None:
+        try:
+            swap_outcomes.append(_refresh_generation(env, swapped_xml))
+        except BaseException as exc:
+            swap_errors.append(exc)
+        finally:
+            swap_finished.set()
 
     def swap_once() -> None:
-        if not fired["done"]:
-            fired["done"] = True
-            _refresh_generation(env, swapped_xml)
+        nonlocal swap_thread
+        if swap_thread is None:
+            swap_started.set()
+            swap_thread = Thread(target=refresh_concurrently, daemon=True)
+            swap_thread.start()
 
-    env.world.shoko.on_post = swap_once
-    try:
-        report = env.cycle(store)
-    finally:
-        env.world.shoko.on_post = None
+    with monkeypatch.context() as patch:
+        patch.setattr(env.world.shoko, "_respond_get", wait_for_swap_before_verification)
+        env.world.shoko.on_post = swap_once
+        try:
+            report = env.cycle(store)
+        finally:
+            env.world.shoko.on_post = None
+            if swap_thread is not None:
+                swap_thread.join(timeout=5.0)
+
+    assert swap_thread is not None
+    assert swap_finished.is_set()
+    assert swap_errors == []
+    assert swap_outcomes == [RefreshOutcome.ACTIVATED]
     return report
 
 
@@ -1098,7 +1130,7 @@ def test_f_campaign_mapping_swap_mid_drain_defers_then_resumes(
         _drain(store, env, campaign_id, until=N_FIVE + N_ONE)
 
         posts_before = env.world.shoko.posts_count()
-        report = _swap_mid_batch(env, store, unrelated)
+        report = _swap_mid_batch(env, store, unrelated, monkeypatch)
         batch = report.campaign
         assert batch is not None
         assert batch.submitted == N_ONE  # only the in-flight candidate POSTs
@@ -1469,6 +1501,38 @@ def test_f_campaign_retries_rejected_candidate_after_unrelated_mapping_change(
         assert campaign.status == "approved"
     finally:
         store.close()
+
+
+def test_f_campaign_rotates_after_one_retry_of_rejected_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _campaign_env(tmp_path, monkeypatch, capsys, n_series=N_ONE, per_series=4)
+    _ready_campaign(env, capsys, 4)
+    plan, _digest = read_plan_file(env.plan_path)
+    posted = env.posted_files()
+    candidate_index = next(
+        index for index, item in enumerate(plan.files) if item.shoko_file_id not in posted
+    )
+    candidate = plan.files[candidate_index]
+    following = plan.files[candidate_index + 1]
+    env.world.shoko.post_status = 400
+
+    for expected_attempts in (N_ONE, 2):
+        rejected_code, rejected = env.apply(batch=N_ONE)
+
+        assert rejected_code == cli.EXIT_OK
+        assert isinstance(rejected, dict)
+        assert rejected["submitted"] == N_ONE
+        assert env.posts_for(candidate.shoko_file_id) == expected_attempts
+
+    env.world.shoko.post_status = None
+    next_code, next_result = env.apply(batch=N_ONE)
+
+    assert next_code == cli.EXIT_OK
+    assert isinstance(next_result, dict)
+    assert next_result["submitted"] == N_ONE
+    assert env.posts_for(following.shoko_file_id) == N_ONE
+    assert env.posts_for(candidate.shoko_file_id) == 2
 
 
 def test_f_campaign_mapping_target_drift_is_candidate_scoped_and_reports_history(

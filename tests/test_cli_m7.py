@@ -16,8 +16,10 @@ import logging
 import multiprocessing
 import os
 import signal
+import sqlite3
 import time
 from collections.abc import Callable, Iterator
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +27,7 @@ from typing import Any, cast
 import hash_fixtures as hf
 import httpx
 import pytest
+import state_v1_fixture as v1fx
 import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import cli
@@ -43,6 +46,7 @@ from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.linking import SendOutcome
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome
 from shoko_linker.state import (
+    SCHEMA_VERSION,
     BaselineFile,
     Cohort,
     FileSeed,
@@ -172,7 +176,7 @@ class Stubs:
             )
         if path.startswith("/api/v3/Series/AniDB/"):
             anime_id = int(path.split("/")[5])
-            rows = [self._anidb_episode() for _ in self.files if anime_id == ANIME_ID]
+            rows = [self._anidb_episode()] if anime_id == ANIME_ID and self.files else []
             return self._json(request, {"Total": len(rows), "List": rows})
         if path.startswith("/api/v3/Episode/AniDB/"):
             return self._json(
@@ -211,6 +215,7 @@ class Stubs:
                 "id": file.series_id,
                 "title": f"Series {file.series_id}",
                 "rootFolderPath": f"{SONARR_ROOT}/series{file.series_id}",
+                "seriesType": "anime",
                 "tvdbId": TVDB_SERIES,
             }
             for file in {f.series_id: f for f in self.files}.values()
@@ -1010,6 +1015,52 @@ def test_report_with_absent_state_is_informational(
     assert env.stubs.all_service_requests() == []
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+def test_offline_report_redacts_legacy_runtime_keys_with_fresh_registry(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    json_output: bool,
+) -> None:
+    from shoko_linker.logging_setup import clear_registered_secrets, registered_secret_count
+
+    clear_registered_secrets()
+    settings = load_settings(env.config_path)
+    keys = ("synthetic-offline-sonarr-key-0000", "synthetic-offline-shoko-key-0000")
+    monkeypatch.setenv(settings.sonarr.api_key.env_var, keys[0])
+    monkeypatch.setenv(settings.shoko.api_key.env_var, keys[1])
+    with closing(env.open_store()) as store:
+        store.record_file(
+            500,
+            sonarr_series_id=1,
+            sonarr_file_id=10,
+            sonarr_path=f"{SONARR_ROOT}/legacy.mkv",
+            sonarr_size=FILE_SIZE,
+            cohort=Cohort.BACKLOG,
+            iso=T0,
+        )
+        # Simulate a pre-redaction database, not a newly scrubbed diagnostic.
+        store.connection.execute(
+            "UPDATE files SET state_detail = ?", (f"legacy refusal: {keys[0]} {keys[1]}",)
+        )
+    assert registered_secret_count() == 0
+
+    def forbid_client(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("offline report must not create HTTP clients")
+
+    monkeypatch.setattr(httpx, "Client", forbid_client)
+    try:
+        code = main(["report", str(env.config_path), *(["--json"] if json_output else [])])
+        captured = capsys.readouterr()
+        assert code == EXIT_OK
+        assert "legacy refusal" in captured.out
+        assert all(key not in captured.out + captured.err for key in keys)
+        assert registered_secret_count() == 2
+        assert env.stubs.all_service_requests() == []
+    finally:
+        clear_registered_secrets()
+
+
 def test_health_reports_liveness_from_meta_only(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1034,7 +1085,15 @@ def test_health_reports_liveness_from_meta_only(
 # ------------------------------------------------------------------ operator commands
 
 
-def _seed_sent_file(env: Env, file_id: int, *, verified: bool = False) -> None:
+def _seed_sent_file(
+    env: Env,
+    file_id: int,
+    *,
+    verified: bool = False,
+    terminal_review: bool = True,
+    http_status: int = 200,
+    request_fingerprint: str = REQUEST_FP,
+) -> None:
     from shoko_linker.linking import VerificationVerdict
     from shoko_linker.state import SendToken
 
@@ -1053,24 +1112,50 @@ def _seed_sent_file(env: Env, file_id: int, *, verified: bool = False) -> None:
         token = store.prepare_send(
             file_id,
             PLAN_FP,
-            REQUEST_FP,
+            request_fingerprint,
             targets_digest="c" * 64,
             structure_digest="d" * 64,
             mapping_revision="1",
             cycle_key="cycle-1",
             iso=env.now_iso,
+            target_ids=((ANIME_ID, ANIDB_EP, SHOKO_EP),),
         )
         assert isinstance(token, SendToken)
         store.mark_sent(token, iso=env.now_iso)
-        store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=env.now_iso)
+        store.record_send_outcome(
+            token,
+            SendOutcome.ACCEPTED_UNVERIFIED,
+            iso=env.now_iso,
+            http_status=http_status,
+        )
         if verified:
             store.record_verification(file_id, VerificationVerdict.VERIFIED, iso=env.now_iso)
+        elif terminal_review:
+            inspection = store.active_send_details(file_id)
+            assert inspection is not None
+            store.record_verification(
+                file_id,
+                VerificationVerdict.CONTRADICTION,
+                iso=env.now_iso,
+                inspection=inspection,
+            )
     finally:
         store.close()
 
 
-def test_resolve_send_release_frees_the_slot_and_refuses_verified(
-    env: Env, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("choice", "resolution", "expected_state"),
+    [
+        ("--release", "released_after_review", FileState.WAITING.value),
+        ("--block", "operator_closed", FileState.BLOCKED_SAFETY.value),
+    ],
+)
+def test_resolve_send_requires_terminal_inspection_records_choice_and_refuses_verified(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    choice: str,
+    resolution: str,
+    expected_state: str,
 ) -> None:
     _seed_sent_file(env, 500)
     code = main(
@@ -1081,25 +1166,34 @@ def test_resolve_send_release_frees_the_slot_and_refuses_verified(
             "500",
             "--fingerprint",
             REQUEST_FP,
-            "--release",
+            choice,
             "--note",
-            "operator verified XRefs after deadline",
+            "operator reviewed terminal same-file XRefs",
             "--confirm",
             "--json",
         ]
     )
     payload = captured_json(capsys)
     assert code == EXIT_OK
-    assert payload["result"]["resolution"] == "released_after_review"
-    assert payload["result"]["state_after"] == "waiting"
+    assert payload["result"]["resolution"] == resolution
+    assert payload["result"]["state_after"] == expected_state
     assert "FRESH request fingerprint" in payload["result"]["replan_note"]
     store = env.open_store()
     try:
         assert store.budget_view().pending_file_requests == 0
+        row = store.connection.execute(
+            "SELECT outcome, verification, slot_released FROM sends WHERE shoko_file_id = 500"
+        ).fetchone()
+        assert tuple(row) == ("resolved", "contradiction", 1)
+        actions = json.loads(str(store.get_meta("operator_actions")))
+        assert actions[-1]["command"] == "resolve-send"
+        assert actions[-1]["note"] == "operator reviewed terminal same-file XRefs"
+        assert actions[-1]["result"]["resolution"] == resolution
     finally:
         store.close()
 
-    _seed_sent_file(env, 501, verified=True)
+    verified_fingerprint = "e" * 64
+    _seed_sent_file(env, 501, verified=True, request_fingerprint=verified_fingerprint)
     code = main(
         [
             "resolve-send",
@@ -1107,7 +1201,7 @@ def test_resolve_send_release_frees_the_slot_and_refuses_verified(
             "--file-id",
             "501",
             "--fingerprint",
-            REQUEST_FP,
+            verified_fingerprint,
             "--block",
             "--note",
             "attempt on a verified row",
@@ -1117,6 +1211,38 @@ def test_resolve_send_release_frees_the_slot_and_refuses_verified(
     captured = capsys.readouterr()
     assert code == EXIT_STATE
     assert "state refused" in captured.err
+
+
+def test_resolve_send_refuses_pending_202_without_terminal_inspection(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_sent_file(env, 500, terminal_review=False, http_status=202)
+    code = main(
+        [
+            "resolve-send",
+            str(env.config_path),
+            "--file-id",
+            "500",
+            "--fingerprint",
+            REQUEST_FP,
+            "--release",
+            "--note",
+            "HTTP 202 is not terminal XRef evidence",
+            "--confirm",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == EXIT_STATE
+    assert "inspected_review" in captured.err
+    store = env.open_store()
+    try:
+        assert store.budget_view().pending_file_requests == 1
+        assert store.active_send_details(500) is not None
+        actions = store.get_meta("operator_actions")
+        assert actions is None
+    finally:
+        store.close()
 
 
 def test_operator_commands_require_confirm(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1251,6 +1377,51 @@ def test_pause_resume_and_clear_rebaseline_persist(
         assert [entry["command"] for entry in actions][-1] == "resume-writes"
     finally:
         store.close()
+
+
+def test_resume_writes_confirmation_migrates_stopped_legacy_state(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The confirmed operator recovery remains available after safe schema maintenance."""
+    v1fx.build_v1_database(env.state_path)
+    connection = sqlite3.connect(env.state_path)
+    try:
+        connection.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            (("writes_disabled", "1"), ("writes_disabled_reason", "operator repair required")),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    base = str(env.config_path)
+    code = main(["resume-writes", base, "--note", "volume fixed", "--json"])
+    assert code == EXIT_CONFIG_INVALID
+    assert "requires the explicit --confirm flag" in capsys.readouterr().out
+    inspect = sqlite3.connect(env.state_path)
+    try:
+        assert inspect.execute("PRAGMA user_version").fetchone() == (1,)
+        assert inspect.execute(
+            "SELECT value FROM meta WHERE key = 'writes_disabled'"
+        ).fetchone() == ("1",)
+    finally:
+        inspect.close()
+
+    code = main(["resume-writes", base, "--note", "volume fixed", "--confirm", "--json"])
+    assert code == EXIT_OK
+    payload = captured_json(capsys)
+    assert payload["result"]["writes_disabled"] is False
+    store = env.open_store()
+    try:
+        assert store.schema_version() == SCHEMA_VERSION
+        assert store.writes_disabled is False
+        assert store.get_meta("writes_disabled_reason") is None
+        actions = json.loads(str(store.get_meta("operator_actions")))
+        assert [entry["command"] for entry in actions][-1] == "resume-writes"
+    finally:
+        store.close()
+    assert env.stubs.all_service_requests() == []
+    assert env.stubs.source_requests == []
 
 
 def test_steal_apply_lock_refuses_live_lease_and_takes_expired(

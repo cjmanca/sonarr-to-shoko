@@ -40,10 +40,15 @@ from shoko_linker.mapping_store import (
 from shoko_linker.mappings import (
     EpisodeType,
     ResolutionStatus,
+    build_mapping_index,
     content_digest,
     load_overrides,
+    parse_anime_lists,
     resolve,
+    structure_digest,
+    targets_digest,
 )
+from shoko_linker.state import ApplyProcessLock
 
 BASE_ORIGIN = "https://raw.githubusercontent.com"
 SOURCE_PATH = "/Anime-Lists/anime-lists/master/anime-list-full.xml"
@@ -65,6 +70,12 @@ ONE_HOUR_SECONDS = 3600.0
 TWO_HOURS_SECONDS = 7200.0
 NO_ENTRIES = 0
 FIRST_BACKOFF_HOURS = 1.0
+CROSS_ENTRY_INVALID_XML = (
+    b'<anime-list><anime anidbid="100" tvdbid="267440" defaulttvdbseason="1" '
+    b'episodeoffset="0"/><anime anidbid="200" tvdbid="267440" defaulttvdbseason="1" '
+    b'episodeoffset="16"><mapping-list><mapping anidbseason="1" tvdbseason="1">'
+    b";1-2oops;</mapping></mapping-list></anime></anime-list>"
+)
 
 SMALL_XML = b"<anime-list><anime anidbid='1' tvdbid='100' defaulttvdbseason='1'/></anime-list>"
 EXTENDED_XML = (
@@ -516,6 +527,540 @@ def test_invalid_content_keeps_last_known_good(tmp_path: Path) -> None:
     assert state["consecutive_failures"] == ONE_FAILURE
     assert state["revision"] == REVISION_ONE
     assert status(store, LATER).last_outcome is RefreshOutcome.FAILED_INVALID
+
+
+def test_invalid_mapping_entry_does_not_activate_partial_snapshot(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    malformed_mapping = (
+        b'<anime-list><anime anidbid="1" tvdbid="100" defaulttvdbseason="1" '
+        b'episodeoffset="0"><mapping-list><mapping anidbseason="1" tvdbseason="1">'
+        b";1-2oops;</mapping></mapping-list></anime></anime-list>"
+    )
+
+    source.queue(ok_response(malformed_mapping, ETAG_B))
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert outcome is RefreshOutcome.FAILED_INVALID
+    active = load_active(store)
+    assert active is not None
+    assert active.revision == REVISION_ONE
+    assert active.index.entries_excluded == 0
+    assert resolve(active.index, 100, 1, 2).status is ResolutionStatus.RESOLVED
+
+
+def test_known_unsupported_entry_activates_and_fences_persist_across_cache_restart(
+    tmp_path: Path,
+) -> None:
+    aot_path = Path(__file__).parent / "fixtures" / "aot_real_entries.xml"
+    extra = (
+        b'<anime anidbid="99001" tvdbid="99002" defaulttvdbseason="a" episodeoffset="4">'
+        b'<mapping-list><mapping anidbseason="1" tvdbseason="1" start="1" end="4" '
+        b'offset="0"/></mapping-list></anime>'
+    )
+    body = aot_path.read_bytes().replace(b"</anime-list>", extra + b"</anime-list>")
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    source.queue(ok_response(body, ETAG_A))
+    endpoint = endpoint_for(source, store)
+
+    try:
+        outcome = refresh(store, endpoint, now=NOW, refresh_hours=HOURS, force=True)
+        active = load_active(store)
+        assert outcome is RefreshOutcome.ACTIVATED
+        assert active is not None
+        assert active.index.entries_indexed == 8
+        assert active.index.entries_excluded == 1
+        assert active.index.unsafe_tvdb_ids == frozenset({99002})
+        anchor = resolve(active.index, 267440, 4, 26, absolute=85)
+        assert anchor.status is ResolutionStatus.RESOLVED
+        assert anchor.target is not None
+        assert (anchor.target.anidb_id, anchor.target.anidb_episode_number) == (16177, 10)
+        assert resolve(active.index, 99002, 1, 1).status is ResolutionStatus.UNMAPPED
+        assert store.invalid_source_hold() is False
+        assert store.active_identity() is not None
+
+        plain_index = build_mapping_index(parse_anime_lists(aot_path.read_bytes()))
+        assert active.targets_digest != targets_digest(plain_index)
+        expected_identity = store.active_identity()
+    finally:
+        endpoint.client.close()
+
+    reopened = make_store(tmp_path)
+    reopened_active = load_active(reopened)
+    assert reopened_active is not None
+    assert reopened.active_identity() == expected_identity
+    assert reopened_active.targets_digest == active.targets_digest
+    assert reopened_active.structure_digest == active.structure_digest
+    assert reopened_active.index.unsafe_tvdb_ids == frozenset({99002})
+    assert resolve(reopened_active.index, 99002, 1, 1).status is ResolutionStatus.UNMAPPED
+    assert reopened.invalid_source_hold() is False
+
+
+def test_pinned_upstream_special_number_uncertainty_does_not_reject_snapshot(
+    tmp_path: Path,
+) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "anime_lists_legacy_number_examples.xml"
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    source.queue(ok_response(fixture.read_bytes(), ETAG_A))
+    endpoint = endpoint_for(source, store)
+
+    try:
+        outcome = refresh(store, endpoint, now=NOW, refresh_hours=HOURS, force=True)
+        active = load_active(store)
+
+        assert outcome is RefreshOutcome.ACTIVATED
+        assert active is not None
+        assert active.index.unsafe_tvdb_keys == frozenset(
+            {(79032, 0, 3), (79032, 0, 4), (79032, 0, 5)}
+        )
+        assert active.index.unsafe_tvdb_ids == frozenset()
+        trailer = resolve(active.index, 79032, 0, 1)
+        other = resolve(active.index, 79032, 0, 2)
+        assert trailer.target is not None
+        assert other.target is not None
+        assert trailer.target.episode_type is EpisodeType.TRAILER
+        assert other.target.episode_type is EpisodeType.OTHER
+        assert store.invalid_source_hold() is False
+    finally:
+        endpoint.client.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            b'<anime-list><anime anidbid="100" tvdbid="2" defaulttvdbseason="a" '
+            b'episodeoffset="2"/><anime anidbid="100" tvdbid="3" '
+            b'defaulttvdbseason="1" episodeoffset="0"/></anime-list>'
+        ),
+        (
+            b'<anime-list><anime anidbid="100" tvdbid="3" defaulttvdbseason="1" '
+            b'episodeoffset="0"/><anime anidbid="100" tvdbid="2" '
+            b'defaulttvdbseason="a" episodeoffset="2"/></anime-list>'
+        ),
+        (
+            b'<anime-list><anime anidbid="100" tvdbid="2" defaulttvdbseason="a" '
+            b'episodeoffset="2"/><anime anidbid="100" tvdbid="3" '
+            b'defaulttvdbseason="a" episodeoffset="4"/></anime-list>'
+        ),
+    ],
+    ids=["unsupported-before-valid", "valid-before-unsupported", "multiple-unsupported"],
+)
+def test_duplicate_anidb_refresh_preserves_last_known_good_and_holds_writes(
+    tmp_path: Path, body: bytes
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    meta_before = store.meta_path.read_bytes()
+    identity_before = store.active_identity()
+    source.queue(ok_response(body, ETAG_B))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    active = load_active(store)
+    assert outcome is RefreshOutcome.FAILED_INVALID
+    assert active is not None
+    assert active.revision == REVISION_ONE
+    assert active.index.unsafe_tvdb_ids == frozenset()
+    assert resolve(active.index, 3, 1, 1).status is ResolutionStatus.UNMAPPED
+    assert store.active_path.read_bytes() == active_before
+    assert store.meta_path.read_bytes() == meta_before
+    assert store.active_identity() == identity_before
+    assert len(tuple(store.generations_path.iterdir())) == 1
+    assert store.invalid_source_hold() is True
+    assert status(store, LATER).last_outcome is RefreshOutcome.FAILED_INVALID
+    endpoint.client.close()
+
+
+@pytest.mark.parametrize("line_ending", ["&#10;", "&#13;", "\n", "\r"])
+@pytest.mark.parametrize("malformed_first", [False, True], ids=["valid-first", "malformed-first"])
+def test_newline_terminated_anidbid_refresh_preserves_last_known_good_and_holds_writes(
+    tmp_path: Path, line_ending: str, malformed_first: bool
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    valid = "<anime anidbid='100' tvdbid='3' defaulttvdbseason='1' episodeoffset='0'/>"
+    malformed = (
+        f"<anime anidbid='100{line_ending}' tvdbid='2' defaulttvdbseason='1' episodeoffset='0'/>"
+    )
+    body = f"<anime-list>{malformed + valid if malformed_first else valid + malformed}</anime-list>"
+    source.queue(ok_response(body.encode("utf-8"), ETAG_B))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    active = load_active(store)
+    assert outcome is RefreshOutcome.FAILED_INVALID
+    assert active is not None
+    assert active.revision == REVISION_ONE
+    assert store.active_path.read_bytes() == active_before
+    assert store.invalid_source_hold() is True
+    assert status(store, LATER).last_outcome is RefreshOutcome.FAILED_INVALID
+    endpoint.client.close()
+
+
+def test_semantically_invalid_refresh_preserves_last_known_good_and_backs_off(
+    tmp_path: Path,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    meta_before = store.meta_path.read_bytes()
+    source.queue(ok_response(CROSS_ENTRY_INVALID_XML, ETAG_B))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert outcome is RefreshOutcome.FAILED_INVALID
+    assert store.active_path.read_bytes() == active_before
+    assert store.meta_path.read_bytes() == meta_before
+    assert len(tuple(store.generations_path.iterdir())) == 1
+    active = load_active(store)
+    assert active is not None
+    assert active.revision == REVISION_ONE
+    failed_state = read_json(store.state_path)
+    assert failed_state["consecutive_failures"] == ONE_FAILURE
+    assert failed_state["next_due_iso"] == iso(LATER + timedelta(hours=FIRST_BACKOFF_HOURS))
+    assert status(store, LATER).last_outcome is RefreshOutcome.FAILED_INVALID
+    assert status(store, LATER).invalid_source_hold is True
+
+    requests_before_backoff = len(source.requests)
+    retry_time = LATER + timedelta(minutes=30)
+    assert due(store, retry_time) is False
+    assert refresh(store, endpoint, now=retry_time, refresh_hours=HOURS) is RefreshOutcome.NOT_DUE
+    assert len(source.requests) == requests_before_backoff
+
+
+def test_invalid_source_hold_survives_transport_failure_restart_and_backoff(
+    tmp_path: Path,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    invalid_at = NOW + timedelta(hours=HOURS)
+    source.queue(ok_response(b'{"anime-list": []}', ETAG_B))
+
+    invalid = refresh(store, endpoint, now=invalid_at, refresh_hours=HOURS)
+    invalid_status = status(store, invalid_at)
+    endpoint.client.close()
+
+    # A new process must not forget the invalid observation when a later transport
+    # failure replaces last_outcome.
+    reopened = make_store(tmp_path)
+    source.queue(status_response(503))
+    reopened_endpoint = endpoint_for(source, reopened)
+    transport_at = invalid_at + timedelta(hours=1)
+    transport = refresh(reopened, reopened_endpoint, now=transport_at, refresh_hours=HOURS)
+    not_due_at = transport_at + timedelta(minutes=30)
+    requests_before_backoff = len(source.requests)
+    not_due = refresh(reopened, reopened_endpoint, now=not_due_at, refresh_hours=HOURS)
+    held_status = status(reopened, not_due_at)
+
+    assert invalid is RefreshOutcome.FAILED_INVALID
+    assert invalid_status.invalid_source_hold is True
+    assert transport is RefreshOutcome.FAILED_TRANSPORT
+    assert not_due is RefreshOutcome.NOT_DUE
+    assert len(source.requests) == requests_before_backoff
+    assert held_status.last_outcome is RefreshOutcome.FAILED_TRANSPORT
+    assert held_status.consecutive_failures == 2
+    assert held_status.invalid_source_hold is True
+    assert held_status.revision == REVISION_ONE
+    reopened_endpoint.client.close()
+
+
+def test_unsolicited_304_does_not_clear_invalid_source_hold_but_valid_200_does(
+    tmp_path: Path,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    invalid_at = NOW + timedelta(hours=HOURS)
+    source.queue(ok_response(b'{"error": "not an Anime-Lists XML document"}', ETAG_B))
+    assert (
+        refresh(store, endpoint, now=invalid_at, refresh_hours=HOURS)
+        is RefreshOutcome.FAILED_INVALID
+    )
+
+    # Even an unsolicited 304 does not validate the malformed representation observed
+    # above and therefore cannot release the hold or reset its bounded retry schedule.
+    source.queue(not_modified(ETAG_A))
+    assert (
+        refresh(store, endpoint, now=invalid_at + timedelta(minutes=1), force=True)
+        is RefreshOutcome.FAILED_TRANSPORT
+    )
+    assert status(store, invalid_at + timedelta(minutes=1)).invalid_source_hold is True
+    assert "If-None-Match" not in source.requests[-1].headers
+
+    # A fetched and fully parsed 200 is the recovery proof, even when its effective
+    # mappings are semantically unchanged from the last-known-good cache.
+    source.queue(ok_response(SMALL_XML, ETAG_B))
+    assert (
+        refresh(store, endpoint, now=invalid_at + timedelta(minutes=2), force=True)
+        is RefreshOutcome.UNCHANGED
+    )
+    assert status(store, invalid_at + timedelta(minutes=2)).invalid_source_hold is False
+    endpoint.client.close()
+
+
+def test_invalid_source_hold_retries_unconditionally_with_backoff_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    invalid_at = NOW + timedelta(hours=HOURS)
+    source.queue(ok_response(b'{"invalid": true}', ETAG_B))
+    assert (
+        refresh(store, endpoint, now=invalid_at, refresh_hours=HOURS)
+        is RefreshOutcome.FAILED_INVALID
+    )
+    endpoint.client.close()
+
+    reopened = make_store(tmp_path)
+    endpoint = endpoint_for(source, reopened)
+    retry_at = invalid_at + timedelta(minutes=1)
+
+    # A broken source may still send an unsolicited 304. It cannot prove that the
+    # previously-invalid body is repaired, and must schedule a bounded retry.
+    source.queue(not_modified(ETAG_A))
+    assert refresh(reopened, endpoint, now=retry_at, force=True) is RefreshOutcome.FAILED_TRANSPORT
+    assert "If-None-Match" not in source.requests[-1].headers
+    held = status(reopened, retry_at)
+    assert held.invalid_source_hold is True
+    assert held.consecutive_failures == TWO_FAILURES
+    assert held.next_due_iso == iso(retry_at + timedelta(hours=2))
+
+    endpoint.client.close()
+    reopened = make_store(tmp_path)
+    endpoint = endpoint_for(source, reopened)
+    source.queue(ok_response(SMALL_XML, ETAG_A))
+    assert (
+        refresh(reopened, endpoint, now=retry_at + timedelta(hours=2), refresh_hours=HOURS)
+        is RefreshOutcome.UNCHANGED
+    )
+    assert "If-None-Match" not in source.requests[-1].headers
+    assert status(reopened, retry_at + timedelta(hours=2)).invalid_source_hold is False
+    assert reopened.active_path.read_bytes() == SMALL_XML
+    endpoint.client.close()
+
+
+def test_generation_lock_releases_queued_refresh_when_owner_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, source, original_endpoint = activated_store(tmp_path)
+    original_endpoint.client.close()
+    queued_store = make_store(tmp_path)
+    request_started = Event()
+    refresh_started = Event()
+    contender_waiting = Event()
+    source.queue(ok_response(b'{"invalid": true}', ETAG_B))
+    original_handler = source.handler
+
+    def observe_request(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        return original_handler(request)
+
+    # Use a separate endpoint so the real refresh's request remains observable while
+    # its separate store instance contends on the same on-disk generation lock.
+    client = httpx.Client(
+        base_url=BASE_ORIGIN,
+        transport=httpx.MockTransport(observe_request),
+        follow_redirects=False,
+        timeout=make_timeout(1.0, 1.0),
+    )
+    endpoint = ApiEndpoint(client, queued_store.headers_factory())
+    outcomes: list[RefreshOutcome] = []
+    errors: list[BaseException] = []
+
+    def queued_refresh() -> None:
+        refresh_started.set()
+        try:
+            outcomes.append(refresh(queued_store, endpoint, now=LATER, force=True))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=queued_refresh, daemon=True)
+    original_acquire = ApplyProcessLock.acquire
+
+    def observe_contender(lock: Any) -> bool:
+        acquired = original_acquire(lock)
+        if lock.path.name == "generation.lock" and not acquired:
+            contender_waiting.set()
+        return acquired
+
+    monkeypatch.setattr(ApplyProcessLock, "acquire", observe_contender)
+
+    def raise_while_refresh_is_queued() -> None:
+        with store.generation_lock() as acquired:
+            assert acquired
+            worker.start()
+            assert refresh_started.wait(1.0)
+            assert contender_waiting.wait(1.0)
+            assert not request_started.wait(0.05)
+            raise RuntimeError("owner failed")
+
+    try:
+        with pytest.raises(RuntimeError, match="owner failed"):
+            raise_while_refresh_is_queued()
+
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert outcomes == [RefreshOutcome.FAILED_INVALID]
+        assert request_started.is_set()
+        assert queued_store.invalid_source_hold()
+    finally:
+        endpoint.client.close()
+
+
+def test_invalid_refresh_under_an_independent_generation_lease_is_persisted(
+    tmp_path: Path,
+) -> None:
+    store, _, initial_endpoint = activated_store(tmp_path)
+    initial_endpoint.client.close()
+    refresh_store = make_store(tmp_path)
+    request_started = Event()
+    release_response = Event()
+    source = ScriptedSource()
+
+    def delayed_invalid_response(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        assert release_response.wait(5.0)
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(b'{"invalid": "not Anime-Lists XML"}'),
+            request=request,
+        )
+
+    source.queue(delayed_invalid_response)
+    endpoint = endpoint_for(source, refresh_store)
+    outcomes: list[RefreshOutcome] = []
+    errors: list[BaseException] = []
+
+    def run_refresh() -> None:
+        try:
+            outcomes.append(refresh(refresh_store, endpoint, now=LATER, force=True))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=run_refresh, daemon=True)
+    try:
+        worker.start()
+        assert request_started.wait(5.0)
+        with store.generation_lock() as acquired:
+            assert acquired
+            release_response.set()
+            worker.join(timeout=5.0)
+            assert not worker.is_alive()
+            assert errors == []
+            assert outcomes == [RefreshOutcome.FAILED_LOCKED]
+            # The invalid response was fully observed, but the independent refresh
+            # store could not update scheduler metadata while the generation lease lived.
+            assert refresh_store.invalid_source_hold() is True
+
+        reopened = make_store(tmp_path)
+        retry_at = LATER + timedelta(minutes=30)
+        recovered = status(reopened, retry_at)
+        assert recovered.invalid_source_hold is True
+        assert recovered.last_outcome is RefreshOutcome.FAILED_INVALID
+        assert recovered.next_due_iso == iso(LATER + timedelta(hours=FIRST_BACKOFF_HOURS))
+        assert due(reopened, retry_at) is False
+
+        retry_source = ScriptedSource()
+        retry_endpoint = endpoint_for(retry_source, reopened)
+        assert refresh(reopened, retry_endpoint, now=retry_at) is RefreshOutcome.NOT_DUE
+        assert retry_source.requests == []
+        retry_endpoint.client.close()
+    finally:
+        release_response.set()
+        worker.join(timeout=5.0)
+        endpoint.client.close()
+
+
+def test_invalid_observation_is_durable_before_refresh_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    invalid_at = NOW + timedelta(hours=HOURS)
+    source.queue(ok_response(b'{"invalid": "not Anime-Lists XML"}', ETAG_B))
+    persist_observation = MappingStore._persist_invalid_source_observation
+
+    def interrupt_after_persist(current_store: MappingStore, now: datetime) -> str:
+        observation_id = persist_observation(current_store, now)
+        raise KeyboardInterrupt(f"simulated process interruption after {observation_id}")
+
+    monkeypatch.setattr(
+        MappingStore, "_persist_invalid_source_observation", interrupt_after_persist
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt, match="simulated process interruption"):
+            refresh(store, endpoint, now=invalid_at, force=True)
+    finally:
+        endpoint.client.close()
+
+    reopened = make_store(tmp_path)
+    assert reopened.invalid_source_hold() is True
+    recovered_state = status(reopened, invalid_at)
+    assert recovered_state.invalid_source_hold is True
+    assert recovered_state.last_outcome is RefreshOutcome.FAILED_INVALID
+    assert recovered_state.next_due_iso == iso(invalid_at + timedelta(hours=FIRST_BACKOFF_HOURS))
+
+
+def test_legacy_failed_invalid_outcome_migrates_to_persisted_source_hold(
+    tmp_path: Path,
+) -> None:
+    store, _, endpoint = activated_store(tmp_path)
+    state = read_json(store.state_path)
+    state.pop("invalid_source_hold", None)
+    state["last_outcome"] = RefreshOutcome.FAILED_INVALID.value
+    state["consecutive_failures"] = ONE_FAILURE
+    state["next_due_iso"] = iso(LATER)
+    store.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    pointer = read_json(store.active_generation_path)
+    pointer_state = pointer["state"]
+    pointer_state.pop("invalid_source_hold", None)
+    pointer_state["last_outcome"] = RefreshOutcome.FAILED_INVALID.value
+    pointer_state["consecutive_failures"] = ONE_FAILURE
+    pointer_state["next_due_iso"] = iso(LATER)
+    store.active_generation_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    migrated = status(store, NOW)
+
+    assert migrated.last_outcome is RefreshOutcome.FAILED_INVALID
+    assert migrated.invalid_source_hold is True
+    endpoint.client.close()
+
+
+def test_invalid_legacy_active_cache_is_neither_usable_nor_a_conditional_hit(
+    tmp_path: Path,
+) -> None:
+    store, _, endpoint = activated_store(tmp_path)
+    state = read_json(store.state_path)
+    meta = read_json(store.meta_path)
+    index = build_mapping_index(parse_anime_lists(CROSS_ENTRY_INVALID_XML))
+    content_sha = content_digest(CROSS_ENTRY_INVALID_XML)
+    targets = targets_digest(index)
+    structure = structure_digest(index)
+    meta.update(
+        {
+            "content_sha256": content_sha,
+            "targets_digest": targets,
+            "structure_digest": structure,
+            "entries_indexed": index.entries_indexed,
+            "mapping_rules": index.mapping_rules,
+            "explicit_pairs": index.explicit_pairs,
+        }
+    )
+    state.update(
+        {
+            "content_sha256": content_sha,
+            "targets_digest": targets,
+            "structure_digest": structure,
+        }
+    )
+    store.active_generation_path.unlink()
+    store._legacy_active_path.write_bytes(CROSS_ENTRY_INVALID_XML)
+    store._legacy_meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    store.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    assert load_active(store) is None
+    assert due(store, NOW) is True
+    assert store.active_identity() is None
+    assert "If-None-Match" not in store.request_headers()
+    endpoint.client.close()
 
 
 def test_transport_failure_backs_off_and_keeps_last_known_good(tmp_path: Path) -> None:

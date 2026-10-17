@@ -23,6 +23,7 @@ from .audit import AuditReport
 from .campaign import CampaignApplyReport, campaign_drain_selection
 from .config import Settings, apply_gate_status
 from .daemon import CycleReport, DaemonReport, rolling_budget_exhausted
+from .logging_setup import redact
 from .mapping_store import MappingStatus, RefreshOutcome
 from .state import (
     META_APPLY_LOCK,
@@ -32,6 +33,7 @@ from .state import (
     META_CAMPAIGN_DEFERRED_UNTIL,
     META_LAST_CYCLE_END_ISO,
     META_LAST_CYCLE_START_ISO,
+    META_LAST_DISCOVERY_EXCLUSIONS,
     META_LAST_FULL_RECONCILE_ISO,
     META_LAST_REFUSAL,
     META_NEXT_CYCLE_DUE_ISO,
@@ -228,6 +230,10 @@ def cycle_report_payload(
         "mapping_outcome": report.mapping_outcome.value if report.mapping_outcome else None,
         "mapping_revision": report.mapping_revision,
         "counts": asdict(report.counts),
+        "discovery_exclusions": {
+            "counts": dict(report.exclusion_counts),
+            "scope_excluded": report.scope_excluded_count,
+        },
         "reasons": list(report.reasons),
         "top_reasons": list(report.reasons[:TOP_REASON_LIMIT]),
         "drift": list(report.drift),
@@ -305,6 +311,8 @@ def cycle_summary_line(report: CycleReport) -> str:
         f" campaign_apply_eligible={report.campaign_apply_eligible}"
         f" campaign_submitted={report.campaign_submitted}"
         f" total_link_requests_attempted={report.total_link_requests_attempted}"
+        f" exclusions={sum(report.exclusion_counts.values())}"
+        f" scope_excluded={report.scope_excluded_count}"
         f" writes_suppressed(new_arrival={report.new_arrival_writes_suppressed},"
         f" campaign={report.campaign_writes_suppressed}, all={report.writes_suppressed})"
         f" reconciliation_ready={report.reconciliation_ready}"
@@ -346,6 +354,7 @@ def mapping_status_payload(
         "refresh_hours": refresh_hours,
         "last_outcome": status.last_outcome.value if status.last_outcome is not None else None,
         "consecutive_failures": status.consecutive_failures,
+        "invalid_source_hold": status.invalid_source_hold,
         "source_available_last_attempt": status.last_outcome
         not in (
             RefreshOutcome.FAILED_TRANSPORT,
@@ -409,7 +418,62 @@ def _detail_rollup(store: StateStore) -> list[dict[str, Any]]:
         " GROUP BY state_detail ORDER BY n DESC, state_detail LIMIT ?",
         (DETAIL_ROLLUP_LIMIT,),
     ).fetchall()
-    return [{"detail": str(row[0]), "count": _as_int(row[1])} for row in rows]
+    return [{"detail": redact(str(row[0])), "count": _as_int(row[1])} for row in rows]
+
+
+def discovery_exclusion_payload(store: StateStore) -> dict[str, Any]:
+    """Decode the last complete Shoko reconciliation's bounded exclusion evidence."""
+    raw = store.get_meta(META_LAST_DISCOVERY_EXCLUSIONS)
+    try:
+        document = json.loads(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        document = None
+    if (
+        not isinstance(document, dict)
+        or document.get("version") != 1
+        or not isinstance(document.get("counts"), dict)
+        or not isinstance(document.get("examples"), list)
+    ):
+        return {"total": 0, "counts": {}, "scope_excluded": 0, "examples": []}
+    counts = {
+        str(reason): count
+        for reason, count in document["counts"].items()
+        if isinstance(reason, str)
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+    }
+    examples = []
+    for example in document["examples"]:
+        if not isinstance(example, dict):
+            continue
+        file_id = example.get("shoko_file_id")
+        reason = example.get("reason")
+        detail = example.get("detail")
+        if (
+            isinstance(file_id, int)
+            and not isinstance(file_id, bool)
+            and file_id > 0
+            and isinstance(reason, str)
+            and isinstance(detail, str)
+        ):
+            examples.append({"shoko_file_id": file_id, "reason": reason, "detail": redact(detail)})
+    total = document.get("total")
+    scope_excluded = document.get("scope_excluded")
+    return {
+        "total": total
+        if isinstance(total, int) and not isinstance(total, bool) and total >= 0
+        else 0,
+        "counts": counts,
+        "scope_excluded": (
+            scope_excluded
+            if isinstance(scope_excluded, int)
+            and not isinstance(scope_excluded, bool)
+            and scope_excluded >= 0
+            else 0
+        ),
+        "examples": examples,
+    }
 
 
 def _baseline_payload(baseline: Baseline | None) -> dict[str, Any] | None:
@@ -469,6 +533,7 @@ def state_rollup(store: StateStore) -> dict[str, Any]:
         "counts_by_cohort": _cohort_counts(store),
         "first_run_baseline": _baseline_payload(store.latest_baseline()),
         "detail_rollup": _detail_rollup(store),
+        "discovery_exclusions": discovery_exclusion_payload(store),
         "mapping_conflicts": by_state[FileState.CONFLICT.value],
         "budget_view": asdict(view),
         "budget_limits": _limits_payload(store.budget_limits),
@@ -639,6 +704,7 @@ def report_payload(
         "cohorts": rollup["counts_by_cohort"],
         "first_run_baseline": rollup["first_run_baseline"],
         "detail_rollup": rollup["detail_rollup"],
+        "discovery_exclusions": rollup["discovery_exclusions"],
         "mapping": mapping,
         "mapping_conflicts": rollup["mapping_conflicts"],
         "safety": {

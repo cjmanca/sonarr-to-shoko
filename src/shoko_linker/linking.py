@@ -54,6 +54,7 @@ import httpx
 from .config import Settings
 from .errors import ConfigError, HttpPolicyError, PathError
 from .http import ApiEndpoint, resolve_and_send
+from .logging_setup import redact
 from .mappings import EpisodeType, MappingIndex, ResolutionStatus
 from .mappings import resolve as resolve_mapping
 from .paths import is_within_root, normalize_posix
@@ -124,8 +125,39 @@ class PreflightReason(Enum):
     IDENTITY_CHANGED = "identity_changed"
     OWNERSHIP_FAILED = "ownership_failed"
     TARGET_DRIFT = "target_drift"
+    TARGET_UNAVAILABLE = "target_unavailable"
     MAPPING_CHANGED = "mapping_changed"
     CANDIDATE_SET_CHANGED = "candidate_set_changed"
+
+
+# A preflight may inspect several frozen targets and collect several reasons. Deferral is safe
+# only when every reason independently permits retry; in particular, a missing target response
+# must never mask drift or malformed data from another target. BLOCKED_SAFETY is explicitly
+# retryable because the preflight uses it only for transient authorization/gate state.
+RETRYABLE_PREFLIGHT_REASONS: Final[frozenset[PreflightReason]] = frozenset(
+    {
+        PreflightReason.BLOCKED_SAFETY,
+        PreflightReason.QUEUE_UNKNOWN,
+        PreflightReason.QUEUE_BLOCKED,
+        PreflightReason.TRANSPORT_FAILURE,
+        PreflightReason.TARGET_UNAVAILABLE,
+    }
+)
+
+
+def preflight_reasons_are_retryable(reasons: Sequence[PreflightReason]) -> bool:
+    """Defer only a nonempty preflight verdict whose complete reason set is retryable."""
+    return bool(reasons) and all(reason in RETRYABLE_PREFLIGHT_REASONS for reason in reasons)
+
+
+def primary_hard_preflight_reason(
+    reasons: Sequence[PreflightReason],
+) -> PreflightReason | None:
+    """Return the first non-retryable reason, so a preceding wait cannot hide hard evidence."""
+    return next(
+        (reason for reason in reasons if reason not in RETRYABLE_PREFLIGHT_REASONS),
+        None,
+    )
 
 
 class SendOutcome(Enum):
@@ -362,8 +394,8 @@ class EpisodeIdResolver:
     """Two-step AniDB→Shoko ID chain with a caller-clock TTL cache.
 
     Cache keyed ``(anime_id, type, number)``; a pass-level instance is the
-    throttling unit: one request per unique key per pass, no per-file re-fetch
-    across files sharing a series. Negative outcomes (404 pending-metadata,
+    throttling unit: one chain per unique key, reusing anime/type listings across
+    different episode numbers for their TTL. Negative outcomes (404 pending-metadata,
     identity mismatch, transport failure) are **not** cached: the key is
     invalidated so a later pass re-reads. Chain identities are validated at both
     hops (``AnimeID``, ``EpisodeNumber``/``Type``, ``IDs.AniDB``); a mismatch
@@ -381,6 +413,7 @@ class EpisodeIdResolver:
         self._clock = clock
         self._ttl = ttl_seconds
         self._cache: dict[tuple[int, str, int], _CacheEntry] = {}
+        self._listings: dict[tuple[int, str], tuple[_GetOutcome, float]] = {}
 
     def resolve(self, anime_id: int, episode_type: str, number: int) -> ResolvedEpisode:
         """Resolve one ``(anime_id, type, number)`` triple to a Shoko internal episode ID."""
@@ -389,30 +422,38 @@ class EpisodeIdResolver:
         cached = self._cache.get(key)
         if cached is not None and now - cached.resolved_at < self._ttl:
             return cached.value
-        result = self._chain(key)
+        result = self._chain(key, now)
         if result.status is EpisodeResolutionStatus.RESOLVED:
             self._cache[key] = _CacheEntry(result, now)
         else:
             self._cache.pop(key, None)
+            self._listings.pop((anime_id, episode_type), None)
         return result
 
     def invalidate(self, anime_id: int, episode_type: str | EpisodeType, number: int) -> None:
         """Drop one cache entry so the next resolve performs a fresh chain."""
         type_name = episode_type.value if isinstance(episode_type, EpisodeType) else episode_type
         self._cache.pop((anime_id, type_name, number), None)
+        self._listings.pop((anime_id, type_name), None)
 
-    def _chain(self, key: tuple[int, str, int]) -> ResolvedEpisode:
+    def _chain(self, key: tuple[int, str, int], now: float) -> ResolvedEpisode:
         anime_id, type_name, number = key
         anidb_episode_id: int | None = None
         shoko_episode_id: int | None = None
         status = EpisodeResolutionStatus.INVALID_TYPE
         detail = ""
         if type_name in EPISODE_TYPE_WIRE_NAMES:
-            listing = _get(
-                self._endpoint,
-                f"api/v3/Series/AniDB/{anime_id}/Episode",
-                {"type": type_name},
-            )
+            listing_key = (anime_id, type_name)
+            cached = self._listings.get(listing_key)
+            if cached is not None and now - cached[1] < self._ttl:
+                listing = cached[0]
+            else:
+                listing = _get(
+                    self._endpoint,
+                    f"api/v3/Series/AniDB/{anime_id}/Episode",
+                    {"type": type_name},
+                )
+                self._listings[listing_key] = (listing, now)
             anidb_episode_id, status, detail = _chain_first(listing, anime_id, type_name, number)
             if anidb_episode_id is not None:
                 episode = _get(self._endpoint, f"api/v3/Episode/AniDB/{anidb_episode_id}/Episode")
@@ -538,8 +579,8 @@ def freeze_plan(
     validated = _validate_resolution_set(match, resolutions)
     if isinstance(validated, PlanSkip):
         return validated
-    by_episode, file_episodes = validated
-    built = _build_targets(by_episode)
+    _, file_episodes = validated
+    built = _build_targets(resolutions)
     if isinstance(built, PlanSkip):
         return built
     targets, pending = built
@@ -650,10 +691,15 @@ def _validate_resolution_set(
         problems.append(("no_episodes", "the matched Sonarr file has no episode group"))
     for item in resolutions:
         if item.episode.id in by_episode:
-            problems.append(
-                ("duplicate_resolution", f"episode {item.episode.id} resolved more than once")
-            )
-            continue
+            prior = [entry for entry in resolutions if entry.episode.id == item.episode.id]
+            identities = {
+                (entry.anidb_anime_id, entry.episode_type, entry.anidb_episode_number)
+                for entry in prior
+            }
+            if len(identities) != len(prior):
+                problems.append(
+                    ("duplicate_resolution", f"episode {item.episode.id} target resolved twice")
+                )
         by_episode[item.episode.id] = item
     missing = [episode.id for episode in file_episodes if episode.id not in by_episode]
     if missing:
@@ -686,13 +732,13 @@ def _validate_resolution_set(
 
 
 def _build_targets(
-    by_episode: Mapping[int, EpisodeTargetResolution],
+    resolutions: Sequence[EpisodeTargetResolution],
 ) -> PlanSkip | tuple[list[LinkTarget], list[PendingTarget]]:
     """Apply the complete-target rule per episode (PROJ: never partial links)."""
     targets: list[LinkTarget] = []
     pending: list[PendingTarget] = []
-    for episode_id in sorted(by_episode):
-        item = by_episode[episode_id]
+    for item in sorted(resolutions, key=lambda item: item.episode.id):
+        episode_id = item.episode.id
         if item.status is not ResolutionStatus.RESOLVED:
             return PlanSkip(
                 f"target_{item.status.value}",
@@ -813,18 +859,18 @@ def preflight(
     mapping_index: MappingIndex | None = None,
     service_mode: bool = False,
     service_authorized: bool | None = None,
+    check_file: bool = True,
 ) -> PreflightVerdict:
     """The fresh gate immediately before the single POST; every check fails closed.
 
     Order: authorization inputs first (legacy attestation/gate or service onboarding sends
     **zero** requests when blocked),
-    then the queue anomaly input, then the **pure** generation checks (mapping
-    digests, active-index candidate set), and only then the fresh network reads:
-    ``File/{id}?include=XRefs,AbsolutePaths`` (existence, candidacy flags
-    per the M3 gate, echoing file ID, zero XRefs, unchanged size/locations,
-    all-location ownership) and re-verification of every planned Shoko internal
-    episode ID against its AniDB identity (one fresh uncached read per unique
-    AniDB episode ID).
+    then the queue anomaly input, then the **pure** generation checks (mapping digests and
+    active-index candidate set), and only then fresh target network reads (one per unique AniDB
+    episode ID). The protected-link ``File/{id}?include=XRefs,AbsolutePaths`` read is last. Send
+    callers with additional source/authorization network checks pass ``check_file=False`` and call
+    :func:`preflight_file` after those checks; it must be the final network guard before the
+    durable send intent.
     """
     reasons: list[PreflightReason] = []
     details: list[str] = []
@@ -870,9 +916,28 @@ def preflight(
     if not reasons and mapping_index is not None:
         _preflight_candidates(plan, mapping_index, add)
     if not reasons:
-        _preflight_file(endpoint, plan, settings, folders, add)
-        if not reasons:
-            _preflight_targets(endpoint, plan, add)
+        _preflight_targets(endpoint, plan, add)
+        if not reasons and check_file:
+            _preflight_file(endpoint, plan, settings, folders, add)
+    return PreflightVerdict(not reasons, tuple(reasons), tuple(details))
+
+
+def preflight_file(
+    endpoint: ApiEndpoint,
+    plan: LinkPlan,
+    settings: Settings,
+    folders: Mapping[int, ImportFolder],
+) -> PreflightVerdict:
+    """Perform the final fresh protected-link/file identity read, with no later network checks."""
+    reasons: list[PreflightReason] = []
+    details: list[str] = []
+
+    def add(reason: PreflightReason, detail: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+        details.append(detail)
+
+    _preflight_file(endpoint, plan, settings, folders, add)
     return PreflightVerdict(not reasons, tuple(reasons), tuple(details))
 
 
@@ -1078,25 +1143,80 @@ def _location_mapping_check(normalized: str, settings: Settings) -> tuple[str | 
         return None, f"location {normalized!r} cannot be translated: {exc}"
 
 
-def _preflight_targets(
+def _preflight_targets(  # noqa: PLR0912 - verify the full identity chain before any write
     endpoint: ApiEndpoint,
     plan: LinkPlan,
     add: AddReason,
 ) -> None:
-    """Re-read every planned Shoko internal ID and validate its AniDB identity (fresh, uncached)."""
+    """Freshly revalidate mapped AniDB identities and their Shoko internal IDs."""
+    source_targets: dict[tuple[int, str], dict[int, set[int]]] = {}
+    source_failed = False
+    for target in plan.targets:
+        anime_id = _positive_int(target.anidb_anime_id)
+        episode_number = _positive_int(target.anidb_episode_number)
+        anidb_episode_id = _positive_int(target.anidb_episode_id)
+        if (
+            anime_id is None
+            or episode_number is None
+            or anidb_episode_id is None
+            or not isinstance(target.episode_type, str)
+            or target.episode_type not in EPISODE_TYPE_WIRE_NAMES
+        ):
+            source_failed = True
+            add(
+                PreflightReason.TARGET_DRIFT,
+                "the frozen AniDB source identity is malformed; no POST",
+            )
+            continue
+        source_targets.setdefault((anime_id, target.episode_type), {}).setdefault(
+            episode_number, set()
+        ).add(anidb_episode_id)
+
+    for (anime_id, type_name), episodes in sorted(source_targets.items()):
+        outcome = _get(
+            endpoint,
+            f"api/v3/Series/AniDB/{anime_id}/Episode",
+            {"type": type_name},
+        )
+        if outcome.payload is None:
+            source_failed = True
+            reason, detail = _target_read_unavailable(
+                outcome,
+                f"Shoko AniDB episode listing for anime {anime_id} type {type_name}",
+                missing_detail="is not available in Shoko yet",
+            )
+            add(reason, detail)
+            continue
+        for number, expected_ids in sorted(episodes.items()):
+            if len(expected_ids) != 1:
+                source_failed = True
+                add(
+                    PreflightReason.TARGET_DRIFT,
+                    f"the frozen AniDB identity {anime_id}/{type_name}/{number} has conflicting "
+                    "episode IDs; no POST",
+                )
+                continue
+            expected_id = next(iter(expected_ids))
+            found = _match_anidb_episode(outcome.payload, anime_id, type_name, number)
+            if not isinstance(found, int) or isinstance(found, bool) or found != expected_id:
+                source_failed = True
+                add(
+                    PreflightReason.TARGET_DRIFT,
+                    f"Shoko AniDB identity {anime_id}/{type_name}/{number} no longer resolves "
+                    f"to episode {expected_id}; no POST",
+                )
+    if source_failed:
+        return
+
     for target_anidb_id, expected_pairs in _group_expected_targets(plan):
         outcome = _get(endpoint, f"api/v3/Episode/AniDB/{target_anidb_id}/Episode")
         if outcome.payload is None:
-            reason_text = (
-                "HTTP 404: no longer materialized"
-                if outcome.status == NOT_FOUND_STATUS
-                else outcome.detail
+            reason, detail = _target_read_unavailable(
+                outcome,
+                f"Shoko episode metadata for AniDB episode {target_anidb_id}",
+                missing_detail="is not materialized in Shoko yet",
             )
-            add(
-                PreflightReason.TARGET_DRIFT,
-                f"Shoko episode for AniDB {target_anidb_id} cannot be re-read "
-                f"({reason_text}): target drift, no POST",
-            )
+            add(reason, detail)
             continue
         shoko_id, anidb_identity, problem = _parse_shoko_episode(outcome.payload)
         if problem:
@@ -1118,6 +1238,37 @@ def _preflight_targets(
             )
 
 
+def _target_read_unavailable(
+    outcome: _GetOutcome,
+    description: str,
+    *,
+    missing_detail: str,
+) -> tuple[PreflightReason, str]:
+    """Classify a failed fresh target read without claiming the frozen identity changed."""
+    if outcome.status == NOT_FOUND_STATUS:
+        detail = (
+            f"{description} {missing_detail} (HTTP 404); target identity cannot be confirmed, "
+            "retry after metadata is available; no POST"
+        )
+    elif outcome.status is not None and MIN_SUCCESS_STATUS <= outcome.status < MAX_SUCCESS_STATUS:
+        detail = (
+            f"{description} returned a malformed response (HTTP {outcome.status}); target "
+            "identity cannot be confirmed, operator review required; no POST"
+        )
+        return PreflightReason.MALFORMED, detail
+    elif outcome.status is not None:
+        detail = (
+            f"{description} could not be re-read (HTTP {outcome.status}); target identity cannot "
+            "be confirmed, retry later; no POST"
+        )
+    else:
+        detail = (
+            f"{description} could not be re-read because Shoko was temporarily unreachable; "
+            "target identity cannot be confirmed, retry later; no POST"
+        )
+    return PreflightReason.TARGET_UNAVAILABLE, detail
+
+
 def _group_expected_targets(plan: LinkPlan) -> list[tuple[int, set[int]]]:
     """One re-read per unique AniDB episode id (dedup for multi-episode files)."""
     grouped: dict[int, set[int]] = {}
@@ -1132,33 +1283,47 @@ def _preflight_candidates(
     add: AddReason,
 ) -> None:
     """The active mapping index must answer each planned source episode identically."""
+    grouped: dict[tuple[int, int, int, int | None], set[tuple[int, int, str, str]]] = {}
     for target in plan.targets:
-        resolution = resolve_mapping(
-            mapping_index,
+        key = (
             target.tvdb_series,
             target.season_number,
             target.episode_number,
             target.absolute_episode_number,
         )
-        expected = (target.anidb_anime_id, target.anidb_episode_number, target.episode_type)
+        grouped.setdefault(key, set()).add(
+            (
+                target.anidb_anime_id,
+                target.anidb_episode_number,
+                target.episode_type,
+                target.source_rule,
+            )
+        )
+    for key, expected in grouped.items():
+        resolution = resolve_mapping(
+            mapping_index,
+            *key,
+        )
         match = (
             resolution.status is ResolutionStatus.RESOLVED
-            and resolution.target is not None
-            and (
-                resolution.target.anidb_id,
-                resolution.target.anidb_episode_number,
-                resolution.target.episode_type.value,
-            )
+            and {
+                (
+                    item.anidb_id,
+                    item.anidb_episode_number,
+                    item.episode_type.value,
+                    item.source_rule.value,
+                )
+                for item in resolution.targets
+            }
             == expected
-            and resolution.target.source_rule.value == target.source_rule
         )
         if not match:
             add(
                 PreflightReason.CANDIDATE_SET_CHANGED,
-                f"active mapping answers TVDB {target.tvdb_series} S{target.season_number}"
-                f"E{target.episode_number} as {resolution.status.value} "
+                f"active mapping answers TVDB {key[0]} S{key[1]}"
+                f"E{key[2]} as {resolution.status.value} "
                 f"({resolution.detail}), not the planned target {expected} "
-                f"[{target.source_rule}] (replan before any POST)",
+                "(replan before any POST)",
             )
 
 
@@ -1199,7 +1364,7 @@ def submit_link(
         attempted_at=attempted_at,
         http_status=http_status,
         retry_forbidden=True,
-        detail=detail,
+        detail=redact(detail),
     )
 
 
@@ -1218,10 +1383,14 @@ def _deliver(endpoint: ApiEndpoint, plan: LinkPlan) -> tuple[SendOutcome, int | 
         return (
             SendOutcome.AMBIGUOUS_SEND,
             None,
-            f"redirect policy stopped the POST: {exc}. {inspect}",
+            f"redirect policy stopped the POST: {type(exc).__name__}. {inspect}",
         )
     except httpx.HTTPError as exc:
-        return SendOutcome.AMBIGUOUS_SEND, None, f"transport failed mid-delivery: {exc}. {inspect}"
+        return (
+            SendOutcome.AMBIGUOUS_SEND,
+            None,
+            f"transport failed mid-delivery: {type(exc).__name__}. {inspect}",
+        )
     try:
         status = response.status_code
         if MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
@@ -1498,6 +1667,8 @@ def _match_anidb_episode(
     total, entries = rows
     if total > len(entries):
         return EpisodeResolutionStatus.LIST_TRUNCATED
+    if total < len(entries):
+        return EpisodeResolutionStatus.MALFORMED
     return _match_anidb_rows(entries, anime_id, type_name, number)
 
 
@@ -1520,18 +1691,34 @@ def _match_anidb_rows(
     entries: Sequence[Any], anime_id: int, type_name: str, number: int
 ) -> int | EpisodeResolutionStatus:
     matches: list[int] = []
+    seen_ids: set[int] = set()
+    seen_identities: set[tuple[int, str, int]] = set()
     for raw in entries:
         row = _as_mapping(raw)
         if row is None:
             return EpisodeResolutionStatus.MALFORMED
-        if row.get("AnimeID") != anime_id:
-            continue
-        if row.get("EpisodeNumber") != number or row.get("Type") != type_name:
-            continue
-        value = _positive_int(row.get("ID"))
-        if value is None:
+        row_anime_id = _positive_int(row.get("AnimeID"))
+        row_number = _positive_int(row.get("EpisodeNumber"))
+        row_id = _positive_int(row.get("ID"))
+        row_type = row.get("Type")
+        if (
+            row_anime_id is None
+            or row_number is None
+            or row_id is None
+            or not isinstance(row_type, str)
+            or row_type not in EPISODE_TYPE_WIRE_NAMES
+        ):
             return EpisodeResolutionStatus.MALFORMED
-        matches.append(value)
+        identity = (row_anime_id, row_type, row_number)
+        if row_id in seen_ids or identity in seen_identities:
+            return EpisodeResolutionStatus.MALFORMED
+        seen_ids.add(row_id)
+        seen_identities.add(identity)
+        if row_anime_id != anime_id:
+            continue
+        if row_number != number or row_type != type_name:
+            continue
+        matches.append(row_id)
     if not matches:
         return EpisodeResolutionStatus.EPISODE_NOT_FOUND
     if len(set(matches)) > 1:
@@ -1558,15 +1745,15 @@ def _get(endpoint: ApiEndpoint, path: str, params: Mapping[str, Any] | None = No
     try:
         response = resolve_and_send(endpoint, "GET", path, params=params)
     except (HttpPolicyError, httpx.HTTPError) as exc:
-        return _GetOutcome(None, None, f"{path}: {exc}")
+        return _GetOutcome(None, None, f"{path}: {type(exc).__name__}")
     try:
         status = response.status_code
         if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
             return _GetOutcome(None, status, f"{path}: HTTP {status}")
         try:
             payload = response.json()
-        except ValueError as exc:
-            return _GetOutcome(None, status, f"{path}: invalid JSON ({exc})")
+        except ValueError:
+            return _GetOutcome(None, status, f"{path}: invalid JSON")
     finally:
         response.close()
     return _GetOutcome(payload, status, "")
@@ -1640,10 +1827,10 @@ def _extract_problem(response: httpx.Response) -> str:
                     parts.append(f"{field_name}: {'; '.join(texts[:3])}")
         message = " | ".join(parts)
     if not message:
-        raw = response.text
-        single = " ".join(char for char in raw if char.isprintable() or char == " ")
+        raw = redact(response.text)
+        single = "".join(char for char in raw if char.isprintable() or char == " ")
         message = single.strip()
-    return message[:200] if message else "no message"
+    return redact(message)[:200] if message else "no message"
 
 
 def _require_digest(value: str, name: str) -> None:

@@ -33,7 +33,7 @@ def normalize_posix(path: str) -> str:
     """
     if not path.strip():
         raise PathError("path must be a non-empty string")
-    candidate = path.strip()
+    candidate = path
     if "\\" in candidate:
         raise PathError(f"path must use POSIX separators, not backslashes: {candidate!r}")
     if not candidate.startswith("/"):

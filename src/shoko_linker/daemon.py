@@ -49,8 +49,9 @@ Hard safety properties this module enforces (PROJECT.md, docs/compatibility.md �
 * **Every cycle consumes persisted recovery before processing new candidates** (M6 review
   P1-3): ``verifying`` rows are re-polled against the send row's persisted target triples,
   ``request_may_have_been_sent``/``indeterminate_write`` rows are inspected read-only via
-  ``GET File/{id}?include=XRefs`` and closed as verified / contradiction / past-deadline
-  partial (with the slot released), ``prepared_not_sent`` rows are voided (P2-2) and
+  ``GET File/{id}?include=XRefs``: exact targets close VERIFIED; terminal partial/contradiction
+  results are persisted for operator review with the slot held. ``prepared_not_sent`` rows
+  are voided (P2-2) and
   re-prepared, and persisted ``waiting``/``ambiguous`` rows re-walk the mapping resolve.
   No recovery branch ever issues a POST.
 * **The apply lock never wedges** (P2-1): acquisition steals only an expired lease (with a
@@ -67,11 +68,12 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -90,17 +92,24 @@ from .linking import (
     EpisodeResolutionStatus,
     EpisodeTargetResolution,
     LinkPlan,
+    LinkTarget,
+    PendingTarget,
     PlanSkip,
     PlanStatus,
     PreflightReason,
+    PreflightVerdict,
     QueueSnapshot,
     SendOutcome,
+    SendResult,
     ShokoFileXRefs,
     VerificationVerdict,
     fetch_queue,
     freeze_plan,
     parse_file_xrefs,
     preflight,
+    preflight_file,
+    preflight_reasons_are_retryable,
+    primary_hard_preflight_reason,
     request_fingerprint,
     submit_link,
     verify_link,
@@ -117,7 +126,7 @@ from .mapping_store import (
 from .mapping_store import (
     refresh as mapping_refresh,
 )
-from .mappings import MappingIndex, ResolutionStatus, TargetIdentity, effective_targets
+from .mappings import EpisodeType, MappingIndex, ResolutionStatus, effective_source_targets
 from .mappings import resolve as resolve_mapping
 from .policies import RunPolicy
 from .rate_control import (
@@ -131,25 +140,39 @@ from .rate_control import (
     service_budget_limits,
 )
 from .shoko import (
+    ExclusionReason,
     ImportFolder,
     ShokoDiscovery,
+    ShokoDiscoveryProgress,
+    ShokoMatchResult,
     canonical_ed2k,
     collect_shoko_discovery,
     match_shoko_files,
 )
-from .sonarr import SonarrFile, SonarrInventory, collect_sonarr_inventory
+from .sonarr import (
+    SonarrFile,
+    SonarrInventory,
+    SourceRelationshipStatus,
+    SourceRelationshipVerdict,
+    check_current_file_relationship,
+    collect_sonarr_inventory,
+)
 from .state import (
     ATTESTATION_PAUSE_REASON,
     CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
     CAMPAIGN_QUEUE_STATES,
     CAMPAIGN_STATUS_PAUSED,
+    DIGEST_HEX_CHARS,
+    MAPPING_RESOLVED_ID_COUNT,
     MAX_DETAIL_CHARS,
     META_ATTESTATION_GATE,
     META_CAMPAIGN_ATTESTATION_GATE,
     META_CAMPAIGN_DEFERRED_UNTIL,
     META_CAMPAIGN_ZERO_PROGRESS,
     META_GLOBAL_PAUSE_ORIGIN,
+    META_LAST_DISCOVERY_EXCLUSIONS,
     META_NEXT_FULL_RECONCILE_ISO,
+    META_RECOVERY_CURSOR,
     ApplyLockUnavailableError,
     BaselineFile,
     BudgetLimits,
@@ -177,7 +200,12 @@ MAX_SUCCESS_STATUS: Final[int] = 300
 
 MAX_BACKOFF_SECONDS: Final[float] = 24 * 3600.0
 MAX_MAPPING_ORIGIN_LABEL_CHARS: Final[int] = 80
+MAPPING_TARGET_KEY_PARTS: Final[int] = 7
+MAX_VERIFIED_MAPPING_SNAPSHOT_CHARS: Final[int] = 1_000_000
+MAX_EXCLUSION_EXAMPLES: Final[int] = 20
+MAX_EXCLUSION_EXAMPLE_CHARS: Final[int] = 512
 SOURCE_IDENTITY_FIELDS: Final[str] = "sonarr_url,shoko_url"
+META_SHOKO_DISCOVERY_PROGRESS: Final[str] = "shoko_discovery_progress:v1"
 # Matches the ``grace_period`` retryable label in :mod:`shoko_linker.state` (reason taxonomy).
 GRACE_PERIOD_REASON: Final[str] = "grace_period"
 
@@ -186,6 +214,13 @@ GRACE_PERIOD_REASON: Final[str] = "grace_period"
 #: every executed cycle (the run is finite). ``DaemonReport.total_cycles``/``total_failed``
 #: are the accurate counts and never depend on this bound.
 DAEMON_HISTORY_MAXLEN: Final[int] = 100
+SCOPE_EXCLUSION_REASONS: Final[frozenset[ExclusionReason]] = frozenset(
+    {
+        ExclusionReason.DROP_FOLDER_TYPE,
+        ExclusionReason.MIXED_OWNERSHIP,
+        ExclusionReason.OUTSIDE_ALLOWED_ROOT,
+    }
+)
 
 
 class CycleMode(Enum):
@@ -269,6 +304,11 @@ class DaemonDeps:
     #: advanced CLI's apply gate or operator attestation.
     service_mode: bool = False
     service_authorized: Callable[[], bool] = _service_authorization_closed
+    #: Local persistence/pause re-check after the last Shoko network guard. Production service
+    #: wiring captures the fresh remote authorization context immediately before that guard.
+    #: Required for service-mode writes: a missing callback fails closed and never falls back to
+    #: another remote authorization request after the final protected-link read.
+    service_authorized_local: Callable[[], bool] | None = None
     lease_seconds: float = 600.0
     blocked_over: int | None = None
     verification_timeout_seconds: float = 600.0
@@ -342,6 +382,13 @@ class CycleReport:
     )
     campaign_identity_drift_details: Mapping[int, tuple[str, str]] = field(
         default_factory=lambda: MappingProxyType({}), repr=False, compare=False
+    )
+    exclusion_counts: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({}), repr=False, compare=False
+    )
+    scope_excluded_count: int = 0
+    resolution_deferred_file_ids: frozenset[int] = field(
+        default_factory=frozenset, repr=False, compare=False
     )
     new_arrival_apply_eligible: bool = False
     campaign_drain_selected: bool = False
@@ -448,16 +495,6 @@ def inventory_snapshot_hash(inventory: SonarrInventory, discovery: ShokoDiscover
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _churned_series(
-    old: Mapping[int, frozenset[TargetIdentity]],
-    new: Mapping[int, frozenset[TargetIdentity]],
-) -> frozenset[int]:
-    series = set(old) | set(new)
-    return frozenset(
-        item for item in series if old.get(item, frozenset()) != new.get(item, frozenset())
-    )
-
-
 def _identity_rule_lines_by_series(index: MappingIndex) -> Mapping[int, tuple[str, ...]]:
     """Daemon-local per-series identity-rule declarations (P2-3 diff input).
 
@@ -475,8 +512,16 @@ def _identity_rule_lines_by_series(index: MappingIndex) -> Mapping[int, tuple[st
             )
     for tvdb_series, absolute_claims in index.absolute.items():
         for absolute_claim in absolute_claims:
-            covered = ",".join(str(item) for item in sorted(absolute_claim.covered))
-            spans = ",".join(f"{start}-{end}" for start, end in sorted(absolute_claim.intervals))
+            covered = ",".join(
+                f"{episode}:{episode_type.value}"
+                for episode, episode_type in sorted(
+                    absolute_claim.covered, key=lambda item: (item[0], item[1].value)
+                )
+            )
+            spans = ",".join(
+                f"{start}-{end}@{anidbseason}"
+                for start, end, anidbseason in sorted(absolute_claim.intervals)
+            )
             per_series.setdefault(tvdb_series, []).append(
                 f"A|{absolute_claim.anidb_id}|{covered}|{spans}"
             )
@@ -485,15 +530,11 @@ def _identity_rule_lines_by_series(index: MappingIndex) -> Mapping[int, tuple[st
             per_series.setdefault(tvdb_series, []).append(
                 f"N|{season}|{anidb_id}|{episode}|{episode_type.value}"
             )
+    for tvdb_series, season, episode in index.unsafe_tvdb_keys:
+        per_series.setdefault(tvdb_series, []).append(f"F|{season}|{episode}")
+    for tvdb_series in index.unsafe_tvdb_ids:
+        per_series.setdefault(tvdb_series, []).append("X|fenced-owner")
     return MappingProxyType({series: tuple(sorted(lines)) for series, lines in per_series.items()})
-
-
-def _churned_identity_rules(old: MappingIndex, new: MappingIndex) -> frozenset[int]:
-    """TVDB series whose identity-rule declarations (offset/a-rule/no-counterpart) changed."""
-    old_lines = _identity_rule_lines_by_series(old)
-    new_lines = _identity_rule_lines_by_series(new)
-    series = set(old_lines) | set(new_lines)
-    return frozenset(item for item in series if old_lines.get(item, ()) != new_lines.get(item, ()))
 
 
 # ------------------------------------------------------------------ mapping scheduler
@@ -545,12 +586,22 @@ def _mapping_phase(deps: DaemonDeps, now_iso: str) -> _MappingPhase:
     reactivated = False
     churned: frozenset[int] = frozenset()
     churn_paused = False
-    if outcome is RefreshOutcome.ACTIVATED and old is not None and active is not None:
+    if active is not None:
         # P2-3: churn includes identity-rule changes (offsets, a-rules, no-counterpart
         # markers) — unbounded rules move no enumerable target digest.
-        churned = _churned_series(effective_targets(old.index), effective_targets(active.index))
-        churned = churned | _churned_identity_rules(old.index, active.index)
-        reactivated = True
+        prior = deps.store.get_meta("reconciled_mapping_semantics:v1")
+        current = _mapping_semantics(active.index)
+        previous = (
+            json.loads(prior)
+            if prior is not None
+            else (_mapping_semantics(old.index) if old is not None else current)
+        )
+        churned = frozenset(
+            int(series)
+            for series in set(previous) | set(current)
+            if previous.get(series, []) != current.get(series, [])
+        )
+        reactivated = bool(churned) or outcome is RefreshOutcome.ACTIVATED
         # P3-A: the churn guard fires at exactly the limit (``>=``): a churn of exactly
         # ``churn_limit`` series pauses; the brief's boundary is inclusive.
         if len(churned) >= deps.churn_limit:
@@ -560,6 +611,15 @@ def _mapping_phase(deps: DaemonDeps, now_iso: str) -> _MappingPhase:
                 deps.store.pause_if_unpaused("mapping_churn", now_iso, origin="mapping_churn")
             churn_paused = True
     return _MappingPhase(outcome, old, active, reactivated, churned, churn_paused)
+
+
+def _mapping_semantics(index: MappingIndex) -> dict[str, list[str]]:
+    enumerable = effective_source_targets(index)
+    identity = _identity_rule_lines_by_series(index)
+    return {
+        str(series): sorted([*enumerable.get(series, ()), *identity.get(series, ())])
+        for series in set(enumerable) | set(identity)
+    }
 
 
 def _load_overrides(deps: DaemonDeps) -> _mappings.Overrides | None:
@@ -621,10 +681,8 @@ def _budget_headroom(deps: DaemonDeps, now_iso: str, *, campaign: bool = False) 
 
     The authoritative reservation happens in ``prepare_send``; this only feeds the
     cycle-level eligibility verdict so a saturated daemon suppresses apply early.
-    F18: the peek applies the same rolling-window reset the reservation path applies
-    (:meth:`shoko_linker.state.StateStore._reserve_tx`) — a persisted rolling counter whose
-    window has already elapsed counts as zero, so a window reopening is never
-    falsely reported exhausted (the deferral would never release).
+    The peek counts the same durable trailing-window reservation timestamps as
+    ``StateStore._reserve_tx``; expiration releases only the expired reservations.
     """
     view = deps.store.budget_view()
     limits = deps.store.budget_limits
@@ -668,29 +726,25 @@ def _apply_service_budget_limits(deps: DaemonDeps) -> None:
 
 
 def _service_mapping_refresh_failed(
-    deps: DaemonDeps, outcome: RefreshOutcome | None, reasons: list[str]
+    deps: DaemonDeps, phase: _MappingPhase, reasons: list[str]
 ) -> bool:
-    failed = deps.service_mode and _is_transport_failure(outcome)
-    if failed:
+    if deps.service_mode and _is_transport_failure(phase.outcome):
         reasons.append("mapping_source_transport_failure")
-    return failed
+        return True
+    if deps.mapping_store.invalid_source_hold():
+        reasons.append("mapping_source_invalid")
+        return True
+    return False
 
 
 def rolling_budget_exhausted(view: BudgetView, limits: BudgetLimits, now_iso: str) -> bool:
-    """The rolling-new-submission peek with the F18 window-elapsed reset.
+    """The shared trailing-window reservation peek.
 
     Shared verbatim by :func:`_budget_headroom` (daemon eligibility), the campaign drain's
     cooldown computation, and :func:`shoko_linker.reporting.budgets_ok` (report/health rollup):
-    a persisted rolling counter whose ``rolling_window_start_iso + rolling_window_hours`` has
-    already elapsed counts as ZERO — exactly the reset ``StateStore._reserve_tx`` applies at
-    reservation time — so an elapsed window is never reported exhausted."""
-    rolling = view.rolling_new_submissions
-    start = view.rolling_window_start_iso
-    if start is not None and _parse_iso(now_iso) - _parse_iso(start) >= timedelta(
-        hours=limits.rolling_window_hours
-    ):
-        rolling = 0
-    return rolling >= limits.rolling_new
+    each reservation expires independently, exactly as in ``StateStore._reserve_tx``.
+    """
+    return view.rolling_exhausted(limits, now_iso)
 
 
 def _eligibility_flags(
@@ -741,6 +795,8 @@ def compute_eligibility(
         reasons.append("mapping_unavailable")
     if not flags.mapping_stable:
         reasons.append("mapping_unstable")
+    if deps.mapping_store.invalid_source_hold():
+        reasons.append("mapping_source_invalid")
     if not flags.source_stable:
         reasons.append("source_unstable")
     return EligibilityVerdict(not reasons, tuple(reasons))
@@ -912,8 +968,16 @@ class _ReconcileResult:
     pending: int
     plans: Mapping[int, LinkPlan]
     skip_reasons: Mapping[int, str]
+    existing_link_drift: tuple[str, ...]
     fresh_campaign_quarantines: frozenset[int]
     campaign_identity_drift_details: Mapping[int, tuple[str, str]]
+    exclusion_counts: Mapping[str, int]
+    scope_excluded_count: int
+    resolution_deferred_file_ids: frozenset[int]
+
+
+class _ResolutionDeferral(Enum):
+    TRANSPORT_FAILURE = "transport_failure"
 
 
 _SEND_RECOVERY_STATES: Final[frozenset[FileState]] = frozenset(
@@ -939,6 +1003,7 @@ def _record_and_match(
     *,
     preserve_unresolved: frozenset[int] = frozenset(),
 ) -> tuple[dict[int, Cohort], int, dict[int, tuple[str, str]]]:
+    preserve_unresolved |= _quarantine_legacy_mapping_targets(deps, now_iso)
     known = _tracked_file_ids(deps.store)
     cohorts: dict[int, Cohort] = {}
     seeds: list[FileSeed] = []
@@ -1098,11 +1163,11 @@ def _episode_resolutions(
     match: Any,
     tvdb_series: int,
     active: ActiveMappings,
-) -> list[EpisodeTargetResolution] | str:
+) -> list[EpisodeTargetResolution] | str | _ResolutionDeferral:
     """Map every episode, then resolve each AniDB target to a Shoko internal ID.
 
-    Returns the resolution list, or a machine-readable skip reason when any episode
-    fails to resolve cleanly (fail closed: never a partial plan).
+    Returns the resolution list, a machine-readable skip reason for a permanent failure,
+    or a typed retryable deferral for a transport failure (never a partial plan).
     """
     resolutions: list[EpisodeTargetResolution] = []
     for episode in match.sonarr_file.episodes:
@@ -1113,7 +1178,7 @@ def _episode_resolutions(
             episode.episode_number,
             episode.absolute_episode_number,
         )
-        if answer.status is not ResolutionStatus.RESOLVED or answer.target is None:
+        if answer.status is not ResolutionStatus.RESOLVED or not answer.targets:
             prefix = f"target_{answer.status.value}:"
             provenance_label = "; candidate_provenance="
             provenance_fallback = f"[omitted={len(answer.candidates)}]"
@@ -1131,27 +1196,29 @@ def _episode_resolutions(
                 answer.candidates, max_chars=max_reason_chars - len(prefix)
             )
             return prefix + provenance
-        target = answer.target
-        triple = (target.anidb_id, target.episode_type.value, target.anidb_episode_number)
-        resolved = resolver.resolve(*triple)
-        pending = resolved.status is EpisodeResolutionStatus.PENDING_METADATA
-        if resolved.status is not EpisodeResolutionStatus.RESOLVED and not pending:
-            return f"target_{resolved.status.value.lower()}:{resolved.detail}"
-        resolutions.append(
-            EpisodeTargetResolution(
-                episode=episode,
-                tvdb_series=tvdb_series,
-                status=ResolutionStatus.RESOLVED,
-                anidb_anime_id=target.anidb_id,
-                anidb_episode_number=target.anidb_episode_number,
-                episode_type=target.episode_type.value,
-                source_rule=target.source_rule.value,
-                anidb_episode_id=resolved.anidb_episode_id,
-                shoko_episode_id=resolved.shoko_episode_id,
-                pending_metadata=pending,
-                detail=resolved.detail,
+        for target in answer.targets:
+            triple = (target.anidb_id, target.episode_type.value, target.anidb_episode_number)
+            resolved = resolver.resolve(*triple)
+            pending = resolved.status is EpisodeResolutionStatus.PENDING_METADATA
+            if resolved.status is EpisodeResolutionStatus.TRANSPORT_FAILURE:
+                return _ResolutionDeferral.TRANSPORT_FAILURE
+            if resolved.status is not EpisodeResolutionStatus.RESOLVED and not pending:
+                return f"target_{resolved.status.value.lower()}:{resolved.detail}"
+            resolutions.append(
+                EpisodeTargetResolution(
+                    episode=episode,
+                    tvdb_series=tvdb_series,
+                    status=ResolutionStatus.RESOLVED,
+                    anidb_anime_id=target.anidb_id,
+                    anidb_episode_number=target.anidb_episode_number,
+                    episode_type=target.episode_type.value,
+                    source_rule=target.source_rule.value,
+                    anidb_episode_id=resolved.anidb_episode_id,
+                    shoko_episode_id=resolved.shoko_episode_id,
+                    pending_metadata=pending,
+                    detail=resolved.detail,
+                )
             )
-        )
     return resolutions
 
 
@@ -1212,7 +1279,10 @@ def _preserve_unaffected_service_unresolved(
         record = deps.store.get_file(match.shoko_file_id)
         if record is None:
             continue
-        if record.state_detail.startswith("service_mapping_target_changed") or (
+        if (
+            deps.store.mapping_target_quarantined(match.shoko_file_id)
+            or record.state_detail.startswith("service_mapping_target_changed")
+        ) or (
             affected_sonarr_series is not None
             and record.state in (FileState.AMBIGUOUS, FileState.CONFLICT)
             and record.sonarr_series_id not in affected_sonarr_series
@@ -1221,7 +1291,687 @@ def _preserve_unaffected_service_unresolved(
     return frozenset(preserved)
 
 
-def _reconcile(
+def _mapping_target_key(
+    tvdb: int,
+    season: int,
+    episode: int,
+    absolute: int | None,
+    anime: int,
+    number: int,
+    episode_type: str,
+) -> str:
+    return json.dumps((tvdb, season, episode, absolute, anime, number, episode_type))
+
+
+def _source_targets(
+    match: Any, tvdb: int, active: ActiveMappings
+) -> dict[str, tuple[int | None, int | None]]:
+    """Collect mapping identities before Shoko metadata I/O can defer the file."""
+    targets: dict[str, tuple[int | None, int | None]] = {}
+    for episode in match.sonarr_file.episodes:
+        answer = resolve_mapping(
+            active.index,
+            tvdb,
+            episode.season_number,
+            episode.episode_number,
+            episode.absolute_episode_number,
+        )
+        if not answer.targets:
+            return {}
+        for target in answer.targets:
+            key = _mapping_target_key(
+                tvdb,
+                episode.season_number,
+                episode.episode_number,
+                episode.absolute_episode_number,
+                target.anidb_id,
+                target.anidb_episode_number,
+                target.episode_type.value,
+            )
+            targets[key] = (None, None)
+    return targets
+
+
+def _resolved_targets(plan: LinkPlan) -> dict[str, tuple[int | None, int | None]]:
+    combined: Sequence[LinkTarget | PendingTarget] = (*plan.targets, *plan.pending_targets)
+    return {
+        _mapping_target_key(
+            target.tvdb_series,
+            target.season_number,
+            target.episode_number,
+            target.absolute_episode_number,
+            target.anidb_anime_id,
+            target.anidb_episode_number,
+            target.episode_type,
+        ): (target.anidb_episode_id, getattr(target, "shoko_episode_id", None))
+        for target in combined
+    }
+
+
+def _source_target_conflicts(
+    deps: DaemonDeps,
+    matches: Sequence[Any],
+    series_tvdb: Mapping[int, int],
+    active: ActiveMappings,
+    affected_sonarr_series: frozenset[int] | None,
+) -> tuple[frozenset[int], Mapping[int, tuple[tuple[int, int, int, int | None], ...] | None]]:
+    snapshots: dict[int, dict[str, tuple[int | None, int | None]]] = {}
+    conflicts: set[int] = set()
+    verified_drift_positions: dict[int, tuple[tuple[int, int, int, int | None], ...] | None] = {}
+    for match in matches:
+        file_id = match.shoko_file_id
+        record = deps.store.get_file(file_id)
+        if record is None or record.campaign_id is not None or record.cohort is Cohort.CAMPAIGN:
+            continue  # Campaigns own their immutable approved plan and quarantine accounting.
+        if deps.service_mode and record.state is FileState.VERIFIED:
+            # A verified row is diagnostic-only. Its durable source positions are compared below;
+            # do not rebuild or enrich the immutable snapshot from the Unrecognized listing.
+            continue
+        tvdb = series_tvdb.get(match.sonarr_file.series_id)
+        if tvdb is None:
+            continue
+        prior = deps.store.get_meta(f"file_mapping_targets:v1:{file_id}")
+        if deps.store.mapping_target_quarantined(file_id) or (
+            prior is None
+            and (
+                record.state in (FileState.PLANNED, FileState.MAPPED)
+                or record.state_detail.startswith("service_mapping_target_changed")
+            )
+        ):
+            # Upgrade from a version that never persisted its planned destinations:
+            # their identity cannot be reconstructed safely from today's mapping.
+            conflicts.add(file_id)
+            continue
+        targets = _source_targets(match, tvdb, active)
+        if targets:
+            snapshots[file_id] = targets
+        elif deps.store.get_meta(f"file_mapping_targets:v1:{file_id}") is not None:
+            conflicts.add(file_id)
+    if deps.service_mode:
+        for record in deps.store.files_in_state(FileState.VERIFIED):
+            if record.campaign_id is not None or record.cohort is Cohort.CAMPAIGN:
+                continue
+            raw = deps.store.get_meta(f"file_mapping_targets:v1:{record.shoko_file_id}")
+            changed_positions = (
+                None if raw is None else _changed_frozen_target_positions(raw, active)
+            )
+            if changed_positions:
+                # Compare only positions that this durable verified file actually resolved.
+                # This is read-only evidence: never reconstruct a path or candidate from it.
+                conflicts.add(record.shoko_file_id)
+                verified_drift_positions[record.shoko_file_id] = changed_positions
+            elif changed_positions is None and (
+                affected_sonarr_series is not None
+                and record.sonarr_series_id in affected_sonarr_series
+            ):
+                # A legacy/malformed snapshot cannot prove which positions were previously
+                # linked. Keep the historical conservative affected-series warning.
+                conflicts.add(record.shoko_file_id)
+                verified_drift_positions[record.shoko_file_id] = None
+    conflicts.update(deps.store.remember_mapping_targets_bulk(snapshots))
+    return frozenset(conflicts), MappingProxyType(verified_drift_positions)
+
+
+def _changed_frozen_target_positions(  # noqa: PLR0911, PLR0912 - fail-closed checks stay explicit
+    encoded: str, active: ActiveMappings
+) -> tuple[tuple[int, int, int, int | None], ...] | None:
+    """Return changed frozen source positions, or None when legacy evidence is malformed.
+
+    The snapshot is a diagnostic record of what a verified link used. It is never rewritten or
+    treated as current path/scope evidence. Only those exact source positions are queried in the
+    active mapping, so unrelated positions elsewhere in the same TVDB series cannot create drift.
+    """
+    if len(encoded) > MAX_VERIFIED_MAPPING_SNAPSHOT_CHARS:
+        return None
+    try:
+        document = json.loads(encoded)
+    except (RecursionError, TypeError, ValueError):
+        return None
+    if not isinstance(document, dict) or not document:
+        return None
+
+    previous: dict[tuple[int, int, int, int | None], set[tuple[int, int, str]]] = {}
+    for source, resolved_ids in document.items():
+        if (
+            not isinstance(source, str)
+            or not isinstance(resolved_ids, list)
+            or len(resolved_ids) != MAPPING_RESOLVED_ID_COUNT
+        ):
+            return None
+        if any(
+            value is not None and (type(value) is not int or value <= 0) for value in resolved_ids
+        ):
+            return None
+        try:
+            values = json.loads(source)
+        except (RecursionError, TypeError, ValueError):
+            return None
+        if not isinstance(values, list) or len(values) != MAPPING_TARGET_KEY_PARTS:
+            return None
+        tvdb, season, episode, absolute, anime, number, episode_type = values
+        if (
+            type(tvdb) is not int
+            or tvdb < 1
+            or type(season) is not int
+            or season < 0
+            or type(episode) is not int
+            or episode < 1
+            or (absolute is not None and (type(absolute) is not int or absolute < 1))
+            or type(anime) is not int
+            or anime < 1
+            or type(number) is not int
+            or number < 1
+            or not isinstance(episode_type, str)
+        ):
+            return None
+        try:
+            EpisodeType(episode_type)
+        except ValueError:
+            return None
+        position = (tvdb, season, episode, absolute)
+        previous.setdefault(position, set()).add((anime, number, episode_type))
+    if not previous or len({position[0] for position in previous}) != 1:
+        return None
+
+    changed: list[tuple[int, int, int, int | None]] = []
+    for position, frozen_targets in previous.items():
+        answer = resolve_mapping(active.index, *position)
+        active_targets = (
+            {
+                (target.anidb_id, target.anidb_episode_number, target.episode_type.value)
+                for target in answer.targets
+            }
+            if answer.status is ResolutionStatus.RESOLVED
+            else set()
+        )
+        if active_targets != frozen_targets:
+            changed.append(position)
+    return tuple(
+        sorted(
+            changed,
+            key=lambda position: (
+                position[0],
+                position[1],
+                position[2],
+                -1 if position[3] is None else position[3],
+            ),
+        )
+    )
+
+
+def _record_service_verified_mapping_drifts(
+    deps: DaemonDeps,
+    changed_positions_by_file: Mapping[int, tuple[tuple[int, int, int, int | None], ...] | None],
+    active: ActiveMappings,
+    now_iso: str,
+) -> tuple[str, ...]:
+    """Persist and report only verified service files with changed frozen targets."""
+    if not deps.service_mode:
+        return ()
+    drift: list[str] = []
+    for file_id, changed_positions in sorted(changed_positions_by_file.items()):
+        record = deps.store.get_file(file_id)
+        if (
+            record is None
+            or record.state is not FileState.VERIFIED
+            or record.campaign_id is not None
+            or record.cohort is Cohort.CAMPAIGN
+        ):
+            continue
+        if changed_positions is None:
+            reason = "frozen target evidence unavailable after an affected mapping change"
+        else:
+            positions = ", ".join(
+                f"TVDB {tvdb} S{season}E{episode}"
+                + (f" (absolute {absolute})" if absolute is not None else "")
+                for tvdb, season, episode, absolute in changed_positions
+            )
+            reason = f"changed mapping at {positions}"
+        # A corrupt pre-existing marker is not permission to stall service reconciliation. The
+        # current report remains visible; the durable marker stays untouched.
+        with contextlib.suppress(StateError):
+            deps.store.record_service_mapping_drift(
+                file_id,
+                previous_targets_digest=record.mapping_targets_digest,
+                active_targets_digest=active.targets_digest,
+                previous_structure_digest=record.mapping_structure_digest,
+                active_structure_digest=active.structure_digest,
+                mapping_revision=str(active.revision),
+                reason=reason,
+                iso=now_iso,
+            )
+        drift.append(f"existing_link drift: verified file {file_id} {reason} (never unlinked)")
+    return tuple(drift)
+
+
+def _filter_resolved_target_drift(
+    deps: DaemonDeps, plans: dict[int, LinkPlan], skip_reasons: dict[int, str], now_iso: str
+) -> None:
+    snapshots = {}
+    for file_id, plan in plans.items():
+        record = deps.store.get_file(file_id)
+        if (
+            record is not None
+            and record.campaign_id is None
+            and record.cohort is not Cohort.CAMPAIGN
+        ):
+            snapshots[file_id] = _resolved_targets(plan)
+    for file_id in deps.store.remember_mapping_targets_bulk(snapshots):
+        skip_reasons[file_id] = "service_mapping_target_changed"
+        _quarantine_mapping_target(deps, file_id, now_iso)
+        del plans[file_id]
+
+
+def _quarantine_mapping_target(deps: DaemonDeps, file_id: int, now_iso: str) -> None:
+    deps.store.quarantine_mapping_targets((file_id,), iso=now_iso)
+
+
+def _quarantine_legacy_mapping_targets(deps: DaemonDeps, now_iso: str) -> frozenset[int]:
+    """Classify legacy resolution evidence before any retry erases state/details."""
+    return deps.store.quarantine_unfrozen_mapping_targets(iso=now_iso)
+
+
+def _resolve_match_plan(
+    resolver: EpisodeIdResolver,
+    match: Any,
+    tvdb: int,
+    active: ActiveMappings,
+    discovery: ShokoDiscovery,
+    policy: RunPolicy,
+) -> LinkPlan | PlanSkip | _ResolutionDeferral:
+    resolutions = _episode_resolutions(resolver, match, tvdb, active)
+    if resolutions is _ResolutionDeferral.TRANSPORT_FAILURE:
+        return resolutions
+    if isinstance(resolutions, str):
+        return PlanSkip(resolutions, resolutions)
+    return freeze_plan(
+        match,
+        resolutions,
+        policy=policy,
+        targets_digest=active.targets_digest,
+        structure_digest=active.structure_digest,
+        shoko_paths=_resolve_shoko_paths(discovery, match.shoko_file_id),
+        mapping_revision=str(active.revision),
+        overrides_active=active.overrides_applied,
+    )
+
+
+def _record_exclusions(
+    deps: DaemonDeps, result: ShokoMatchResult, discovery: ShokoDiscovery, now_iso: str
+) -> tuple[dict[int, str], Mapping[str, int], int]:
+    """Retain categorized exclusions without admitting them to the write plan."""
+    skipped: dict[int, str] = {}
+    files = {file.id: file for file in discovery.files}
+    counts = {reason.value: 0 for reason in ExclusionReason}
+    scope_excluded = 0
+    examples: list[dict[str, Any]] = []
+    known = _tracked_file_ids(deps.store)
+    for exclusion in result.exclusions:
+        file_id = exclusion.shoko_file_id
+        source = exclusion.sonarr_file
+        reason = exclusion.reason.value
+        counts[reason] += 1
+        if exclusion.reason in SCOPE_EXCLUSION_REASONS:
+            scope_excluded += 1
+        detail = f"exclusion:{reason}: {exclusion.detail}"
+        skipped[file_id] = detail
+        if len(examples) < MAX_EXCLUSION_EXAMPLES:
+            examples.append(
+                {
+                    "shoko_file_id": file_id,
+                    "reason": reason,
+                    "detail": exclusion.detail[:MAX_EXCLUSION_EXAMPLE_CHARS],
+                }
+            )
+
+        file = files.get(file_id)
+        record = deps.store.get_file(file_id)
+        if record is None and source is not None and file is not None:
+            cohort = deps.store.classify_new(
+                file_id,
+                sonarr_series_id=source.series_id,
+                sonarr_file_id=source.episode_file_id,
+                known_shoko_file_ids=known,
+            )
+            deps.store.record_file(
+                file_id,
+                sonarr_series_id=source.series_id,
+                sonarr_file_id=source.episode_file_id,
+                sonarr_path=source.path,
+                sonarr_size=source.size,
+                cohort=cohort,
+                iso=now_iso,
+                identity=FileIdentitySnapshot(
+                    ed2k=file.hashes.ed2k,
+                    sha1=file.hashes.sha1,
+                    md5=file.hashes.md5,
+                    crc32=file.hashes.crc32,
+                    shoko_paths=tuple(sorted({loc.absolute_path for loc in file.locations})),
+                ),
+            )
+            known = known | {file_id}
+        record = deps.store.get_file(file_id)
+        if record is not None and (
+            source is None
+            or (record.sonarr_series_id, record.sonarr_file_id)
+            == (source.series_id, source.episode_file_id)
+        ):
+            mutable_states = {
+                FileState.DISCOVERED,
+                FileState.MATCHED,
+                FileState.MAPPED,
+                FileState.PLANNED,
+                FileState.WAITING,
+                FileState.AMBIGUOUS,
+            }
+            if record.state in mutable_states:
+                state_detail = f"source_exclusion:{reason}: {exclusion.detail}"
+                if record.state in (FileState.PLANNED, FileState.AMBIGUOUS):
+                    _advance(deps, file_id, FileState.WAITING, state_detail, now_iso)
+                _advance(deps, file_id, FileState.AMBIGUOUS, state_detail, now_iso)
+
+    summary = {
+        "version": 1,
+        "total": len(result.exclusions),
+        "counts": counts,
+        "scope_excluded": scope_excluded,
+        "examples": examples,
+    }
+    with contextlib.suppress(WriteDisabledError, StateError):
+        deps.store.set_meta(
+            META_LAST_DISCOVERY_EXCLUSIONS,
+            json.dumps(summary, sort_keys=True, separators=(",", ":")),
+        )
+    return skipped, MappingProxyType(counts), scope_excluded
+
+
+def _resolution_deadline(deps: DaemonDeps, cycle_start_mono: float) -> float:
+    """Leave half the remaining cycle for fresh preflight, submit and verification."""
+    now = deps.monotonic()
+    remaining = max(0.0, cycle_start_mono + deps.max_cycle_seconds - now)
+    return now + remaining / 2
+
+
+def _inventory_deadline(deps: DaemonDeps, cycle_start_mono: float) -> float:
+    """Use at most half the remaining cycle for one bounded inventory slice."""
+    now = deps.monotonic()
+    remaining = max(0.0, cycle_start_mono + deps.max_cycle_seconds - now)
+    return now + remaining / 2
+
+
+def _load_shoko_discovery_progress(  # noqa: PLR0911
+    deps: DaemonDeps, now_iso: str
+) -> ShokoDiscoveryProgress | None:
+    """Load a fresh, well-formed persisted Shoko page sweep, failing closed otherwise."""
+    raw = deps.store.get_meta(META_SHOKO_DISCOVERY_PROGRESS)
+    if raw is None:
+        return None
+    endpoint_identity = str(deps.shoko.client.base_url).rstrip("/")
+
+    def invalidate() -> None:
+        deps.store.clear_meta(META_SHOKO_DISCOVERY_PROGRESS)
+
+    try:
+        document = json.loads(raw)
+        fields = {
+            "version",
+            "endpoint_identity",
+            "folders_fingerprint",
+            "total",
+            "page_size",
+            "cursor",
+            "swept_pages",
+            "pages",
+            "fetched_at",
+        }
+        if (
+            not isinstance(document, dict)
+            or set(document) != fields
+            or type(document["version"]) is not int
+            or document["version"] != 1
+            or not isinstance(document["endpoint_identity"], str)
+            or not document["endpoint_identity"]
+            or document["endpoint_identity"] != endpoint_identity
+            or not isinstance(document["folders_fingerprint"], str)
+            or len(document["folders_fingerprint"]) != DIGEST_HEX_CHARS
+            or any(char not in "0123456789abcdef" for char in document["folders_fingerprint"])
+            or type(document["total"]) is not int
+            or document["total"] < 0
+            or type(document["page_size"]) is not int
+            or document["page_size"] <= 0
+            or type(document["cursor"]) is not int
+            or document["cursor"] < 0
+            or not isinstance(document["swept_pages"], list)
+            or not isinstance(document["pages"], dict)
+            or not isinstance(document["fetched_at"], dict)
+        ):
+            invalidate()
+            return None
+
+        expected_pages = max(
+            1,
+            (document["total"] + document["page_size"] - 1) // document["page_size"],
+        )
+        pages: dict[int, tuple[Any, ...]] = {}
+        for raw_page, rows in document["pages"].items():
+            page = int(raw_page)
+            if (
+                str(page) != raw_page
+                or page <= 0
+                or page > expected_pages
+                or not isinstance(rows, list)
+                or any(not isinstance(row, dict) for row in rows)
+            ):
+                invalidate()
+                return None
+            pages[page] = tuple(rows)
+        if set(document["fetched_at"]) != {str(page) for page in pages}:
+            invalidate()
+            return None
+        swept_values = document["swept_pages"]
+        if any(type(page) is not int or page <= 0 or page not in pages for page in swept_values):
+            invalidate()
+            return None
+        if len(swept_values) != len(set(swept_values)) or document["cursor"] > expected_pages:
+            invalidate()
+            return None
+        fetched_at = {int(page): value for page, value in document["fetched_at"].items()}
+        if any(not isinstance(value, str) for value in fetched_at.values()):
+            invalidate()
+            return None
+        now = _parse_iso(now_iso)
+        max_cache_age = timedelta(hours=deps.settings.sync.full_reconcile_interval_hours)
+        for timestamp in fetched_at.values():
+            fetched = _parse_iso(timestamp)
+            if fetched > now or now - fetched >= max_cache_age:
+                invalidate()
+                return None
+        return ShokoDiscoveryProgress(
+            endpoint_identity=document["endpoint_identity"],
+            folders_fingerprint=document["folders_fingerprint"],
+            total=document["total"],
+            page_size=document["page_size"],
+            cursor=document["cursor"],
+            swept_pages=frozenset(swept_values),
+            pages=pages,
+            fetched_at=fetched_at,
+        )
+    except (KeyError, TypeError, ValueError):
+        invalidate()
+        return None
+
+
+def _save_shoko_discovery_progress(
+    deps: DaemonDeps, progress: ShokoDiscoveryProgress | None
+) -> None:
+    if progress is None:
+        deps.store.clear_meta(META_SHOKO_DISCOVERY_PROGRESS)
+        return
+    document = {
+        "version": 1,
+        "endpoint_identity": progress.endpoint_identity,
+        "folders_fingerprint": progress.folders_fingerprint,
+        "total": progress.total,
+        "page_size": progress.page_size,
+        "cursor": progress.cursor,
+        "swept_pages": sorted(progress.swept_pages),
+        "pages": {str(page): list(rows) for page, rows in progress.pages.items()},
+        "fetched_at": {str(page): value for page, value in progress.fetched_at.items()},
+    }
+    deps.store.set_meta(
+        META_SHOKO_DISCOVERY_PROGRESS,
+        json.dumps(document, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def _collect_bounded_shoko_discovery(
+    deps: DaemonDeps, cycle_start_mono: float, now_iso: str
+) -> ShokoDiscovery:
+    """Resume a bounded Shoko page sweep without reconciling stale or partial pages."""
+    progress = _load_shoko_discovery_progress(deps, now_iso)
+    discovery = collect_shoko_discovery(
+        deps.shoko,
+        cached_progress=progress,
+        endpoint_identity=str(deps.shoko.client.base_url).rstrip("/"),
+        deadline=_inventory_deadline(deps, cycle_start_mono),
+        monotonic=deps.monotonic,
+        observed_at=now_iso,
+    )
+    _save_shoko_discovery_progress(deps, discovery.progress)
+    return discovery
+
+
+def _collect_bounded_sonarr_inventory(deps: DaemonDeps, cycle_start_mono: float) -> SonarrInventory:
+    """Resume a stable, rotating full-series inventory without trusting partial sweeps."""
+    manifest, cursor, swept, encoded_fragments = deps.store.load_sonarr_inventory_cache()
+    children: dict[int, tuple[tuple[Any, ...], tuple[Any, ...]]] = {}
+    invalidated: set[int] = set()
+    try:
+        freshness_now = _parse_iso(deps.now())
+    except ValueError:
+        freshness_now = None
+    max_cache_age = timedelta(hours=deps.settings.sync.full_reconcile_interval_hours)
+    for series_id, encoded in encoded_fragments.items():
+        try:
+            document = json.loads(encoded)
+        except ValueError:
+            invalidated.add(series_id)
+            continue
+        if (
+            isinstance(document, dict)
+            and set(document) == {"episodes", "files", "fetched_at"}
+            and isinstance(document["episodes"], list)
+            and isinstance(document["files"], list)
+            and isinstance(document["fetched_at"], str)
+        ):
+            try:
+                fetched_at = _parse_iso(document["fetched_at"])
+            except ValueError:
+                invalidated.add(series_id)
+                continue
+            if (
+                freshness_now is None
+                or fetched_at > freshness_now
+                or freshness_now - fetched_at >= max_cache_age
+            ):
+                invalidated.add(series_id)
+                continue
+            children[series_id] = (tuple(document["episodes"]), tuple(document["files"]))
+        else:
+            # Legacy fragments have no persisted observation time, so they cannot be
+            # trusted across restarts.  New fragments remain resumable until the bound.
+            invalidated.add(series_id)
+
+    inventory = collect_sonarr_inventory(
+        deps.sonarr,
+        deps.settings,
+        cached_manifest_hash=manifest,
+        cached_series_children=children,
+        series_cursor=cursor,
+        swept_series_ids=frozenset(swept & children.keys()),
+        series_deadline=_inventory_deadline(deps, cycle_start_mono),
+        monotonic=deps.monotonic,
+    )
+    if inventory.series_manifest_hash is None:
+        return inventory
+
+    invalidated.update(inventory.invalidated_series_ids)
+    try:
+        fetched_at_iso = deps.now()
+        _parse_iso(fetched_at_iso)
+    except ValueError:
+        fetched_at_iso = None
+    fetched_fragments = {}
+    for series_id, payloads in (inventory.fetched_series_children or {}).items():
+        if fetched_at_iso is None:
+            invalidated.add(series_id)
+            continue
+        fetched_fragments[series_id] = json.dumps(
+            {
+                "episodes": list(payloads[0]),
+                "files": list(payloads[1]),
+                "fetched_at": fetched_at_iso,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    manifest_changed = manifest != inventory.series_manifest_hash
+    deps.store.save_sonarr_inventory_cache(
+        inventory.series_manifest_hash,
+        inventory.series_cursor,
+        () if inventory.refresh_sweep_complete else sorted(inventory.swept_series_ids),
+        fetched_fragments,
+        reset=manifest_changed,
+        invalidated_series_ids=sorted(invalidated),
+    )
+    return inventory
+
+
+def _resolution_order(
+    deps: DaemonDeps,
+    matches: Sequence[Any],
+    policy: RunPolicy,
+    limit: int | None,
+    deadline: float | None,
+    priority_file_ids: frozenset[int],
+) -> Iterator[tuple[Any, bool]]:
+    """Yield every safety check, but rotate a bounded set of remote resolutions.
+
+    Cursor persistence deliberately precedes I/O: interrupted or unavailable anime
+    metadata must not repeatedly starve later files. Explicitly approved campaign files
+    lead the bounded window so unrelated backlog work cannot starve an active campaign.
+    Frozen targets are independent of this scheduling marker and are never discarded by
+    rotation.
+    """
+    cursor_key = f"reconcile_cursor:v1:{policy.value}"
+    cursor = int(deps.store.get_meta(cursor_key) or "0") if limit is not None else 0
+    ordered = sorted(
+        matches,
+        key=lambda m: (
+            m.shoko_file_id not in priority_file_ids,
+            m.shoko_file_id <= cursor,
+            m.shoko_file_id,
+        ),
+    )
+    count = 0
+    for match in ordered:
+        record = deps.store.get_file(match.shoko_file_id)
+        terminal = record is not None and record.state in (
+            _SEND_RECOVERY_STATES | {FileState.VERIFIED, FileState.BLOCKED_SAFETY}
+        )
+        due = (
+            not terminal
+            and (limit is None or count < limit)
+            and (deadline is None or deps.monotonic() < deadline)
+        )
+        if due:
+            count += 1
+            if limit is not None:
+                deps.store.set_meta(cursor_key, str(match.shoko_file_id))
+        yield match, due
+
+
+def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transitions in phase order
     deps: DaemonDeps,
     inventory: SonarrInventory,
     discovery: ShokoDiscovery,
@@ -1231,6 +1981,9 @@ def _reconcile(
     policy: RunPolicy = RunPolicy.NEW_ARRIVAL,
     campaign_quarantine_limit: int | None = None,
     affected_sonarr_series: frozenset[int] | None = None,
+    resolution_limit: int | None = None,
+    resolution_deadline: float | None = None,
+    resolution_priority_file_ids: frozenset[int] = frozenset(),
 ) -> _ReconcileResult:
     series_tvdb = {
         item.series.id: item.series.tvdb_id
@@ -1251,13 +2004,34 @@ def _reconcile(
     )
     resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic)
     plans: dict[int, LinkPlan] = {}
-    skip_reasons: dict[int, str] = {}
+    skip_reasons, exclusion_counts, scope_excluded_count = _record_exclusions(
+        deps, match_result, discovery, now_iso
+    )
     fresh_campaign_quarantines: set[int] = set()
     deferred_campaign_identity_details: dict[int, tuple[str, str]] = {}
     mapped_ids: list[int] = []
-    planned_ids: list[int] = []
     pending = 0
-    for match in sorted(match_result.matches, key=lambda m: m.shoko_file_id):
+    resolution_deferred_ids: set[int] = set()
+    target_conflicts, verified_drift_positions = _source_target_conflicts(
+        deps, match_result.matches, series_tvdb, active, affected_sonarr_series
+    )
+    # Exact frozen destinations isolate the source positions changed for verified files,
+    # including files Shoko omits from its Unrecognized listing. Legacy rows without usable
+    # evidence retain a conservative affected-series warning.
+    existing_link_drift = _record_service_verified_mapping_drifts(
+        deps,
+        verified_drift_positions,
+        active,
+        now_iso,
+    )
+    for match, resolution_due in _resolution_order(
+        deps,
+        match_result.matches,
+        policy,
+        resolution_limit,
+        resolution_deadline,
+        resolution_priority_file_ids,
+    ):
         file_id = match.shoko_file_id
         identity_drift = identity_drifts.get(file_id)
         if identity_drift is not None:
@@ -1285,35 +2059,32 @@ def _reconcile(
             skip_reasons[file_id] = "no_tvdb_series"
             _advance(deps, file_id, FileState.AMBIGUOUS, "no tvdb series", now_iso)
             continue
-        resolutions = _episode_resolutions(resolver, match, tvdb_series, active)
-        if isinstance(resolutions, str):
-            skip_reasons[file_id] = resolutions
-            _advance(deps, file_id, FileState.AMBIGUOUS, resolutions, now_iso)
+        if file_id in target_conflicts:
+            skip_reasons[file_id] = "service_mapping_target_changed"
+            _quarantine_mapping_target(deps, file_id, now_iso)
             continue
-        mapped_ids.append(file_id)
-        shoko_paths = _resolve_shoko_paths(discovery, file_id)
-        frozen = freeze_plan(
-            match,
-            resolutions,
-            policy=policy,
-            targets_digest=active.targets_digest,
-            structure_digest=active.structure_digest,
-            shoko_paths=shoko_paths,
-            mapping_revision=str(active.revision),
-            overrides_active=active.overrides_applied,
-        )
+        if not resolution_due:
+            resolution_deferred_ids.add(file_id)
+            continue
+        frozen = _resolve_match_plan(resolver, match, tvdb_series, active, discovery, policy)
+        if frozen is _ResolutionDeferral.TRANSPORT_FAILURE:
+            resolution_deferred_ids.add(file_id)
+            skip_reasons[file_id] = "resolution_deferred:transport_failure"
+            continue
         if isinstance(frozen, PlanSkip):
             skip_reasons[file_id] = frozen.reason
             _advance(deps, file_id, FileState.AMBIGUOUS, frozen.reason, now_iso)
             continue
+        mapped_ids.append(file_id)
         if frozen.status is PlanStatus.PENDING_TARGETS:
             pending += 1
             plans[file_id] = frozen
             continue
         plans[file_id] = frozen
-        planned_ids.append(file_id)
     # P3b: the walk steps run bulk (one transaction each, per-edge validation
     # identical to per-file advance — illegal edges skipped).
+    _filter_resolved_target_drift(deps, plans, skip_reasons, now_iso)
+    planned_ids = [file_id for file_id, plan in plans.items() if plan.status is PlanStatus.LINKABLE]
     deps.store.advance_bulk(mapped_ids, FileState.MAPPED, "mapped", iso=now_iso)
     deps.store.advance_bulk(planned_ids, FileState.PLANNED, "planned", iso=now_iso)
     backlog, new_arrival = _cohort_counts(
@@ -1326,8 +2097,12 @@ def _reconcile(
         pending=pending,
         plans=plans,
         skip_reasons=skip_reasons,
+        existing_link_drift=existing_link_drift,
         fresh_campaign_quarantines=frozenset(fresh_campaign_quarantines),
         campaign_identity_drift_details=MappingProxyType(deferred_campaign_identity_details),
+        exclusion_counts=exclusion_counts,
+        scope_excluded_count=scope_excluded_count,
+        resolution_deferred_file_ids=frozenset(resolution_deferred_ids),
     )
 
 
@@ -1346,6 +2121,7 @@ def _reopen_generation_unresolved(
     deps: DaemonDeps, now_iso: str, affected: frozenset[int]
 ) -> list[str]:
     """Re-open affected unresolved files and quarantine frozen service targets."""
+    _quarantine_legacy_mapping_targets(deps, now_iso)
     drift: list[str] = []
     for state, target, reason in (
         (FileState.AMBIGUOUS, FileState.WAITING, "mapping_reactivated"),
@@ -1358,9 +2134,8 @@ def _reopen_generation_unresolved(
                 record.campaign_id is not None or record.cohort is Cohort.CAMPAIGN
             ):
                 continue
-            if (
-                deps.service_mode
-                and state is FileState.CONFLICT
+            if deps.store.mapping_target_quarantined(record.shoko_file_id) or (
+                state is FileState.CONFLICT
                 and record.state_detail.startswith("service_mapping_target_changed")
             ):
                 continue
@@ -1375,17 +2150,10 @@ def _reopen_generation_unresolved(
                 and record.state_detail in {"mapping_drift", "mapping_changed"}
             ):
                 with contextlib.suppress(TransitionError):
-                    deps.store.advance(
-                        record.shoko_file_id,
-                        FileState.CONFLICT,
-                        "service_mapping_target_changed",
-                        iso=now_iso,
-                    )
+                    _quarantine_mapping_target(deps, record.shoko_file_id, now_iso)
                     drift.append(
                         f"mapping_changed: waiting file {record.shoko_file_id} quarantined"
                     )
-    planned_target = FileState.CONFLICT if deps.service_mode else FileState.WAITING
-    planned_reason = "service_mapping_target_changed" if deps.service_mode else "mapping_changed"
     for record in deps.store.files_in_state(FileState.PLANNED):
         if record.sonarr_series_id not in affected:
             continue
@@ -1393,8 +2161,10 @@ def _reopen_generation_unresolved(
             record.campaign_id is not None or record.cohort is Cohort.CAMPAIGN
         ):
             continue
+        if deps.store.get_meta(f"file_mapping_targets:v1:{record.shoko_file_id}") is not None:
+            continue  # Compare the actual per-file destinations during reconciliation.
         with contextlib.suppress(TransitionError):
-            deps.store.advance(record.shoko_file_id, planned_target, planned_reason, iso=now_iso)
+            _quarantine_mapping_target(deps, record.shoko_file_id, now_iso)
             drift.append(f"mapping_changed: file {record.shoko_file_id} quarantined from planned")
     return drift
 
@@ -1403,20 +2173,19 @@ def _apply_generation_change(
     deps: DaemonDeps,
     now_iso: str,
     affected: frozenset[int],
-    active: ActiveMappings,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Re-evaluate affected candidates on an ACTIVATED generation (PLAN M4/M6 semantics).
+    """Re-evaluate affected candidates when durable mapping semantics change.
 
     ``affected`` is the set of Sonarr series whose effective mapping target set changed.
 
     * files in ``ambiguous``/``conflict`` in an affected series → ``waiting`` (prompt
       re-evaluation this cycle);
-    * ``planned`` (unlinked, in-flight approvals) in an affected series → ``waiting``
-      for advanced mode, or a durable service ``conflict`` quarantine until the changed target
-      is explicitly reviewed;
-    * ``verified`` (already-linked) service files in an affected series → a durable mapping-drift
-      review marker and report; never unlinked or relinked. Advanced mode retains report-only
-      behavior.
+    * ``planned`` files without durable destinations are conservatively quarantined;
+      files with frozen destinations compare their actual source→target sets during
+      reconciliation and quarantine only changes;
+    * ``verified`` service files are compared against their frozen per-file destinations during
+      reconciliation; only a file whose targets changed gets a durable mapping-drift marker.
+      Advanced mode retains its series-level report-only behavior.
 
     The resolved-ID cache is per-cycle (a new generation is a new cycle), so no
     in-cycle cache invalidation is needed here.
@@ -1425,20 +2194,11 @@ def _apply_generation_change(
     existing_link: list[str] = []
     for record in deps.store.files_in_state(FileState.VERIFIED):
         if record.sonarr_series_id in affected:
-            if (
-                deps.service_mode
-                and record.campaign_id is None
-                and record.cohort is not Cohort.CAMPAIGN
-            ):
-                deps.store.record_service_mapping_drift(
-                    record.shoko_file_id,
-                    previous_targets_digest=record.mapping_targets_digest,
-                    active_targets_digest=active.targets_digest,
-                    previous_structure_digest=record.mapping_structure_digest,
-                    active_structure_digest=active.structure_digest,
-                    mapping_revision=str(active.revision),
-                    iso=now_iso,
-                )
+            if deps.service_mode:
+                # In service mode the reconciliation compares this file's frozen source
+                # destinations below; a series-level semantic change alone does not mean
+                # every episode's existing XRefs have drifted.
+                continue
             existing_link.append(
                 f"existing_link drift: verified file {record.shoko_file_id} in a "
                 "changed mapping series (never unlinked)"
@@ -1497,17 +2257,70 @@ class _ApplyOutcome:
     verified: bool = False
 
 
+def _preflight_failure_outcome(
+    deps: DaemonDeps,
+    file_id: int,
+    verdict: PreflightVerdict,
+    now_iso: str,
+) -> _ApplyOutcome:
+    """Defer only wholly retryable verdicts; persist every hard block for operator review."""
+    if preflight_reasons_are_retryable(verdict.reasons):
+        reason = verdict.reasons[0].value
+        if PreflightReason.TARGET_UNAVAILABLE in verdict.reasons:
+            detail = "; ".join(verdict.details) or (
+                "Shoko target metadata is unavailable; target identity cannot be confirmed, "
+                "retry later; no link was submitted"
+            )
+            return _ApplyOutcome(
+                0,
+                1,
+                (f"preflight_deferred:{file_id}:target_unavailable: {detail}",),
+                (),
+            )
+        if (
+            PreflightReason.QUEUE_BLOCKED in verdict.reasons
+            or PreflightReason.QUEUE_UNKNOWN in verdict.reasons
+        ):
+            return _ApplyOutcome(0, 1, (f"preflight_{reason}",), ())
+        return _ApplyOutcome(0, 1, (f"preflight_deferred:{file_id}:{reason}",), ())
+
+    hard_reason = primary_hard_preflight_reason(verdict.reasons)
+    reason = hard_reason.value if hard_reason is not None else "preflight_blocked"
+    detail = f"preflight_quarantine:{reason}"
+    if verdict.details:
+        detail += f": {'; '.join(verdict.details)}"
+    record = deps.store.get_file(file_id)
+    if hard_reason is PreflightReason.MAPPING_CHANGED and record is not None:
+        deps.store.quarantine_mapping_targets((file_id,), iso=now_iso, reason=detail)
+    elif record is not None and record.state is FileState.PLANNED:
+        deps.store.advance(file_id, FileState.BLOCKED_SAFETY, detail, iso=now_iso)
+    drift = (
+        (f"mapping_changed: file {file_id} in-flight plan drift, no POST",)
+        if hard_reason is PreflightReason.MAPPING_CHANGED
+        else ()
+    )
+    return _ApplyOutcome(0, 0, (f"preflight_{reason}",), drift)
+
+
 def _verify_and_close(
     deps: DaemonDeps, plan: LinkPlan, file_id: int, cycle_key: str, now_iso: str
 ) -> str:
     """Poll the XRef set to the exact planned set and close the loop (slot released on VERIFIED)."""
     deadline = deps.monotonic() + deps.verification_timeout_seconds
     expected_ed2k = canonical_ed2k(plan.shoko_ed2k)
+    same_file_observation = False
+
+    def fetch_xrefs() -> ShokoFileXRefs | None:
+        nonlocal same_file_observation
+        observed = _xref_fetcher(deps.shoko, file_id, expected_ed2k=expected_ed2k)()
+        same_file_observation = observed is not None and observed.file_id == file_id
+        return observed
+
     verification = (
         VerificationVerdict.UNKNOWN
         if expected_ed2k is None
         else verify_link(
-            _xref_fetcher(deps.shoko, file_id, expected_ed2k=expected_ed2k),
+            fetch_xrefs,
             plan,
             clock=deps.monotonic,
             deadline=deadline,
@@ -1516,7 +2329,12 @@ def _verify_and_close(
             max_polls=deps.max_verify_polls,
         )
     )
-    deps.store.record_verification(file_id, verification, iso=now_iso)
+    deps.store.record_verification(
+        file_id,
+        verification,
+        iso=now_iso,
+        inspection=deps.store.active_send_details(file_id) if same_file_observation else None,
+    )
     if verification is VerificationVerdict.VERIFIED:
         deps.store.mark_completed(cycle_key, now_iso)
     return f"verification:{verification.value}"
@@ -1573,8 +2391,8 @@ def _stored_triples_verdict(
     unlink, no resubmit); subset/pending keeps PENDING before the deadline. Past the
     deadline a non-empty subset is PARTIAL; an empty set is CONTRADICTION (leaving the
     file Unrecognized does not prove success) unless ``partial_on_empty_past`` (the
-    hold-branch policy: not-linked past the deadline is a PARTIAL close that releases
-    the held slot and is reported for the operator).
+    hold-branch review classification for not-linked files). Terminal PARTIAL and
+    CONTRADICTION results retain the reservation for explicit operator resolution.
     """
     if observed.file_id != file_id:
         return VerificationVerdict.CONTRADICTION
@@ -1616,14 +2434,15 @@ def _recovery_poll_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRow
         seconds=deps.verification_timeout_seconds
     )
     observed = inspect_send_state(deps, file_id)
-    if observed is None:
+    if observed is None or observed.file_id != file_id:
         with contextlib.suppress(TransitionError):
-            deps.store.record_verification(file_id, VerificationVerdict.UNKNOWN, iso=now_iso)
+            if observed is None:
+                deps.store.record_verification(file_id, VerificationVerdict.UNKNOWN, iso=now_iso)
         return _RecoveryRowOutcome(f"recovery_poll_unknown:{file_id}")
     verdict = _stored_triples_verdict(observed, file_id, expected, now=now, deadline=deadline)
     _advance(deps, file_id, FileState.VERIFYING, "recovery re-poll", now_iso)
     with contextlib.suppress(TransitionError):
-        deps.store.record_verification(file_id, verdict, iso=now_iso)
+        deps.store.record_verification(file_id, verdict, iso=now_iso, inspection=inspection)
     return _RecoveryRowOutcome(f"recovery_poll:{file_id}:{verdict.value}")
 
 
@@ -1644,7 +2463,7 @@ def _recovery_hold_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRow
         seconds=deps.verification_timeout_seconds
     )
     observed = inspect_send_state(deps, file_id)
-    if observed is None:
+    if observed is None or observed.file_id != file_id:
         return _RecoveryRowOutcome(f"recovery_hold_unknown:{file_id}")
     verdict = _stored_triples_verdict(
         observed,
@@ -1656,12 +2475,7 @@ def _recovery_hold_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRow
     )
     _advance(deps, file_id, FileState.VERIFYING, "recovery inspection", now_iso)
     with contextlib.suppress(TransitionError):
-        deps.store.record_verification(file_id, verdict, iso=now_iso)
-    if verdict is VerificationVerdict.PARTIAL and not _xref_triples(observed):
-        # NOT-linked past the deadline: partial close, release the held slot per policy.
-        # P1-A: the release is owned by the send row's ``slot_released`` flag — a late
-        # ManualLinkJob that later verifies this row VERIFIED is a no-op, never a second release.
-        deps.store.release_send_slot(file_id, inspection.request_fingerprint, iso=now_iso)
+        deps.store.record_verification(file_id, verdict, iso=now_iso, inspection=inspection)
     return _RecoveryRowOutcome(f"recovery_hold:{file_id}:{verdict.value}")
 
 
@@ -1715,18 +2529,30 @@ def _recovery_phase(
     queue: list[tuple[Any, str]] = [(row, "poll") for row in plan.continue_polling]
     queue.extend((row, "hold") for row in plan.hold_for_verification)
     queue.sort(key=lambda entry: (_recovery_sort_key(deps, entry[0]), entry[0].shoko_file_id))
+    raw_cursor = deps.store.get_meta(META_RECOVERY_CURSOR)
+    try:
+        cursor = max(0, int(raw_cursor or "0"))
+    except ValueError:
+        cursor = 0
+    start = next(
+        (index + 1 for index, (row, _kind) in enumerate(queue) if row.shoko_file_id == cursor),
+        0,
+    )
+    if start:
+        queue = queue[start:] + queue[:start]
     cap = (
         deps.max_recovery_rows_per_cycle if full else max(1, deps.max_recovery_rows_per_cycle // 2)
     )
     deferred = 0
     for processed, (row, kind) in enumerate(queue):
-        if processed >= cap or deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
+        if processed >= cap or deps.monotonic() - cycle_start_mono >= deps.max_cycle_seconds:
             deferred = len(queue) - processed
             break
         if kind == "poll":
             outcomes.append(_recovery_poll_row(deps, row, now_iso))
         else:
             outcomes.append(_recovery_hold_row(deps, row, now_iso))
+        deps.store.set_meta(META_RECOVERY_CURSOR, str(row.shoko_file_id))
     if deferred:
         outcomes.append(_RecoveryRowOutcome(f"recovery_deferred:{deferred}"))
     # (d) replan rows are DB-only (no GETs) and bounded by the prepared-not-sent count.
@@ -1748,14 +2574,20 @@ def _recovery_sort_key(deps: DaemonDeps, row: Any) -> str:
 
 
 def _candidate_freshness_guard(
-    deps: DaemonDeps, active: ActiveMappings, send_iso: str
+    deps: DaemonDeps,
+    active: ActiveMappings,
+    send_iso: str,
+    *,
+    generation_lock_held: bool = False,
 ) -> _ApplyOutcome | None:
     """F11: per-candidate freshness refusals — deferral (stays ``planned``/queueable), never
     a quarantine, never a POST. The lease/gate freshness is owned by the
     per-candidate eligibility + preflight below (F2/P2-4)."""
     if deps.shutdown_requested():
         return _ApplyOutcome(0, 1, ("shutdown_requested",), ())
-    if mapping_generation_stale(deps, active, send_iso):
+    if deps.mapping_store.invalid_source_hold():
+        return _ApplyOutcome(0, 1, ("mapping_source_invalid",), ())
+    if mapping_generation_stale(deps, active, send_iso, generation_lock_held=generation_lock_held):
         # The plan was frozen against the guard-time generation: a swap defers the candidate
         # (the next cycle re-validates), never POSTs on the stale digests.
         return _ApplyOutcome(0, 1, ("mapping_generation_changed",), ())
@@ -1763,24 +2595,34 @@ def _candidate_freshness_guard(
 
 
 def _post_preflight_freshness_guard(
-    deps: DaemonDeps, active: ActiveMappings, send_iso: str
+    deps: DaemonDeps,
+    active: ActiveMappings,
+    send_iso: str,
+    *,
+    cycle_deadline: float | None,
+    generation_lock_held: bool = False,
 ) -> _ApplyOutcome | None:
     """P2-1: the guard re-run between preflight's network phase and the intent commit.
 
-    Preflight's File + per-episode GETs are slow (10s connect / 30s read), so a
+    The target/file and current-Sonarr-source GETs are slow (10s connect / 30s read), so a
     shutdown, generation swap, lease expiry, or gate close that lands DURING them must not ride the
     pre-preflight verdict into ``prepare_send``. This re-evaluation is purely local (store meta +
     the disk lease + config gate) — no network, no polling.
     """
-    guard = _candidate_freshness_guard(deps, active, send_iso)
+    guard = _candidate_freshness_guard(
+        deps, active, send_iso, generation_lock_held=generation_lock_held
+    )
     if guard is not None:
         return guard
     if deps.service_mode:
-        if not deps.service_authorized():
+        authorized = deps.service_authorized_local is not None and deps.service_authorized_local()
+        if not authorized:
             return _ApplyOutcome(0, 1, ("service_authorization_changed",), ())
     elif not deps.attestation_valid() or not apply_gate(deps.settings):
         # Transient safety (F8 semantics): defer, never quarantine.
         return _ApplyOutcome(0, 1, ("attestation_expired",), ())
+    if cycle_deadline is not None and deps.monotonic() >= cycle_deadline:
+        return _ApplyOutcome(0, 1, ("cycle_time_budget_exhausted",), ())
     return None
 
 
@@ -1804,6 +2646,40 @@ def _close_send(
     )
 
 
+def check_plan_sonarr_source(
+    deps: DaemonDeps, plan: LinkPlan, *, deadline: float | None
+) -> SourceRelationshipVerdict:
+    """Compare a frozen plan with current Sonarr series, file, and episode rows."""
+    tvdb_series_ids = {item.tvdb_series for item in plan.targets}
+    tvdb_series_ids.update(item.tvdb_series for item in plan.pending_targets)
+    if len(tvdb_series_ids) != 1:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "frozen plan does not identify exactly one TVDB series",
+        )
+    return check_current_file_relationship(
+        deps.sonarr,
+        series_id=plan.sonarr_series_id,
+        episode_file_id=plan.sonarr_episode_file_id,
+        path=plan.sonarr_path,
+        size=plan.sonarr_size,
+        tvdb_series_id=next(iter(tvdb_series_ids)),
+        allowed_roots=deps.settings.sonarr.allowed_roots,
+        episode_identities=tuple(
+            (
+                episode.episode_id,
+                episode.tvdb_episode_id,
+                episode.season_number,
+                episode.episode_number,
+                episode.absolute_episode_number,
+            )
+            for episode in plan.episodes
+        ),
+        deadline=deadline,
+        monotonic=deps.monotonic,
+    )
+
+
 def _refresh_service_canary(deps: DaemonDeps, now_iso: str) -> tuple[int, str] | None:
     """Advance the durable first-send canary from the file's durable ledger state."""
     canary = deps.store.get_service_canary()
@@ -1815,6 +2691,7 @@ def _refresh_service_canary(deps: DaemonDeps, now_iso: str) -> tuple[int, str] |
         deps.store.set_service_canary_status("verified", now_iso)
         return (file_id, "verified")
     if record is not None and record.state in {
+        FileState.MATCHED,
         FileState.MAPPED,
         FileState.PLANNED,
         FileState.PREPARED_NOT_SENT,
@@ -1822,8 +2699,25 @@ def _refresh_service_canary(deps: DaemonDeps, now_iso: str) -> tuple[int, str] |
         FileState.VERIFYING,
     }:
         return canary
+    if record is not None and record.state is FileState.WAITING:
+        outcomes = deps.store.service_canary_send_outcomes()
+        if len(outcomes) == 1 and outcomes[0] in {
+            SendOutcome.REJECTED.value,
+            SendOutcome.REFUSED.value,
+        }:
+            return canary
     deps.store.set_service_canary_status("failed", now_iso)
     return (file_id, "failed")
+
+
+def _service_canary_resolution_priority(
+    deps: DaemonDeps, file_ids: frozenset[int]
+) -> frozenset[int]:
+    """Keep the pending service canary inside the bounded resolution window."""
+    canary = deps.store.get_service_canary() if deps.service_mode else None
+    if canary is not None and canary[1] == "pending":
+        return file_ids | {canary[0]}
+    return file_ids
 
 
 def _finish_service_candidate(
@@ -1869,7 +2763,7 @@ def _service_canary_hold_reason(deps: DaemonDeps) -> str | None:
     return "service_canary_failed" if canary[1] == "failed" else "service_canary_pending"
 
 
-def _process_candidate(
+def _process_candidate(  # noqa: PLR0911, PLR0912
     deps: DaemonDeps,
     plan: LinkPlan,
     file_id: int,
@@ -1880,6 +2774,7 @@ def _process_candidate(
     cycle_key: str,
     *,
     service_backlog: bool = False,
+    source_check_deadline: float | None = None,
 ) -> _ApplyOutcome:
     """One file's guarded send: fresh safety inputs → eligibility → preflight → prepare →
     mark_sent → submit → verify (F11: every submission timestamp comes from the fresh clock)."""
@@ -1924,50 +2819,111 @@ def _process_candidate(
         active_structure_digest=active.structure_digest,
         blocked_over=effective_blocked_over(deps),
         mapping_index=active.index,
+        check_file=False,
     )
     if not gate.ok:
-        reason = gate.reasons[0].value if gate.reasons else "preflight_blocked"
-        drift: tuple[str, ...] = ()
-        if PreflightReason.MAPPING_CHANGED in gate.reasons:
-            _advance(deps, file_id, FileState.WAITING, "mapping_drift", send_iso)
-            drift = (f"mapping_changed: file {file_id} in-flight plan drift, no POST",)
-        return _ApplyOutcome(0, 0, (f"preflight_{reason}",), drift)
-    # P2-1: preflight's network phase is slow — re-take the fresh clock and re-run the LOCAL
-    # evaluation (shutdown, generation swap, lease verdict, gate) immediately before the intent
-    # commit, so an authorization that expired mid-preflight never authorizes this POST.
-    send_iso = deps.now()
-    stale_after = _post_preflight_freshness_guard(deps, active, send_iso)
-    if stale_after is not None:
-        return stale_after
-    prepared = deps.store.prepare_send(
-        file_id,
-        plan.fingerprint,
-        request_fingerprint(plan),
-        targets_digest=plan.targets_digest,
-        structure_digest=plan.structure_digest,
-        mapping_revision=str(active.revision),
-        cycle_key=cycle_key,
-        iso=send_iso,
-        policy=plan.policy,
-        # P2-4: reserve the plan's real episode-job count; P1-3: persist the expected
-        # verification triples so a persisted row survives restarts (re-poll/re-inspect).
-        expected_episode_jobs=len(plan.episode_ids),
-        target_ids=tuple(
-            (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
-            for target in plan.targets
-        ),
-    )
-    if isinstance(prepared, BudgetRefusal):
-        return _ApplyOutcome(0, 1, ("budget_refusal",), ())
-    if deps.service_mode:
-        deps.store.record_service_canary(file_id, send_iso)
-    token: SendToken = prepared
-    # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
-    deps.store.mark_sent(token, iso=send_iso)
-    send = submit_link(deps.shoko, plan, clock=deps.monotonic)
-    deps.store.record_send_outcome(
-        token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
-    )
+        return _preflight_failure_outcome(deps, file_id, gate, send_iso)
+    source = check_plan_sonarr_source(deps, plan, deadline=source_check_deadline)
+    if source.status is SourceRelationshipStatus.UNAVAILABLE:
+        return _ApplyOutcome(
+            0,
+            1,
+            (f"sonarr_source_unavailable:{file_id}",),
+            (f"sonarr_source_check_deferred: file {file_id} - {source.detail}",),
+        )
+    if source.status is SourceRelationshipStatus.CHANGED:
+        deps.store.quarantine_mapping_targets(
+            (file_id,), iso=deps.now(), reason="sonarr_source_changed"
+        )
+        return _ApplyOutcome(
+            0,
+            0,
+            (f"sonarr_source_changed:{file_id}",),
+            (
+                f"sonarr_source_changed: file {file_id} - {source.detail}; "
+                "frozen target retained for review, no POST",
+            ),
+        )
+    # All source/target/authorization network checks precede the final protected-link read.
+    # For normal service the remote check captures current setup facts; a local callback below
+    # catches a pause/consent change that lands during this final Shoko request.
+    if deps.service_mode and not deps.service_authorized():
+        return _ApplyOutcome(0, 1, ("service_authorization_changed",), ())
+    file_gate = preflight_file(deps.shoko, plan, deps.settings, folders)
+    if deps.store.writes_disabled:
+        return _ApplyOutcome(0, 1, ("writes_disabled",), ())
+    # The final hold/generation check, durable send intent, and one Shoko mutation share the
+    # generation lock with mapping refresh. A refresh may fetch concurrently, but cannot commit
+    # an invalid-source hold or swap the active generation between this authorization and POST.
+    send: SendResult
+    token: SendToken | None = None
+    transport_started = False
+    try:
+        with deps.mapping_store.generation_lock() as acquired:
+            if not acquired:
+                return _ApplyOutcome(0, 1, ("mapping_generation_busy",), ())
+            send_iso = deps.now()
+            stale_after = _post_preflight_freshness_guard(
+                deps,
+                active,
+                send_iso,
+                cycle_deadline=source_check_deadline,
+                generation_lock_held=True,
+            )
+            if stale_after is not None:
+                return stale_after
+            if not file_gate.ok:
+                return _preflight_failure_outcome(deps, file_id, file_gate, send_iso)
+            prepared = deps.store.prepare_send(
+                file_id,
+                plan.fingerprint,
+                request_fingerprint(plan),
+                targets_digest=plan.targets_digest,
+                structure_digest=plan.structure_digest,
+                mapping_revision=str(active.revision),
+                cycle_key=cycle_key,
+                iso=send_iso,
+                policy=plan.policy,
+                # P2-4: reserve the plan's real episode-job count; P1-3: persist the expected
+                # verification triples so a persisted row survives restarts (re-poll/re-inspect).
+                expected_episode_jobs=len(plan.episode_ids),
+                target_ids=tuple(
+                    (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
+                    for target in plan.targets
+                ),
+            )
+            if isinstance(prepared, BudgetRefusal):
+                return _ApplyOutcome(0, 1, ("budget_refusal",), ())
+            token = prepared
+            if deps.service_mode:
+                deps.store.record_service_canary(file_id, send_iso, send_id=prepared.send_id)
+            # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
+            deps.store.mark_sent(token, iso=send_iso)
+            with deps.store.protect_transport(token):
+                transport_started = True
+                send = submit_link(deps.shoko, plan, clock=deps.monotonic)
+            deps.store.record_send_outcome(
+                token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
+            )
+    except ApplyLockUnavailableError:
+        return _ApplyOutcome(0, 1, ("mapping_generation_lock_unavailable",), ())
+    except WriteDisabledError:
+        # Only prepared rows are voidable. A send already marked attempted stays in verify/hold,
+        # even when the stop fenced the transport guard before HTTP began.
+        if token is not None:
+            with contextlib.suppress(WriteDisabledError, StateError):
+                deps.store._void_prepared_send_after_write_stop(
+                    file_id,
+                    token.request_fingerprint,
+                    iso=send_iso,
+                    reason="durable write stop fenced transport",
+                )
+        return _ApplyOutcome(
+            int(transport_started),
+            int(not transport_started),
+            ("writes_disabled",),
+            (),
+        )
     return _finish_service_candidate(deps, plan, file_id, cycle_key, send_iso, send)
 
 
@@ -2064,10 +3020,14 @@ def _apply(
             service_backlog and record.cohort is Cohort.BACKLOG
         ):
             continue  # backlog requires the explicit onboarding-authorized SERVICE policy
+        if deps.store.writes_disabled:
+            reasons.append("writes_disabled")
+            deferred += len(ordered) - index
+            break
         if submitted >= max_submissions:
             deferred += len(ordered) - index
             break
-        if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
+        if deps.monotonic() - cycle_start_mono >= deps.max_cycle_seconds:
             deferred += len(ordered) - index
             break
         if deps.shutdown_requested():
@@ -2090,6 +3050,7 @@ def _apply(
             queue,
             cycle_key,
             service_backlog=service_backlog,
+            source_check_deadline=cycle_start_mono + deps.max_cycle_seconds,
         )
         submitted += outcome.submitted
         verified += int(outcome.verified)
@@ -2127,6 +3088,7 @@ _FILE_SCOPED_REASON_PREFIXES: Final[tuple[str, ...]] = (
     "pending_target:",
     "campaign_quarantine:",
     "preflight_deferred:",
+    "resolution_deferred:",
     "budget_refusal:",
     "send_stale:",
     "shutdown_requested:",
@@ -2168,6 +3130,7 @@ _RECOVERABLE_ZERO_PROGRESS_PREFIXES: Final[tuple[str, ...]] = (
     "budget_refusal:",
     "pending_target:",
     "preflight_deferred:",
+    "resolution_deferred:",
     "batch_limit:",
     "batch_time_limit:",
     "shutdown_requested:",
@@ -2248,7 +3211,7 @@ def _stall_yield_cooldown_iso(deps: DaemonDeps, now_iso: str) -> str:
 
 def _rolling_cooldown_retry_iso(deps: DaemonDeps, now_iso: str, reasons: Sequence[str]) -> str:
     """F18: the expected retry time for a budget-deferred campaign — the earliest rolling
-    slot expiry (``rolling_window_start + rolling_window_hours``) when the rolling window
+    slot expiry (enough individual reservations expire to leave headroom) when the rolling window
     is what blocks, else the bounded stall cooldown (:func:`_stall_yield_cooldown_iso`).
 
     Non-rolling stalls (the per-cycle cap resets with every batch's fresh window key; a
@@ -2268,12 +3231,8 @@ def _rolling_cooldown_retry_iso(deps: DaemonDeps, now_iso: str, reasons: Sequenc
         rolling_blocked = True
     if not rolling_blocked:
         return _stall_yield_cooldown_iso(deps, now_iso)
-    start = view.rolling_window_start_iso
-    if start is None:
-        return _stall_yield_cooldown_iso(deps, now_iso)
-    expiry = _parse_iso(start) + timedelta(hours=limits.rolling_window_hours)
-    now = _parse_iso(now_iso)
-    return expiry.isoformat() if expiry > now else now.isoformat()
+    retry = view.rolling_retry_iso(limits, now_iso)
+    return retry if retry is not None else now_iso
 
 
 def _recoverable_stall_family(deps: DaemonDeps, campaign_id: str, reasons: Sequence[str]) -> str:
@@ -2535,13 +3494,25 @@ def _reconcile_mapping_generation(
     active: ActiveMappings,
     now_iso: str,
 ) -> tuple[frozenset[int] | None, tuple[str, ...], tuple[str, ...]]:
+    if not inventory.verdict.complete:
+        # A truncated series inventory cannot account for all durable files. Keep
+        # the old marker so the next complete pass repeats generation reconciliation.
+        return None, (), ()
     if not phase.reactivated:
+        deps.store.set_meta(
+            "reconciled_mapping_semantics:v1", json.dumps(_mapping_semantics(active.index))
+        )
         return None, (), ()
     series_tvdb = _sonarr_to_tvdb(inventory)
     affected = frozenset(
         sonarr_id for sonarr_id, tvdb in series_tvdb.items() if tvdb in phase.churned
     )
-    drift, existing = _apply_generation_change(deps, now_iso, affected, active)
+    drift, existing = _apply_generation_change(deps, now_iso, affected)
+    # Written AFTER durable quarantine/reopen work. A crash earlier repeats that
+    # idempotent work; per-file frozen targets independently fence every rebuild.
+    deps.store.set_meta(
+        "reconciled_mapping_semantics:v1", json.dumps(_mapping_semantics(active.index))
+    )
     return affected, drift, existing
 
 
@@ -2586,13 +3557,16 @@ def run_cycle(
     cycle_key: str,
     full: bool = True,
     campaign_quarantine_limit: int | None = None,
+    bounded_read_only: bool = False,
+    budget_start_mono: float | None = None,
+    resolution_priority_file_ids: frozenset[int] = frozenset(),
 ) -> CycleReport:
     """Run one reconciliation cycle. See module docstring for the safety contract.
 
     Order: apply-lock preflight (APPLY only) → legacy attestation gate (advanced mode only;
-    APPLY mutates its persisted pause transition, dry-run only warns) → mapping scheduler → Sonarr
-    inventory → Shoko discovery → baseline establishment → source continuity →
-    persisted recovery consumption → reconcile matches → (APPLY only) the ordered
+    APPLY mutates its persisted pause transition, dry-run only warns) → mapping scheduler →
+    persisted recovery consumption → inventory → Shoko discovery → baseline establishment →
+    source continuity → reconcile matches → (APPLY only) the ordered
     send/verify loop. Advanced daemon policy ``NEW_ARRIVAL`` submits only new arrivals; an
     **approved** backlog campaign drains as one bounded batch per apply cycle on the F7 path when
     ``campaign.daemon_auto_apply`` is set. Explicitly authorized normal service mode uses
@@ -2644,6 +3618,9 @@ def run_cycle(
             policy=policy,
             full=full,
             campaign_quarantine_limit=campaign_quarantine_limit,
+            bounded_read_only=bounded_read_only,
+            budget_start_mono=budget_start_mono,
+            resolution_priority_file_ids=resolution_priority_file_ids,
         )
     finally:
         if deps.service_mode:
@@ -2672,12 +3649,15 @@ def _run_cycle_body(
     policy: RunPolicy,
     full: bool,
     campaign_quarantine_limit: int | None,
+    bounded_read_only: bool,
+    budget_start_mono: float | None,
+    resolution_priority_file_ids: frozenset[int],
 ) -> CycleReport:
     """The cycle body — runs with the apply lock held (APPLY) under the caller's
     ``try/finally`` that guarantees the release (P2-1). ``full=False`` is the M7-b light
     cycle (same inventories, halved recovery/apply work budgets; see :func:`run_cycle`).
     """
-    cycle_start_mono = deps.monotonic()
+    cycle_start_mono = deps.monotonic() if budget_start_mono is None else budget_start_mono
     reasons: list[str] = []
     drift: list[str] = []
     existing_link: list[str] = []
@@ -2686,9 +3666,22 @@ def _run_cycle_body(
         reasons.extend(attestation_gate(deps, now_iso, mutate=mode is CycleMode.APPLY))
 
     phase = _mapping_phase(deps, now_iso)
-    service_mapping_refresh_failed = _service_mapping_refresh_failed(deps, phase.outcome, reasons)
-    inventory = collect_sonarr_inventory(deps.sonarr, deps.settings)
-    discovery = collect_shoko_discovery(deps.shoko)
+    service_mapping_refresh_failed = _service_mapping_refresh_failed(deps, phase, reasons)
+    # Reconcile already-sent jobs before taking the discovery/continuity snapshot. Otherwise
+    # an async link that landed since the previous cycle looks like an unexplained source
+    # drop until recovery verifies it, spuriously latching a hard rebaseline hold. Recovery
+    # is bounded and read-only remotely; it never submits new links.
+    reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono, full=full))
+    inventory = (
+        _collect_bounded_sonarr_inventory(deps, cycle_start_mono)
+        if mode is CycleMode.APPLY or bounded_read_only
+        else collect_sonarr_inventory(deps.sonarr, deps.settings)
+    )
+    discovery = (
+        _collect_bounded_shoko_discovery(deps, cycle_start_mono, now_iso)
+        if mode is CycleMode.APPLY or bounded_read_only
+        else collect_shoko_discovery(deps.shoko)
+    )
     reconciliation_ready = (
         inventory.verdict.complete and discovery.verdict.complete and phase.active is not None
     )
@@ -2719,16 +3712,14 @@ def _run_cycle_body(
         roots_fingerprint=roots_fingerprint(deps.settings),
         discovery_total=discovery.total_reported if discovery_complete else None,
         complete=discovery_complete,
+        discovered_file_ids=frozenset(file.id for file in discovery.files),
     )
-    if continuity.requires_rebaseline:
-        reasons.extend(continuity.reasons)
-    elif not discovery_complete:
-        # Incomplete discovery: neutral continuity observation, no anchor, no drop trigger.
+    if not continuity.ok or not discovery_complete:
         reasons.extend(continuity.reasons)
     elif discovery.total_reported is not None:
         # P1-1: a fully-complete, non-truncated, continuity-OK cycle re-anchors the
-        # observation, so ordinary inventory growth never accumulates as discontinuity
-        # and a triggered flag clears on the first healthy full-scan cycle.
+        # observation, so ordinary inventory growth never accumulates as discontinuity.
+        # A latched discontinuity takes the requires_rebaseline branch above.
         deps.store.record_source_observation(
             _source_identity(deps.settings),
             snapshot_id,
@@ -2736,12 +3727,21 @@ def _run_cycle_body(
             roots_fingerprint=roots_fingerprint(deps.settings),
             discovery_total=discovery.total_reported,
         )
+    if not continuity.ok and not continuity.requires_rebaseline:
+        # A departed in-flight job is not evidence of either a source reset or a
+        # successful link. Hold both normal apply and campaign sweeps/drains until
+        # bounded recovery can explain the snapshot; never re-anchor this wait.
+        reconciliation_ready = False
 
     active = phase.active
     if active is None:
         return _unavailable_service_mapping_report(
             deps, mode, cycle_key, phase, reasons, drift, now_iso
         )
+
+    resolution_priority_file_ids = _service_canary_resolution_priority(
+        deps, resolution_priority_file_ids
+    )
 
     affected_sonarr_series, gen_drift, gen_existing = _reconcile_mapping_generation(
         deps, phase, inventory, active, now_iso
@@ -2750,12 +3750,6 @@ def _run_cycle_body(
     existing_link.extend(gen_existing)
     if phase.churn_paused:
         reasons.append("mapping_churn")
-
-    # P1-3: consume persisted recovery rows BEFORE processing new candidates (the
-    # budget ceiling is enforced against the true in-flight count). P2-A: bounded by the
-    # per-cycle recovery row cap and the monotonic cycle budget (M7-b light cycles
-    # run with the halved cap).
-    reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono, full=full))
 
     reconcile = _reconcile(
         deps,
@@ -2766,13 +3760,25 @@ def _run_cycle_body(
         policy=policy,
         campaign_quarantine_limit=campaign_quarantine_limit,
         affected_sonarr_series=affected_sonarr_series,
+        resolution_limit=(
+            MAX_SERVICE_CYCLE_SUBMISSIONS if mode is CycleMode.APPLY or bounded_read_only else None
+        ),
+        resolution_deadline=(
+            _resolution_deadline(deps, cycle_start_mono)
+            if mode is CycleMode.APPLY or bounded_read_only
+            else None
+        ),
+        resolution_priority_file_ids=resolution_priority_file_ids,
     )
+    existing_link.extend(reconcile.existing_link_drift)
     for file_id, skip_reason in sorted(reconcile.skip_reasons.items()):
         reasons.append(f"skip:{file_id}:{skip_reason}")
+        if skip_reason == "service_mapping_target_changed":
+            drift.append(f"mapping_changed: file {file_id} immutable targets quarantined")
 
     flags = _eligibility_flags(deps, mapping_present=True, now_iso=now_iso)
     eligibility = compute_eligibility(deps, now_iso)
-    cycle_eligible = eligibility.eligible
+    cycle_eligible = eligibility.eligible and continuity.ok
     if not cycle_eligible:
         # P3c: every suppression path surfaces its refusal reasons.
         reasons.extend(eligibility.reasons)
@@ -2881,6 +3887,9 @@ def _run_cycle_body(
             active.overrides_applied,
         ),
         campaign_identity_drift_details=reconcile.campaign_identity_drift_details,
+        exclusion_counts=reconcile.exclusion_counts,
+        scope_excluded_count=reconcile.scope_excluded_count,
+        resolution_deferred_file_ids=reconcile.resolution_deferred_file_ids,
     )
 
 
@@ -2962,6 +3971,7 @@ def _update_service_rate_state(
         "mapping_generation_changed",
         "mapping_changed",
         "mapping_source_transport_failure",
+        "mapping_source_invalid",
         "source_unstable",
         "source_discontinuity",
         "source_identity_drift",
@@ -3102,16 +4112,22 @@ def _run_apply(
     current_queue_reasons = queue_reasons(queue)
     reasons.extend(current_queue_reasons)
     if rate_state is not None:
-        _update_service_rate_state(
-            deps,
-            rate_state,
-            now_iso=deps.now(),
-            queue=queue,
-            submitted=submitted,
-            verified=verified,
-            reasons=reasons,
-            drift=drift,
-        )
+        try:
+            if deps.store.writes_disabled:
+                reasons.append("writes_disabled")
+            else:
+                _update_service_rate_state(
+                    deps,
+                    rate_state,
+                    now_iso=deps.now(),
+                    queue=queue,
+                    submitted=submitted,
+                    verified=verified,
+                    reasons=reasons,
+                    drift=drift,
+                )
+        except WriteDisabledError:
+            reasons.append("writes_disabled")
     return (submitted, deferred)
 
 

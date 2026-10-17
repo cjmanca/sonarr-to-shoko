@@ -54,6 +54,7 @@ from .daemon import (
     CycleReport,
     DaemonDeps,
     attestation_gate,
+    check_plan_sonarr_source,
     compute_eligibility,
     effective_blocked_over,
     mapping_generation_stale,
@@ -70,15 +71,20 @@ from .linking import (
     PreflightReason,
     QueueSnapshot,
     SendOutcome,
+    SendResult,
     fetch_queue,
     plan_fingerprint,
     preflight,
+    preflight_file,
+    preflight_reasons_are_retryable,
+    primary_hard_preflight_reason,
     request_fingerprint,
     submit_link,
 )
 from .mapping_store import ActiveMappings, load_active
 from .policies import RunPolicy
 from .shoko import ImportFolder, canonical_ed2k
+from .sonarr import SourceRelationshipStatus
 from .state import (
     CAMPAIGN_DRAIN_REVOKED_REASON,
     CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
@@ -94,6 +100,8 @@ from .state import (
     BudgetRefusal,
     CampaignBinding,
     CampaignRecord,
+    CampaignSendRefusedError,
+    CampaignSubmissionLimitError,
     Cohort,
     FileState,
     LockHeldError,
@@ -151,19 +159,7 @@ _CAMPAIGN_WIDE_BUDGET_REFUSALS: Final[frozenset[str]] = frozenset(
         "pending_files_exhausted",
         "cycle_new_exhausted",
         "rolling_new_exhausted",
-    }
-)
-_DEFERRING_PREFLIGHT_REASONS: Final[frozenset[PreflightReason]] = frozenset(
-    {
-        PreflightReason.QUEUE_UNKNOWN,
-        PreflightReason.QUEUE_BLOCKED,
-        PreflightReason.TRANSPORT_FAILURE,
-        # F1: BLOCKED_SAFETY is raised only by the transient attestation/gate inputs (never by
-        # plan/mapping/candidacy checks). A lease expiry / gate close mid-batch is a TRANSIENT
-        # safety state: defer (the row stays queueable, no quarantine, no operator review) so it
-        # re-applies after re-attestation. Quarantine stays reserved for the durable
-        # plan/mapping/digest/candidacy reasons.
-        PreflightReason.BLOCKED_SAFETY,
+        "legacy_campaign_history_unresolved",
     }
 )
 _SEND_PROGRESS_STATES: Final[frozenset[FileState]] = frozenset(
@@ -902,6 +898,7 @@ def _release_apply_lock(deps: DaemonDeps, now_iso: str) -> None:
 
 
 def _defer_remaining(
+    store: StateStore,
     files: Sequence[CampaignFile],
     counters: _CampaignCounters,
     reasons: list[str],
@@ -910,8 +907,28 @@ def _defer_remaining(
     """Defer the unprocessed tail of a stopped batch (F9/F11): non-destructive by design —
     every row stays queueable (never quarantined) for a later batch to re-validate."""
     for deferred in files:
+        record = store.get_file(deferred.shoko_file_id)
+        if record is None or record.state not in _CAMPAIGN_QUEUE_STATES:
+            continue
         counters.deferred += 1
         reasons.append(f"{prefix}:{deferred.shoko_file_id}")
+
+
+def _campaign_scan_order(
+    store: StateStore, campaign_id: str, files: tuple[CampaignFile, ...]
+) -> tuple[CampaignFile, ...]:
+    """Start after the last scanned approved file, wrapping once through the immutable set."""
+    raw_cursor = store.get_meta(f"campaign_scan_cursor:v1:{campaign_id}")
+    try:
+        cursor_file_id = int(raw_cursor or "0")
+    except ValueError:
+        cursor_file_id = 0
+    cursor_position = next(
+        (index for index, entry in enumerate(files) if entry.shoko_file_id == cursor_file_id),
+        -1,
+    )
+    start = cursor_position + 1
+    return files[start:] + files[:start]
 
 
 def _fold_tally(counters: _CampaignCounters, tally: _SendTally, reasons: list[str]) -> None:
@@ -922,6 +939,25 @@ def _fold_tally(counters: _CampaignCounters, tally: _SendTally, reasons: list[st
     counters.deferred += tally.deferred
     counters.sent_running += tally.submitted
     reasons.extend(tally.reasons)
+
+
+def _should_retry_rejected_file_at_scan_head(
+    store: StateStore, campaign_id: str, file_id: int, tally: _SendTally
+) -> bool:
+    """Keep a first definite zero-write rejection at the scan head for one retry."""
+    rejected_reasons = {
+        f"send_{SendOutcome.REJECTED.value}:{file_id}",
+        f"send_{SendOutcome.REFUSED.value}:{file_id}",
+    }
+    if not any(reason in rejected_reasons for reason in tally.reasons):
+        return False
+    history = tuple(
+        row for row in store.campaign_send_history(campaign_id) if row.shoko_file_id == file_id
+    )
+    return len(history) == 1 and history[0].outcome in {
+        SendOutcome.REJECTED.value,
+        SendOutcome.REFUSED.value,
+    }
 
 
 def _campaign_budget_cycle_key(
@@ -1017,7 +1053,14 @@ def apply_campaign(
             if record.state is FileState.BLOCKED_SAFETY
             and record.state_detail.startswith("campaign_quarantine:")
         )
-        sweep = _apply_sweep(deps, campaign.campaign_id, now_iso, reasons)
+        sweep = _apply_sweep(
+            deps,
+            campaign.campaign_id,
+            now_iso,
+            reasons,
+            cycle_start_mono=cycle_start_mono,
+            resolution_priority_file_ids=frozenset(entry.shoko_file_id for entry in plan.files),
+        )
         active = _apply_mapping(deps, sweep)
         counters = _CampaignCounters(sent_running=campaign.total_sent)
         queue = _campaign_queue_snapshot(deps, active, now_iso)
@@ -1042,50 +1085,15 @@ def apply_campaign(
             preexisting_quarantines=preexisting_quarantines,
             fresh_campaign_quarantines=fresh_campaign_quarantines,
         )
-        # F9/F29: bounded batch loop. The per-cycle cap resets each manual batch, while daemon
-        # drains use their outer key. The batch guard counts meaningful processing attempts
-        # directly (resolution, send, and new quarantine decisions); a wall-time cap mirrors
-        # the daemon cycle bound, and a campaign-wide budget refusal stops the batch.
-        # Deferred/remaining files are never quarantined — they stay queueable for later batches.
-        for index, entry in enumerate(plan.files):
-            if counters.attempts >= size:
-                _defer_remaining(plan.files[index:], counters, reasons, "batch_limit")
-                break
-            if deps.monotonic() - cycle_start_mono > deps.max_cycle_seconds:
-                # Wall-time cap (same semantics as daemon ``_apply``): stop starting new
-                # submissions (never interrupts an in-flight send); the rest stay queueable.
-                _defer_remaining(plan.files[index:], counters, reasons, "batch_time_limit")
-                break
-            if deps.shutdown_requested():
-                # F11: a shutdown request (SIGTERM) stops starting new submissions mid-batch;
-                # the remainder defers non-destructively (queueable — recovery completes them).
-                _defer_remaining(plan.files[index:], counters, reasons, "shutdown_requested")
-                break
-            candidate = _prepare_candidate(context, entry, counters, reasons)
-            if candidate is None:
-                continue
-            counters.attempts += 1
-            tally = _send_one(
-                deps,
-                settings,
-                store,
-                candidate,
-                campaign.campaign_id,
-                sweep.folders,
-                active,
-                context.queue,
-                batch_cycle_key,
-                daemon_drain=daemon_drain,
-            )
-            _fold_tally(counters, tally, reasons)
-            if tally.stop_batch or tally.budget_blocked:
-                # F11: the guard-time authorization went stale (deadline/status/shutdown/
-                # generation swap) — F9: a campaign-wide budget refusal is NOT progress. Stop
-                # starting new submissions; the remainder defers non-destructively (queueable,
-                # the next cycle re-validates every input).
-                counters.deferred += len(plan.files) - index - 1
-                break
-            counters.processed += 1
+        _apply_campaign_candidates(
+            context,
+            plan.files,
+            size,
+            counters,
+            reasons,
+            cycle_start_mono=cycle_start_mono,
+            daemon_drain=daemon_drain,
+        )
         # P1/P2: real progress is persisted submissions/verifications/quarantines, never a scan
         # count. ``plan_complete`` reflects persisted campaign progress; the
         # zero-progress breaker (daemon) reads ``progress`` so per-file deferrals and
@@ -1145,6 +1153,65 @@ class _ApplyContext:
     cycle_key: str
     preexisting_quarantines: frozenset[int] = frozenset()
     fresh_campaign_quarantines: frozenset[int] = frozenset()
+
+
+def _apply_campaign_candidates(
+    context: _ApplyContext,
+    files: tuple[CampaignFile, ...],
+    size: int,
+    counters: _CampaignCounters,
+    reasons: list[str],
+    *,
+    cycle_start_mono: float,
+    daemon_drain: bool,
+) -> None:
+    """Process one bounded, rotating scan of the campaign's immutable approved set."""
+    deps = context.deps
+    store = context.store
+    campaign_id = context.campaign.campaign_id
+    cursor_key = f"campaign_scan_cursor:v1:{campaign_id}"
+    ordered_files = _campaign_scan_order(store, campaign_id, files)
+    # F9/F29: the batch guard counts meaningful attempts; every deferred row remains queueable.
+    for index, entry in enumerate(ordered_files):
+        if counters.attempts >= size:
+            _defer_remaining(store, ordered_files[index:], counters, reasons, "batch_limit")
+            break
+        if deps.monotonic() - cycle_start_mono >= deps.max_cycle_seconds:
+            # Never interrupt an in-flight send; defer the remaining queueable files.
+            _defer_remaining(store, ordered_files[index:], counters, reasons, "batch_time_limit")
+            break
+        if deps.shutdown_requested():
+            # F11: a shutdown request stops starting submissions; recovery can resume the tail.
+            _defer_remaining(store, ordered_files[index:], counters, reasons, "shutdown_requested")
+            break
+        candidate = _prepare_candidate(context, entry, counters, reasons)
+        if candidate is None:
+            store.set_meta(cursor_key, str(entry.shoko_file_id))
+            continue
+        counters.attempts += 1
+        tally = _send_one(
+            deps,
+            context.settings,
+            store,
+            candidate,
+            campaign_id,
+            context.sweep.folders,
+            context.active,
+            context.queue,
+            context.cycle_key,
+            daemon_drain=daemon_drain,
+            source_check_deadline=cycle_start_mono + deps.max_cycle_seconds,
+        )
+        _fold_tally(counters, tally, reasons)
+        if tally.stop_batch or tally.budget_blocked:
+            # A stale guard or campaign-wide budget refusal stops the batch without advancing.
+            counters.deferred += len(ordered_files) - index - 1
+            break
+        if not _should_retry_rejected_file_at_scan_head(
+            store, campaign_id, entry.shoko_file_id, tally
+        ):
+            store.set_meta(cursor_key, str(entry.shoko_file_id))
+        counters.processed += 1
 
 
 def _batch_size(settings: Settings, batch_size: int | None) -> int:
@@ -1254,6 +1321,8 @@ def _apply_sweep(
     reasons: list[str],
     *,
     campaign_quarantine_limit: int = 0,
+    cycle_start_mono: float,
+    resolution_priority_file_ids: frozenset[int],
 ) -> CycleReport:
     """The dry-run reconciliation sweep whose frozen plans feed the bounded apply loop.
 
@@ -1267,6 +1336,9 @@ def _apply_sweep(
         policy=RunPolicy.BACKLOG,
         cycle_key=f"campaign-{_short(campaign_id)}-apply",
         campaign_quarantine_limit=campaign_quarantine_limit,
+        bounded_read_only=True,
+        budget_start_mono=cycle_start_mono,
+        resolution_priority_file_ids=resolution_priority_file_ids,
     )
     reasons.extend(sweep.reasons)
     reasons.extend(f"historical_mapping_drift:{item}" for item in sweep.existing_link_drift)
@@ -1397,10 +1469,16 @@ def _entry_gate(
         return None
     if record.state is FileState.AMBIGUOUS:
         mapping_skip = _campaign_mapping_resolution_skip(context.sweep, file_id)
+        source_exclusion = record.state_detail.startswith("source_exclusion:")
         if mapping_skip is not None:
             _ensure_campaign_mapping_generation(context.deps, context.active, context.now_iso)
             detail = _campaign_mapping_drift_detail(entry, context.active, mapping_skip)
             _campaign_quarantine_with_generation_guard(context, file_id, detail, counters, reasons)
+        elif source_exclusion:
+            _campaign_quarantine(
+                store, file_id, record.state_detail, context.now_iso, counters, reasons
+            )
+        if mapping_skip is not None or source_exclusion:
             return None
     if record.state is FileState.BLOCKED_SAFETY and record.state_detail.startswith(
         "campaign_quarantine:"
@@ -1473,6 +1551,10 @@ def _prepare_candidate(
         elif identity_drift is not None:
             code, detail = identity_drift
             reason = f"{code}: {detail}"
+        elif file_id in context.sweep.resolution_deferred_file_ids:
+            counters.deferred += 1
+            reasons.append(f"resolution_deferred:{file_id}")
+            return None
         else:
             reason = "plan_no_longer_frozen"
         if mapping_skip is not None:
@@ -1591,14 +1673,19 @@ def _resolve_and_rebuild(
     # bounds the resolve-chain quarantine walks too — an all-pending plan can never walk all N
     # files per batch, and a quarantined resolve no longer slips past the batch cap.
     counters.attempts += 1
-    if reason == "pending_metadata":
+    if reason is EpisodeResolutionStatus.PENDING_METADATA:
         counters.processed += 1
         counters.deferred += 1
         reasons.append(f"pending_target:{file_id}")
         return None
+    if reason is EpisodeResolutionStatus.TRANSPORT_FAILURE:
+        counters.processed += 1
+        counters.deferred += 1
+        reasons.append(f"resolution_deferred:{file_id}:transport_failure")
+        return None
     if reason is not None:
         _ensure_campaign_mapping_generation(context.deps, context.active, now_iso)
-        detail = reason
+        detail = f"target_{reason.value}" if isinstance(reason, EpisodeResolutionStatus) else reason
         if reason == "target_drift":
             current = sorted(
                 (
@@ -1758,38 +1845,48 @@ def _resolved_pending_plan(
     plan: LinkPlan,
     entry: CampaignFile,
     resolver: EpisodeIdResolver,
-) -> tuple[LinkPlan, None] | tuple[None, str]:
+) -> tuple[LinkPlan, None] | tuple[None, str | EpisodeResolutionStatus]:
     """Resolve a pending-target plan; the exact-identity rule, fail closed.
 
     The preapproved set is the plan file's frozen ``(anime, episode_number, type,
     anidb_episode_id)`` identities. Returns the rebuilt LINKABLE plan, or a reason:
-    ``pending_metadata`` (Shoko metadata not materialized yet — defer, the file stays
-    approved) / ``target_drift`` (resolved identities do not equal the preapproved set
-    exactly — quarantine, zero POSTs).
+    ``PENDING_METADATA`` (Shoko metadata not materialized yet — defer, the file stays
+    approved), ``TRANSPORT_FAILURE`` (retryable service failure — defer), or
+    ``target_drift`` (resolved identities do not equal the preapproved set exactly —
+    quarantine, zero POSTs).
     """
     approved = set(entry.anidb_target_identities)
     targets, failure = _resolve_pending_targets(plan, approved, resolver)
     if failure is not None:
         return None, failure
-    resolved_identities = {
-        (
+    complete_targets: list[LinkTarget] = []
+    shoko_id_by_identity: dict[AnidbIdentity, int] = {}
+    for target in (*plan.targets, *targets):
+        identity = (
             target.anidb_anime_id,
             target.anidb_episode_number,
             target.episode_type,
             target.anidb_episode_id,
         )
-        for target in targets
-    }
-    if resolved_identities != approved or len(targets) != len(approved):
+        if identity not in approved:
+            return None, "target_drift"
+        previous_shoko_id = shoko_id_by_identity.get(identity)
+        if previous_shoko_id is not None and previous_shoko_id != target.shoko_episode_id:
+            return None, "target_drift"
+        shoko_id_by_identity[identity] = target.shoko_episode_id
+        # Retain each TVDB source occurrence: preflight validates the mapping at every
+        # source position even when multiple positions share one AniDB/Shoko destination.
+        complete_targets.append(target)
+    if set(shoko_id_by_identity) != approved:
         return None, "target_drift"
-    return _freeze_resolved_plan(plan, tuple(targets)), None
+    return _freeze_resolved_plan(plan, tuple(complete_targets)), None
 
 
 def _resolve_pending_targets(
     plan: LinkPlan,
     approved: set[AnidbIdentity],
     resolver: EpisodeIdResolver,
-) -> tuple[list[LinkTarget], str | None]:
+) -> tuple[list[LinkTarget], str | EpisodeResolutionStatus | None]:
     """Resolve each pending target; the first failure names the quarantine/defer reason."""
     tvdb_series = plan.pending_targets[0].tvdb_series
     targets: list[LinkTarget] = []
@@ -1805,8 +1902,11 @@ def _resolve_pending_targets(
         resolved = resolver.resolve(
             pending.anidb_anime_id, pending.episode_type, pending.anidb_episode_number
         )
-        if resolved.status is EpisodeResolutionStatus.PENDING_METADATA:
-            return [], "pending_metadata"
+        if resolved.status in {
+            EpisodeResolutionStatus.PENDING_METADATA,
+            EpisodeResolutionStatus.TRANSPORT_FAILURE,
+        }:
+            return [], resolved.status
         if resolved.status is not EpisodeResolutionStatus.RESOLVED:
             return [], f"target_{resolved.status.value}"
         if resolved.shoko_episode_id is None or resolved.anidb_episode_id is None:
@@ -1886,15 +1986,18 @@ def _campaign_send_staleness(
     campaign_id: str,
     active: ActiveMappings,
     send_iso: str,
+    *,
+    generation_lock_held: bool = False,
 ) -> str | None:
     """F11: the inputs a batch-start guard could not see, re-evaluated before each POST.
 
     Returns the refusal reason (the candidate defers non-destructively and the batch stops) or
     ``None`` when the POST stays authorized. The lease and the write gate are already fresh per
     submission inside :func:`~shoko_linker.linking.preflight` (P2-4), and the file/XRef identity
-    is re-read there; this covers the clock-bound and store-bound inputs: the operator shutdown,
-    the campaign deadline, the campaign status, and the active mapping generation identity. The
-    daemon drain adds the F10 authorization per submission via :func:`_daemon_drain_staleness`.
+    is re-read by the final file preflight; this covers the clock-bound and store-bound inputs:
+    the operator shutdown, the campaign deadline, the campaign status, and the active mapping
+    generation identity. The daemon drain adds the F10 authorization per submission via
+    :func:`_daemon_drain_staleness`.
     """
     if deps.shutdown_requested():
         return "shutdown_requested"
@@ -1908,8 +2011,11 @@ def _campaign_send_staleness(
         return "deadline_exceeded"
     if campaign.status != CAMPAIGN_STATUS_APPROVED:
         return f"campaign_{campaign.status}"
-    if mapping_generation_stale(deps, active, send_iso):
-        return "mapping_generation_changed"
+    source_invalid = deps.mapping_store.invalid_source_hold()
+    if source_invalid or mapping_generation_stale(
+        deps, active, send_iso, generation_lock_held=generation_lock_held
+    ):
+        return "mapping_source_invalid" if source_invalid else "mapping_generation_changed"
     return None
 
 
@@ -1923,9 +2029,23 @@ def _preflight_tally(
     """
     if verdict.ok:
         return None
-    reason = verdict.reasons[0].value if verdict.reasons else "preflight_blocked"
-    if any(item in _DEFERRING_PREFLIGHT_REASONS for item in verdict.reasons):
+    if preflight_reasons_are_retryable(verdict.reasons):
+        reason = verdict.reasons[0].value
+        if PreflightReason.TARGET_UNAVAILABLE in verdict.reasons:
+            detail = "; ".join(verdict.details) or (
+                "Shoko target metadata is unavailable; target identity cannot be confirmed, "
+                "retry later; no POST"
+            )
+            return _SendTally(
+                0,
+                0,
+                0,
+                1,
+                (f"preflight_deferred:{plan.shoko_file_id}:target_unavailable: {detail}",),
+            )
         return _SendTally(0, 0, 0, 1, (f"preflight_deferred:{plan.shoko_file_id}:{reason}",))
+    hard_reason = primary_hard_preflight_reason(verdict.reasons)
+    reason = hard_reason.value if hard_reason is not None else "preflight_blocked"
     _quarantine(store, plan.shoko_file_id, f"preflight_{reason}", send_iso)
     return _SendTally(
         0,
@@ -1944,11 +2064,14 @@ def _post_preflight_send_staleness(
     active: ActiveMappings,
     plan: LinkPlan,
     *,
+    cycle_deadline: float | None,
     daemon_drain: bool = False,
+    generation_lock_held: bool = False,
 ) -> tuple[str, _SendTally | None]:
     """P2-1: the local re-evaluation between preflight's network phase and the intent commit.
 
-    Preflight's File + per-episode GETs are slow (10s connect / 30s read), so a shutdown,
+    Preflight's target/file GETs and the current Sonarr source check are slow (10s connect / 30s
+    read), so a shutdown,
     deadline pass, status change, generation swap, lease expiry, gate close, or daemon-drain
     revocation that lands DURING them must not ride the pre-preflight verdict into
     ``prepare_send``. The clock is re-taken and every check is local (store re-read, disk
@@ -1957,7 +2080,14 @@ def _post_preflight_send_staleness(
     authorized).
     """
     send_iso = deps.now()
-    stale = _campaign_send_staleness(deps, store, campaign_id, active, send_iso)
+    stale = _campaign_send_staleness(
+        deps,
+        store,
+        campaign_id,
+        active,
+        send_iso,
+        generation_lock_held=generation_lock_held,
+    )
     if stale is None and daemon_drain:
         stale = _daemon_drain_staleness(store, campaign_id)
     if stale is not None:
@@ -1974,52 +2104,123 @@ def _post_preflight_send_staleness(
         return send_iso, _SendTally(
             0, 0, 0, 1, (f"preflight_deferred:{plan.shoko_file_id}:blocked_safety",)
         )
+    if cycle_deadline is not None and deps.monotonic() >= cycle_deadline:
+        return send_iso, _SendTally(
+            0,
+            0,
+            0,
+            1,
+            ("cycle_time_budget_exhausted",),
+            stop_batch=True,
+        )
     return send_iso, None
 
 
-def _commit_send(
+def _commit_send(  # noqa: PLR0911
     deps: DaemonDeps,
     store: StateStore,
     plan: LinkPlan,
     campaign_id: str,
-    cycle_key: str,
     send_iso: str,
     prepared: SendToken | BudgetRefusal,
-) -> _SendTally:
-    """Durably commit the send intent, submit once, and inline-verify — never replay (P1-3)."""
+) -> tuple[_SendTally, SendResult | None]:
+    """Durably commit intent and one POST; verification happens after the mapping lease."""
     if isinstance(prepared, BudgetRefusal):
         # F9-1d: only campaign-wide refusals break the batch. A per-file
         # ``pending_episode_jobs_exhausted`` depends on this file's own episode count, so the
         # healthy later files must still send — defer this file, keep the batch running.
         campaign_wide = prepared.reason in _CAMPAIGN_WIDE_BUDGET_REFUSALS
-        return _SendTally(
-            0,
-            0,
-            0,
-            1,
-            (f"budget_refusal:{plan.shoko_file_id}:{prepared.reason}",),
-            budget_blocked=campaign_wide,
+        return (
+            _SendTally(
+                0,
+                0,
+                0,
+                1,
+                (f"budget_refusal:{plan.shoko_file_id}:{prepared.reason}",),
+                budget_blocked=campaign_wide,
+            ),
+            None,
         )
     token: SendToken = prepared
-    # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
-    store.mark_sent(token, iso=send_iso)
-    send = submit_link(deps.shoko, plan, clock=deps.monotonic)
-    store.record_send_outcome(
-        token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
-    )
-    store.record_campaign_send(campaign_id, send_iso)
+    # mark_sent atomically debits the campaign attempt ceiling and durably commits
+    # request_may_have_been_sent BEFORE any bytes reach HTTP. A concurrent apply may have used
+    # the last slot after the earlier guards; close this definitely-not-sent prepared intent and
+    # stop without handing it to transport.
+    transport_started = False
+    try:
+        store.mark_sent(token, iso=send_iso)
+        with store.protect_transport(token):
+            transport_started = True
+            send = submit_link(deps.shoko, plan, clock=deps.monotonic)
+    except CampaignSendRefusedError as exc:
+        store.void_prepared_send(
+            plan.shoko_file_id,
+            token.request_fingerprint,
+            iso=send_iso,
+            reason=str(exc),
+        )
+        is_limit = isinstance(exc, CampaignSubmissionLimitError)
+        reason = (
+            f"max_submissions_reached:{plan.shoko_file_id}"
+            if is_limit
+            else f"campaign_send_refused:{plan.shoko_file_id}: {exc}"
+        )
+        return (
+            _SendTally(
+                0,
+                0,
+                0,
+                1,
+                (reason,),
+                stop_batch=True,
+            ),
+            None,
+        )
+    except WriteDisabledError:
+        # A stop may commit after prepare but before mark_sent. Only a still-prepared row is
+        # definitely unsent and eligible for cleanup; attempted rows remain verify/hold only.
+        with contextlib.suppress(WriteDisabledError, StateError):
+            store._void_prepared_send_after_write_stop(
+                plan.shoko_file_id,
+                token.request_fingerprint,
+                iso=send_iso,
+                reason="durable write stop fenced transport",
+            )
+        return (
+            _SendTally(
+                int(transport_started),
+                0,
+                0,
+                int(not transport_started),
+                ("writes_disabled",),
+                stop_batch=True,
+            ),
+            None,
+        )
+    try:
+        store.record_send_outcome(
+            token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
+        )
+        store.record_campaign_send(campaign_id, send_iso)
+    except WriteDisabledError:
+        # The POST is already an irrevocably attempted send; retain its durable hold for recovery.
+        return (_SendTally(1, 0, 0, 0, ("writes_disabled",), stop_batch=True), None)
     if send.outcome is SendOutcome.AMBIGUOUS_SEND:
-        return _SendTally(
-            1, 0, 0, 0, (f"ambiguous_send:{plan.shoko_file_id} - verify, never resubmit",)
+        return (
+            _SendTally(
+                1, 0, 0, 0, (f"ambiguous_send:{plan.shoko_file_id} - verify, never resubmit",)
+            ),
+            None,
         )
     if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
-        return _SendTally(1, 0, 0, 0, (f"send_{send.outcome.value}:{plan.shoko_file_id}",))
-    detail = verify_and_close(deps, plan, plan.shoko_file_id, cycle_key, send_iso)
-    verified = 1 if detail.endswith(":verified") else 0
-    return _SendTally(1, verified, 0, 0, (detail,))
+        return (
+            _SendTally(1, 0, 0, 0, (f"send_{send.outcome.value}:{plan.shoko_file_id}",)),
+            None,
+        )
+    return _SendTally(1, 0, 0, 0, ()), send
 
 
-def _send_one(
+def _send_one(  # noqa: PLR0911
     deps: DaemonDeps,
     settings: Settings,
     store: StateStore,
@@ -2031,6 +2232,7 @@ def _send_one(
     cycle_key: str,
     *,
     daemon_drain: bool = False,
+    source_check_deadline: float | None = None,
 ) -> _SendTally:
     """One approved candidate through the guarded path; zero writes unless preflight passes.
 
@@ -2068,33 +2270,111 @@ def _send_one(
         active_structure_digest=active.structure_digest,
         blocked_over=effective_blocked_over(deps),
         mapping_index=active.index,
+        check_file=False,
     )
     blocked = _preflight_tally(verdict, store, plan, send_iso)
     if blocked is not None:
         return blocked
-    send_iso, stale_after = _post_preflight_send_staleness(
-        deps, settings, store, campaign_id, active, plan, daemon_drain=daemon_drain
-    )
-    if stale_after is not None:
-        return stale_after
-    prepared = store.prepare_send(
-        plan.shoko_file_id,
-        plan.fingerprint,
-        request_fingerprint(plan),
-        targets_digest=plan.targets_digest,
-        structure_digest=plan.structure_digest,
-        mapping_revision=str(active.revision),
-        cycle_key=cycle_key,
-        iso=send_iso,
-        policy=plan.policy,
-        campaign_id=campaign_id,
-        expected_episode_jobs=len(plan.episode_ids),
-        target_ids=tuple(
-            (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
-            for target in plan.targets
-        ),
-    )
-    return _commit_send(deps, store, plan, campaign_id, cycle_key, send_iso, prepared)
+    source_tally = _campaign_source_check_tally(deps, store, plan, deadline=source_check_deadline)
+    if source_tally is not None:
+        return source_tally
+    file_verdict = preflight_file(deps.shoko, plan, settings, folders)
+    send: SendResult | None = None
+    tally: _SendTally
+    try:
+        # Mapping refresh shares this lock when changing the active generation or persisting the
+        # invalid-source hold. Keep it from the final local guard through send intent and POST.
+        with deps.mapping_store.generation_lock() as acquired:
+            if not acquired:
+                return _SendTally(
+                    0,
+                    0,
+                    0,
+                    1,
+                    (f"send_stale:{plan.shoko_file_id}:mapping_generation_busy",),
+                    stop_batch=True,
+                )
+            send_iso, stale_after = _post_preflight_send_staleness(
+                deps,
+                settings,
+                store,
+                campaign_id,
+                active,
+                plan,
+                cycle_deadline=source_check_deadline,
+                daemon_drain=daemon_drain,
+                generation_lock_held=True,
+            )
+            if stale_after is not None:
+                return stale_after
+            blocked = _preflight_tally(file_verdict, store, plan, send_iso)
+            if blocked is not None:
+                return blocked
+            prepared = store.prepare_send(
+                plan.shoko_file_id,
+                plan.fingerprint,
+                request_fingerprint(plan),
+                targets_digest=plan.targets_digest,
+                structure_digest=plan.structure_digest,
+                mapping_revision=str(active.revision),
+                cycle_key=cycle_key,
+                iso=send_iso,
+                policy=plan.policy,
+                campaign_id=campaign_id,
+                expected_episode_jobs=len(plan.episode_ids),
+                target_ids=tuple(
+                    (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
+                    for target in plan.targets
+                ),
+            )
+            tally, send = _commit_send(deps, store, plan, campaign_id, send_iso, prepared)
+    except ApplyLockUnavailableError:
+        return _SendTally(
+            0,
+            0,
+            0,
+            1,
+            (f"send_stale:{plan.shoko_file_id}:mapping_generation_lock_unavailable",),
+            stop_batch=True,
+        )
+    except WriteDisabledError:
+        return _SendTally(0, 0, 0, 1, ("writes_disabled",), stop_batch=True)
+    if send is None:
+        return tally
+    detail = verify_and_close(deps, plan, plan.shoko_file_id, cycle_key, send_iso)
+    return _SendTally(1, int(detail.endswith(":verified")), 0, 0, (detail,))
+
+
+def _campaign_source_check_tally(
+    deps: DaemonDeps,
+    store: StateStore,
+    plan: LinkPlan,
+    *,
+    deadline: float | None,
+) -> _SendTally | None:
+    """Return a defer/quarantine tally when the current Sonarr source has drifted."""
+    source = check_plan_sonarr_source(deps, plan, deadline=deadline)
+    if source.status is SourceRelationshipStatus.UNAVAILABLE:
+        return _SendTally(
+            0,
+            0,
+            0,
+            1,
+            (f"preflight_deferred:{plan.shoko_file_id}:sonarr_source_unavailable",),
+        )
+    if source.status is SourceRelationshipStatus.CHANGED:
+        _quarantine(store, plan.shoko_file_id, "sonarr_source_changed", deps.now())
+        return _SendTally(
+            0,
+            0,
+            1,
+            0,
+            (
+                f"campaign_quarantine:{plan.shoko_file_id}:sonarr_source_changed: "
+                f"{source.detail}; frozen target retained, no POST",
+            ),
+        )
+    return None
 
 
 # ------------------------------------------------------------------ lifecycle
@@ -2109,6 +2389,7 @@ def clear_campaign_terminal_meta(store: StateStore, campaign_id: str) -> None:
         f"{META_CAMPAIGN_ATTESTATION_GATE}:{campaign_id}",
         f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}",
         f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}",
+        f"campaign_scan_cursor:v1:{campaign_id}",
     ):
         with contextlib.suppress(WriteDisabledError, StateError):
             store.clear_meta(key)
@@ -2138,6 +2419,13 @@ def campaign_resume(
     campaign = _require_campaign(store, campaign_id)
     if campaign.status == "revoked":
         raise CampaignError(f"campaign {campaign_id} is revoked: resume is refused")
+    unresolved = store.unresolved_campaign_send_history()
+    if unresolved:
+        send_ids = ", ".join(str(row.send_id) for row in unresolved)
+        raise CampaignError(
+            "campaign resume refused: legacy campaign send history is ambiguous for send(s) "
+            f"{send_ids}; resolve each with campaign history-resolve before resuming"
+        )
     if attestation is None or not attestation.valid_for_apply:
         raise CampaignError(
             f"campaign {campaign_id} resume refused: the safety attestation is not valid "
@@ -2267,6 +2555,13 @@ def authorize_campaign_drain(
             f"campaign {campaign_id} is {campaign.status} ({campaign.status_reason}): drain "
             "authorization requires an approved campaign — resume it first"
         )
+    unresolved = store.unresolved_campaign_send_history()
+    if unresolved:
+        send_ids = ", ".join(str(row.send_id) for row in unresolved)
+        raise CampaignError(
+            f"campaign {campaign_id} canary is blocked by ambiguous legacy send(s) {send_ids}; "
+            "resolve each with campaign history-resolve before authorizing a drain"
+        )
     history = store.campaign_send_history(campaign_id)
     # A voided ``prepared_not_sent`` row is a definite zero-write (never attempted):
     # it is durable audit history but is not a canary send and never blocks the grant.
@@ -2383,6 +2678,16 @@ def campaign_report(
                 "attempted_iso": row.attempted_iso,
             }
             for row in store.campaign_send_history(campaign_id)
+        ],
+        "unresolved_legacy_sends": [
+            {
+                "send_id": row.send_id,
+                "shoko_file_id": row.shoko_file_id,
+                "outcome": row.outcome,
+                "state": row.file_state.value,
+                "attempted_iso": row.attempted_iso,
+            }
+            for row in store.unresolved_campaign_send_history()
         ],
     }
 

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
+import pytest
 
 from shoko_linker.http import ApiEndpoint, make_timeout, sonarr_headers
 from shoko_linker.paths import PathMapping
@@ -15,6 +16,7 @@ from shoko_linker.setup import (
     ApiCompatibility,
     MappingDiscoveryStatus,
     PathMappingDiscovery,
+    ScopeReadStatus,
     ScopeStatus,
     SetupReadinessStage,
     build_setup_readiness,
@@ -239,6 +241,7 @@ def test_unidentified_series_type_does_not_guess_anime_scope() -> None:
     assert discovery.status is ScopeStatus.BLOCKED
     assert discovery.candidates == ()
     assert "supported anime series types" in discovery.message
+    assert discovery.read_status is ScopeReadStatus.INCOMPLETE
 
 
 def test_inaccessible_anime_root_blocks_scope_discovery() -> None:
@@ -267,6 +270,48 @@ def test_incomplete_or_malformed_inventory_fails_closed() -> None:
         endpoint.client.close()
 
     assert discovery.status is ScopeStatus.BLOCKED
+    assert discovery.candidates == ()
+    assert discovery.read_status is ScopeReadStatus.INCOMPLETE
+
+
+@pytest.mark.parametrize("failed_path", ["/api/v3/series", "/api/v3/rootfolder"])
+def test_scope_endpoint_failures_are_not_complete_empty_scope(failed_path: str) -> None:
+    endpoint, requests = endpoint_for(
+        series=[series_entry(1, ANIME_ROOT)],
+        roots=[root_entry(ANIME_ROOT)],
+        statuses={failed_path: 503},
+    )
+    try:
+        discovery = discover_sonarr_scope(endpoint)
+    finally:
+        endpoint.client.close()
+
+    assert discovery.status is ScopeStatus.BLOCKED
+    assert discovery.read_status is ScopeReadStatus.UNAVAILABLE
+    assert discovery.candidates == ()
+    assert all(request.method == "GET" for request in requests)
+
+
+def test_successful_empty_series_inventory_is_complete_observation() -> None:
+    endpoint, _ = endpoint_for(series=[], roots=[])
+    try:
+        discovery = discover_sonarr_scope(endpoint)
+    finally:
+        endpoint.client.close()
+
+    assert discovery.status is ScopeStatus.NO_ANIME
+    assert discovery.read_status is ScopeReadStatus.COMPLETE
+
+
+def test_successful_rootfolder_response_missing_confirmed_root_is_complete_observation() -> None:
+    endpoint, _ = endpoint_for(series=[series_entry(1, ANIME_ROOT)], roots=[])
+    try:
+        discovery = discover_sonarr_scope(endpoint)
+    finally:
+        endpoint.client.close()
+
+    assert discovery.status is ScopeStatus.BLOCKED
+    assert discovery.read_status is ScopeReadStatus.COMPLETE
     assert discovery.candidates == ()
 
 

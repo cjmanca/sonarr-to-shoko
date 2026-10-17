@@ -417,6 +417,22 @@ def test_backfill_from_sha_must_be_ancestor_of_to_sha_before_enumeration() -> No
     assert "not-ancestor-of-to-sha" in run
 
 
+def test_schedule_and_default_manual_backfills_share_inclusive_buildable_boundary() -> None:
+    run = _plan_run()
+    run_missing = re.search(r"(?ms)^[ \t]*run_missing\(\)[ \t]*\{(.*?)^[ \t]*\}", run)
+    assert run_missing is not None
+    assert '--first-buildable "$FIRST_BUILDABLE"' in run_missing.group(1)
+    assert 'if [ -n "$FROM" ]; then args+=(--since "$FROM"); fi' in run_missing.group(1)
+    assert "run_missing absent.txt" in run  # the verified-absent retry uses the same boundary
+    assert "FIRST_BUILDABLE=aa6b85ea71192d9c94c7f3c8a58d715c6c37db42" in run
+    assert enum.DEFAULT_FIRST_BUILDABLE == "aa6b85ea71192d9c94c7f3c8a58d715c6c37db42"
+    assert publish["_triggers"]["schedule"]
+    assert "workflow_dispatch" in str(publish["jobs"]["plan"]["if"])
+    assert 'if [ -z "$TO" ]; then TO="$PUSH_SHA"; fi' in run  # scheduled default tip
+    assert 'if [ -z "$TO" ]; then TO="$BRANCH_HEAD"; fi' in run  # manual default tip
+    assert run.count("run_missing\n") == 1  # schedule and manual paths share this call site
+
+
 def test_failed_sha_backfill_comment_describes_registry_recheck() -> None:
     assert re.search(
         r"later backfill\s+#\s+rechecks registry provenance for the failed SHA",

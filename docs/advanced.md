@@ -60,7 +60,7 @@ uv run python -m pytest -q
 | `campaign authorize-drain --campaign-id ID --note TEXT --confirm [--json]` | **F10 drain authorization.** The operator's explicit confirmation that the canary passed: requires an APPROVED campaign whose canary is SETTLED (≥1 submitted file and EVERY submitted campaign file `verified` — a `request_may_have_been_sent`/`verifying`/`partial`/`indeterminate_write`/`conflict` row refuses). The grant binds the campaign's current approval digest and persists across restarts; only the automatic daemon drain consumes it — manual `campaign apply` never requires it. Without this authorization the daemon drains NOTHING | none |
 | `campaign revoke-drain --campaign-id ID --note TEXT --confirm [--json]` | Withdraw the drain authorization: the daemon skips the campaign (`drain_revoked`) **and a running drain batch stops at its next submission** — zero further campaign POSTs, the remainder stays queueable; the campaign status is untouched, so manual `campaign apply` stays available. A re-grant after a fresh review is the operator's decision | none |
 | `audit [--series-anidb N] [--limit N] [--max-requests N] [--json]` | Bounded **read-only** existing-link audit (GETs only, zero writes): classifies already-linked Shoko files against the verified mapping as `linked_consistent` (exact identity-set equality only), `partial_link`, `existing_link_mismatch`, `wrong_first_episode`, `ambiguous_match`, plus `no_sonarr_counterpart`/`audit_incomplete` buckets | Shoko/Sonarr GETs within the request budget |
-| `resolve-send --file-id N --fingerprint FP (--release\|--block) --note TEXT --confirm [--json]` | Operator close of a live terminal-review send (releases the budget slot). Refuses verified/closed rows. A closed send authorizes only a **fresh** re-plan fingerprint | none |
+| `resolve-send --file-id N --fingerprint FP (--release\|--block) --note TEXT --confirm [--json]` | Explicit operator close of a durably inspected terminal-review send. Refuses uninspected/pending, verified, or closed rows. `--release` returns the file to `waiting`; `--block` moves it to `blocked_safety`. Only a **fresh** request fingerprint may be re-planned | none |
 | `clear-requires-rebaseline --note TEXT --confirm [--json]` | Operator clear of the persisted source-discontinuity flag | none |
 | `steal-apply-lock --note TEXT --confirm [--json]` | Take over a **dead** owner's apply lease: it requires the OS advisory lock (`apply.lock`) to be **free**, so a live owner (kernel-held lock) refuses and names the holder. An expired meta lease with a free OS lock is audit-recorded and the OS lock is released | none |
 | `resume-writes --note TEXT --confirm [--json]` | Clear the stopped-writes marker and the write pause | none |
@@ -82,6 +82,41 @@ they refuse (exit `5`) while state writes are stopped, except `resume-writes`.
 **names**, never values, and never raw Shoko settings dumps. In `--json` mode stdout is
 **exactly one JSON document**: the human config summary and the `daemon` startup preamble
 are suppressed, so `json.loads(stdout)` parses cleanly (diagnostics go to the log stream).
+
+## Restart recovery and `resolve-send`
+
+Recovery never replays a possibly delivered POST. Run a read-only cycle (or let the
+daemon recover) to inspect held sends through `GET File/<id>?include=XRefs`. An
+inspection qualifies only when Shoko returns the same file ID and the persisted
+ED2K identity still matches. Exact persisted target triples close as `verified`;
+empty, partial, or contradictory XRefs are recorded durably as `inspected_review`
+and keep their pending budget reservation. Identity-mismatched, unavailable, and
+still-pending observations remain held and cannot be resolved. HTTP 202 is acceptance,
+not completion, and is not itself a terminal inspection.
+
+After the recovery result and current file/XRefs have been reviewed, choose one of
+the explicit operator outcomes. The command writes an audit entry containing the
+operator note and choice. `--release` permits evaluation again by moving the file to
+`waiting`; it does not unlink or repair Shoko associations. `--block` keeps the file
+out of automatic evaluation in `blocked_safety`. A partial inspection may be resolved
+only after the configured verification timeout. Neither choice refunds the rolling
+submission history or a campaign's attempted-send debit, and a previously attempted
+request fingerprint is never reused.
+
+```powershell
+# Read-only recovery inspection; this cycle never replays a held POST.
+uv run shoko-sonarr-linker once --dry-run config.yaml
+
+# Only after a durable terminal inspection and operator review:
+uv run shoko-sonarr-linker resolve-send config.yaml --file-id <id> `
+  --fingerprint <request-fingerprint> --release `
+  --note "reviewed the same-file XRefs" --confirm
+
+# Or keep the file blocked from automatic re-evaluation:
+uv run shoko-sonarr-linker resolve-send config.yaml --file-id <id> `
+  --fingerprint <request-fingerprint> --block `
+  --note "conflicting XRefs require manual action" --confirm
+```
 
 Configuration is YAML (`config.example.yaml` is the full example; every accepted
 field is documented there).
