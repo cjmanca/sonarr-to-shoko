@@ -933,7 +933,7 @@ def _index_revision(
     return _fetch_config_revision(transport, owner, package, bearer, inner, timeout)
 
 
-def verify_sha_tag(
+def verify_sha_tag(  # noqa: PLR0912 -- keep the fail-closed registry/digest checks explicit
     full_sha: str,
     owner: str,
     package: str = PACKAGE,
@@ -941,8 +941,9 @@ def verify_sha_tag(
     *,
     transport: Transport | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    digest: str | None = None,
 ) -> str:
-    """Best-effort, bounded provenance check of one ``sha-<fullsha>`` tag."""
+    """Check a SHA tag, or its resolved digest for race-free image promotion."""
     if not FULL_SHA.match(full_sha):
         msg = f"--shas entries must be 40-char lowercase hex SHAs (got {full_sha!r})"
         raise ValueError(msg)
@@ -950,12 +951,14 @@ def verify_sha_tag(
     http = transport or UrllibTransport()
     tag = f"sha-{full_sha}"
     try:
+        if digest is not None:
+            _require_digest_format(digest)
         bearer = _exchange_token(http, owner, package, token, timeout)
         # Trust boundary: the tag-addressed top document is the registry's own
         # answer (TLS/auth-bound, no client-side digest to check). Every
         # digest-addressed document it references — child manifests and config
         # blobs — is format-validated and hash-verified before use.
-        manifest_url = f"{REGISTRY}/v2/{owner}/{package}/manifests/{tag}"
+        manifest_url = f"{REGISTRY}/v2/{owner}/{package}/manifests/{digest or tag}"
         status, headers, document, raw = _fetch_json(http, manifest_url, bearer, timeout)
         if status == HTTP_NOT_FOUND:
             if _has_oci_error_code(raw, "MANIFEST_UNKNOWN") or _has_oci_error_code(
@@ -971,6 +974,8 @@ def verify_sha_tag(
         if status != HTTP_OK:
             msg = f"manifest fetch returned {status}"
             raise RegistryUnavailableError(msg)
+        if digest is not None:
+            _require_digest(digest, raw)
         if not isinstance(document, dict):
             raise RegistryUnavailableError("manifest document is not a JSON object")
         media_type = _validated_manifest_media_type(headers, document)
@@ -1063,6 +1068,8 @@ def _run_verify(args: argparse.Namespace) -> int:
         print(f"error: --shas exceeds the bounded provenance cap of {VERIFY_CAP}", file=sys.stderr)
         return 2
     try:
+        if args.digest is not None and len(shas) != 1:
+            raise ValueError("--digest requires exactly one SHA")
         validate_namespace(args.owner, args.package)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1078,7 +1085,7 @@ def _run_verify(args: argparse.Namespace) -> int:
     for sha in shas:
         try:
             results[sha] = verify_sha_tag(
-                sha, args.owner, args.package, token, timeout=args.timeout
+                sha, args.owner, args.package, token, timeout=args.timeout, digest=args.digest
             )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1110,6 +1117,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--shas", required=True, help=f"comma-separated 40-hex SHAs (cap {VERIFY_CAP})"
     )
     verify.add_argument("--token-env", default="GHCR_TOKEN")
+    verify.add_argument(
+        "--digest", help="verify a resolved manifest digest instead of a mutable tag"
+    )
     verify.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     return parser
 

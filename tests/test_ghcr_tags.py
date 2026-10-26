@@ -623,6 +623,59 @@ def test_verify_index_annotation_revision_published() -> None:
     assert len(transport.calls) == 2
 
 
+@pytest.mark.parametrize("revision", [SHA_A, SHA_B])
+def test_verify_resolved_digest_checks_exact_bytes_and_revision(revision: str) -> None:
+    manifest = _manifest(OCI_INDEX, {"annotations": {REVISION_KEY: revision}})
+    digest = _digest_of(manifest[2])
+    transport = FakeTransport([_token_ok(), manifest])
+    result = tags.verify_sha_tag(SHA_A, "octo", token=TOKEN, transport=transport, digest=digest)
+    expected = tags.PROVENANCE_PUBLISHED if revision == SHA_A else tags.PROVENANCE_UNKNOWN
+    assert result == expected
+    assert transport.calls[1][0].endswith(f"/manifests/{digest}")
+
+
+def test_verify_resolved_digest_rejects_hash_mismatch() -> None:
+    manifest = _manifest(OCI_INDEX, {"annotations": {REVISION_KEY: SHA_A}})
+    transport = FakeTransport([_token_ok(), manifest])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", transport=transport, digest=ZERO_DIGEST)
+        == tags.PROVENANCE_UNKNOWN
+    )
+
+
+@pytest.mark.parametrize("digest", ["", "sha256:bad", "../escape", "sha512:" + "a" * 128])
+def test_verify_invalid_promotion_digest_makes_no_request(digest: str) -> None:
+    transport = FakeTransport([])
+    assert (
+        tags.verify_sha_tag(SHA_A, "octo", transport=transport, digest=digest)
+        == tags.PROVENANCE_UNKNOWN
+    )
+    assert transport.calls == []
+
+
+def test_verify_digest_cli_requires_single_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHCR_TOKEN", TOKEN)
+    assert (
+        tags.main(
+            ["verify", "--owner", "octo", "--shas", f"{SHA_A},{SHA_B}", "--digest", ZERO_DIGEST]
+        )
+        == 2
+    )
+
+
+def test_verify_digest_cli_verifies_the_resolved_manifest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manifest = _manifest(OCI_INDEX, {"annotations": {REVISION_KEY: SHA_A}})
+    digest = _digest_of(manifest[2])
+    transport = FakeTransport([_token_ok(), manifest])
+    monkeypatch.setenv("GHCR_TOKEN", TOKEN)
+    monkeypatch.setattr(tags, "UrllibTransport", lambda: transport)
+    assert tags.main(["verify", "--owner", "octo", "--shas", SHA_A, "--digest", digest]) == 0
+    assert json.loads(capsys.readouterr().out)["results"] == {SHA_A: tags.PROVENANCE_PUBLISHED}
+    assert transport.calls[1][0].endswith(f"/manifests/{digest}")
+
+
 @pytest.mark.parametrize("index_media_type", [OCI_INDEX, DOCKER_LIST])
 def test_verify_case_varied_supported_index_media_types_published(index_media_type: str) -> None:
     child = _child(b"{}", annotations={REVISION_KEY: SHA_A})

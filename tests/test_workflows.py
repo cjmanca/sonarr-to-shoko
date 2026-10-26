@@ -200,7 +200,7 @@ def test_shared_check_list_parity() -> None:
         assert command in CHECKS_TEXT
     assert "scripts/ci_checks.sh" in _steps(publish["jobs"]["test"])
     assert "scripts/ci_checks.sh" in _steps(publish["jobs"]["publish"])
-    assert "scripts/ci_checks.sh" in _steps(publish["jobs"]["promote-latest"])
+    assert "scripts/ci_checks.sh" not in _steps(publish["jobs"]["promote-latest"])
     assert "scripts/ci_checks.sh" in _steps(ci["jobs"]["quality"])
     # ci.yml must not hand-roll a divergent check list
     assert "uv run ruff check ." not in CI_TEXT
@@ -470,14 +470,14 @@ def test_promote_gate_requires_successful_publish_or_empty_matrix_skip() -> None
     assert "!cancelled()" in promote_if
     promote = publish["jobs"]["promote-latest"]
     steps = promote["steps"]
-    assert "scripts/ci_checks.sh" in _steps(promote)
+    assert "scripts/ci_checks.sh" not in _steps(promote)
     verify = next(
         i for i, step in enumerate(steps) if "ghcr_tags.py verify" in str(step.get("run", ""))
     )
     push = next(
         i
         for i, step in enumerate(steps)
-        if "docker/build-push-action@" in str(step.get("uses", ""))
+        if "docker buildx imagetools create" in str(step.get("run", ""))
     )
     assert verify < push
     verify_run = steps[verify]["run"]
@@ -503,7 +503,7 @@ def test_latest_allows_safe_main_backfill_events() -> None:
     assert "PUSH_REF" not in promote_if
 
     steps = promote["steps"]
-    assert "scripts/ci_checks.sh" in _steps(promote)
+    assert "scripts/ci_checks.sh" not in _steps(promote)
     verify = next(step for step in steps if "ghcr_tags.py verify" in str(step.get("run", "")))
     assert verify["env"]["RUN_SHA"] == "${{ github.sha }}"
     head_check = next(
@@ -514,8 +514,7 @@ def test_latest_allows_safe_main_backfill_events() -> None:
     latest_push = next(
         index
         for index, step in enumerate(steps)
-        if str(step.get("uses", "")).startswith("docker/build-push-action@")
-        and step.get("with", {}).get("tags") == "${{ needs.plan.outputs.image }}:latest"
+        if "docker buildx imagetools create" in str(step.get("run", ""))
     )
     assert head_check + 1 == latest_push
 
@@ -532,6 +531,30 @@ def test_skipped_empty_publish_matrix_still_requires_exact_sha_verification() ->
     assert verify["env"]["RUN_SHA"] == "${{ github.sha }}"
     assert '--shas "${RUN_SHA}"' in verify["run"]
     assert "ghcr_plan.py verify-promotion" in verify["run"]
+
+
+def test_latest_copies_the_verified_digest_without_rebuilding_or_retesting() -> None:
+    steps = publish["jobs"]["promote-latest"]["steps"]
+    assert not any(
+        str(step.get("uses", "")).startswith(("docker/build-push-action@", "astral-sh/setup-uv@"))
+        for step in steps
+    )
+    assert "uv sync" not in _steps(publish["jobs"]["promote-latest"])
+    source = next(step for step in steps if step.get("id") == "source_image")
+    assert source["env"]["SOURCE_TAG"] == "${{ needs.plan.outputs.image }}:sha-${{ github.sha }}"
+    assert "docker buildx imagetools inspect" in source["run"]
+    assert "^sha256:[0-9a-f]{64}$" in source["run"]
+    verify = next(step for step in steps if "ghcr_tags.py verify" in str(step.get("run", "")))
+    copy = next(
+        step for step in steps if "docker buildx imagetools create" in str(step.get("run", ""))
+    )
+    assert steps.index(source) < steps.index(verify) < steps.index(copy)
+    for step in (verify, copy):
+        assert step["env"]["SOURCE_DIGEST"] == "${{ steps.source_image.outputs.digest }}"
+    assert '--digest "${SOURCE_DIGEST}"' in verify["run"]
+    assert "--prefer-index=false" in copy["run"]
+    assert '"${IMAGE_NAME}@${SOURCE_DIGEST}"' in copy["run"]
+    assert ":sha-" not in copy["run"]  # Never resolve the tag again after verification.
 
 
 def _plan_run() -> str:
@@ -585,6 +608,7 @@ def test_image_reference_is_validated_before_any_push() -> None:
             i
             for i, s in enumerate(steps)
             if str(s.get("uses", "")).startswith("docker/build-push-action@")
+            or "docker buildx imagetools create" in str(s.get("run", ""))
         )
         assert gate < push  # the gate runs before docker/build-push-action can see the tag
         gate_run = steps[gate]["run"]
@@ -592,8 +616,8 @@ def test_image_reference_is_validated_before_any_push() -> None:
         assert steps[gate]["env"]["IMAGE_TAG"].startswith("${{ needs.plan.outputs.image }}")
 
 
-def test_publish_tags_flow_from_plan_output_not_shell() -> None:
-    """`tags:` is a GitHub-evaluated input; the tag string never reaches a shell body."""
+def test_publish_tags_flow_from_plan_output() -> None:
+    """Build inputs and promotion environment use the validated plan image name."""
     build = next(
         step
         for step in publish["jobs"]["publish"]["steps"]
@@ -603,9 +627,10 @@ def test_publish_tags_flow_from_plan_output_not_shell() -> None:
     promote = next(
         step
         for step in publish["jobs"]["promote-latest"]["steps"]
-        if str(step.get("uses", "")).startswith("docker/build-push-action@")
+        if "docker buildx imagetools create" in str(step.get("run", ""))
     )
-    assert promote["with"]["tags"] == "${{ needs.plan.outputs.image }}:latest"
+    assert promote["env"]["IMAGE_NAME"] == "${{ needs.plan.outputs.image }}"
+    assert '--tag "${IMAGE_NAME}:latest"' in promote["run"]
     plan = publish["jobs"]["plan"]
     assert plan["env"]["REPO_OWNER"] == "${{ github.repository_owner }}"
     assert plan["env"]["GHCR_PACKAGE"] == "shoko-sonarr-linker"

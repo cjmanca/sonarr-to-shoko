@@ -521,11 +521,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-      - name: Install (locked dev group)
-        run: uv sync --frozen
-      - name: Verify head SHA (full checks, not cached)
-        run: bash scripts/ci_checks.sh
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -539,18 +534,32 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "${IMAGE_TAG}" | LC_ALL=C grep -Eq '^ghcr\.io/[a-z0-9._-]+/shoko-sonarr-linker:latest$' \
-            || { echo "::error::invalid image reference '${IMAGE_TAG}'; refusing to invoke docker/build-push-action" >&2; exit 1; }
+            || { echo "::error::invalid image reference '${IMAGE_TAG}'; refusing to promote latest" >&2; exit 1; }
+      - name: Resolve immutable SHA image digest
+        id: source_image
+        env:
+          SOURCE_TAG: ${{ needs.plan.outputs.image }}:sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${SOURCE_TAG}" | LC_ALL=C grep -Eq '^ghcr\.io/[a-z0-9._-]+/shoko-sonarr-linker:sha-[0-9a-f]{40}$' \
+            || { echo "::error::invalid source image reference; refusing to promote latest" >&2; exit 1; }
+          docker buildx imagetools inspect "${SOURCE_TAG}" --format '{{json .Manifest}}' > source_manifest.json
+          DIGEST=$(python3 -c 'import json; print(json.load(open("source_manifest.json"))["digest"])')
+          printf '%s' "${DIGEST}" | LC_ALL=C grep -Eq '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::invalid source image digest; refusing to promote latest" >&2; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
       - name: Verify immutable SHA image and provenance
         # A successful or skipped matrix result is not image identity proof.
-        # Verify the exact candidate tag now; absent/mismatched images block latest.
+        # Verify the resolved digest; copy that same digest even if the SHA tag changes.
         env:
           GHCR_OWNER: ${{ needs.plan.outputs.owner }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_SHA: ${{ github.sha }}
+          SOURCE_DIGEST: ${{ steps.source_image.outputs.digest }}
         run: |
           set -euo pipefail
           if ! python3 scripts/ghcr_tags.py verify --owner "${GHCR_OWNER}" \
-            --shas "${RUN_SHA}" > immutable_provenance.json; then
+            --shas "${RUN_SHA}" --digest "${SOURCE_DIGEST}" > immutable_provenance.json; then
             echo "::error::immutable SHA provenance query failed; refusing to promote latest" >&2
             exit 1
           fi
@@ -567,21 +576,15 @@ jobs:
             echo "- latest promotion skipped: run SHA superseded by $HEAD" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-      - name: Build & push latest from the verified head SHA
-        # sha- tags are immutable and untouched here; latest is rebuilt from the
-        # head SHA's source with identical labels (no mutable tag in publish job).
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: true
-          tags: ${{ needs.plan.outputs.image }}:latest
-          labels: |
-            org.opencontainers.image.title=shoko-sonarr-linker
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=latest
-          cache-to: type=gha,mode=max,scope=latest
-          provenance: true
+      - name: Promote verified digest to latest
+        # Copy the existing manifest/index and its attestation descriptors; no rebuild.
+        env:
+          IMAGE_NAME: ${{ needs.plan.outputs.image }}
+          SOURCE_DIGEST: ${{ steps.source_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false \
+            --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}@${SOURCE_DIGEST}"
       - name: Promotion report
         env:
           RUN_SHA: ${{ github.sha }}
