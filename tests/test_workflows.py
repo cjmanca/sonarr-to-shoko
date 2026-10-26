@@ -220,6 +220,45 @@ def test_publish_matrix_wired_to_plan_and_isolated() -> None:
     }
 
 
+def test_successful_test_job_records_the_exact_checked_revision_after_checks() -> None:
+    job = publish["jobs"]["test"]
+    steps = job["steps"]
+    checks = next(step for step in steps if "bash scripts/ci_checks.sh" in str(step.get("run", "")))
+    record = next(step for step in steps if step.get("id") == "validated_revision")
+    assert steps.index(checks) < steps.index(record)
+    assert record.get("if") is None  # Default success gate: no output after failed checks.
+    assert job["outputs"]["validated_sha"] == "${{ steps.validated_revision.outputs.sha }}"
+    assert record["env"]["EXPECTED_SHA"] == "${{ github.sha }}"
+    assert "git rev-parse HEAD" in record["run"]
+    assert record["run"].index('test "$SHA" = "$EXPECTED_SHA"') < record["run"].index(
+        'echo "sha=$SHA" >> "$GITHUB_OUTPUT"'
+    )
+
+
+def test_publish_reuses_checks_only_for_the_same_runs_identical_revision() -> None:
+    job = publish["jobs"]["publish"]
+    assert "test" in job["needs"]
+    steps = job["steps"]
+    guarded = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("astral-sh/setup-uv@")
+        or step.get("with", {}).get("name") == "historical-validator"
+        or "uv sync --frozen" in str(step.get("run", ""))
+        or "bash scripts/ci_checks.sh" in str(step.get("run", ""))
+    ]
+    assert len(guarded) == 4
+    for step in guarded:
+        # Missing output or a different matrix SHA falls back to its own checks.
+        assert step["if"] == "${{ needs.test.outputs.validated_sha != matrix.sha }}"
+    verify = next(step for step in guarded if "ci_checks.sh" in str(step.get("run", "")))
+    assert "historical-validator/validate_historical.py --repo ." in verify["run"]
+    reuse = next(step for step in steps if step.get("name", "").startswith("Reuse successful"))
+    assert reuse["if"] == "${{ needs.test.outputs.validated_sha == matrix.sha }}"
+    registry = next(step for step in steps if step.get("id") == "registry_check")
+    assert registry.get("if") is None  # Reusing tests never skips the registry safety gate.
+
+
 def test_publish_sha_is_reverified_under_lock_before_docker_steps() -> None:
     job = publish["jobs"]["publish"]
     steps = job["steps"]
