@@ -377,7 +377,7 @@ def test_container_and_compose_start_service_without_yaml_or_published_port() ->
     service = compose["services"]["shoko-sonarr-linker"]
     environment = service["environment"]
 
-    assert 'ENTRYPOINT ["shoko-sonarr-linker"]' in dockerfile
+    assert 'ENTRYPOINT ["python", "-m", "shoko_linker.container_entrypoint"]' in dockerfile
     assert 'CMD ["service"]' in dockerfile
     assert service["image"] == "ghcr.io/cjmanca/shoko-sonarr-linker:latest"
     assert service["command"] == ["service"]
