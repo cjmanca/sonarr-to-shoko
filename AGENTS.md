@@ -38,7 +38,7 @@
 2. **Micro-plan:** Identify the smallest complete change and its acceptance checks. Don't over-plan trivial local changes.
 3. **Implement:** Change only necessary code/docs. Separate external I/O, mapping decisions, and persistence when useful; avoid speculative abstractions and infrastructure.
 4. **Verify:** Run focused tests and applicable static checks; inspect actual output. Never weaken assertions or disable safety controls to turn failures green.
-5. **Review:** Inspect the actual diff against the assigned requirements and PROJECT.md. A read-only reviewer should report concrete **severity, path/line, impact, reproduction, and proposed fix**, not edit the code.
+5. **Review:** Inspect the actual diff against the assigned requirements and PROJECT.md. A read-only reviewer should report concrete **severity, path/line, impact, reproduction, and proposed fix**, not edit the code. The reviewer MUST be a different sub-agent from implementation.
 6. **Fix and recheck:** Correct P0/P1 and acceptance-blocking P2 findings, then retest and re-review affected behavior. State any deferred P3 issue and justification.
 7. **Return evidence:** Report changed paths, exact commands/outcomes, open findings, limitations, and next recommendation to the orchestrator. Do not claim milestone completion or update central execution records yourself.
 
