@@ -166,6 +166,12 @@ from .service import (
     run_dashboard_worker,
     settings_for_scope,
 )
+from .service_settings import (
+    ServiceSettingsController,
+    apply_service_settings,
+    configured_bootstrap,
+    load_service_settings,
+)
 from .service_setup import ServiceSetupController
 from .state import (
     ATTESTATION_PAUSE_REASON,
@@ -900,7 +906,7 @@ class _NormalServiceRuntime:
             "authorized": False,
             "next_action": "Create the dashboard account and complete setup to begin.",
             "diagnostics": (),
-            "mapping_cache": "Waiting for setup and the first service check.",
+            "mapping_cache": "Available after scope and safety setup is confirmed above.",
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
 
@@ -955,6 +961,14 @@ class _NormalServiceRuntime:
             store.close()
 
     def worker_tick(self) -> None:
+        if configured_bootstrap(self.settings) != self.settings:
+            self._update_latest(
+                authorized=False,
+                next_action=(
+                    "Restart the container to use saved connection URLs, then confirm setup."
+                ),
+            )
+            return
         connection = probe_connections(self.sonarr, self.shoko)
         self._update_latest(connection=connection)
         if not connection.ready:
@@ -1026,6 +1040,7 @@ class _NormalServiceRuntime:
         effective = settings_for_scope(
             self.settings, roots=binding.roots, mappings=binding.path_mappings
         )
+        effective = apply_service_settings(effective, load_service_settings(store, self.settings))
         store.budget_limits = budget_limits_from_settings(effective)
         mapping_store = open_mapping_store(effective)
         deps = build_daemon_deps(
@@ -1047,6 +1062,12 @@ class _NormalServiceRuntime:
             return self._service_context_authorized(manager, context, expected_binding_digest)
 
         def service_authorized_local() -> bool:
+            document = load_service_settings(store, self.settings)
+            if (
+                document["sonarr_url"] != self.settings.sonarr_url
+                or document["shoko_url"] != self.settings.shoko_url
+            ):
+                return False
             context = authorization_context[0]
             if context is None:
                 return False
@@ -1132,7 +1153,7 @@ class _NormalServiceRuntime:
 
 def _run_service(_args: argparse.Namespace) -> int:
     """Run the authenticated dashboard with the guarded worker on its own thread."""
-    settings = load_bootstrap_settings()
+    settings = configured_bootstrap(load_bootstrap_settings())
     configure_logging(logging.DEBUG if cast(bool, _args.verbose) else logging.INFO)
     state = StopState()
     _SHUTDOWN_WAKE.clear()
@@ -1169,12 +1190,17 @@ def _run_service(_args: argparse.Namespace) -> int:
             finally:
                 dashboard_store.close()
 
+        worker_wake = threading.Event()
+        preferences = ServiceSettingsController(settings, worker_wake.set)
         application = DashboardApplication(
             settings.database_path,
             status_provider=runtime.status,
             onboarding_context=dashboard_onboarding_context,
             setup_provider=dashboard_setup.view,
             setup_action=dashboard_setup.action,
+            settings_provider=preferences.view,
+            settings_action=preferences.save,
+            control_changed=worker_wake.set,
         )
         server = create_dashboard_server(DASHBOARD_BIND_HOST, dashboard_port, application)
         logger.info("service started; no dashboard host port is published by default")
@@ -1184,6 +1210,8 @@ def _run_service(_args: argparse.Namespace) -> int:
             stop_requested=state.should_stop,
             monotonic=time.monotonic,
             worker_interval_seconds=SERVICE_POLL_SECONDS,
+            worker_wake=worker_wake,
+            interval_provider=preferences.interval,
         )
     except OSError:
         logger.error("Dashboard listener could not start; check its port configuration.")
@@ -1268,7 +1296,7 @@ def _run_resume(_args: argparse.Namespace) -> int:
             print("Complete dashboard setup before automatic linking can resume.")
             return EXIT_STATE
         try:
-            bootstrap = load_bootstrap_settings()
+            bootstrap = configured_bootstrap(load_bootstrap_settings())
             sonarr, shoko = bootstrap_endpoints(bootstrap)
             try:
                 controller = ServiceSetupController(bootstrap, sonarr, shoko, path)

@@ -90,6 +90,14 @@ shoko-sonarr-linker pause
 shoko-sonarr-linker resume
 ```
 
+Status updates automatically without reloading the page. Setup shows its current
+discovery stage and an estimated progress percentage, including series/file counts.
+Open **Settings** to change service timing, throughput, connection URLs, and selected
+anime libraries or folder mappings. **Show advanced** reveals the remaining service
+configuration. Saving a library change pauses linking until you confirm its scope
+and safety facts again. Connection URL changes require a container restart and new
+confirmation. API keys stay in the container environment; change them there.
+
 The container listens on port `8080` internally. Map a host port only when you
 want dashboard access, and keep that mapping on a trusted network. Authentication
 is required after first-use account creation.

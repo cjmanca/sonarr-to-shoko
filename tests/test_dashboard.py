@@ -337,8 +337,11 @@ def test_setup_scope_and_safety_controls_are_authenticated_and_csrf_protected(
 ) -> None:
     calls: list[tuple[str, dict[str, str]]] = []
     selected_roots: list[str] = []
+    discovering = True
 
     def setup_view() -> DashboardSetupView:
+        if discovering:
+            return ServiceSetupController._loading_view()
         return DashboardSetupView(
             message="Choose the Sonarr folder and review safety before automatic linking.",
             root_options=tuple(f"/anime/{index}" for index in range(12)),
@@ -366,8 +369,24 @@ def test_setup_scope_and_safety_controls_are_authenticated_and_csrf_protected(
         with httpx.Client(follow_redirects=False) as client:
             assert setup_account(client, base_url).status_code == 303
             page = client.get(f"{base_url}/status")
+            assert '<meta http-equiv="refresh"' not in page.text
+            assert "fetch(statusUrl" in page.text
+            assert "script-src 'sha256-" in page.headers["content-security-policy"]
+            assert "connect-src 'self'" in page.headers["content-security-policy"]
+            assert 'role="progressbar"' in page.text
+            assert 'aria-valuenow="0"' in page.text
+            assert "Setup checks start automatically" in page.text
+            assert 'action="/setup/scope"' not in page.text
+            assert 'action="/setup/confirm"' not in page.text
+            assert page.text.index("Set up automatic linking") < page.text.index("Verified files")
+            discovering = False
+            page = client.get(f"{base_url}/status")
             assert "Choose the Sonarr folder" in page.text
             assert "/anime/9" in page.text
+            assert '<meta http-equiv="refresh"' not in page.text
+            assert 'role="progressbar"' not in page.text
+            assert "fetch(statusUrl" in page.text
+            assert 'action="/setup/scope"' in page.text
             first_token = csrf_from(page.text)
             selected = client.post(
                 f"{base_url}/setup/scope",
@@ -490,6 +509,8 @@ def test_setup_provider_cache_miss_does_not_block_status_pause_or_resume(  # noq
             page = status_result["response"]
             assert page.status_code == 200
             assert "Checking current Sonarr and Shoko setup" in page.text
+            assert 'role="progressbar"' in page.text
+            assert "fetch(statusUrl" in page.text
             pause = client.post(
                 f"{base_url}/pause",
                 data={"csrf_token": csrf_from(page.text)},

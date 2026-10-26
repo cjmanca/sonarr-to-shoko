@@ -190,6 +190,8 @@ def run_dashboard_worker(
     monotonic: Callable[[], float],
     worker_interval_seconds: float,
     request_poll_seconds: float = 0.5,
+    worker_wake: threading.Event | None = None,
+    interval_provider: Callable[[], float] | None = None,
 ) -> None:
     """Keep the dashboard loop responsive while a dedicated thread runs worker ticks.
 
@@ -200,20 +202,29 @@ def run_dashboard_worker(
     if worker_interval_seconds <= 0 or request_poll_seconds <= 0:
         raise ValueError("service intervals must be positive")
     worker_stop = threading.Event()
+    wake = worker_wake if worker_wake is not None else threading.Event()
 
     def run_worker() -> None:
         next_worker_tick = monotonic()
         while not worker_stop.is_set() and not stop_requested():
             remaining = next_worker_tick - monotonic()
             if remaining > 0:
-                if worker_stop.wait(remaining):
-                    break
+                if wake.wait(remaining):
+                    wake.clear()
+                    next_worker_tick = monotonic()
                 continue
             try:
                 worker_tick()
             except Exception:
                 _logger.exception("Service worker tick failed; it will be retried.")
-            next_worker_tick = monotonic() + worker_interval_seconds
+            try:
+                interval = (
+                    worker_interval_seconds if interval_provider is None else interval_provider()
+                )
+            except Exception:
+                _logger.warning("Service interval unavailable; using the default retry interval.")
+                interval = worker_interval_seconds
+            next_worker_tick = monotonic() + interval
 
     worker = threading.Thread(target=run_worker, name="shoko-link-worker", daemon=False)
     try:
@@ -223,5 +234,6 @@ def run_dashboard_worker(
             server.handle_request()
     finally:
         worker_stop.set()
+        wake.set()
         server.server_close()
         worker.join()

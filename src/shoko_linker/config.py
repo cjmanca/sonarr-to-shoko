@@ -291,6 +291,19 @@ class Settings:
         return (self.sonarr.api_key.env_var, self.shoko.api_key.env_var)
 
 
+def parse_runtime_options(
+    document: Mapping[str, Any],
+) -> tuple[SyncSettings, MappingSettings, SafetySettings, CampaignSettings]:
+    """Validate operational settings without inventing an undiscovered media scope."""
+    _known_keys(document, {"sync", "mappings", "safety", "campaign"}, "settings")
+    return (
+        _sync(_section(document, "sync")),
+        _mappings(_section(document, "mappings")),
+        _safety(document.get("safety")),
+        _campaign(document.get("campaign")),
+    )
+
+
 def apply_gate(settings: Settings, environ: Mapping[str, str] | None = None) -> bool:
     """The single default-deny gate for live Shoko writes.
 

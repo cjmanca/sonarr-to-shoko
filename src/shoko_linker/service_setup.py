@@ -25,6 +25,7 @@ from .onboarding import (
 )
 from .paths import PathMapping, validate_mappings
 from .safety_check import SafetyAssessment, SafetyStatus, inspect_shoko_safety_settings
+from .service_settings import configured_bootstrap
 from .setup import (
     AnimeScopeDiscovery,
     ApiCompatibility,
@@ -46,6 +47,9 @@ from .sonarr import SonarrInventory, collect_sonarr_inventory
 from .state import StateError, StateStore, open_state
 
 SETUP_VIEW_CACHE_SECONDS = 30.0
+SETUP_INVENTORY_CACHE_SECONDS = 3600.0
+DRAFT_ROOTS_META = "normal_service_draft_roots_v1"
+type _SetupInventory = tuple[SonarrInventory, ShokoDiscovery, PathMappingDiscovery]
 
 
 def _setup_snapshot_digest(
@@ -102,7 +106,7 @@ class ServiceSetupController:
         shoko: ApiEndpoint,
         state_path: str | Path,
     ) -> None:
-        self.bootstrap = bootstrap
+        self.bootstrap = replace(bootstrap, database_path=Path(state_path))
         self.sonarr = sonarr
         self.shoko = shoko
         self.state_path = Path(state_path)
@@ -116,6 +120,18 @@ class ServiceSetupController:
         self._refresh_lock = threading.Lock()
         self._view_generation = 0
         self._refreshing = False
+        self._progress_message = "Checking current Sonarr and Shoko setup."
+        self._progress_percent = 0
+        self._editing_scope = False
+        self._inventory_cache: (
+            tuple[float, tuple[str, ...], ApiCompatibility, AnimeScopeDiscovery, _SetupInventory]
+            | None
+        ) = None
+
+    def _set_progress(self, message: str, percent: int) -> None:
+        with self._view_lock:
+            self._progress_message = message
+            self._progress_percent = max(self._progress_percent, min(99, max(0, percent)))
 
     @staticmethod
     def onboarding(store: StateStore) -> OnboardingManager:
@@ -124,11 +140,13 @@ class ServiceSetupController:
     def _environment(
         self,
     ) -> tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]:
-        return (
-            inspect_api_compatibility(self.sonarr, self.shoko),
-            discover_sonarr_scope(self.sonarr),
-            inspect_shoko_safety_settings(self.shoko),
-        )
+        self._set_progress("Checking current Sonarr and Shoko setup and service versions.", 2)
+        compatibility = inspect_api_compatibility(self.sonarr, self.shoko)
+        self._set_progress("Discovering Sonarr anime folders and eligible series.", 8)
+        scope = discover_sonarr_scope(self.sonarr)
+        self._set_progress("Checking Shoko safety settings.", 15)
+        assessment = inspect_shoko_safety_settings(self.shoko)
+        return compatibility, scope, assessment
 
     def _saved_record(self) -> OnboardingRecord | None:
         try:
@@ -141,6 +159,8 @@ class ServiceSetupController:
     def current_context(self, store: StateStore) -> tuple[ScopeBinding, SafetyAssessment] | None:
         """Return current non-secret authorization facts only for a still-present scope."""
         try:
+            if configured_bootstrap(self.bootstrap) != self.bootstrap:
+                return None
             record = self.onboarding(store).record()
             if record is None:
                 return None
@@ -222,13 +242,30 @@ class ServiceSetupController:
     def _inventory(
         self, roots: tuple[str, ...]
     ) -> tuple[SonarrInventory, ShokoDiscovery, PathMappingDiscovery]:
-        inventory = collect_sonarr_inventory(self.sonarr, allowed_roots=roots, anime_only=True)
-        discovery = collect_shoko_discovery(self.shoko)
+        self._set_progress("Reading episodes and files from the selected Sonarr anime folders.", 20)
+        inventory = collect_sonarr_inventory(
+            self.sonarr,
+            allowed_roots=roots,
+            anime_only=True,
+            on_progress=lambda done, total: self._set_progress(
+                f"Reading Sonarr anime series: {done} of {total} checked.",
+                20 + int(40 * done / max(1, total)),
+            ),
+        )
+        self._set_progress("Reading Shoko import folders and unrecognized files.", 60)
+        discovery = collect_shoko_discovery(
+            self.shoko,
+            on_progress=lambda done, total: self._set_progress(
+                f"Reading Shoko unrecognized files: {done} of {total} read.",
+                60 + int(30 * done / max(1, total)),
+            ),
+        )
+        self._set_progress("Comparing exact file paths and sizes to verify folder mappings.", 92)
         mapping = infer_path_mappings(inventory, discovery)
         return inventory, discovery, mapping
 
     def _mapping_state(
-        self, compatibility: ApiCompatibility, roots: tuple[str, ...]
+        self, compatibility: ApiCompatibility, roots: tuple[str, ...], scope: AnimeScopeDiscovery
     ) -> tuple[
         SonarrInventory | None,
         ShokoDiscovery | None,
@@ -240,7 +277,31 @@ class ServiceSetupController:
         if not compatibility.compatible or not roots:
             return None, None, None, (), False, ()
         try:
-            inventory, discovery, path_result = self._inventory(roots)
+            cached = self._inventory_cache
+            if (
+                cached is not None
+                and time.monotonic() - cached[0] < SETUP_INVENTORY_CACHE_SECONDS
+                and cached[1:4] == (roots, compatibility, scope)
+            ):
+                current_folders = collect_import_folders(self.shoko)
+                if current_folders is None:
+                    return None, None, None, (), False, ()
+                if {folder.id: folder for folder in current_folders} != cached[4][1].folders:
+                    cached = None
+            else:
+                cached = None
+            if cached is None:
+                inventory, discovery, path_result = self._inventory(roots)
+                if inventory.verdict.complete and discovery.verdict.complete:
+                    self._inventory_cache = (
+                        time.monotonic(),
+                        roots,
+                        compatibility,
+                        scope,
+                        (inventory, discovery, path_result),
+                    )
+            else:
+                inventory, discovery, path_result = cached[4]
         except (ValueError, OSError, PathError):
             return None, None, None, (), False, ()
         inferred_roots = {item.sonarr for item in path_result.mappings}
@@ -313,13 +374,15 @@ class ServiceSetupController:
         return message
 
     @staticmethod
-    def _loading_view() -> DashboardSetupView:
+    def _loading_view(
+        message: str = "Checking current Sonarr and Shoko setup.", percent: int = 0
+    ) -> DashboardSetupView:
         return DashboardSetupView(
-            message=(
-                "Checking current Sonarr and Shoko setup. " "Scope choices will appear when ready."
-            ),
+            message=f"{message} Scope choices will appear when ready.",
             root_options=(),
             confirmation_enabled=False,
+            loading=True,
+            progress_percent=percent,
         )
 
     def view(self, *, refresh: bool = False) -> DashboardSetupView | None:
@@ -335,13 +398,17 @@ class ServiceSetupController:
                 return self._view_cache[1]
             if not self._refreshing:
                 self._refreshing = True
+                self._progress_message = "Checking current Sonarr and Shoko setup."
+                self._progress_percent = 0
                 worker = threading.Thread(
                     target=self._refresh_in_background,
                     name="shoko-linker-setup-discovery",
                     daemon=True,
                 )
                 worker.start()
-        return self._loading_view()
+            progress = self._progress_message
+            percent = self._progress_percent
+        return self._loading_view(progress, percent)
 
     def _refresh_in_background(self) -> None:
         try:
@@ -363,6 +430,7 @@ class ServiceSetupController:
                     generation = self._view_generation
                     self._view_cache = None
                     self._view_environment = None
+                    self._progress_percent = 0
                     selected_roots = self._selected_roots
                     selected_mappings = self._selected_mappings
                 view, environment = self._compute_view(selected_roots, selected_mappings)
@@ -389,13 +457,40 @@ class ServiceSetupController:
     ]:
         compatibility, scope, assessment = self._environment()
         environment = (compatibility, scope, assessment)
+        if configured_bootstrap(self.bootstrap) != self.bootstrap:
+            return DashboardSetupView(
+                "Restart the container to use the saved connection URLs, then review setup.",
+                (),
+                confirmation_enabled=False,
+            ), environment
         saved_record = self._saved_record()
-        roots = selected_roots or (() if saved_record is None else saved_record.binding.roots)
+        with open_state(self.state_path) as store:
+            encoded_draft = store.get_meta(DRAFT_ROOTS_META)
+        draft_roots: tuple[str, ...] = ()
+        if encoded_draft is not None:
+            raw_draft = json.loads(encoded_draft)
+            if not isinstance(raw_draft, list) or not all(
+                isinstance(root, str) for root in raw_draft
+            ):
+                raise StateError("Saved library selection is invalid.")
+            draft_roots = tuple(raw_draft)
+        roots = (
+            selected_roots
+            or draft_roots
+            or (() if saved_record is None else saved_record.binding.roots)
+        )
         mappings = selected_mappings or (
-            () if saved_record is None else saved_record.binding.path_mappings
+            saved_record.binding.path_mappings
+            if (
+                saved_record is not None
+                and saved_record.binding.roots == roots
+                and not self._editing_scope
+                and encoded_draft is None
+            )
+            else ()
         )
         inventory, discovery, path_result, inferred, mapping_required, mapping_options = (
-            self._mapping_state(compatibility, roots)
+            self._mapping_state(compatibility, roots, scope)
         )
         current_mappings = mappings or inferred
         safe_shoko_roots = self._safe_roots(discovery)
@@ -455,7 +550,7 @@ class ServiceSetupController:
             ):
                 with open_state(self.state_path) as store:
                     reconfirmation_required = self.onboarding(store).reconfirmation_required()
-                if not reconfirmation_required:
+                if not reconfirmation_required and not self._editing_scope:
                     return None, environment
 
         message = self._message(
@@ -483,6 +578,7 @@ class ServiceSetupController:
             mapping_required=mapping_required,
             required_confirmations=required,
             confirmation_enabled=confirmation_enabled,
+            progress_percent=100,
         )
         view = replace(
             view,
@@ -492,6 +588,12 @@ class ServiceSetupController:
 
     def action(self, action: str, form: Mapping[str, str]) -> str:
         try:
+            if action == "edit":
+                with self._view_lock:
+                    self._editing_scope = True
+                    self._selected_mappings = ()
+                    self._inventory_cache = None
+                return "Review your selected anime folders below. Continue to save a new selection."
             if action == "scope":
                 return self._select_scope(form)
             if action == "confirm":
@@ -541,7 +643,16 @@ class ServiceSetupController:
             raise ValueError("Select at least one Sonarr anime folder.")
         with self._view_lock:
             self._assert_snapshot_current_locked(view, generation)
-            self._selected_roots = tuple(sorted(set(selected)))
+            selected_scope = tuple(sorted(set(selected)))
+            with open_state(self.state_path) as store:
+                if self.onboarding(store).record() is not None:
+                    self.onboarding(store).pause_for_review(
+                        "setup_changed",
+                        "Library selection needs confirmation.",
+                        iso=datetime.now(UTC).isoformat(),
+                    )
+                store.set_meta(DRAFT_ROOTS_META, json.dumps(selected_scope))
+            self._selected_roots = selected_scope
             self._selected_mappings = ()
         return "Anime scope selected. Checking exact file paths and folder correspondence."
 
@@ -661,8 +772,10 @@ class ServiceSetupController:
                     automatic_link_consent=True,
                     iso=datetime.now(UTC).isoformat(),
                 )
+                store.clear_meta(DRAFT_ROOTS_META)
             self._selected_roots = roots
             self._selected_mappings = mappings
+            self._editing_scope = False
         return "Setup saved. Automatic linking will start after current safety checks pass."
 
     def _submitted_view(

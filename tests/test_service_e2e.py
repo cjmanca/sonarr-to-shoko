@@ -447,7 +447,7 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         background_refresh_pending = True
         scope_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
         assert scope_page.status == 200
-        assert b"Checking current Sonarr and Shoko setup" in scope_page.body
+        assert b'role="progressbar"' in scope_page.body
         discovery_deadline = time.monotonic() + 10.0
         while SONARR_ROOT.encode() not in scope_page.body and time.monotonic() < discovery_deadline:
             time.sleep(0.01)
@@ -475,14 +475,14 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         )
         assert scope_result.status == 200
         cookie = _response_header(scope_result, "Set-Cookie").split(";", 1)[0]
-        assert b"Checking current Sonarr and Shoko setup" in scope_result.body
+        assert b'role="progressbar"' in scope_result.body
         assert b'action="/setup/confirm"' not in scope_result.body
         assert background_refresh_started.wait(timeout=5)
         assert selected_inventory_started.wait(timeout=5)
 
         loading_page = _dashboard_request(application, "GET", "/status", cookie=cookie)
         assert loading_page.status == 200
-        assert b"Checking current Sonarr and Shoko setup" in loading_page.body
+        assert b'role="progressbar"' in loading_page.body
         assert b'action="/setup/confirm"' not in loading_page.body
 
         release_selected_inventory.set()

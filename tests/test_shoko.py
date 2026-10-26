@@ -267,7 +267,13 @@ def test_stable_pagination_walks_all_pages_and_uses_contract_params(
         2: envelope(rows[2:4], SMALL_TOTAL),
         3: envelope(rows[4:5], SMALL_TOTAL),
     }
-    discovery = discover(stub, page_size=SMALL_PAGE_SIZE)
+    progress: list[tuple[int, int]] = []
+    discovery = discover(
+        stub,
+        page_size=SMALL_PAGE_SIZE,
+        on_progress=lambda done, total: progress.append((done, total)),
+    )
+    assert progress == [(2, SMALL_TOTAL), (4, SMALL_TOTAL), (5, SMALL_TOTAL)]
     assert discovery.verdict.complete is True
     assert discovery.total_reported == SMALL_TOTAL
     assert len(discovery.files) == SMALL_TOTAL

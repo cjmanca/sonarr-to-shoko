@@ -706,6 +706,7 @@ def collect_sonarr_inventory(
     swept_series_ids: frozenset[int] = frozenset(),
     series_deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> SonarrInventory:
     """Read the eligible Sonarr collection once (series, episodes, files, rootfolders).
 
@@ -754,6 +755,7 @@ def collect_sonarr_inventory(
         monotonic=monotonic,
         reasons=reasons,
         details=details,
+        on_progress=on_progress,
     )
     indexed = _index_series_children(eligible, children.cache, reasons, details)
     _mark_incomplete_inventory(eligible, children, reasons, details)
@@ -1009,6 +1011,7 @@ def _collect_series_children(
     monotonic: Callable[[], float],
     reasons: list[VerdictReason],
     details: list[str],
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> _SeriesChildrenSnapshot:
     cache_is_current = cached_manifest_hash == manifest_hash
     cache = {
@@ -1023,7 +1026,9 @@ def _collect_series_children(
     invalidated: set[int] = set()
     eligible_ids = {item.series.id for item in eligible}
     ordered = sorted(eligible, key=lambda item: (item.series.id <= cursor, item.series.id))
-    for item in ordered:
+    if on_progress is not None:
+        on_progress(0, len(ordered))
+    for index, item in enumerate(ordered, start=1):
         if series_deadline is not None and monotonic() >= series_deadline:
             break
         cursor = item.series.id
@@ -1035,6 +1040,8 @@ def _collect_series_children(
             deadline=series_deadline,
             monotonic=monotonic,
         )
+        if on_progress is not None:
+            on_progress(index, len(ordered))
         if episodes is None or files is None:
             cache.pop(item.series.id, None)
             swept.discard(item.series.id)

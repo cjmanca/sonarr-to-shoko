@@ -322,6 +322,53 @@ def test_partial_dashboard_requests_release_controls_and_shutdown(
         server.server_close()
 
 
+def test_control_wake_starts_next_check_without_waiting_for_configured_interval(
+    tmp_path: Path,
+) -> None:
+    from shoko_linker.dashboard import DashboardApplication, create_dashboard_server
+    from shoko_linker.service import run_dashboard_worker
+
+    server = create_dashboard_server(
+        "127.0.0.1", 0, DashboardApplication(tmp_path / "state.sqlite3")
+    )
+    first_tick = threading.Event()
+    second_tick = threading.Event()
+    stop = threading.Event()
+    wake = threading.Event()
+
+    def tick() -> None:
+        if first_tick.is_set():
+            second_tick.set()
+            stop.set()
+        else:
+            first_tick.set()
+
+    runner = threading.Thread(
+        target=run_dashboard_worker,
+        kwargs={
+            "server": server,
+            "worker_tick": tick,
+            "stop_requested": stop.is_set,
+            "monotonic": time.monotonic,
+            "worker_interval_seconds": 3600,
+            "interval_provider": lambda: 3600,
+            "worker_wake": wake,
+            "request_poll_seconds": 0.02,
+        },
+    )
+    try:
+        runner.start()
+        assert first_tick.wait(timeout=2)
+        wake.set()
+        assert second_tick.wait(timeout=2)
+    finally:
+        stop.set()
+        wake.set()
+        runner.join(timeout=3)
+        server.server_close()
+    assert not runner.is_alive()
+
+
 def test_worker_exception_is_retried_and_repeated_start_stop_closes_server(
     tmp_path: Path,
 ) -> None:

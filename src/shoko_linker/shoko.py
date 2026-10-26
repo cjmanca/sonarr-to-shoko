@@ -639,6 +639,7 @@ def collect_shoko_discovery(
     deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     observed_at: str | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> ShokoDiscovery:
     """Fetch import folders once, then page through ``include_only=Unrecognized`` files.
 
@@ -675,7 +676,7 @@ def collect_shoko_discovery(
     details.extend(folder_details)
 
     files, pages_fetched, total = _walk_file_pages(
-        endpoint, effective_size, max_pages, reasons, details
+        endpoint, effective_size, max_pages, reasons, details, on_progress=on_progress
     )
 
     if total is not None and len(files) > total:
@@ -1061,6 +1062,8 @@ def _walk_file_pages(
     max_pages: int,
     reasons: list[SnapshotReason],
     details: list[str],
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[ShokoFile], int, int | None]:
     """Page the File listing until the total, a cap, or a stability failure."""
     files: list[ShokoFile] = []
@@ -1101,6 +1104,8 @@ def _walk_file_pages(
         absolute_paths_missing |= paths_flag
         xrefs_missing |= xrefs_flag
         _merge_page(parsed, page, seen, files, reasons, details)
+        if on_progress is not None and total is not None:
+            on_progress(len(files), total)
         if total is not None and len(files) >= total:
             break
         if not outcome.rows:

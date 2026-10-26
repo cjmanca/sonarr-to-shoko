@@ -122,6 +122,43 @@ def _ready_setup_form(
     return controller, form, environment, folder_paths, clock, sonarr, shoko
 
 
+def test_status_polling_reuses_inventory_until_folders_change_or_refresh_is_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, _form, _environment, folder_paths, clock, sonarr, shoko = _ready_setup_form(
+        tmp_path, monkeypatch
+    )
+    original_inventory = controller._inventory
+    reads = 0
+
+    def counted_inventory(
+        roots: tuple[str, ...],
+    ) -> tuple[SonarrInventory, ShokoDiscovery, PathMappingDiscovery]:
+        nonlocal reads
+        reads += 1
+        return original_inventory(roots)
+
+    monkeypatch.setattr(controller, "_inventory", counted_inventory)
+    controller._inventory_cache = None
+    try:
+        assert controller.refresh_view() is not None
+        for _ in range(4):
+            clock[0] += service_setup.SETUP_VIEW_CACHE_SECONDS + 1
+            view = controller.refresh_view()
+            assert view is not None
+            assert view.progress_percent == 100
+        assert reads == 1
+        folder_paths["value"].append("/new-anime")
+        assert controller.refresh_view() is not None
+        assert reads == 2
+        clock[0] += service_setup.SETUP_INVENTORY_CACHE_SECONDS + 1
+        assert controller.refresh_view() is not None
+        assert reads == 3
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
 def test_setup_controller_requires_explicit_scope_consent_and_all_unknown_safety_facts(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -164,7 +201,7 @@ def test_setup_controller_requires_explicit_scope_consent_and_all_unknown_safety
         return inventory
 
     monkeypatch.setattr(service_setup, "collect_sonarr_inventory", collect_inventory)
-    monkeypatch.setattr(service_setup, "collect_shoko_discovery", lambda *_: discovery)
+    monkeypatch.setattr(service_setup, "collect_shoko_discovery", lambda *_, **__: discovery)
     monkeypatch.setattr(service_setup, "infer_path_mappings", lambda *_: path_discovery)
     monkeypatch.setattr(
         service_setup, "collect_import_folders", lambda *_: tuple(discovery.folders.values())
