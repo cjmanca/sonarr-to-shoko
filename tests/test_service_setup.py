@@ -379,6 +379,29 @@ def test_setup_controller_requires_explicit_scope_consent_and_all_unknown_safety
         shoko.client.close()
 
 
+@pytest.mark.parametrize("action", ["scope", "confirm"])
+def test_incompatible_api_is_reported_instead_of_false_scope_or_safety_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    controller, form, environment, _folders, _clock, sonarr, shoko = _ready_setup_form(
+        tmp_path, monkeypatch
+    )
+    message = "Cannot verify Shoko compatibility. Check its connection and API version."
+    unavailable = replace(
+        environment[0], shoko_version=None, shoko_supported=False, messages=(message,)
+    )
+    monkeypatch.setattr(controller, "_environment", lambda: (unavailable, *environment[1:]))
+    try:
+        result = controller.action(action, {**form, "root_0": ANIME_ROOT})
+        assert result == f"Setup was not saved. {message}"
+        assert "scope or safety changed" not in result
+        with open_state(controller.state_path) as store:
+            assert controller.onboarding(store).record() is None
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
 def test_setup_confirmation_accepts_form_valid_at_submission_after_slow_revalidation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

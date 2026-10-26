@@ -615,9 +615,14 @@ class ServiceSetupController:
                 "The current Sonarr anime scope check is incomplete or unavailable. Wait for it "
                 "to recover before choosing a folder."
             )
+        if not compatibility.compatible:
+            raise ValueError(
+                compatibility.messages[0]
+                if compatibility.messages
+                else "Required Sonarr/Shoko API checks could not be completed."
+            )
         if (
-            not compatibility.compatible
-            or compatibility != shown_compatibility
+            compatibility != shown_compatibility
             or scope.status is not shown_scope.status
             or scope.read_status is not shown_scope.read_status
             or tuple((candidate.path, candidate.series_ids) for candidate in scope.candidates)
@@ -677,6 +682,12 @@ class ServiceSetupController:
             raise ValueError(
                 "The current Sonarr anime scope check is incomplete or unavailable. Wait for it "
                 "to recover before confirming setup."
+            )
+        if not compatibility.compatible:
+            raise ValueError(
+                compatibility.messages[0]
+                if compatibility.messages
+                else "Required Sonarr/Shoko API checks could not be completed."
             )
         if (
             compatibility != shown_compatibility

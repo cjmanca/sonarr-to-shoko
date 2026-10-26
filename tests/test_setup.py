@@ -384,7 +384,26 @@ def test_sonarr_v4_and_v5_api_v3_versions_are_supported() -> None:
         assert compatibility.compatible is True
 
 
-def test_unsupported_or_unreported_api_versions_block_setup() -> None:
+@pytest.mark.parametrize("version", ["5.3.3.0", "5.3.4", "6.0.0", "6.1.0-dev.42"])
+def test_shoko_release_labels_do_not_restrict_available_v3_api(version: str) -> None:
+    sonarr, _ = response_endpoint(
+        "http://sonarr:8989", "/api/v3/system/status", {"version": "4.0.0"}
+    )
+    shoko, requests = response_endpoint(
+        "http://shoko:8111", "/api/v3/Init/Version", {"Server": {"Version": version}}
+    )
+    try:
+        compatibility = inspect_api_compatibility(sonarr, shoko)
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+    assert compatibility.compatible
+    assert compatibility.shoko_version == version
+    assert compatibility.messages == ()
+    assert all(request.method == "GET" for request in requests)
+
+
+def test_unsupported_sonarr_version_still_blocks_setup() -> None:
     sonarr, _ = response_endpoint(
         "http://sonarr:8989", "/api/v3/system/status", {"version": "7.0.0.1"}
     )
@@ -399,8 +418,8 @@ def test_unsupported_or_unreported_api_versions_block_setup() -> None:
 
     assert compatibility.compatible is False
     assert compatibility.sonarr_supported is False
-    assert compatibility.shoko_supported is False
-    assert len(compatibility.messages) == 2
+    assert compatibility.shoko_supported is True
+    assert len(compatibility.messages) == 1
 
 
 def test_api_version_probe_refuses_malformed_version_payloads() -> None:

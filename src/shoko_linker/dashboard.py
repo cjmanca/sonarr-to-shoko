@@ -696,11 +696,12 @@ class DashboardApplication:
             f'<span class="status-badge {"running" if active else "paused"}">'
             f'<span aria-hidden="true" class="status-dot"></span>'
             f"{'Running' if active else 'Paused'}</span></header>"
-            '<nav aria-label="Dashboard navigation"><a href="/status">Overview</a>'
-            '<a href="/settings">Settings</a></nav>'
+            '<nav class="section-nav" aria-label="Dashboard navigation">'
+            f'<a href="/status"{" aria-current=\"page\"" if not settings else ""}>Overview</a>'
+            f'<a href="/settings"{" aria-current=\"page\"" if settings else ""}>Settings</a></nav>'
             + (f'<p role="status">{html.escape(next_action)}</p>' if next_action else "")
             + (DashboardApplication._settings_section(settings, csrf_token) if settings else "")
-            + '<p id="update-status" role="status">Updates automatically every 2 seconds.</p>'
+            + '<p id="update-status" role="status" hidden></p>'
             '<div data-live="setup">'
             f"{DashboardApplication._setup_section(setup, csrf_token)}"
             '</div><dl class="metrics" data-live="metrics">'
@@ -903,6 +904,7 @@ _DASHBOARD_JS: Final[str] = """
       const next = new DOMParser().parseFromString(await response.text(), 'text/html');
       if (!next.querySelector('[data-live="metrics"]')) {
         stopped = true;
+        notice.hidden = false;
         notice.textContent = 'Your session expired. ';
         const login = document.createElement('a');
         login.href = '/'; login.textContent = 'Sign in again'; notice.append(login);
@@ -952,8 +954,10 @@ _DASHBOARD_JS: Final[str] = """
       }
       notice.textContent = changedSetup
         ? 'Setup facts changed. Review the updated choices and confirmations.'
-        : 'Live updates connected. Updates automatically every 2 seconds.';
+        : '';
+      notice.hidden = !changedSetup;
     } catch (_) {
+      notice.hidden = false;
       notice.textContent = 'Live updates interrupted. Retrying automatically…';
     } finally {
       if (!stopped) window.setTimeout(update, 2000);
@@ -1035,6 +1039,15 @@ dd { margin: 0; }
 .next-action { color: var(--ink); }
 nav { display: flex; flex-wrap: wrap; gap: 10px; margin: 24px 0; }
 nav form { margin: 0; }
+.section-nav { display: inline-flex; gap: 4px; margin: 0 0 28px; padding: 5px;
+  background: #eeedf8; border: 1px solid #e1def3; border-radius: 12px; }
+.section-nav a { padding: 8px 20px; border-radius: 8px; text-decoration: none;
+  color: var(--muted); font-size: 14px; font-weight: 650; }
+.section-nav a:hover { color: var(--accent); background: #ffffff80; }
+.section-nav a[aria-current="page"] { color: var(--accent); background: var(--surface);
+  box-shadow: 0 2px 6px #18243b0d; }
+#update-status:not([hidden]) { padding: 12px 16px; background: #fff7e7;
+  color: #85570c; border: 1px solid #efdcaf; border-radius: 9px; }
 button, .button { background: var(--accent); color: white; border: 1px solid var(--accent);
   border-radius: 9px; padding: 11px 20px; font: inherit; font-size: 14px;
   font-weight: 650; cursor: pointer; transition: background .15s, box-shadow .15s; }

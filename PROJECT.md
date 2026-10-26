@@ -79,6 +79,7 @@ If a file contains multiple Sonarr episodes, **all** must map successfully; link
 ### Shoko linking and verification
 
 - Use **Shoko's supported API**, not direct database changes. Verify endpoint schemas against the deployed Shoko version.
+- Shoko compatibility is determined by the required API v3 endpoints and response contracts, not an exact server release allowlist. Accept version labels such as `5.3.3.0` and other releases when those contracts remain compatible; reject missing or incompatible API responses before writing. Continue recording the observed version in setup consent so a changed server installation prompts fresh confirmation.
 - Link only Shoko files that still qualify as unrecognized and **have no existing protected episode associations**.
 - Re-read the current file associations immediately before writing; the linking endpoint may replace existing manual links.
 - Shoko may process link requests asynchronously: **HTTP success means accepted, not completed**. Poll/re-read the resulting associations and record success only after verification.

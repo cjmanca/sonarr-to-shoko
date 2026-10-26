@@ -52,11 +52,17 @@ class ServiceSonarrStub(eh.SonarrStub):
 
 
 class ServiceShokoStub(eh.ShokoStub):
+    version = "5.3.3"
+    incompatible_queue = False
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/api/v3/Init/Version":
             self.requests.append((request.method, path))
-            return httpx.Response(200, json={"Server": {"Version": "5.3.3"}}, request=request)
+            return httpx.Response(200, json={"Server": {"Version": self.version}}, request=request)
+        if path == "/api/v3/Queue" and self.incompatible_queue:
+            self.requests.append((request.method, path))
+            return httpx.Response(200, json={"UnexpectedQueueSchema": True}, request=request)
         if path == "/api/v3/Settings":
             self.requests.append((request.method, path))
             return httpx.Response(
@@ -222,8 +228,10 @@ def _confirm_setup(controller: ServiceSetupController) -> None:
     assert "saved" in controller.action("confirm", form).lower()
 
 
+@pytest.mark.parametrize("component", ["sonarr", "shoko"])
 def test_real_setup_controller_latches_supported_version_drift_until_fresh_confirmation(
     tmp_path: Path,
+    component: str,
 ) -> None:
     """Fresh current facts invalidate saved consent even when the cycle digest is stale."""
     environ = {
@@ -240,7 +248,13 @@ def test_real_setup_controller_latches_supported_version_drift_until_fresh_confi
     shoko = _endpoint(world.shoko.handler, eh.SHOKO_BASE)
     runtime = cli._NormalServiceRuntime(bootstrap, sonarr, shoko, cli.StopState())
     controller = runtime.setup
-    service_sonarr = cast(ServiceSonarrStub, world.sonarr)
+    service = (
+        cast(ServiceSonarrStub, world.sonarr)
+        if component == "sonarr"
+        else cast(ServiceShokoStub, world.shoko)
+    )
+    original_version = service.version
+    changed_version = "4.0.1" if component == "sonarr" else "5.3.4"
     try:
         _confirm_setup(controller)
         with open_state(bootstrap.database_path) as store:
@@ -250,17 +264,17 @@ def test_real_setup_controller_latches_supported_version_drift_until_fresh_confi
             expected_cycle_digest = saved.binding_digest
             assert runtime._service_authorized(store, manager, expected_cycle_digest)
 
-            service_sonarr.version = "4.0.1"  # Supported, but not covered by the saved consent.
+            service.version = changed_version  # Available API, but not covered by saved consent.
             current = controller.current_context(store)
             assert current is not None
-            assert current[0].sonarr_version == "4.0.1"
+            assert getattr(current[0], f"{component}_version") == changed_version
             assert not runtime._service_authorized(store, manager, expected_cycle_digest)
             assert store.get_service_pause() == (True, "setup_changed")
             assert manager.reconfirmation_required()
 
         # Restart after the changed observation and restore the old version. The hard
         # reconfirmation requirement is persisted independently of the current version.
-        service_sonarr.version = "4.0.0"
+        service.version = original_version
         with open_state(bootstrap.database_path) as reopened:
             manager = OnboardingManager(reopened)
             assert not runtime._service_authorized(reopened, manager, expected_cycle_digest)
@@ -349,9 +363,11 @@ def test_unavailable_scope_check_blocks_posts_and_cannot_clear_reconfirmation(  
         shoko.client.close()
 
 
+@pytest.mark.parametrize("shoko_version", ["5.3.3", "5.3.3.0", "5.3.4", "6.0.0"])
 def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_restart(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    shoko_version: str,
 ) -> None:
     environ = {
         SONARR_URL_ENV: "http://sonarr:8989",
@@ -364,6 +380,8 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         database_path=tmp_path / "state.sqlite3",
     )
     world = _service_world(tmp_path)
+    service_shoko = cast(ServiceShokoStub, world.shoko)
+    service_shoko.version = shoko_version
     monkeypatch.setattr(
         cli,
         "sonarr_endpoint",
@@ -517,6 +535,11 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
         runtime.worker_tick()
         assert world.shoko.posts_count() == 0
         assert "grace_period" in runtime.latest["diagnostics"]
+        clock["now"] += timedelta(seconds=301)
+        service_shoko.incompatible_queue = True
+        runtime.worker_tick()
+        assert world.shoko.posts_count() == 0
+        service_shoko.incompatible_queue = False
         clock["now"] += timedelta(seconds=301)
         runtime.worker_tick()
         assert world.shoko.posts_count() == 1

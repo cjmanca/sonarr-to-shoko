@@ -39,7 +39,6 @@ MIN_SUCCESS_STATUS = 200
 MAX_SUCCESS_STATUS = 300
 SONARR_VERSION_COMPONENT_COUNT = 3
 SUPPORTED_SONARR_MAJOR_VERSIONS = frozenset({4, 5, 6})
-SUPPORTED_SHOKO_VERSION = "5.3.3"
 
 
 class ScopeStatus(Enum):
@@ -99,7 +98,7 @@ class ApiCompatibility:
 
     @property
     def compatible(self) -> bool:
-        """True only when both service versions match verified API contracts."""
+        """Metadata probes succeeded; operational response contracts are checked at use."""
         return self.sonarr_supported and self.shoko_supported
 
 
@@ -182,7 +181,7 @@ def _sonarr_version_supported(version: str) -> bool:
 
 
 def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCompatibility:
-    """Read version metadata from documented v3 endpoints and fail closed if unknown.
+    """Read metadata through the required v3 endpoints without pinning a Shoko release.
 
     Sonarr's `/api/v3/system/status` and Shoko's `/api/v3/Init/Version` expose only the
     version/capability metadata needed here. Shoko's settings endpoint is deliberately
@@ -207,7 +206,10 @@ def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCom
         if isinstance(shoko_version_raw, str) and shoko_version_raw.strip()
         else None
     )
-    shoko_supported = shoko_version == SUPPORTED_SHOKO_VERSION
+    # A release label is not an API capability. Keep the observed version for consent
+    # drift detection; discovery, queue, resolution and preflight parsers independently
+    # refuse unavailable endpoints or incompatible response shapes before any link.
+    shoko_supported = shoko_version is not None
 
     capabilities: list[str] = []
     messages: list[str] = []
@@ -224,11 +226,6 @@ def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCom
         )
     if shoko_version is None:
         messages.append("Cannot verify Shoko compatibility. Check its connection and API version.")
-    elif not shoko_supported:
-        messages.append(
-            f"Shoko {shoko_version} is not verified for safe linking; "
-            f"expected Shoko {SUPPORTED_SHOKO_VERSION}."
-        )
     return ApiCompatibility(
         sonarr_version=sonarr_version,
         shoko_version=shoko_version,

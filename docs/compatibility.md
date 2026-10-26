@@ -100,9 +100,14 @@ Zero network calls to any live Shoko; zero writes.
 - **`GET /api/v3/Init/Status`** returns `ServerStatus` with startup state, startup
   message, uptime, and database-blocked state. It is a read-only availability signal;
   do not call `POST /api/v3/Init/StartServer` from the linker.
-- This project has verified linking side-effect semantics only for Shoko **5.3.3**;
-  newer Shoko versions (including the v6 rewrite) remain unsupported until their
-  `ManualLinkJob` semantics and safety inputs are independently verified.
+- The source audit below establishes the **v5.3.3** contract baseline, not a runtime
+  release allowlist. Setup accepts any nonempty `Server.Version` reported by the
+  required v3 metadata endpoint, including `5.3.3.0`. Discovery, queue, episode
+  resolution and protected preflight independently validate their response contracts
+  and refuse missing/incompatible data before writing. This does not claim that
+  every release has been live-tested or that metadata alone proves all capabilities.
+  The observed version remains bound to setup consent; version changes require fresh
+  confirmation. Missing safety settings still require the existing operator checks.
 
 ### `GET /api/v3/File` — listing unrecognized files
 
