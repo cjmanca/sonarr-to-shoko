@@ -31,3 +31,18 @@
 - Delivery commits `8bdf12bb0c8b14f7957e3c0ebc7d27bb9625ca55` and `c5a7a4f63fe39bc3641903a8b0cba55e304ae5ba` were pushed with `git push origin main`.
 - Immediately after that push, `git rev-parse HEAD` and `git ls-remote origin refs/heads/main` both returned `c5a7a4f63fe39bc3641903a8b0cba55e304ae5ba`; the working tree was clean.
 - Next: no repository implementation work remains. External validations above require the target services/operator environment.
+
+## First-use account verification fix — 2026-10-26
+
+- Bounded follow-up to the reported account-creation failure, on `main` at `5124fc5`. Local changes remain uncommitted in `src/shoko_linker/dashboard.py` and `tests/test_dashboard.py`, plus this record.
+- Changed the response Referrer-Policy to `same-origin`; retained rejection of missing, null, and cross-site origins and all session/CSRF checks.
+- `uv run pytest -o addopts='' -q tests/test_dashboard.py` — 22 passed, 1 skipped. Focused Ruff lint/format, focused mypy, and `git diff --check` passed. Independent read-only reviewer reran the dashboard tests with the same result and reported no findings.
+- `uv run --with playwright python -` with installed headless Edge and temporary local state reproduced the native form failure under the old policy (`Origin: null`, POST 403). Under the fixed policy the browser sent its origin, received POST 303, and reached authenticated `/status`. No production services were contacted; Playwright was an ephemeral tool dependency.
+- Next: deliver the local fix through an authorized image build/release, then reload the setup page and retry account creation. The installed container remains unverified; no push, publication, or deployment was performed.
+
+## Dashboard appearance refresh — 2026-10-26
+
+- Added a shared branded layout, inline styling, status cards, connection/control panels, and responsive account/setup forms in `src/shoko_linker/dashboard.py`. Preserved authentication, CSRF, scope consent, and the first-use form verification fix above.
+- `uv run pytest tests/test_dashboard.py -q` passed (one existing skip). `uv run ruff check .`, `uv run ruff format --check .` (75 files), `uv run mypy` (70 source files), and `git diff --check` passed.
+- An independent read-only reviewer reported no blocking findings. Local fixture previews were inspected in Chrome at desktop and 390px phone widths; status and setup pages had no horizontal overflow. No live Sonarr/Shoko operations were performed.
+- User authorized committing and pushing the UI refresh and existing form-security fix. Next: push the accepted local change, then verify the resulting image workflow; installed-container appearance remains unverified.

@@ -572,28 +572,36 @@ class DashboardApplication:
     def _setup_page(error: str = "") -> str:
         return _page(
             "Create dashboard account",
+            '<div class="eyebrow">Welcome to your library</div>'
             "<h1>Create your dashboard account</h1>"
             "<p>This account protects setup and controls.</p>"
             f'{_error(error)}<form method="post" action="/setup">'
             f'<label>Username <input name="username" '
-            f'maxlength="{MAX_DASHBOARD_USERNAME_CHARS}" required></label>'
+            f'maxlength="{MAX_DASHBOARD_USERNAME_CHARS}" autocomplete="username" required></label>'
             f'<label>Password <input name="password" type="password" '
             f'minlength="{MIN_DASHBOARD_PASSWORD_CHARS}" '
-            f'maxlength="{MAX_DASHBOARD_PASSWORD_CHARS}" required></label>'
-            "<button>Create account</button></form>",
+            f'maxlength="{MAX_DASHBOARD_PASSWORD_CHARS}" autocomplete="new-password" '
+            'aria-describedby="password-hint" required></label>'
+            f'<p id="password-hint" class="hint">Use at least '
+            f"{MIN_DASHBOARD_PASSWORD_CHARS} characters.</p>"
+            '<button>Create account <span aria-hidden="true">&rarr;</span></button></form>',
+            compact=True,
         )
 
     @staticmethod
     def _login_page(error: str = "") -> str:
         return _page(
             "Sign in",
-            f'<h1>Sign in</h1>{_error(error)}<form method="post" action="/login">'
+            '<div class="eyebrow">Welcome back</div><h1>Sign in</h1>'
+            "<p>Your library, connected. Sign in to manage automatic linking.</p>"
+            f'{_error(error)}<form method="post" action="/login">'
             f'<label>Username <input name="username" maxlength="{MAX_DASHBOARD_USERNAME_CHARS}" '
             'autocomplete="username" required></label>'
             f'<label>Password <input name="password" type="password" '
             f'maxlength="{MAX_DASHBOARD_PASSWORD_CHARS}" '
             'autocomplete="current-password" required></label>'
             "<button>Sign in</button></form>",
+            compact=True,
         )
 
     @staticmethod
@@ -619,29 +627,45 @@ class DashboardApplication:
         controls = (
             f'<form method="post" action="/pause">'
             f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
-            "<button>Pause</button></form>"
+            '<button class="secondary">Pause</button></form>'
             f'<form method="post" action="/resume">'
             f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
             "<button>Resume</button></form>"
         )
         return _page(
             "Automatic linking status",
+            '<header class="page-heading"><div><div class="eyebrow">Library overview</div>'
             "<h1>Automatic linking</h1>"
-            f"<p>{html.escape(status.connection_message)}</p>"
-            f"<dl><dt>Verified files</dt><dd>{status.linked_files}</dd>"
-            f"<dt>Waiting</dt><dd>{status.waiting_files}</dd>"
-            f"<dt>Need review</dt><dd>{status.review_files}</dd>"
-            f"<dt>Latest cycle exclusions</dt><dd>{status.excluded_files}</dd>"
-            f"<dt>Excluded outside scope</dt><dd>{status.scope_excluded_files}</dd>"
-            f"<dt>Exclusion categories</dt><dd>{exclusion_categories}</dd>"
-            f"<dt>Episode mappings</dt><dd>{html.escape(status.mapping_cache_status)}</dd>"
-            f"<dt>Automatic linking</dt><dd>{'Running' if active else 'Paused'}</dd></dl>"
-            "<p>Waiting includes work being prepared or waiting for Shoko to confirm a link.</p>"
-            "<p>Partial or uncertain link results need attention; conflicts and safety issues "
-            "are included.</p>"
-            f"<p>{html.escape(action)}</p><nav>{controls}</nav>"
+            '<p>Keep your anime library in sync.</p></div>'
+            f'<span class="status-badge {"running" if active else "paused"}">'
+            f'<span aria-hidden="true" class="status-dot"></span>'
+            f"{'Running' if active else 'Paused'}</span></header>"
+            '<dl class="metrics"><div class="metric verified"><dt>Verified files</dt>'
+            f'<dd>{status.linked_files:,}</dd><dd class="metric-note">Confirmed in Shoko</dd></div>'
+            '<div class="metric waiting"><dt>Waiting</dt>'
+            f'<dd>{status.waiting_files:,}</dd><dd class="metric-note">'
+            'Preparing or confirming links'
+            '</dd></div><div class="metric review"><dt>Need review</dt>'
+            f'<dd>{status.review_files:,}</dd><dd class="metric-note">Files needing attention'
+            '</dd></div></dl><div class="overview-grid">'
+            '<section class="panel"><div class="eyebrow">Service health</div>'
+            '<h2>Connections &amp; mappings</h2>'
+            f'<p class="connection-message">{html.escape(status.connection_message)}</p>'
+            '<dl class="facts"><div><dt>Episode mappings</dt>'
+            f'<dd>{html.escape(status.mapping_cache_status)}</dd></div>'
+            f'<div><dt>Latest cycle exclusions</dt><dd>{status.excluded_files}</dd></div>'
+            f'<div><dt>Excluded outside scope</dt><dd>{status.scope_excluded_files}</dd></div>'
+            f'<div><dt>Exclusion categories</dt><dd>{exclusion_categories}</dd></div>'
+            '</dl></section>'
+            '<section class="panel control-panel"><div class="eyebrow">Your next step</div>'
+            f'<h2>Linking controls</h2><p class="next-action">{html.escape(action)}</p>'
+            f'<nav aria-label="Linking controls">{controls}</nav>'
+            '<p class="hint">Waiting includes work being prepared or waiting for Shoko '
+            'to confirm a link. Partial or uncertain link results need attention; '
+            'conflicts and safety issues are included.</p></section></div>'
             f"{DashboardApplication._setup_section(setup, csrf_token)}"
-            f"<details><summary>Advanced diagnostics</summary><ul>{diagnostics}</ul></details>",
+            '<details class="panel diagnostics"><summary>Advanced diagnostics</summary>'
+            f"<ul>{diagnostics}</ul></details>",
         )
 
     @staticmethod
@@ -703,7 +727,8 @@ class DashboardApplication:
                 "<button>Confirm setup</button></form>"
             )
         return (
-            "<section><h2>Set up automatic linking</h2>"
+            '<section class="panel setup-panel"><div class="eyebrow">Finish setup</div>'
+            "<h2>Set up automatic linking</h2>"
             f"<p>{html.escape(setup.message)}</p>{scope_form}{confirm_form}</section>"
         )
 
@@ -737,11 +762,145 @@ def _error(message: str) -> str:
     return "" if not message else f'<p role="alert">{html.escape(message)}</p>'
 
 
-def _page(title: str, body: str) -> str:
+_DASHBOARD_CSS: Final[str] = """
+:root {
+  color-scheme: light;
+  --ink: #18243b; --muted: #58677e; --line: #e1e7f0;
+  --accent: #5146cf; --accent-hover: #4036b0; --surface: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f6fb; color: var(--ink); font-size: 15px; line-height: 1.6;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; }
+.site-header { background: var(--surface); border-bottom: 1px solid var(--line); }
+.header-inner {
+  max-width: 1160px; margin: auto; padding: 21px 32px; display: flex;
+  align-items: center; justify-content: space-between; gap: 20px;
+}
+.brand { display: flex; align-items: center; gap: 12px; font-size: 17px;
+  font-weight: 750; letter-spacing: -.4px; }
+.brand-mark {
+  display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px;
+  background: var(--accent); color: white; font-size: 25px; line-height: 1;
+  box-shadow: 0 4px 10px #5146cf26;
+}
+.header-caption { color: var(--muted); font-size: 13px; }
+main { max-width: 1160px; margin: auto; padding: 44px 32px 24px; }
+h1, h2, p, dl { margin-top: 0; }
+h1 { font-size: clamp(26px, 4vw, 34px); line-height: 1.2;
+  letter-spacing: -1.1px; margin-bottom: 12px; }
+h2 { font-size: 18px; line-height: 1.4; letter-spacing: -.35px; margin-bottom: 18px; }
+p { color: var(--muted); margin-bottom: 20px; }
+.eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: 1.6px;
+  font-weight: 750; color: var(--accent); margin-bottom: 10px; }
+.page-heading { display: flex; justify-content: space-between; align-items: center;
+  gap: 20px; margin-bottom: 30px; }
+.page-heading p { margin-bottom: 0; }
+.status-badge { display: inline-flex; align-items: center; gap: 8px;
+  border: 1px solid; border-radius: 100px; padding: 6px 14px;
+  font-size: 13px; font-weight: 650; white-space: nowrap; }
+.running { color: #176546; background: #edf9f2; border-color: #c9e8d7; }
+.paused { color: #85570c; background: #fff7e7; border-color: #efdcaf; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px; margin-bottom: 24px; }
+.metric, .panel { background: var(--surface); border: 1px solid var(--line);
+  border-radius: 16px; box-shadow: 0 3px 12px #18243b04; }
+.metric { padding: 24px; border-top: 3px solid var(--accent); }
+.metric dt { color: var(--muted); font-size: 13px; font-weight: 650; }
+dd { margin: 0; }
+.metric dd { font-size: 38px; font-weight: 700; line-height: 1.5;
+  letter-spacing: -1.5px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.metric .metric-note { font-size: 12px; font-weight: 400; letter-spacing: 0;
+  color: var(--muted); }
+.verified { border-top-color: #339877; }
+.verified > dd:first-of-type { color: #207657; }
+.review { border-top-color: #d4a140; }
+.review > dd:first-of-type { color: #966311; }
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 24px; margin-bottom: 24px; }
+.panel { padding: 26px; min-width: 0; overflow-wrap: anywhere; }
+.connection-message { padding: 12px 16px; background: #f4f6fb; border-radius: 9px;
+  color: var(--ink); font-size: 14px; }
+.facts { margin-bottom: 0; font-size: 13px; }
+.facts > div { display: flex; justify-content: space-between; gap: 20px;
+  padding: 12px 0; border-top: 1px solid var(--line); }
+.facts dt { color: var(--muted); flex: 1; }
+.facts dd { flex: 1; text-align: right; font-weight: 550; }
+.next-action { color: var(--ink); }
+nav { display: flex; flex-wrap: wrap; gap: 10px; margin: 24px 0; }
+nav form { margin: 0; }
+button { background: var(--accent); color: white; border: 1px solid var(--accent);
+  border-radius: 9px; padding: 11px 20px; font: inherit; font-size: 14px;
+  font-weight: 650; cursor: pointer; transition: background .15s, box-shadow .15s; }
+button:hover { background: var(--accent-hover); box-shadow: 0 3px 8px #5146cf22; }
+button.secondary { background: white; color: var(--ink); border-color: #cbd3e1; }
+button.secondary:hover { background: #f0f2f8; }
+:focus-visible { outline: 3px solid #8277ef; outline-offset: 3px; }
+button:disabled { opacity: .55; cursor: not-allowed; }
+.hint { font-size: 12px; color: var(--muted); margin: 12px 0 0; }
+.setup-panel { margin-bottom: 24px; }
+label { display: block; font-size: 14px; font-weight: 550; margin: 18px 0; }
+input:not([type="hidden"]):not([type="checkbox"]), select {
+  display: block; width: 100%; margin-top: 7px; padding: 11px 13px;
+  border: 1px solid #cbd3e1; border-radius: 9px; background: #fff;
+  color: var(--ink); font: inherit; min-width: 0;
+}
+input[type="checkbox"] { accent-color: var(--accent); width: 17px; height: 17px;
+  margin: 0 10px 0 0; vertical-align: middle; }
+.setup-panel form + form { margin-top: 24px; padding-top: 6px;
+  border-top: 1px solid var(--line); }
+.diagnostics { padding: 18px 24px; }
+summary { cursor: pointer; font-size: 13px; font-weight: 650; color: var(--muted); }
+details[open] summary { margin-bottom: 16px; }
+details ul { font-family: ui-monospace, monospace; font-size: 12px; padding-left: 20px; }
+[role="alert"] { color: #9c293d; background: #fff0f2; border: 1px solid #f1cbd2;
+  border-radius: 9px; padding: 12px 16px; }
+.compact { max-width: 520px; margin: 58px auto 32px; padding: 0 24px; }
+.auth-card { background: white; border: 1px solid var(--line); border-radius: 20px;
+  padding: 36px; box-shadow: 0 12px 40px #18243b08; }
+.compact h1 { font-size: 28px; letter-spacing: -.8px; }
+.compact form button { width: 100%; margin-top: 24px; }
+footer { max-width: 1160px; padding: 24px 32px 32px; margin: auto;
+  color: var(--muted); font-size: 12px; text-align: center; }
+@media (max-width: 760px) {
+  .overview-grid { grid-template-columns: 1fr; }
+  .metrics { gap: 12px; }
+  .metric { padding: 18px; }
+  .header-caption { display: none; }
+}
+@media (max-width: 480px) {
+  .header-inner { padding: 16px 20px; }
+  main { padding: 28px 20px 12px; }
+  .page-heading { align-items: flex-start; flex-direction: column; gap: 14px; }
+  .metrics { grid-template-columns: 1fr; }
+  .metric { padding: 18px 22px; }
+  .metric dd { font-size: 32px; }
+  .panel { padding: 22px; }
+  .facts > div { flex-direction: column; gap: 4px; }
+  .facts dd { text-align: left; }
+  .compact { margin-top: 28px; padding: 0 20px; }
+  .auth-card { padding: 26px; }
+}
+@media (prefers-reduced-motion: reduce) { button { transition: none; } }
+"""
+
+
+def _page(title: str, body: str, *, compact: bool = False) -> str:
+    main_class = ' class="compact"' if compact else ""
+    content = f'<div class="auth-card">{body}</div>' if compact else body
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{html.escape(title)}</title></head><body>{body}</body></html>"
+        f"<title>{html.escape(title)} · Shoko&ndash;Sonarr Linker</title>"
+        f"<style>{_DASHBOARD_CSS}</style></head><body>"
+        '<header class="site-header"><div class="header-inner">'
+        '<div class="brand"><span class="brand-mark" aria-hidden="true">&#8644;</span>'
+        'Shoko&ndash;Sonarr Linker</div><span class="header-caption">Your anime library, connected'
+        "</span></div></header>"
+        f"<main{main_class}>{content}</main>"
+        "<footer>Sonarr metadata. Shoko connections. One organized library.</footer>"
+        "</body></html>"
     )
 
 
@@ -817,7 +976,9 @@ def create_dashboard_server(host: str, port: int, application: DashboardApplicat
             self.send_header("Content-Length", str(len(response.body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
+            # no-referrer makes native form POSTs send Origin: null, which our
+            # same-origin verification must reject. Keep origin on local forms.
+            self.send_header("Referrer-Policy", "same-origin")
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "

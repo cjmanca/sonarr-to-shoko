@@ -182,6 +182,8 @@ def test_first_user_setup_is_atomic_and_persists_only_password_hash_and_signing_
             first_visit = client.get(base_url)
             assert first_visit.status_code == 200
             assert "Create your dashboard account" in first_visit.text
+            # Native browser form POSTs need an origin-preserving policy.
+            assert first_visit.headers["referrer-policy"] == "same-origin"
             created = setup_account(client, base_url)
             assert created.status_code == 303
             assert created.headers["location"] == "/status"
@@ -964,6 +966,24 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
         stop_server(server, server_thread)
         sonarr.client.close()
         shoko.client.close()
+
+
+@pytest.mark.parametrize("origin", [None, "null", "http://attacker.invalid"])
+def test_setup_rejects_unverifiable_origins(tmp_path: Path, origin: str | None) -> None:
+    app = make_app(tmp_path)
+    server, thread, base_url = start_server(app)
+    try:
+        with httpx.Client() as client:
+            response = client.post(
+                f"{base_url}/setup",
+                data={"username": USERNAME, "password": PASSWORD},
+                headers={} if origin is None else {"Origin": origin},
+            )
+            assert response.status_code == 403
+        with open_state(tmp_path / "state.sqlite3") as store:
+            assert store.get_dashboard_account() is None
+    finally:
+        stop_server(server, thread)
 
 
 def test_dashboard_rejects_unbounded_or_malformed_setup_fields(tmp_path: Path) -> None:
