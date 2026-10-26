@@ -44,6 +44,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build image
         run: docker build -t shoko-sonarr-linker:ci .
+      - name: Smoke configurable non-root identity and persistent state
+        run: docker run --rm -i --entrypoint python shoko-sonarr-linker:ci - < scripts/smoke_container_identity.py
       - name: Smoke (CLI help + offline config validate + default-deny gate)
         # Dummy long keys satisfy config load (values stay in the environment;
         # offline validate makes no network call). once --apply must refuse (exit 3)

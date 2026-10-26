@@ -61,7 +61,7 @@ WORKDIR /app
 # Writable persistent state directory (mount a volume here in Compose).
 RUN mkdir -p /data && chown -R 1000:1000 /data && chmod 0755 /data
 
-USER 1000:1000
-
-ENTRYPOINT ["shoko-sonarr-linker"]
+# Bootstrap owns only /data and drops to PUID/PGID (default 1000:1000) before
+# executing the application. Docker --user also works with pre-owned state.
+ENTRYPOINT ["python", "-m", "shoko_linker.container_entrypoint"]
 CMD ["service"]

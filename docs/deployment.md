@@ -19,8 +19,22 @@ SHOKO_API_KEY
 
 Keep the named `/data` volume. SQLite state, the mapping cache, dashboard account,
 and setup consent live there. Do not place `/data` on SMB/NFS storage; SQLite
-locking is not reliable on network shares. The container runs as UID/GID 1000 and
-does not need the Docker socket or media mounts.
+locking is not reliable on network shares. The application runs as `PUID:PGID`
+(default `1000:1000`). Set these optional environment variables to match your
+host appdata owner; Unraid normally uses `PUID=99` and `PGID=100`. Startup uses
+root only to adjust ownership within the dedicated `/data` directory before
+dropping supplementary groups and switching to the selected non-root identity.
+It does not follow symbolic links when adjusting ownership. Do not mount a
+shared appdata parent or media directory at `/data`.
+
+Docker `--user UID:GID` is also supported with pre-owned writable state; when
+using it, set PUID/PGID to the same IDs or leave both unset. Ownership adjustment
+is skipped in this mode. ID 0 and invalid IDs are rejected. The service does
+not need the Docker socket or media mounts.
+
+`docker exec` uses the image's root bootstrap identity by default. To inspect
+application permissions, use `docker exec --user 99:100 ...` on Unraid (or your
+configured IDs).
 
 Start the container with `docker compose up -d`. The service checks connections
 read-only, and the first dashboard visit creates the dashboard account and opens
@@ -46,8 +60,10 @@ put it behind an unauthenticated reverse proxy.
 1. Add the `unraid.xml` template in the Docker template editor.
 2. Set Sonarr and Shoko URLs and API keys. API keys are masked fields and are read
    from the container environment at runtime.
-3. Set the `/data` host path to a persistent local appdata directory owned by
-   UID/GID 1000. Keep the optional advanced YAML mount empty for the normal setup.
+3. Set the `/data` host path to a dedicated persistent local appdata directory.
+   Set User ID (`PUID`) and Group ID (`PGID`) to its intended owner; the template
+   defaults to `99:100`. Existing containers need these variables added when
+   upgrading. Keep the optional advanced YAML mount empty for the normal setup.
 4. Join the Docker network used by Sonarr and Shoko.
 5. Leave **Dashboard Port (optional)** empty to publish no host port. If you want
    dashboard access, assign a trusted local host port to container port `8080`.

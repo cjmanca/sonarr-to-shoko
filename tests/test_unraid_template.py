@@ -25,7 +25,8 @@ def test_unraid_template_keeps_dashboard_private_and_state_persistent() -> None:
     assert by_name["Application Data"].attrib["Target"] == "/data"
     assert by_name["Application Data"].attrib["Required"] == "true"
     assert by_name["Application Data"].attrib["Mode"] == "rw"
-    assert "USER 1000:1000" in (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert by_target["PUID"].attrib["Default"] == "99"
+    assert by_target["PGID"].attrib["Default"] == "100"
 
     for variable in ("SONARR_URL", "SONARR_API_KEY", "SHOKO_URL", "SHOKO_API_KEY"):
         assert variable in by_target

@@ -31,11 +31,13 @@ services:
       SONARR_API_KEY: "${SONARR_API_KEY}"
       SHOKO_URL: "${SHOKO_URL}"
       SHOKO_API_KEY: "${SHOKO_API_KEY}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
     volumes:
       - shoko-sonarr-linker-data:/data
-      # Unraid bind mounts: the container writes as UID/GID 1000. Set the share
-      # owner accordingly (e.g. `chown 1000:1000` on the appdata path) so /data
-      # is writable without running the container as root.
+      # For Unraid bind mounts, set PUID=99 and PGID=100 in .env.
+      # Startup adjusts ownership of this dedicated state directory and its
+      # contents, then runs the application as PUID:PGID.
     # Dashboard listens on container port 8080, but no host port is published by
     # default. To expose it only on the Docker host, opt in explicitly:
     # ports:

@@ -58,6 +58,13 @@ The [Unraid template](unraid.xml) uses the same published `latest` image, requir
 the same four connection settings, persists `/data`, and leaves dashboard port
 publishing optional.
 
+The application runs as `PUID:PGID`, defaulting to `1000:1000`. For Unraid,
+set `PUID=99` and `PGID=100` (the template includes these defaults). Compose
+users can add these optional values to `.env`. Startup briefly uses root to
+adjust ownership of `/data` and its contents, then drops privileges before
+starting the application. Mount only a dedicated appdata directory at `/data`.
+Existing installations must add these variables when updating their container.
+
 `latest` is a moving tag. To stay on the newest successful default-branch image,
 run `docker compose -f compose.example.yaml pull` before restarting after an update.
 For reproducible deployments, replace `latest` in the Compose `image` line with a

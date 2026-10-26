@@ -13,6 +13,8 @@
   <Icon>/plugins/dynamix.docker.manager/images/question.png</Icon>
   <ExtraParams>--restart unless-stopped --stop-timeout=360</ExtraParams>
   <PostArgs />
+  <Config Name="User ID" Target="PUID" Default="99" Mode="" Description="Non-root application UID; match the appdata owner (Unraid nobody is 99)." Type="Variable" Display="always" Required="true" Mask="false" />
+  <Config Name="Group ID" Target="PGID" Default="100" Mode="" Description="Application GID; match the appdata group (Unraid users is 100)." Type="Variable" Display="always" Required="true" Mask="false" />
   <DonateText />
   <DonateLink />
   <Config Name="Application Data" Target="/data" Default="/mnt/user/appdata/shoko-sonarr-linker/data" Mode="rw" Description="Persistent SQLite state and mapping cache; keep on local or cache-backed storage." Type="Path" Display="always" Required="true" Mask="false" />

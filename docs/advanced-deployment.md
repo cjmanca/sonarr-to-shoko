@@ -119,8 +119,10 @@ Rules:
 - Shoko live-action/manual-drop roots must be excluded by allowing only the
   Sonarr-owned anime roots.
 - `/data` should be local disk/cache storage. Avoid SMB/NFS for SQLite.
-- The container writes `/data` as UID/GID 1000. Set ownership on the host
-  share; do not run the tool as root.
+- The application writes `/data` as `PUID:PGID` (default `1000:1000`; Unraid
+  template `99:100`). Startup adjusts ownership inside the dedicated state
+  directory as root, then drops privileges before running the tool. See
+  [deployment guidance](deployment.md) for Docker `--user` support.
 
 ## 4. Read-only preflight
 
