@@ -3,13 +3,12 @@
 # publish job, latest promotion) — this workflow deliberately has
 # NO packages:write permission and no registry login.
 #
-# Action pins (M8 security review F9) — every `uses:` ref below is pinned to a
-# full commit SHA with the tag noted in a trailing comment. SHAs fetched 2026-10-09
-# from the GitHub public refs API (git/matching-refs/tags/v<MAJOR>.), newest
-# patch release of the major version in use:
-#   actions/checkout    v4.4.0  11d5960a326750d5838078e36cf38b85af677262
-#   actions/setup-python v5.6.0 a26af69be951a213d495a4c3e4e4022e16d87065
-#   astral-sh/setup-uv  v4.2.0  38f3f104447c67c051c4a08e39b64a148898af3a
+# Action pins (M8 security review F9): full commit SHAs verified 2026-10-26
+# against upstream release tags and action.yml manifests (all use node24).
+# GitHub-hosted ubuntu-latest runners satisfy the Node.js 24 requirements.
+#   actions/checkout            v7.0.1    3d3c42e5aac5ba805825da76410c181273ba90b1
+#   actions/setup-python        v7.1.0    6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+#   astral-sh/setup-uv          v10.3.2   07a047e608db84b3d8c06cd9a7c7dcc9c355c18e
 
 name: CI
 
@@ -26,11 +25,11 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Install (locked dev group)
         run: uv sync --frozen
       # Shared check list (M8): the exact same commands the per-SHA publish
@@ -41,7 +40,7 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build image
         run: docker build -t shoko-sonarr-linker:ci .
       - name: Smoke configurable non-root identity and persistent state
