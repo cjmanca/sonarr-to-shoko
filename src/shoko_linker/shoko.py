@@ -58,6 +58,7 @@ import httpx
 from .config import Settings
 from .errors import HttpPolicyError, PathError
 from .http import ApiEndpoint, resolve_and_send
+from .logging_setup import diagnostic_text
 from .paths import PathMapping, is_within_root, normalize_posix, path_parts
 from .sonarr import SonarrFile
 
@@ -1362,7 +1363,28 @@ def _check_location(
         failure, absolute = _location_paths(location, folder, absolute, settings)
     if failure is None:
         translated, failure = _location_mapping(absolute, settings)
+    if failure is not None:
+        reason, detail = failure
+        failure = (reason, _location_diagnostic(location, detail))
     return translated, failure
+
+
+def _location_diagnostic(location: ShokoLocation, detail: str) -> str:
+    """Identify the rejected location, without I/O or changing ownership decisions."""
+    raw_path = location.absolute_path or location.relative_path
+    path = diagnostic_text(raw_path, limit=max(1, len(raw_path)))
+    filename = path.replace("\\", "/").rsplit("/", 1)[-1] or "Filename unavailable"
+    label = "Shoko path" if location.absolute_path else "Relative path"
+    context = (
+        f"{diagnostic_text(filename, limit=120)} — "
+        f"{diagnostic_text(detail, limit=150)}; "
+        f"{label}: {diagnostic_text(path, limit=180)}"
+        if path
+        else f"Filename/path unavailable — {diagnostic_text(detail, limit=150)}"
+    )
+    return diagnostic_text(
+        f"{context}; location ID {location.place_id}, import folder ID {location.import_folder_id}"
+    )
 
 
 def _location_access(

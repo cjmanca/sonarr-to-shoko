@@ -79,6 +79,7 @@ class DashboardStatus:
     scope_excluded_files: int = 0
     exclusion_counts: tuple[tuple[str, int], ...] = ()
     worker_activity: str = ""
+    skipped_file_details: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -678,6 +679,9 @@ class DashboardApplication:
             )
             or "None"
         )
+        skipped_files = "".join(
+            f"<li>{html.escape(item)}</li>" for item in status.skipped_file_details
+        )
         controls = (
             f'<form method="post" action="/pause">'
             f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
@@ -735,7 +739,15 @@ class DashboardApplication:
             '<p class="hint">Waiting includes work being prepared or waiting for Shoko '
             "to confirm a link. Partial or uncertain link results need attention; "
             "conflicts and safety issues are included.</p></section></div>"
-            '<details class="panel diagnostics" data-live="diagnostics">'
+            + '<section class="panel" data-live="skipped-files"><h2>Files skipped</h2>'
+            + (
+                "<p>Recent examples from the latest scan. Other eligible files can continue.</p>"
+                f"<ul>{skipped_files}</ul>"
+                if skipped_files
+                else "<p>No skipped-file examples from the latest scan.</p>"
+            )
+            + "</section>"
+            + '<details class="panel diagnostics" data-live="diagnostics">'
             "<summary>Advanced diagnostics</summary>"
             f"<ul>{diagnostics}</ul></details>",
             live=True,

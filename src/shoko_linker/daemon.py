@@ -116,6 +116,7 @@ from .linking import (
     submit_link,
     verify_link,
 )
+from .logging_setup import diagnostic_text
 from .mapping_store import (
     ActiveMappings,
     MappingStore,
@@ -1633,14 +1634,15 @@ def _record_exclusions(
         counts[reason] += 1
         if exclusion.reason in SCOPE_EXCLUSION_REASONS:
             scope_excluded += 1
-        detail = f"exclusion:{reason}: {exclusion.detail}"
+        safe_detail = diagnostic_text(exclusion.detail, limit=MAX_EXCLUSION_EXAMPLE_CHARS)
+        detail = f"exclusion:{reason}: {safe_detail}"
         skipped[file_id] = detail
         if len(examples) < MAX_EXCLUSION_EXAMPLES:
             examples.append(
                 {
                     "shoko_file_id": file_id,
                     "reason": reason,
-                    "detail": exclusion.detail[:MAX_EXCLUSION_EXAMPLE_CHARS],
+                    "detail": safe_detail,
                 }
             )
 
@@ -1685,7 +1687,7 @@ def _record_exclusions(
                 FileState.AMBIGUOUS,
             }
             if record.state in mutable_states:
-                state_detail = f"source_exclusion:{reason}: {exclusion.detail}"
+                state_detail = f"source_exclusion:{reason}: {safe_detail}"
                 if record.state in (FileState.PLANNED, FileState.AMBIGUOUS):
                     _advance(deps, file_id, FileState.WAITING, state_detail, now_iso)
                 _advance(deps, file_id, FileState.AMBIGUOUS, state_detail, now_iso)

@@ -8689,3 +8689,114 @@ def test_owner_quarantine_restart_preserves_verified_links_and_quarantines_unsen
             assert shoko.posts_count() == 1
         finally:
             reopened.close()
+
+
+@pytest.mark.parametrize("hostile", [False, True])
+def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: PLR0915
+    tmp_path: Path,
+    hostile: bool,
+) -> None:
+    from shoko_linker import cli
+    from shoko_linker.bootstrap import BootstrapSettings
+    from shoko_linker.config import SecretRef
+    from shoko_linker.logging_setup import register_secret
+
+    secret = "synthetic-exclusion-secret-123456"
+    register_secret(secret)
+    filename = "Episode 01.mkv" if not hostile else f"<b>Episode</b>-{secret}\r\n\x1b.mkv"
+    absolute = f"{SHOKO_ROOT}/Show/{filename}"
+
+    class InaccessibleShoko(ShokoStub):
+        def _location(self, file: SpecFile) -> dict[str, Any]:
+            row = super()._location(file)
+            row.update(
+                ID=999, AbsolutePath=absolute, RelativePath=f"Show/{filename}", IsAccessible=False
+            )
+            return row
+
+    file = SpecFile(series_id=1, file_id=10, shoko_id=142)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [file])
+    shoko = InaccessibleShoko([file])
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[file],
+        shoko_files=[file],
+        xml=mapping_xml(),
+        monotonic=Clock([0.0]),
+        advance=lambda _: None,
+        shoko=shoko,
+    )
+    try:
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.DRY_RUN,
+            policy=RunPolicy.SERVICE,
+            cycle_key="inaccessible",
+        )
+        assert report.exclusion_counts["inaccessible_location"] == 1
+        assert not report.plans
+        assert shoko.posts == []
+        assert not any(request.url.path.endswith("/File/142") for request in shoko.requests)
+        raw = store.get_meta(META_LAST_DISCOVERY_EXCLUSIONS) or ""
+        detail = json.loads(raw)["examples"][0]["detail"]
+        assert "location ID 999" in detail
+        assert "Shoko path:" in detail
+        assert len(detail) <= 512
+        assert secret not in raw
+        assert secret not in " ".join(report.reasons)
+        assert "\r" not in detail
+        assert "\n" not in detail
+        assert "\x1b" not in detail
+        store.close()
+        assert secret.encode() not in (tmp_path / "state.sqlite3").read_bytes()
+        bootstrap = BootstrapSettings(
+            SONARR_BASE,
+            SecretRef("SONARR_API_KEY"),
+            SHOKO_BASE,
+            SecretRef("SHOKO_API_KEY"),
+            tmp_path / "state.sqlite3",
+        )
+        runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
+        app = DashboardApplication(bootstrap.database_path, status_provider=runtime.status)
+        anonymous = app.handle("GET", "/status", {})
+        assert absolute not in anonymous.body.decode()
+        created = app.handle(
+            "POST",
+            "/setup",
+            {
+                "origin": "http://localhost",
+                "host": "localhost",
+                "content-type": "application/x-www-form-urlencoded",
+            },
+            urlencode(
+                {"username": "library-admin", "password": "a sufficiently long password"}
+            ).encode(),
+        )
+        assert created.status == 303
+        cookie = dict(created.headers)["Set-Cookie"].split(";", 1)[0]
+        page = app.handle("GET", "/status", {"cookie": cookie}).body.decode()
+        ordinary = page.split('data-live="skipped-files"', 1)[1].split("</section>", 1)[0]
+        assert "Shoko file ID 142" in ordinary
+        assert "location ID 999" in ordinary
+        assert "Shoko path:" in ordinary
+        assert secret not in page
+        assert "\x1b" not in page
+        if hostile:
+            assert "<b>Episode</b>" not in ordinary
+            assert "&lt;b&gt;Episode&lt;/b&gt;" in ordinary
+        else:
+            assert filename in ordinary
+            assert absolute in ordinary
+        # Authenticated polling uses the same status provider and persisted evidence.
+        assert (
+            app.handle("GET", "/status", {"cookie": cookie}).body
+            == app.handle("GET", "/status", {"cookie": cookie}).body
+        )
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()

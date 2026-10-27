@@ -22,8 +22,8 @@ from typing import Any, Final
 from .audit import AuditReport
 from .campaign import CampaignApplyReport, campaign_drain_selection
 from .config import Settings, apply_gate_status
-from .daemon import CycleReport, DaemonReport, rolling_budget_exhausted
-from .logging_setup import redact
+from .daemon import MAX_EXCLUSION_EXAMPLES, CycleReport, DaemonReport, rolling_budget_exhausted
+from .logging_setup import diagnostic_text, redact
 from .mapping_store import MappingStatus, RefreshOutcome
 from .state import (
     META_APPLY_LOCK,
@@ -465,7 +465,7 @@ def discovery_exclusion_payload(store: StateStore) -> dict[str, Any]:
         and count >= 0
     }
     examples = []
-    for example in document["examples"]:
+    for example in document["examples"][:MAX_EXCLUSION_EXAMPLES]:
         if not isinstance(example, dict):
             continue
         file_id = example.get("shoko_file_id")
@@ -478,7 +478,9 @@ def discovery_exclusion_payload(store: StateStore) -> dict[str, Any]:
             and isinstance(reason, str)
             and isinstance(detail, str)
         ):
-            examples.append({"shoko_file_id": file_id, "reason": reason, "detail": redact(detail)})
+            examples.append(
+                {"shoko_file_id": file_id, "reason": reason, "detail": diagnostic_text(detail)}
+            )
     total = document.get("total")
     scope_excluded = document.get("scope_excluded")
     return {

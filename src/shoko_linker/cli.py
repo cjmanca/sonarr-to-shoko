@@ -1078,6 +1078,16 @@ class _NormalServiceRuntime:
                 excluded_files=exclusions["total"],
                 scope_excluded_files=exclusions["scope_excluded"],
                 exclusion_counts=exclusion_counts,
+                skipped_file_details=tuple(
+                    f"{item['detail']} (Shoko file ID {item['shoko_file_id']})"
+                    + (
+                        " Check that the recorded path exists and is readable inside Shoko; "
+                        "a read-only mount is sufficient."
+                        if item["reason"] == "inaccessible_location"
+                        else ""
+                    )
+                    for item in exclusions["examples"]
+                ),
                 worker_activity=cast(str, latest["worker_activity"]),
             )
         finally:

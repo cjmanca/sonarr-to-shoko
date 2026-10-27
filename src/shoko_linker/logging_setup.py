@@ -31,6 +31,8 @@ Design rules for later milestones:
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 from threading import Lock
 from typing import Final, TextIO
 
@@ -65,6 +67,14 @@ def redact(text: str) -> str:
         if value in text:
             text = text.replace(value, REDACTED)
     return text
+
+
+def diagnostic_text(text: str, *, limit: int = 512) -> str:
+    """Bound untrusted diagnostic metadata after redacting secrets and URL payloads."""
+    text = redact(text)
+    text = re.sub(r"(?i)https?://\S+", "[URL omitted]", text)
+    text = "".join(" " if unicodedata.category(char).startswith("C") else char for char in text)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def registered_secret_count() -> int:

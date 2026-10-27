@@ -1868,3 +1868,124 @@ def test_multi_episode_sonarr_file_passes_through_intact(
     result = reconcile(discover(stub), (pair,), shoko_settings(base_document, write_document))
     assert len(result.matches) == 1
     assert tuple(e.id for e in result.matches[0].sonarr_file.episodes) == (11, 12)
+
+
+@pytest.mark.parametrize(
+    ("absolute", "relative", "expected"),
+    [
+        ("/anime/Show/Episode.mkv", "Show/Episode.mkv", "Shoko path: /anime/Show/Episode.mkv"),
+        ("", "Show/Episode.mkv", "Relative path: Show/Episode.mkv"),
+        ("", "", "Filename/path unavailable"),
+    ],
+)
+def test_rejected_location_has_actionable_path_without_lookup(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    absolute: str,
+    relative: str,
+    expected: str,
+) -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    stub.pages = {
+        1: envelope(
+            [
+                shoko_file(
+                    142,
+                    1000,
+                    [
+                        location(
+                            999, 142, 1, "Show/Episode.mkv", f"{SHOKO_ROOT}/Show/Episode.mkv", False
+                        )
+                    ],
+                )
+            ],
+            1,
+        )
+    }
+    snapshot = discover(stub)
+    item = snapshot.files[0]
+    snapshot = replace(
+        snapshot,
+        files=(
+            replace(
+                item,
+                locations=(
+                    replace(item.locations[0], absolute_path=absolute, relative_path=relative),
+                ),
+            ),
+        ),
+    )
+    result = reconcile(snapshot, (), shoko_settings(base_document, write_document))
+    excluded = result.exclusions[0]
+    assert excluded.shoko_file_id == 142
+    assert excluded.reason is ExclusionReason.INACCESSIBLE_LOCATION
+    assert expected in excluded.detail
+    assert "location ID 999" in excluded.detail
+    assert "import folder ID 1" in excluded.detail
+    assert stub.methods() == ["GET", "GET"]
+
+
+def test_multi_location_message_identifies_failing_location(
+    base_document: dict[str, Any],
+    write_document: Writer,
+) -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    stub.pages = {
+        1: envelope(
+            [
+                shoko_file(
+                    142,
+                    1000,
+                    [
+                        location(100, 142, 1, "A/good.mkv", f"{SHOKO_ROOT}/A/good.mkv"),
+                        location(999, 142, 1, "Z/broken.mkv", f"{SHOKO_ROOT}/Z/broken.mkv", False),
+                    ],
+                )
+            ],
+            1,
+        )
+    }
+    result = reconcile(discover(stub), (), shoko_settings(base_document, write_document))
+    assert result.matches == ()
+    excluded = result.exclusions[0]
+    assert excluded.reason is ExclusionReason.MIXED_OWNERSHIP
+    assert "broken.mkv" in excluded.detail
+    assert "location ID 999" in excluded.detail
+    assert "good.mkv" not in excluded.detail
+    assert stub.methods() == ["GET", "GET"]
+
+
+@pytest.mark.parametrize(
+    ("path", "forbidden"),
+    [
+        ("/anime/" + "nested/" * 100 + "FinalEpisode.mkv", "never-present-sentinel"),
+        (
+            "https://user:password@example.invalid/Episode.mkv?apikey=synthetic-query-secret",
+            "synthetic-query-secret",
+        ),
+    ],
+)
+def test_location_diagnostics_bound_metadata_without_leaking_url_payloads(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    path: str,
+    forbidden: str,
+) -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
+    stub.pages = {
+        1: envelope([shoko_file(142, 1000, [location(999, 142, 1, "Episode.mkv", path, False)])], 1)
+    }
+    excluded = reconcile(
+        discover(stub), (), shoko_settings(base_document, write_document)
+    ).exclusions[0]
+    assert len(excluded.detail) <= 512
+    assert forbidden not in excluded.detail
+    if path.startswith("/anime/"):
+        assert excluded.detail.startswith("FinalEpisode.mkv")
+    else:
+        assert "password" not in excluded.detail
+        assert "example.invalid" not in excluded.detail
+        assert "URL omitted" in excluded.detail
