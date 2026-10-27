@@ -32,11 +32,17 @@ from shoko_linker.dashboard import (
     verify_password,
 )
 from shoko_linker.http import ApiEndpoint
-from shoko_linker.onboarding import OnboardingManager, OnboardingStatus, ScopeBinding
+from shoko_linker.onboarding import (
+    OnboardingContext,
+    OnboardingManager,
+    OnboardingStatus,
+    ScopeBinding,
+)
 from shoko_linker.paths import PathMapping
 from shoko_linker.safety_check import (
     SafetyAssessment,
     assess_settings_payload,
+    evaluate_service_safety,
     inspect_shoko_safety_settings,
 )
 from shoko_linker.service_settings import ServiceSettingsController
@@ -110,7 +116,7 @@ def make_app(
     path = tmp_path / "state.sqlite3"
     if onboarding:
         with open_state(path) as store:
-            OnboardingManager(store).confirm_setup(
+            record = OnboardingManager(store).confirm_setup(
                 binding,
                 assessment,
                 confirmed_facts=(assessment.unverifiable_facts + assessment.unknown_settings),
@@ -120,7 +126,9 @@ def make_app(
     return DashboardApplication(
         path,
         clock=clock or MutableClock(),
-        onboarding_context=lambda: (binding, assessment),
+        onboarding_context=lambda: OnboardingContext(
+            binding, assessment, "" if not onboarding else record.to_json()
+        ),
         status_provider=lambda: DashboardStatus(
             connection_message="Sonarr and Shoko are connected.",
             linked_files=12,
@@ -582,6 +590,32 @@ def test_setup_provider_cache_miss_does_not_block_status_pause_or_resume(  # noq
 
     monkeypatch.setattr(controller, "_inventory", slow_inventory)
     app = make_app(tmp_path, onboarding=True)
+    scoped_assessment = evaluate_service_safety(
+        assessment, binding.path_mappings, discovery.folders
+    )
+    current_binding = replace(
+        binding,
+        safety_digest=scoped_assessment.digest,
+        unverifiable_facts=scoped_assessment.unverifiable_facts,
+        settings_observation=tuple(scoped_assessment.observed_settings.items()),
+        selected_folders_observation=((1, "/anime", "None"),),
+    )
+    with open_state(bootstrap.database_path) as store:
+        record = OnboardingManager(store).confirm_setup(
+            current_binding,
+            scoped_assessment,
+            confirmed_facts=scoped_assessment.unverifiable_facts
+            + scoped_assessment.unknown_settings,
+            automatic_link_consent=True,
+            iso=T0.isoformat(),
+        )
+    app.onboarding_context = lambda: OnboardingContext(
+        current_binding, scoped_assessment, record.to_json()
+    )
+    monkeypatch.setattr(
+        "shoko_linker.service_setup.collect_import_folders",
+        lambda *_: tuple(discovery.folders.values()),
+    )
     app.setup_provider = controller.view
     app.setup_action = controller.action
     server, server_thread, base_url = start_server(app)
@@ -873,6 +907,14 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
     scope_state = {"value": scope}
     assessment_state = {"value": assessment}
     import_folder = ImportFolder(1, "Anime", "/anime", "None", True)
+    scoped_assessment = evaluate_service_safety(
+        assessment, binding.path_mappings, {import_folder.id: import_folder}
+    )
+    binding = replace(
+        scope_binding(scoped_assessment),
+        settings_observation=tuple(scoped_assessment.observed_settings.items()),
+        selected_folders_observation=((import_folder.id, import_folder.path, "None"),),
+    )
     folder_state: dict[str, tuple[ImportFolder, ...] | None] = {"value": (import_folder,)}
     discovery = ShokoDiscovery(
         (),
@@ -921,8 +963,10 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
     with open_state(state_path) as store:
         OnboardingManager(store).confirm_setup(
             binding,
-            assessment,
-            confirmed_facts=assessment.unverifiable_facts + assessment.unknown_settings,
+            scoped_assessment,
+            confirmed_facts=(
+                scoped_assessment.unverifiable_facts + scoped_assessment.unknown_settings
+            ),
             automatic_link_consent=True,
             iso=T0.isoformat(),
         )
@@ -1005,7 +1049,7 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
     with open_state(state_path) as store:
         current = controller.current_context(store)
         assert current is not None
-        decision = OnboardingManager(store).evaluate(*current, iso=T0.isoformat())
+        decision = OnboardingManager(store).evaluate_context(current, iso=T0.isoformat())
         assert decision.status is expected_status
         assert store.get_service_pause() == (True, expected_pause)
     recovered = controller.refresh_view()
@@ -1016,7 +1060,7 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
         assert recovered.confirmation_enabled
         assert recovered.snapshot_digest
 
-    def current_context() -> tuple[ScopeBinding, SafetyAssessment] | None:
+    def current_context() -> OnboardingContext | None:
         with open_state(state_path) as store:
             return controller.current_context(store)
 

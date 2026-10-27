@@ -77,6 +77,30 @@ choose the match. Unsafe or unavailable Shoko settings and physical/plugin safet
 facts require review before linking can start. Uncertain matches are left for
 review rather than guessed.
 
+### Separate Sonarr and Shoko-managed collections
+
+You can keep Shoko's global move/rename options enabled for a separate manual
+import source and destination. Set the selected Sonarr import folder in Shoko to
+**Drop Type: None** and mount its media **read-only inside the Shoko container**.
+Setup checks that the selected paths belong unambiguously to excluded folders;
+every location of each linked file must also be eligible and mapped. This folder
+exclusion behavior was verified in Shoko 5.3.3 source; see the
+[compatibility evidence](docs/compatibility.md#excluded-folders-and-mixed-collections).
+
+During setup, confirm that the selected media has no writable aliases or writable
+hardlink exposure in Shoko, and that plugins or external hooks cannot modify any
+media on link events. These facts cannot be checked through Shoko's API. Mounting
+media read-only only in the linker container does not provide this protection.
+`FileQualityFilterEnabled` and `AniDb.MyList_AddFiles` must still be disabled;
+folder exclusion does not contain their side effects. If settings cannot be read,
+setup asks you to confirm the applicable facts manually. The service never changes
+Shoko settings.
+
+After upgrading to this safety policy, review and confirm setup again. Changes to
+selected Shoko folder IDs, paths or types, safety settings, or the observed server
+version also pause linking for confirmation. Changes to unrelated valid manual
+folders do not require confirmation while selected ownership remains unambiguous.
+
 ## Dashboard and controls
 
 The authenticated dashboard shows connection health, verified and waiting files,

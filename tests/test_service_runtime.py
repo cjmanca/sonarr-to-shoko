@@ -19,7 +19,7 @@ from shoko_linker.dashboard import DashboardApplication
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.linking import SendOutcome, VerificationVerdict
 from shoko_linker.mapping_store import MappingStore
-from shoko_linker.onboarding import OnboardingManager, ScopeBinding
+from shoko_linker.onboarding import OnboardingContext, OnboardingManager, ScopeBinding
 from shoko_linker.paths import PathMapping
 from shoko_linker.policies import RunPolicy
 from shoko_linker.safety_check import assess_settings_payload
@@ -622,8 +622,12 @@ def test_worker_runs_service_policy_only_with_current_durable_consent(
         available = True
         binding: ScopeBinding
 
-        def current_context(self, _store: StateStore) -> tuple[ScopeBinding, Any] | None:
-            return (self.binding, assessment) if self.available else None
+        def current_context(self, _store: StateStore) -> OnboardingContext | None:
+            return (
+                OnboardingContext(self.binding, assessment, _store.get_onboarding_json() or "")
+                if self.available
+                else None
+            )
 
     current_setup = CurrentSetup()
     current_setup.binding = binding
@@ -701,8 +705,10 @@ def test_different_scope_confirmed_during_preflight_cannot_authorize_old_cycle(
         )
 
     class CurrentSetup:
-        def current_context(self, _store: StateStore) -> tuple[ScopeBinding, Any]:
-            return current["binding"], assessment
+        def current_context(self, _store: StateStore) -> OnboardingContext:
+            return OnboardingContext(
+                current["binding"], assessment, _store.get_onboarding_json() or ""
+            )
 
     runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
     runtime.setup = cast(Any, CurrentSetup())
@@ -789,8 +795,8 @@ def test_service_durable_stop_from_second_handle_during_final_file_get_prevents_
     runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
 
     class CurrentSetup:
-        def current_context(self, _store: StateStore) -> tuple[ScopeBinding, Any]:
-            return binding, assessment
+        def current_context(self, _store: StateStore) -> OnboardingContext:
+            return OnboardingContext(binding, assessment, _store.get_onboarding_json() or "")
 
     runtime.setup = cast(Any, CurrentSetup())
     stop_sent = False
@@ -892,8 +898,8 @@ def test_real_service_authorization_callback_cannot_mask_current_non_anime_serie
     )
 
     class CurrentSetup:
-        def current_context(self, _store: StateStore) -> tuple[ScopeBinding, Any]:
-            return binding, assessment
+        def current_context(self, _store: StateStore) -> OnboardingContext:
+            return OnboardingContext(binding, assessment, _store.get_onboarding_json() or "")
 
     def change_candidate_type_during_target_resolution(path: str) -> None:
         if path.startswith("/api/v3/Series/AniDB/"):

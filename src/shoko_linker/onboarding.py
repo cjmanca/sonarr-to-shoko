@@ -8,23 +8,22 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from .config import validate_base_url
 from .errors import ConfigError, PathError
 from .paths import PathMapping, is_within_root, normalize_posix, validate_mappings
-from .safety_check import SafetyAssessment, SafetyStatus
-from .state import StateStore
+from .safety_check import SAFETY_SETTING_PATHS, SafetyAssessment, SafetyStatus
+from .state import (
+    META_ONBOARDING_RECONFIRMATION_REQUIRED,
+    SYSTEM_PAUSE_REASONS,
+    SYSTEM_RECONFIRMATION_PAUSE_REASONS,
+    StateStore,
+)
 
 ONBOARDING_DOCUMENT_SCHEMA: Final[str] = "shoko-sonarr-linker/onboarding/1"
+_SELECTED_FOLDER_FACT_COUNT: Final[int] = 3
 _HEX64_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
-SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
-    {"setup_changed", "setup_unavailable", "unsafe_shoko_settings"}
-)
-SYSTEM_RECONFIRMATION_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
-    {"setup_changed", "unsafe_shoko_settings"}
-)
-_RECONFIRMATION_REQUIRED_META: Final[str] = "onboarding_reconfirmation_required"
 
 
 class OnboardingError(ValueError):
@@ -41,6 +40,32 @@ class OnboardingStatus(Enum):
     UNSAFE = "unsafe"
 
 
+def _validated_folder_observation(raw: Any) -> tuple[tuple[int, str, str], ...]:
+    """Validate only selected, approved folder IDs/normalized paths/exclusion types."""
+    if not isinstance(raw, list | tuple) or not raw:
+        raise OnboardingError("selected folder observation must be a nonempty list")
+    selected: list[tuple[int, str, str]] = []
+    for item in raw:
+        if (
+            not isinstance(item, list | tuple)
+            or len(item) != _SELECTED_FOLDER_FACT_COUNT
+            or not isinstance(item[0], int)
+            or isinstance(item[0], bool)
+            or item[0] <= 0
+            or not isinstance(item[1], str)
+            or item[2] != "None"
+        ):
+            raise OnboardingError("selected folder observation is malformed")
+        try:
+            path = normalize_posix(item[1])
+        except PathError:
+            raise OnboardingError("selected folder observation has an invalid path") from None
+        selected.append((item[0], path, "None"))
+    if len({item[0] for item in selected}) != len(selected):
+        raise OnboardingError("selected folder observation has duplicate IDs")
+    return tuple(sorted(selected))
+
+
 @dataclass(frozen=True)
 class ScopeBinding:
     """Non-secret facts that define one authorized Sonarr/Shoko scope."""
@@ -54,6 +79,8 @@ class ScopeBinding:
     path_mappings: tuple[PathMapping, ...]
     safety_digest: str
     unverifiable_facts: tuple[str, ...]
+    settings_observation: tuple[tuple[str, bool | None], ...] | None = None
+    selected_folders_observation: tuple[tuple[int, str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -77,6 +104,26 @@ class ScopeBinding:
             not any(is_within_root(mapping.sonarr, root) for root in roots) for mapping in mappings
         ):
             raise OnboardingError("path mapping source must stay inside a confirmed anime root")
+        if self.settings_observation is not None:
+            observations = dict(self.settings_observation)
+            if (
+                len(observations) != len(self.settings_observation)
+                or set(observations) != set(SAFETY_SETTING_PATHS)
+                or any(
+                    value is not None and not isinstance(value, bool)
+                    for value in observations.values()
+                )
+            ):
+                raise OnboardingError(
+                    "setup settings observation must contain only safety booleans"
+                )
+            object.__setattr__(self, "settings_observation", tuple(sorted(observations.items())))
+        if self.selected_folders_observation is not None:
+            object.__setattr__(
+                self,
+                "selected_folders_observation",
+                _validated_folder_observation(self.selected_folders_observation),
+            )
         capabilities = tuple(sorted(set(self.capabilities)))
         facts = tuple(sorted(set(self.unverifiable_facts)))
         if any(not item.strip() for item in (*capabilities, *facts)):
@@ -90,7 +137,7 @@ class ScopeBinding:
 
     def document(self) -> dict[str, Any]:
         """Canonical non-secret representation used only for durable digest binding."""
-        return {
+        document: dict[str, Any] = {
             "sonarr_url": self.sonarr_url,
             "shoko_url": self.shoko_url,
             "sonarr_version": self.sonarr_version,
@@ -103,6 +150,15 @@ class ScopeBinding:
             "safety_digest": self.safety_digest,
             "unverifiable_facts": list(self.unverifiable_facts),
         }
+
+        # Omit the new optional baseline for legacy documents to preserve their digest.
+        if self.settings_observation is not None:
+            document["settings_observation"] = dict(self.settings_observation)
+        if self.selected_folders_observation is not None:
+            document["selected_folders_observation"] = [
+                list(folder) for folder in self.selected_folders_observation
+            ]
+        return document
 
     @property
     def digest(self) -> str:
@@ -124,7 +180,8 @@ class ScopeBinding:
             "safety_digest",
             "unverifiable_facts",
         }
-        if set(raw) != expected:
+        optional = {"settings_observation", "selected_folders_observation"}
+        if not expected <= set(raw) or set(raw) - expected - optional:
             raise OnboardingError("persisted setup binding has an unsupported schema")
         text_fields = (
             "sonarr_url",
@@ -148,6 +205,20 @@ class ScopeBinding:
         list_values = (*raw["capabilities"], *raw["roots"], *raw["unverifiable_facts"])
         if not all(isinstance(item, str) for item in list_values):
             raise OnboardingError("persisted setup binding contains invalid list entries")
+        observation = raw.get("settings_observation")
+        if "settings_observation" in raw and (
+            not isinstance(observation, dict)
+            or set(observation) != set(SAFETY_SETTING_PATHS)
+            or any(
+                value is not None and not isinstance(value, bool) for value in observation.values()
+            )
+        ):
+            raise OnboardingError("persisted setup settings observation is malformed")
+        selected = (
+            _validated_folder_observation(raw["selected_folders_observation"])
+            if "selected_folders_observation" in raw
+            else None
+        )
         return cls(
             sonarr_url=raw["sonarr_url"],
             shoko_url=raw["shoko_url"],
@@ -158,6 +229,8 @@ class ScopeBinding:
             path_mappings=tuple(mappings),
             safety_digest=raw["safety_digest"],
             unverifiable_facts=tuple(raw["unverifiable_facts"]),
+            settings_observation=None if observation is None else tuple(observation.items()),
+            selected_folders_observation=selected,
         )
 
 
@@ -225,6 +298,14 @@ class OnboardingRecord:
         )
 
 
+class OnboardingContext(NamedTuple):
+    """Remote facts tied to the exact consent captured before collecting them."""
+
+    binding: ScopeBinding
+    assessment: SafetyAssessment
+    consent_json: str
+
+
 @dataclass(frozen=True)
 class OnboardingDecision:
     status: OnboardingStatus
@@ -261,6 +342,10 @@ class OnboardingManager:
         _validate_iso(iso)
         if assessment.status is SafetyStatus.UNSAFE:
             raise OnboardingError("unsafe Shoko settings must be fixed before setup confirmation")
+        if binding.settings_observation is not None and dict(binding.settings_observation) != dict(
+            assessment.observed_settings
+        ):
+            raise OnboardingError("setup settings observation does not match current safety facts")
         if binding.safety_digest != assessment.digest:
             raise OnboardingError("safety settings changed during setup; review them again")
         if set(binding.unverifiable_facts) != set(assessment.unverifiable_facts):
@@ -286,33 +371,46 @@ class OnboardingManager:
             automatic_link_consent=True,
             consented_iso=iso,
         )
-        self.store.save_onboarding_json(record.to_json(), iso)
-        # Only a newly validated, digest-bound confirmation clears the independent hard hold.
-        self.store.clear_meta(_RECONFIRMATION_REQUIRED_META)
-        paused, reason = self.store.get_service_pause()
-        if paused and reason in SYSTEM_PAUSE_REASONS:
-            self.store.set_service_pause(False, "", iso)
+        self.store.confirm_onboarding_json(record.to_json(), iso)
         return record
 
     def reconfirmation_required(self) -> bool:
         """Return the durable hard-consent hold, including pre-latch legacy pause reasons."""
-        if self.store.get_meta(_RECONFIRMATION_REQUIRED_META) is not None:
+        if self.store.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None:
             return True
         paused, reason = self.store.get_service_pause()
         return paused and reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
 
     def evaluate(
-        self, binding: ScopeBinding, assessment: SafetyAssessment, *, iso: str
+        self,
+        binding: ScopeBinding,
+        assessment: SafetyAssessment,
+        *,
+        iso: str,
+        expected_consent: str | None = None,
     ) -> OnboardingDecision:
         _validate_iso(iso)
-        return self._evaluate(binding, assessment, iso=iso, respect_user_pause=True)
+        return self._evaluate(
+            binding,
+            assessment,
+            iso=iso,
+            respect_user_pause=True,
+            expected_consent=expected_consent,
+        )
+
+    def evaluate_context(self, context: OnboardingContext, *, iso: str) -> OnboardingDecision:
+        return self.evaluate(
+            context.binding, context.assessment, iso=iso, expected_consent=context.consent_json
+        )
+
+    def resume_context(self, context: OnboardingContext, *, iso: str) -> OnboardingDecision:
+        return self.resume(
+            context.binding, context.assessment, iso=iso, expected_consent=context.consent_json
+        )
 
     def pause(self, *, iso: str) -> OnboardingDecision:
         _validate_iso(iso)
-        if self.reconfirmation_required():
-            # Preserve legacy hard holds before the user-facing pause reason replaces them.
-            self.store.set_meta(_RECONFIRMATION_REQUIRED_META, "1")
-        self.store.set_service_pause(True, "user_paused", iso)
+        self.store.pause_service_for_user(iso)
         return OnboardingDecision(OnboardingStatus.PAUSED, "Automatic linking is paused.")
 
     def pause_for_review(self, reason: str, message: str, *, iso: str) -> OnboardingDecision:
@@ -323,28 +421,48 @@ class OnboardingManager:
         self._pause_for_system_change(reason, iso)
         return OnboardingDecision(OnboardingStatus.NEEDS_CONFIRMATION, message)
 
+    def observe_review(self, record: OnboardingRecord, reason: str, *, iso: str) -> bool:
+        """Persist an observed hard hold only if its approved consent is still current."""
+        _validate_iso(iso)
+        if reason not in SYSTEM_RECONFIRMATION_PAUSE_REASONS:
+            raise OnboardingError("unsupported observed setup review reason")
+        encoded = self.store.get_onboarding_json()
+        if encoded is None or OnboardingRecord.from_json(encoded) != record:
+            return False
+        return self.store.pause_onboarding_if_current(encoded, reason, iso)
+
     def resume(
-        self, binding: ScopeBinding, assessment: SafetyAssessment, *, iso: str
+        self,
+        binding: ScopeBinding,
+        assessment: SafetyAssessment,
+        *,
+        iso: str,
+        expected_consent: str | None = None,
     ) -> OnboardingDecision:
         _validate_iso(iso)
-        decision = self._evaluate(binding, assessment, iso=iso, respect_user_pause=False)
+        if expected_consent is None:
+            expected_consent = self.store.get_onboarding_json()
+        decision = self._evaluate(
+            binding,
+            assessment,
+            iso=iso,
+            respect_user_pause=False,
+            expected_consent=expected_consent,
+        )
         if decision.status is OnboardingStatus.AUTHORIZED:
-            self.store.set_service_pause(False, "", iso)
-            return decision
+            if expected_consent is not None and self.store.resume_onboarding_if_current(
+                expected_consent, iso
+            ):
+                return decision
+            return OnboardingDecision(
+                OnboardingStatus.NEEDS_CONFIRMATION,
+                "Setup changed while resuming. Review the current scope and safety facts.",
+                binding.digest,
+            )
         return decision
 
     def _pause_for_system_change(self, reason: str, iso: str) -> None:
-        is_hard_hold = reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
-        if is_hard_hold:
-            self.store.set_meta(_RECONFIRMATION_REQUIRED_META, "1")
-        elif self.reconfirmation_required():
-            # A temporary outage cannot downgrade an existing reconfirmation requirement.
-            self.store.set_meta(_RECONFIRMATION_REQUIRED_META, "1")
-            return
-        paused, existing_reason = self.store.get_service_pause()
-        if paused and existing_reason == "user_paused":
-            return
-        self.store.set_service_pause(True, reason, iso)
+        self.store.pause_service_for_review(reason, iso)
 
     def _evaluate(
         self,
@@ -353,60 +471,72 @@ class OnboardingManager:
         *,
         iso: str,
         respect_user_pause: bool,
+        expected_consent: str | None = None,
     ) -> OnboardingDecision:
+        encoded = self.store.get_onboarding_json()
+        if expected_consent is not None and encoded != expected_consent:
+            return OnboardingDecision(
+                OnboardingStatus.NEEDS_CONFIRMATION,
+                "Setup changed during safety checks. Refresh setup before resuming.",
+                binding.digest,
+            )
+        record = None if encoded is None else OnboardingRecord.from_json(encoded)
         status = OnboardingStatus.AUTHORIZED
         message = "Setup is confirmed and current safety checks pass."
         binding_digest: str | None = None
         if assessment.status is SafetyStatus.UNSAFE:
-            self._pause_for_system_change("unsafe_shoko_settings", iso)
-            status = OnboardingStatus.UNSAFE
-            message = assessment.message
+            held = self.store.pause_onboarding_if_current(encoded, "unsafe_shoko_settings", iso)
+            status = OnboardingStatus.UNSAFE if held else OnboardingStatus.NEEDS_CONFIRMATION
+            message = (
+                assessment.message
+                if held
+                else "Setup changed during safety checks. Refresh setup before resuming."
+            )
+        elif record is None:
+            paused, _reason = self.store.get_service_pause()
+            status = OnboardingStatus.PAUSED if paused else OnboardingStatus.NOT_CONFIGURED
+            message = (
+                "Automatic linking is paused."
+                if paused
+                else "Complete scope and safety setup before automatic linking."
+            )
         else:
-            record = self.record()
-            if record is None:
-                paused, _reason = self.store.get_service_pause()
-                status = OnboardingStatus.PAUSED if paused else OnboardingStatus.NOT_CONFIGURED
+            binding_digest = binding.digest
+            required_facts = set(assessment.unverifiable_facts) | set(assessment.unknown_settings)
+            current_facts_match = required_facts <= set(record.confirmed_facts)
+            if (
+                binding.digest != record.binding_digest
+                or binding.safety_digest != assessment.digest
+                or set(binding.unverifiable_facts) != set(assessment.unverifiable_facts)
+                or not current_facts_match
+            ):
+                held = self.observe_review(record, "setup_changed", iso=iso)
+                status = OnboardingStatus.NEEDS_CONFIRMATION
                 message = (
-                    "Automatic linking is paused."
-                    if paused
-                    else "Complete scope and safety setup before automatic linking."
+                    "Setup or Shoko safety changed. Confirm the current scope and safety facts."
+                    if held
+                    else "Setup changed during safety checks. Refresh setup before resuming."
                 )
+            elif self.reconfirmation_required():
+                status = OnboardingStatus.NEEDS_CONFIRMATION
+                message = "Setup must be confirmed again before automatic linking can resume."
+            elif not record.automatic_link_consent:
+                status = OnboardingStatus.NEEDS_CONFIRMATION
+                message = "Explicit consent to automatic linking is required."
             else:
-                binding_digest = binding.digest
-                required_facts = set(assessment.unverifiable_facts) | set(
-                    assessment.unknown_settings
-                )
-                current_facts_match = required_facts <= set(record.confirmed_facts)
-                if (
-                    binding.digest != record.binding_digest
-                    or binding.safety_digest != assessment.digest
-                    or set(binding.unverifiable_facts) != set(assessment.unverifiable_facts)
-                    or not current_facts_match
-                ):
-                    self._pause_for_system_change("setup_changed", iso)
-                    status = OnboardingStatus.NEEDS_CONFIRMATION
+                paused, reason = self.store.get_service_pause()
+                if paused and respect_user_pause:
+                    status = OnboardingStatus.PAUSED
+                    message = "Automatic linking is paused."
+                elif paused and reason == "setup_unavailable":
                     message = (
-                        "Setup or Shoko safety changed. Confirm the current scope and safety facts."
+                        "Current setup checks pass. Resume automatic linking to clear the "
+                        "temporary connection hold."
                     )
-                elif self.reconfirmation_required():
+                elif paused and reason != "user_paused":
                     status = OnboardingStatus.NEEDS_CONFIRMATION
                     message = "Setup must be confirmed again before automatic linking can resume."
-                elif not record.automatic_link_consent:
-                    status = OnboardingStatus.NEEDS_CONFIRMATION
-                    message = "Explicit consent to automatic linking is required."
-                else:
-                    paused, reason = self.store.get_service_pause()
-                    if paused and respect_user_pause:
-                        status = OnboardingStatus.PAUSED
-                        message = "Automatic linking is paused."
-                    elif paused and reason == "setup_unavailable":
-                        message = (
-                            "Current setup checks pass. Resume automatic linking to clear the "
-                            "temporary connection hold."
-                        )
-                    elif paused and reason != "user_paused":
-                        status = OnboardingStatus.NEEDS_CONFIRMATION
-                        message = (
-                            "Setup must be confirmed again before automatic linking can resume."
-                        )
+        if status is OnboardingStatus.AUTHORIZED and self.store.get_onboarding_json() != encoded:
+            status = OnboardingStatus.NEEDS_CONFIRMATION
+            message = "Setup changed during safety checks. Refresh setup before resuming."
         return OnboardingDecision(status, message, binding_digest)

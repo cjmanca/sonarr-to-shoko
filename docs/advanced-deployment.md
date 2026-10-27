@@ -170,9 +170,18 @@ Confirm:
   - `Plugins.Renamer.RenameOnImport=false`
   - `Plugins.Renamer.MoveOnImport=false`
   - `AniDb.MyList_AddFiles=false`
+- Installed Shoko plugins and external hooks cannot rename, move, delete, or
+  rewrite **any media on link events**, including media in a separate manual
+  collection. Inspect their configuration and behavior; read-only Sonarr mounts
+  do not protect other writable media.
 - Sonarr API key used by this tool is read-only.
 - Shoko queue is healthy. Apply is fail-closed when queue reads fail
   or when blocked work exceeds `sync.queue_blocked_tolerance` (default `0`).
+
+The offline attestation lease cannot verify plugin/hook behavior; a valid lease
+does not replace this inspection. The normal service's separate manual import
+workflow may remain enabled under its scoped safety policy; this advanced
+checklist retains the global settings requirements above.
 
 Record only inspected facts. Never put raw settings dumps, API keys, media
 file mutations, or secrets into notes.

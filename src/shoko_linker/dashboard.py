@@ -24,13 +24,12 @@ from typing import Final
 from urllib.parse import parse_qs, urlsplit
 
 from .onboarding import (
+    OnboardingContext,
     OnboardingDecision,
     OnboardingError,
     OnboardingManager,
     OnboardingStatus,
-    ScopeBinding,
 )
-from .safety_check import SafetyAssessment
 from .state import (
     DASHBOARD_SIGNING_KEY_BYTES,
     MAX_DASHBOARD_USERNAME_CHARS,
@@ -256,8 +255,7 @@ class DashboardApplication:
         budget_limits: BudgetLimits | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         status_provider: Callable[[], DashboardStatus] | None = None,
-        onboarding_context: Callable[[], tuple[ScopeBinding, SafetyAssessment] | None]
-        | None = None,
+        onboarding_context: Callable[[], OnboardingContext | None] | None = None,
         setup_provider: Callable[[], DashboardSetupView | None] | None = None,
         setup_action: Callable[[str, Mapping[str, str]], str] | None = None,
         settings_provider: Callable[[], DashboardSettingsView] | None = None,
@@ -469,8 +467,7 @@ class DashboardApplication:
                     "Complete setup before automatic linking can resume.",
                 )
             else:
-                binding, assessment = context
-                decision = manager.resume(binding, assessment, iso=now.isoformat())
+                decision = manager.resume_context(context, iso=now.isoformat())
             if decision.status is not OnboardingStatus.AUTHORIZED:
                 return self._html(
                     HTTPStatus.OK,

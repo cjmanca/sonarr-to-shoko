@@ -418,7 +418,7 @@ container's own mounts on the host**:
 docker inspect --format "{{json .Mounts}}" <shoko-container>   # verify media mounts are :ro
 ```
 
-Checklist the lease records (operator-inspected, human-verified):
+Checklist before recording a lease (operator-inspected, human-verified):
 
 - Shoko's import-folder media mounts are **read-only** on the host; the Shoko-side
   `ImportFolder` list has no drop folders (`DropFolderType: None` for Sonarr-owned
@@ -428,6 +428,13 @@ Checklist the lease records (operator-inspected, human-verified):
   `Plugins.Renamer.MoveOnImport=false` (rename/move physically relocates files),
   `AniDb.MyList_AddFiles=false` (every link writes to AniDB MyList upstream).
   Record the values you inspected — never a raw settings dump.
+- Installed Shoko plugins and external hooks cannot rename, move, delete, or
+  rewrite **any media on link events**, including media in a separate manual
+  collection. Inspect their configuration and behavior; read-only Sonarr mounts
+  do not protect other writable media. The offline lease cannot verify this
+  behavior, and lease validity does not replace inspection. The normal service
+  permits a separate manual import workflow under its scoped safety policy;
+  this advanced checklist retains the global settings requirements above.
 - Sonarr is read-only: the Sonarr API key used here has read scope only.
 - `/data` persistence: the SQLite state DB and the Anime-Lists cache live in the
   `/data` volume. Keep it on a **local** disk/cache mount (SQLite locking is

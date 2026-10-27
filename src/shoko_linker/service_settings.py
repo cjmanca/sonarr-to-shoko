@@ -17,9 +17,9 @@ from .config import Settings, parse_runtime_options, validate_base_url
 from .dashboard import DashboardSettingsView
 from .errors import ConfigError
 from .onboarding import OnboardingManager
-from .state import StateStore, open_state
+from .state import META_SERVICE_SETTINGS, StateStore, open_state
 
-SETTINGS_META = "normal_service_settings_v1"
+SETTINGS_META = META_SERVICE_SETTINGS
 MAX_SERVICE_CYCLE_LINKS = 20
 MAX_SERVICE_ROLLING_LINKS = 5000
 MIN_SERVICE_ROLLING_HOURS = 168
@@ -78,7 +78,10 @@ def _validate(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_service_settings(store: StateStore, bootstrap: BootstrapSettings) -> dict[str, Any]:
-    encoded = store.get_meta(SETTINGS_META)
+    return _decode_service_settings(store.get_meta(SETTINGS_META), bootstrap)
+
+
+def _decode_service_settings(encoded: str | None, bootstrap: BootstrapSettings) -> dict[str, Any]:
     if encoded is None:
         return _defaults(bootstrap)
     try:
@@ -168,7 +171,9 @@ class ServiceSettingsController:
 
     def save(self, form: Mapping[str, str]) -> str:
         try:
-            current = self.document()
+            with open_state(self.bootstrap.database_path) as store:
+                expected_json = store.get_meta(SETTINGS_META)
+            current = _decode_service_settings(expected_json, self.bootstrap)
             if not hmac.compare_digest(form.get("settings_digest", ""), _digest(current)):
                 raise ConfigError("Settings changed in another window. Review the current values.")
             advanced = yaml.safe_load(form.get("advanced_yaml", ""))
@@ -201,18 +206,17 @@ class ServiceSettingsController:
             advanced["mappings"]["refresh_hours"] = yaml.safe_load(form.get("refresh_hours", ""))
             _validate(document)
             with open_state(self.bootstrap.database_path) as store:
-                # Recheck immediately before saving so stale forms cannot overwrite changes.
-                if _digest(load_service_settings(store, self.bootstrap)) != _digest(current):
+                if not store.save_service_settings_if_current(
+                    expected_json,
+                    json.dumps(document, sort_keys=True),
+                    connection_changed=any(
+                        document[name] != current[name] for name in ("sonarr_url", "shoko_url")
+                    ),
+                    iso=datetime.now(UTC).isoformat(),
+                ):
                     raise ConfigError(
                         "Settings changed in another window. Review the current values."
                     )
-                if any(document[name] != current[name] for name in ("sonarr_url", "shoko_url")):
-                    OnboardingManager(store).pause_for_review(
-                        "setup_changed",
-                        "Connection settings changed.",
-                        iso=datetime.now(UTC).isoformat(),
-                    )
-                store.set_meta(SETTINGS_META, json.dumps(document, sort_keys=True))
             self.wake()
             return "Settings saved. " + self.view().message
         except ConfigError as exc:

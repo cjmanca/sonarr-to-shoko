@@ -122,7 +122,7 @@ from .mapping_store import (
 from .mapping_store import (
     status as mapping_status,
 )
-from .onboarding import OnboardingManager, OnboardingStatus, ScopeBinding
+from .onboarding import OnboardingContext, OnboardingManager, OnboardingStatus, ScopeBinding
 from .policies import PolicyRequest, RunPolicy, parse_policy
 from .reporting import (
     META_CYCLE_ALIVE,
@@ -1045,9 +1045,9 @@ class _NormalServiceRuntime:
                     ),
                 )
                 return
-            binding, assessment = context
+            binding = context.binding
             manager = OnboardingManager(store)
-            decision = manager.evaluate(binding, assessment, iso=current_iso())
+            decision = manager.evaluate_context(context, iso=current_iso())
             if decision.status is not OnboardingStatus.AUTHORIZED:
                 self._update_latest(authorized=False, next_action=decision.message)
                 return
@@ -1067,21 +1067,21 @@ class _NormalServiceRuntime:
         context = self._service_authorization_context(store)
         return self._service_context_authorized(manager, context, expected_binding_digest)
 
-    def _service_authorization_context(self, store: StateStore) -> tuple[Any, Any] | None:
+    def _service_authorization_context(self, store: StateStore) -> OnboardingContext | None:
         """Refresh remote facts before onboarding compares them with persisted consent."""
         return self.setup.current_context(store)
 
     @staticmethod
     def _service_context_authorized(
         manager: OnboardingManager,
-        context: tuple[Any, Any] | None,
+        context: OnboardingContext | None,
         expected_binding_digest: str,
     ) -> bool:
         """Evaluate current facts against consent before rejecting a stale cycle digest."""
         if context is None:
             return False
-        binding, assessment = context
-        decision = manager.evaluate(binding, assessment, iso=current_iso())
+        binding = context.binding
+        decision = manager.evaluate_context(context, iso=current_iso())
         return (
             decision.status is OnboardingStatus.AUTHORIZED
             and binding.digest == expected_binding_digest
@@ -1107,7 +1107,7 @@ class _NormalServiceRuntime:
         endpoints = (deps.sonarr, deps.shoko, deps.mapping_source)
         expected_binding_digest = binding.digest
 
-        authorization_context: list[tuple[Any, Any] | None] = [None]
+        authorization_context: list[OnboardingContext | None] = [None]
 
         def service_authorized() -> bool:
             context = self._service_authorization_context(store)
@@ -1128,7 +1128,7 @@ class _NormalServiceRuntime:
             # different scope while the final Shoko read is in flight, the cached facts are
             # stale; refuse this old cycle without misclassifying the new consent as drift.
             record = manager.record()
-            if record is None or context[0].digest != record.binding_digest:
+            if record is None or context.binding.digest != record.binding_digest:
                 return False
             return self._service_context_authorized(manager, context, expected_binding_digest)
 
@@ -1241,7 +1241,7 @@ def _run_service(_args: argparse.Namespace) -> int:
             settings, *dashboard_endpoints, settings.database_path
         )
 
-        def dashboard_onboarding_context() -> tuple[Any, Any] | None:
+        def dashboard_onboarding_context() -> OnboardingContext | None:
             path = Path(settings.database_path)
             if not path.exists():
                 return None
@@ -1365,8 +1365,7 @@ def _run_resume(_args: argparse.Namespace) -> int:
                 if context is None:
                     print("Current services or anime scope need review before linking can resume.")
                     return EXIT_STATE
-                binding, assessment = context
-                decision = manager.resume(binding, assessment, iso=current_iso())
+                decision = manager.resume_context(context, iso=current_iso())
             finally:
                 sonarr.client.close()
                 shoko.client.close()

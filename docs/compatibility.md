@@ -213,6 +213,54 @@ imported), `Created`, `Updated`, `SeriesIDs[]` (**present only with `include=XRe
 
 `ImportAsNewEp`: **absent at v5.3.3.**
 
+### Excluded folders and mixed collections
+
+The normal service permits global `MoveOnImport`, `RenameOnImport`, and
+`RelocateOnImport` for a separate manual collection when all selected Sonarr
+targets belong unambiguously to usable `DropFolderType=None` folders. Evidence
+from Shoko **5.3.3**:
+
+- The API maps a folder with both drop flags false to `None`
+  ([ImportFolder.cs](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/API/v3/Models/Shoko/ImportFolder.cs#L53-L74)).
+  This represents the renamer's excluded folder type;
+  [RenameFileService.cs](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/Renamer/RenameFileService.cs#L38-L60)
+  returns for excluded folders before invoking the renamer.
+- [RenameMoveFileJob.cs](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/Scheduling/Jobs/Shoko/RenameMoveFileJob.cs#L45-L50)
+  handles **all places** of the file. Therefore every candidate location must
+  still be in an eligible, mapped `None` folder; one excluded location is insufficient.
+- [VideoLocal_PlaceService.cs](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/Services/VideoLocal_PlaceService.cs#L130-L151)
+  also guards excluded folders. Other move branches can delete a destination
+  before a move from a read-only source fails
+  ([lines 267–281](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/Services/VideoLocal_PlaceService.cs#L267-L281)).
+  Read-only mounts alone are not a universal bypass for folder exclusion.
+- Folder exclusion does not contain all
+  [ManualLinkJob side effects](https://github.com/ShokoAnime/ShokoServer/blob/v5.3.3/Shoko.Server/Scheduling/Jobs/Shoko/ManualLinkJob.cs#L78-L122):
+  quality filtering can delete other files and plugins can react to link events.
+  `FileQualityFilterEnabled` and `AniDb.MyList_AddFiles` remain independent blockers
+  when enabled, regardless of folder type or mount protection.
+
+Normal setup requires complete, known import-folder context, no overlapping selected
+ownership, and explicit confirmation that selected media is read-only **inside
+Shoko**, without writable aliases/hardlink exposure, and that plugins/external hooks
+cannot modify any media on link events. The separate manual import workflow may
+remain enabled. These physical and hook facts cannot be API-verified. Unavailable
+renamer settings require manual confirmation of selected-folder exclusion;
+unavailable quality-filter/MyList settings require confirmation that they are disabled.
+
+Consent binds the safety-policy revision, sanitized settings, and selected folder
+IDs, normalized paths, and types alongside the existing scope/version binding.
+Selected-folder or settings drift and older consent require renewed confirmation;
+unrelated valid manual-folder changes do not when selected ownership stays
+unambiguous. This is a source-verified baseline, not a release allowlist or live
+validation of arbitrary versions. Advanced one-shot/campaign apply retains its
+independent offline operator-attestation gate. Its lease requires boolean
+`FileQualityFilterEnabled`, `RenameOnImport`, `MoveOnImport`, and `MyListAddFiles`
+fields and refuses `FileQualityFilterEnabled=true`; it accepts either boolean for
+the other three flags and has no `RelocateOnImport` field. Lease validity does not
+automatically verify settings or physical safety. Operators must still follow the
+[advanced deployment safety checklist](advanced-deployment.md), including disabling
+global renaming/moving and MyList writes and verifying mounts and plugins.
+
 ### Settings / Queue — read-only safety inputs
 
 - `GET /api/v3/Settings`: **admin+init only**; returns **full server config including

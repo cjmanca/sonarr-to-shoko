@@ -19,7 +19,14 @@ from shoko_linker.onboarding import (
 )
 from shoko_linker.paths import PathMapping
 from shoko_linker.safety_check import SafetyAssessment, assess_settings_payload
-from shoko_linker.state import _CAMPAIGN_V2_DRAIN_COLUMNS, SCHEMA_VERSION, StateError, open_state
+from shoko_linker.state import (
+    _CAMPAIGN_V2_DRAIN_COLUMNS,
+    META_ONBOARDING_RECONFIRMATION_REQUIRED,
+    SCHEMA_VERSION,
+    StateError,
+    WriteDisabledError,
+    open_state,
+)
 
 SONARR_ROOT = "/data/media/anime"
 SHOKO_ROOT = "/anime"
@@ -522,3 +529,733 @@ def test_inaccessible_settings_require_confirmation_of_unknown_flags(tmp_path: P
             iso=T0,
         )
         assert manager.evaluate(binding, assessment, iso=T0).status is OnboardingStatus.AUTHORIZED
+
+
+def test_sanitized_settings_baseline_is_bound_and_checked_at_confirmation(tmp_path: Path) -> None:
+    assessment = safe_assessment()
+    binding = replace(
+        make_binding(), settings_observation=tuple(assessment.observed_settings.items())
+    )
+    assert ScopeBinding.from_document(binding.document()) == binding
+    assert binding.digest != make_binding().digest
+    assert SETTINGS_SECRET not in json.dumps(binding.document())
+    assert "settings_observation" not in make_binding().document()
+    assert ScopeBinding.from_document(make_binding().document()) == make_binding()
+    mismatched = replace(
+        binding,
+        settings_observation=tuple(
+            (name, True if name == "RenameOnImport" else value)
+            for name, value in assessment.observed_settings.items()
+        ),
+    )
+    with open_state(tmp_path / "state.sqlite3") as store:
+        with pytest.raises(OnboardingError, match="observation does not match"):
+            OnboardingManager(store).confirm_setup(
+                mismatched,
+                assessment,
+                confirmed_facts=confirmed_facts(assessment),
+                automatic_link_consent=True,
+                iso=T0,
+            )
+        assert store.get_onboarding_json() is None
+
+
+@pytest.mark.parametrize("invalid", [{}, {"DatabasePassword": "secret"}, None])
+def test_invalid_settings_baseline_is_rejected(invalid: object) -> None:
+    document = make_binding().document()
+    document["settings_observation"] = invalid
+    with pytest.raises(OnboardingError, match="observation is malformed"):
+        ScopeBinding.from_document(document)
+
+
+def test_selected_folder_observation_is_digest_bound_and_legacy_compatible() -> None:
+    legacy = make_binding()
+    assert "selected_folders_observation" not in legacy.document()
+    binding = replace(legacy, selected_folders_observation=((1, SHOKO_ROOT, "None"),))
+    assert ScopeBinding.from_document(binding.document()) == binding
+    assert binding.digest != legacy.digest
+    assert ScopeBinding.from_document(legacy.document()).digest == legacy.digest
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        [],
+        [[True, SHOKO_ROOT, "None"]],
+        [[1, "relative", "None"]],
+        [[1, SHOKO_ROOT, "Unknown"]],
+        [[1, SHOKO_ROOT, "Source"]],
+        [[1, SHOKO_ROOT, "None"], [1, "/other", "None"]],
+    ],
+)
+def test_invalid_selected_folder_observation_is_rejected(invalid: object) -> None:
+    document = make_binding().document()
+    document["selected_folders_observation"] = invalid
+    with pytest.raises(OnboardingError, match="folder observation"):
+        ScopeBinding.from_document(document)
+
+
+@pytest.mark.parametrize("interleave", ["confirmation", "pause"])
+def test_observed_review_atomically_checks_consent_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interleave: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        record = manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        original_transition = store.pause_onboarding_if_current
+
+        def interleaved_transition(expected_document_json: str, reason: str, iso: str) -> bool:
+            # Race after manager's identity read, before persistence obtains its writer lock.
+            with open_state(state_path) as other:
+                other_manager = OnboardingManager(other)
+                if interleave == "confirmation":
+                    other_manager.confirm_setup(
+                        record.binding,
+                        assessment,
+                        confirmed_facts=record.confirmed_facts,
+                        automatic_link_consent=True,
+                        iso=T_PLUS_30_DAYS,
+                    )
+                else:
+                    other_manager.pause(iso=T_PLUS_30_DAYS)
+            return original_transition(expected_document_json, reason, iso)
+
+        monkeypatch.setattr(store, "pause_onboarding_if_current", interleaved_transition)
+        applied = manager.observe_review(record, "setup_changed", iso=T_PLUS_30_DAYS)
+        assert applied is (interleave == "pause")
+        assert manager.reconfirmation_required() is (interleave == "pause")
+        assert store.get_service_pause() == (
+            (True, "user_paused") if interleave == "pause" else (False, "")
+        )
+
+
+@pytest.mark.parametrize("interleave", ["review", "confirmation", "pause"])
+def test_confirmation_does_not_erase_review_of_new_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interleave: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        original_commit = store._commit_tx
+        observed = False
+
+        def observe_after_commit() -> None:
+            nonlocal observed
+            original_commit()
+            if observed:
+                return
+            observed = True
+            # Another process can observe the new consent as soon as it commits.
+            with open_state(state_path) as other:
+                observer = OnboardingManager(other)
+                if interleave == "confirmation":
+                    observer.confirm_setup(
+                        make_binding(),
+                        assessment,
+                        confirmed_facts=confirmed_facts(assessment),
+                        automatic_link_consent=True,
+                        iso=T_PLUS_30_DAYS,
+                    )
+                elif interleave == "pause":
+                    observer.pause(iso=T_PLUS_30_DAYS)
+                current = observer.record()
+                assert current is not None
+                assert observer.observe_review(current, "setup_changed", iso=T_PLUS_30_DAYS)
+
+        monkeypatch.setattr(store, "_commit_tx", observe_after_commit)
+        manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        assert observed
+        assert manager.reconfirmation_required()
+        assert store.get_service_pause() == (
+            (True, "user_paused") if interleave == "pause" else (True, "setup_changed")
+        )
+        record = manager.record()
+        assert record is not None
+        assert record.consented_iso == (T_PLUS_30_DAYS if interleave == "confirmation" else T0)
+    with open_state(state_path) as reopened:
+        assert (
+            OnboardingManager(reopened)
+            .evaluate(make_binding(), assessment, iso=T_PLUS_30_DAYS)
+            .status
+            is OnboardingStatus.NEEDS_CONFIRMATION
+        )
+
+
+@pytest.mark.parametrize(
+    "old_reason", ["setup_changed", "unsafe_shoko_settings", "setup_unavailable", "user_paused"]
+)
+def test_confirmation_publishes_consent_and_releases_only_system_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_reason: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        store.set_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED, "1")
+        store.set_service_pause(True, "setup_changed", T0)
+        original_begin = store._begin_immediate_tx
+
+        def pause_before_lock(busy_context: str | None) -> None:
+            # A concurrent user action commits after confirmation validation but
+            # before this connection obtains the writer lock.
+            with open_state(state_path) as other:
+                other.set_service_pause(True, old_reason, T_PLUS_30_DAYS)
+            original_begin(busy_context)
+
+        monkeypatch.setattr(store, "_begin_immediate_tx", pause_before_lock)
+        manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T_PLUS_30_DAYS,
+        )
+        assert not manager.reconfirmation_required()
+        assert store.get_service_pause() == (
+            (True, "user_paused") if old_reason == "user_paused" else (False, "")
+        )
+
+
+def test_failed_confirmation_commit_rolls_back_consent_and_hold_release(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        previous = manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        manager.pause_for_review("setup_changed", "Review setup", iso=T0)
+        denied = False
+
+        def deny_first_commit(
+            action: int,
+            arg1: str | None,
+            _arg2: str | None,
+            _database: str | None,
+            _source: str | None,
+        ) -> int:
+            nonlocal denied
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT" and not denied:
+                denied = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store.connection.set_authorizer(deny_first_commit)
+        with pytest.raises(WriteDisabledError, match="state writes stopped"):
+            manager.confirm_setup(
+                make_binding(),
+                assessment,
+                confirmed_facts=confirmed_facts(assessment),
+                automatic_link_consent=True,
+                iso=T_PLUS_30_DAYS,
+            )
+        assert denied
+        assert manager.record() == previous
+        assert manager.reconfirmation_required()
+        assert store.get_service_pause() == (True, "setup_changed")
+        assert store.writes_disabled
+    with open_state(state_path) as reopened:
+        assert OnboardingManager(reopened).record() == previous
+        assert OnboardingManager(reopened).reconfirmation_required()
+        assert reopened.get_service_pause() == (True, "setup_changed")
+        assert reopened.writes_disabled
+
+
+@pytest.mark.parametrize("reason", ["setup_changed", "unsafe_shoko_settings", "setup_unavailable"])
+@pytest.mark.parametrize("timing", ["before_writer_lock", "after_commit"])
+def test_automatic_review_preserves_concurrent_user_pause_through_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, timing: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    binding = make_binding()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        original_begin = store._begin_immediate_tx
+        original_commit = store._commit_tx
+        injected = False
+
+        def user_pause() -> None:
+            nonlocal injected
+            if injected:
+                return
+            injected = True
+            with open_state(state_path) as other:
+                OnboardingManager(other).pause(iso=T_PLUS_30_DAYS)
+
+        def pause_before_lock(busy_context: str | None) -> None:
+            user_pause()
+            original_begin(busy_context)
+
+        def pause_after_commit() -> None:
+            original_commit()
+            user_pause()
+
+        with monkeypatch.context() as patch:
+            if timing == "before_writer_lock":
+                patch.setattr(store, "_begin_immediate_tx", pause_before_lock)
+            else:
+                patch.setattr(store, "_commit_tx", pause_after_commit)
+            manager.pause_for_review(reason, "Review setup", iso=T_PLUS_30_DAYS)
+        assert injected
+        assert store.get_service_pause() == (True, "user_paused")
+        assert manager.reconfirmation_required() is (reason != "setup_unavailable")
+    with open_state(state_path) as reopened:
+        manager = OnboardingManager(reopened)
+        assert reopened.get_service_pause() == (True, "user_paused")
+        assert manager.reconfirmation_required() is (reason != "setup_unavailable")
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T_PLUS_30_DAYS,
+        )
+        assert not manager.reconfirmation_required()
+        assert reopened.get_service_pause() == (True, "user_paused")
+        assert manager.evaluate(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.PAUSED
+        )
+
+
+def test_failed_automatic_review_commit_rolls_back_hold_and_stops_writes(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        denied = False
+
+        def deny_first_commit(
+            action: int,
+            arg1: str | None,
+            _arg2: str | None,
+            _database: str | None,
+            _source: str | None,
+        ) -> int:
+            nonlocal denied
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT" and not denied:
+                denied = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store.connection.set_authorizer(deny_first_commit)
+        with pytest.raises(WriteDisabledError, match="state writes stopped"):
+            manager.pause_for_review("setup_changed", "Review setup", iso=T_PLUS_30_DAYS)
+        assert denied
+        assert store.writes_disabled
+        assert store.get_service_pause() == (False, "")
+        assert not manager.reconfirmation_required()
+    with open_state(state_path) as reopened:
+        assert reopened.writes_disabled
+        assert reopened.get_service_pause() == (False, "")
+        assert not OnboardingManager(reopened).reconfirmation_required()
+
+
+@pytest.mark.parametrize("timing", ["before_writer_lock", "after_commit"])
+def test_user_pause_preserves_fresh_confirmation_without_resurrecting_old_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timing: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    binding = make_binding()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        manager.pause_for_review("setup_changed", "Review setup", iso=T0)
+        original_begin = store._begin_immediate_tx
+        original_commit = store._commit_tx
+        injected = False
+
+        def confirm() -> None:
+            nonlocal injected
+            if injected:
+                return
+            injected = True
+            with open_state(state_path) as other:
+                OnboardingManager(other).confirm_setup(
+                    binding,
+                    assessment,
+                    confirmed_facts=confirmed_facts(assessment),
+                    automatic_link_consent=True,
+                    iso=T_PLUS_30_DAYS,
+                )
+
+        def confirm_before_lock(busy_context: str | None) -> None:
+            confirm()
+            original_begin(busy_context)
+
+        def confirm_after_commit() -> None:
+            original_commit()
+            confirm()
+
+        with monkeypatch.context() as patch:
+            if timing == "before_writer_lock":
+                patch.setattr(store, "_begin_immediate_tx", confirm_before_lock)
+            else:
+                patch.setattr(store, "_commit_tx", confirm_after_commit)
+            assert manager.pause(iso=T_PLUS_30_DAYS).status is OnboardingStatus.PAUSED
+        assert injected
+        assert not manager.reconfirmation_required()
+        assert store.get_service_pause() == (True, "user_paused")
+    with open_state(state_path) as reopened:
+        manager = OnboardingManager(reopened)
+        assert not manager.reconfirmation_required()
+        assert manager.evaluate(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.PAUSED
+        )
+        assert manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.AUTHORIZED
+        )
+
+
+@pytest.mark.parametrize("timing", ["before_writer_lock", "after_commit"])
+def test_user_pause_preserves_genuinely_new_observed_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timing: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        record = manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        original_begin = store._begin_immediate_tx
+        original_commit = store._commit_tx
+        injected = False
+
+        def observe() -> None:
+            nonlocal injected
+            if injected:
+                return
+            injected = True
+            with open_state(state_path) as other:
+                assert OnboardingManager(other).observe_review(
+                    record, "setup_changed", iso=T_PLUS_30_DAYS
+                )
+
+        def observe_before_lock(busy_context: str | None) -> None:
+            observe()
+            original_begin(busy_context)
+
+        def observe_after_commit() -> None:
+            original_commit()
+            observe()
+
+        with monkeypatch.context() as patch:
+            if timing == "before_writer_lock":
+                patch.setattr(store, "_begin_immediate_tx", observe_before_lock)
+            else:
+                patch.setattr(store, "_commit_tx", observe_after_commit)
+            manager.pause(iso=T_PLUS_30_DAYS)
+        assert injected
+        assert manager.reconfirmation_required()
+        assert store.get_service_pause() == (True, "user_paused")
+    with open_state(state_path) as reopened:
+        assert (
+            OnboardingManager(reopened)
+            .resume(make_binding(), assessment, iso=T_PLUS_30_DAYS)
+            .status
+            is OnboardingStatus.NEEDS_CONFIRMATION
+        )
+        assert reopened.get_service_pause() == (True, "user_paused")
+
+
+@pytest.mark.parametrize("reason", ["setup_changed", "unsafe_shoko_settings"])
+def test_user_pause_migrates_current_legacy_hard_hold(tmp_path: Path, reason: str) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        store.set_service_pause(True, reason, T0)
+        assert store.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is None
+        manager.pause(iso=T_PLUS_30_DAYS)
+        assert store.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) == "1"
+        assert store.get_service_pause() == (True, "user_paused")
+    with open_state(state_path) as reopened:
+        assert (
+            OnboardingManager(reopened)
+            .resume(make_binding(), assessment, iso=T_PLUS_30_DAYS)
+            .status
+            is OnboardingStatus.NEEDS_CONFIRMATION
+        )
+        assert reopened.get_service_pause() == (True, "user_paused")
+
+
+@pytest.mark.parametrize("reason", ["setup_changed", "unsafe_shoko_settings"])
+def test_failed_user_pause_commit_rolls_back_legacy_hold_migration(
+    tmp_path: Path, reason: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        store.set_service_pause(True, reason, T0)
+        assert store.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is None
+        denied = False
+
+        def deny_first_commit(
+            action: int,
+            arg1: str | None,
+            _arg2: str | None,
+            _database: str | None,
+            _source: str | None,
+        ) -> int:
+            nonlocal denied
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT" and not denied:
+                denied = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store.connection.set_authorizer(deny_first_commit)
+        with pytest.raises(WriteDisabledError, match="state writes stopped"):
+            manager.pause(iso=T_PLUS_30_DAYS)
+        assert denied
+        assert store.writes_disabled
+        assert store.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is None
+        assert store.get_service_pause() == (True, reason)
+    with open_state(state_path) as reopened:
+        assert reopened.writes_disabled
+        assert reopened.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is None
+        assert reopened.get_service_pause() == (True, reason)
+
+
+@pytest.mark.parametrize("change", ["observed_hold", "legacy_hold", "new_consent"])
+def test_resume_refuses_concurrent_hold_or_consent_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    binding = make_binding()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        record = manager.confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        manager.pause(iso=T0)
+        original_begin = store._begin_immediate_tx
+        injected = False
+
+        def change_before_lock(busy_context: str | None) -> None:
+            nonlocal injected
+            if not injected:
+                injected = True
+                with open_state(state_path) as other:
+                    observer = OnboardingManager(other)
+                    if change == "observed_hold":
+                        assert observer.observe_review(record, "setup_changed", iso=T_PLUS_30_DAYS)
+                    elif change == "legacy_hold":
+                        other.set_service_pause(True, "unsafe_shoko_settings", T_PLUS_30_DAYS)
+                    else:
+                        observer.confirm_setup(
+                            binding,
+                            assessment,
+                            confirmed_facts=record.confirmed_facts,
+                            automatic_link_consent=True,
+                            iso=T_PLUS_30_DAYS,
+                        )
+            original_begin(busy_context)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_begin_immediate_tx", change_before_lock)
+            decision = manager.resume(binding, assessment, iso=T_PLUS_30_DAYS)
+        assert injected
+        assert decision.status is OnboardingStatus.NEEDS_CONFIRMATION
+        assert manager.reconfirmation_required() is (change != "new_consent")
+        expected_pause = (
+            (True, "unsafe_shoko_settings") if change == "legacy_hold" else (True, "user_paused")
+        )
+        assert store.get_service_pause() == expected_pause
+    with open_state(state_path) as reopened:
+        manager = OnboardingManager(reopened)
+        assert reopened.get_service_pause() == expected_pause
+        assert manager.evaluate(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+            OnboardingStatus.PAUSED
+            if change == "new_consent"
+            else OnboardingStatus.NEEDS_CONFIRMATION
+        )
+        if change == "new_consent":
+            # Current valid consent permits a fresh explicit Resume, without reconfirmation.
+            assert manager.resume(binding, assessment, iso=T_PLUS_30_DAYS).status is (
+                OnboardingStatus.AUTHORIZED
+            )
+
+
+def test_failed_resume_commit_preserves_pause_and_stops_writes(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        record = manager.confirm_setup(
+            make_binding(),
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        manager.pause(iso=T0)
+        denied = False
+
+        def deny_first_commit(
+            action: int,
+            arg1: str | None,
+            _arg2: str | None,
+            _database: str | None,
+            _source: str | None,
+        ) -> int:
+            nonlocal denied
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT" and not denied:
+                denied = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store.connection.set_authorizer(deny_first_commit)
+        with pytest.raises(WriteDisabledError, match="state writes stopped"):
+            manager.resume(make_binding(), assessment, iso=T_PLUS_30_DAYS)
+        assert denied
+        assert store.writes_disabled
+        assert store.get_service_pause() == (True, "user_paused")
+        assert manager.record() == record
+        assert not manager.reconfirmation_required()
+    with open_state(state_path) as reopened:
+        assert reopened.writes_disabled
+        assert reopened.get_service_pause() == (True, "user_paused")
+        assert OnboardingManager(reopened).record() == record
+
+
+@pytest.mark.parametrize("timing", ["after_record_read", "before_writer_lock"])
+@pytest.mark.parametrize("reconfirm", [False, True])
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_evaluate_mismatch_holds_only_the_consent_it_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timing: str, reconfirm: bool, unsafe: bool
+) -> None:
+    reason = "unsafe_shoko_settings" if unsafe else "setup_changed"
+    state_path = tmp_path / "state.sqlite3"
+    assessment = safe_assessment()
+    original_binding = make_binding()
+    current_binding = replace(original_binding, shoko_version="5.3.3.0")
+    with open_state(state_path) as store:
+        manager = OnboardingManager(store)
+        original_record = manager.confirm_setup(
+            original_binding,
+            assessment,
+            confirmed_facts=confirmed_facts(assessment),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        original_read = store.get_onboarding_json
+        original_begin = store._begin_immediate_tx
+        injected = False
+
+        def maybe_confirm() -> None:
+            nonlocal injected
+            if injected:
+                return
+            injected = True
+            if reconfirm:
+                with open_state(state_path) as other:
+                    OnboardingManager(other).confirm_setup(
+                        current_binding,
+                        assessment,
+                        confirmed_facts=original_record.confirmed_facts,
+                        automatic_link_consent=True,
+                        iso=T_PLUS_30_DAYS,
+                    )
+
+        def confirm_after_read() -> str | None:
+            record = original_read()
+            maybe_confirm()
+            return record
+
+        def confirm_before_lock(busy_context: str | None) -> None:
+            maybe_confirm()
+            original_begin(busy_context)
+
+        with monkeypatch.context() as patch:
+            if timing == "after_record_read":
+                patch.setattr(store, "get_onboarding_json", confirm_after_read)
+            else:
+                patch.setattr(store, "_begin_immediate_tx", confirm_before_lock)
+            observed = (
+                assess_settings_payload({"FileQualityFilterEnabled": True})
+                if unsafe
+                else assessment
+            )
+            decision = manager.evaluate(current_binding, observed, iso=T_PLUS_30_DAYS)
+        assert injected
+        # Stale checks always refuse; only a fresh call may authorize the new consent.
+        assert decision.status is (
+            OnboardingStatus.UNSAFE
+            if unsafe and not reconfirm
+            else OnboardingStatus.NEEDS_CONFIRMATION
+        )
+        assert manager.reconfirmation_required() is not reconfirm
+        assert store.get_service_pause() == ((False, "") if reconfirm else (True, reason))
+    with open_state(state_path) as reopened:
+        manager = OnboardingManager(reopened)
+        assert manager.reconfirmation_required() is not reconfirm
+        if reconfirm:
+            assert manager.record() is not None
+            assert manager.resume(current_binding, assessment, iso=T_PLUS_30_DAYS).status is (
+                OnboardingStatus.AUTHORIZED
+            )
+            assert reopened.get_service_pause() == (False, "")
+        else:
+            # Returning to the original observable facts cannot clear an observed hard hold.
+            assert manager.resume(original_binding, assessment, iso=T_PLUS_30_DAYS).status is (
+                OnboardingStatus.NEEDS_CONFIRMATION
+            )
+            assert reopened.get_service_pause() == (True, reason)

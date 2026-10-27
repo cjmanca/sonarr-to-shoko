@@ -16,7 +16,7 @@ import e2e_harness as eh
 import httpx
 import pytest
 
-from shoko_linker import cli
+from shoko_linker import cli, service_setup
 from shoko_linker.bootstrap import (
     SHOKO_API_KEY_ENV,
     SHOKO_URL_ENV,
@@ -26,7 +26,7 @@ from shoko_linker.bootstrap import (
 )
 from shoko_linker.dashboard import DashboardApplication, DashboardResponse
 from shoko_linker.http import ApiEndpoint
-from shoko_linker.onboarding import OnboardingManager
+from shoko_linker.onboarding import OnboardingContext, OnboardingManager
 from shoko_linker.paths import PathMapping
 from shoko_linker.service_setup import ServiceSetupController
 from shoko_linker.state import FileState, open_state
@@ -54,6 +54,7 @@ class ServiceSonarrStub(eh.SonarrStub):
 class ServiceShokoStub(eh.ShokoStub):
     version = "5.3.3"
     incompatible_queue = False
+    renamer_enabled = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -71,9 +72,9 @@ class ServiceShokoStub(eh.ShokoStub):
                     "FileQualityFilterEnabled": False,
                     "Plugins": {
                         "Renamer": {
-                            "RenameOnImport": False,
-                            "MoveOnImport": False,
-                            "RelocateOnImport": False,
+                            "RenameOnImport": self.renamer_enabled,
+                            "MoveOnImport": self.renamer_enabled,
+                            "RelocateOnImport": self.renamer_enabled,
                         }
                     },
                     "AniDb": {"MyList_AddFiles": False},
@@ -265,9 +266,7 @@ def test_real_setup_controller_latches_supported_version_drift_until_fresh_confi
             assert runtime._service_authorized(store, manager, expected_cycle_digest)
 
             service.version = changed_version  # Available API, but not covered by saved consent.
-            current = controller.current_context(store)
-            assert current is not None
-            assert getattr(current[0], f"{component}_version") == changed_version
+            assert controller.current_context(store) is None
             assert not runtime._service_authorized(store, manager, expected_cycle_digest)
             assert store.get_service_pause() == (True, "setup_changed")
             assert manager.reconfirmation_required()
@@ -332,7 +331,7 @@ def test_unavailable_scope_check_blocks_posts_and_cannot_clear_reconfirmation(  
         with open_state(bootstrap.database_path) as store:
             current = runtime.setup.current_context(store)
             assert current is not None
-            decision = OnboardingManager(store).resume(*current, iso="2026-10-16T00:00:00Z")
+            decision = OnboardingManager(store).resume_context(current, iso="2026-10-16T00:00:00Z")
             assert decision.status.value == "authorized"
             assert store.get_service_pause() == (False, "")
 
@@ -358,6 +357,85 @@ def test_unavailable_scope_check_blocks_posts_and_cannot_clear_reconfirmation(  
             assert store.get_service_pause() == (True, "setup_changed")
             assert manager.reconfirmation_required()
         assert world.shoko.posts_count() == 0
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["folder_identity", "settings_during_folder_outage", "selected_type_during_folder_outage"],
+)
+def test_mixed_library_selected_folder_identity_drift_before_write_prevents_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    bootstrap = replace(
+        load_bootstrap_settings(
+            environ={
+                SONARR_URL_ENV: "http://sonarr:8989",
+                SONARR_API_KEY_ENV: "service-e2e-sonarr-key-never-real",
+                SHOKO_URL_ENV: "http://shoko:8111",
+                SHOKO_API_KEY_ENV: "service-e2e-shoko-key-never-real",
+            }
+        ),
+        database_path=tmp_path / "state.sqlite3",
+    )
+    world = _service_world(tmp_path)
+    cast(ServiceShokoStub, world.shoko).renamer_enabled = True
+    world.shoko.folders.update({2: ("/drop", "Source"), 3: ("/manual", "Destination")})
+    monkeypatch.setattr(
+        cli, "sonarr_endpoint", lambda _: _endpoint(world.sonarr.handler, eh.SONARR_BASE)
+    )
+    monkeypatch.setattr(
+        cli, "shoko_endpoint", lambda _: _endpoint(world.shoko.handler, eh.SHOKO_BASE)
+    )
+
+    def mapping_endpoint(store: Any, **_kwargs: Any) -> ApiEndpoint:
+        return ApiEndpoint(
+            httpx.Client(
+                base_url=store.origin,
+                transport=httpx.MockTransport(world.source.handler),
+                follow_redirects=False,
+            ),
+            lambda: {"Accept-Encoding": "identity"},
+        )
+
+    monkeypatch.setattr(cli, "make_source_endpoint", mapping_endpoint)
+    sonarr = _endpoint(world.sonarr.handler, eh.SONARR_BASE)
+    shoko = _endpoint(world.shoko.handler, eh.SHOKO_BASE)
+    runtime = cli._NormalServiceRuntime(bootstrap, sonarr, shoko, cli.StopState())
+    clock = [datetime.now(UTC) + timedelta(seconds=1)]
+    monkeypatch.setattr(cli, "current_iso", lambda: clock[0].isoformat())
+    try:
+        _confirm_setup(runtime.setup)
+        runtime.worker_tick()
+        assert world.shoko.posts_count() == 0
+        assert "grace_period" in runtime.latest["diagnostics"]
+        clock[0] += timedelta(seconds=301)
+        original_context = runtime._service_authorization_context
+        refreshes = 0
+
+        def drift_before_send(store: Any) -> Any:
+            nonlocal refreshes
+            refreshes += 1
+            if refreshes == 2:
+                if drift == "folder_identity":
+                    world.shoko.folders[7] = world.shoko.folders.pop(1)
+                elif drift == "settings_during_folder_outage":
+                    cast(ServiceShokoStub, world.shoko).renamer_enabled = False
+                    monkeypatch.setattr(service_setup, "collect_import_folders", lambda *_: None)
+                else:
+                    world.shoko.folders[1] = (SHOKO_ROOT, "Source")
+                    world.shoko.folders[2] = ("/drop", "Unknown")
+            return original_context(store)
+
+        monkeypatch.setattr(runtime, "_service_authorization_context", drift_before_send)
+        runtime.worker_tick()
+        assert refreshes >= 2
+        assert world.shoko.posts_count() == 0
+        with open_state(bootstrap.database_path) as store:
+            assert store.get_service_pause() == (True, "setup_changed")
+            assert OnboardingManager(store).reconfirmation_required()
     finally:
         sonarr.client.close()
         shoko.client.close()
@@ -434,7 +512,7 @@ def test_fresh_four_variable_service_onboards_links_canary_and_recovers_after_re
     monkeypatch.setattr(dashboard_setup, "_inventory", held_selected_inventory)
     monkeypatch.setattr(dashboard_setup, "_refresh_in_background", tracked_background_refresh)
 
-    def dashboard_onboarding_context() -> tuple[Any, Any] | None:
+    def dashboard_onboarding_context() -> OnboardingContext | None:
         if not bootstrap.database_path.exists():
             return None
         with open_state(bootstrap.database_path) as store:

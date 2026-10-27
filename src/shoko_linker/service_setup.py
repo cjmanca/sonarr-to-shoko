@@ -18,13 +18,20 @@ from .dashboard import DashboardSetupView
 from .errors import ConfigError, PathError
 from .http import ApiEndpoint
 from .onboarding import (
+    OnboardingContext,
     OnboardingError,
     OnboardingManager,
     OnboardingRecord,
     ScopeBinding,
 )
-from .paths import PathMapping, validate_mappings
-from .safety_check import SafetyAssessment, SafetyStatus, inspect_shoko_safety_settings
+from .paths import PathMapping, is_within_root, normalize_posix, validate_mappings
+from .safety_check import (
+    SafetyAssessment,
+    SafetyStatus,
+    evaluate_service_safety,
+    inspect_shoko_safety_settings,
+    selected_service_folders,
+)
 from .service_settings import configured_bootstrap
 from .setup import (
     AnimeScopeDiscovery,
@@ -39,6 +46,8 @@ from .setup import (
 )
 from .shoko import (
     DROP_TYPE_NONE,
+    VALID_DROP_TYPES,
+    ImportFolder,
     ShokoDiscovery,
     collect_import_folders,
     collect_shoko_discovery,
@@ -49,7 +58,30 @@ from .state import StateError, StateStore, open_state
 SETUP_VIEW_CACHE_SECONDS = 30.0
 SETUP_INVENTORY_CACHE_SECONDS = 3600.0
 DRAFT_ROOTS_META = "normal_service_draft_roots_v1"
+type _SetupEnvironment = tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]
 type _SetupInventory = tuple[SonarrInventory, ShokoDiscovery, PathMappingDiscovery]
+
+
+def _preview_safety(
+    raw: SafetyAssessment,
+    mappings: tuple[PathMapping, ...],
+    options: tuple[tuple[str, str], ...],
+    folders: Mapping[int, ImportFolder],
+) -> SafetyAssessment:
+    """Bind every offered manual choice, without authorizing an unselected folder."""
+    if mappings or not options:
+        return evaluate_service_safety(raw, mappings, folders)
+    assessments = tuple(
+        evaluate_service_safety(raw, (PathMapping(source, target),), folders)
+        for source, target in options
+    )
+    preview = next(
+        (item for item in assessments if item.status is SafetyStatus.UNSAFE), assessments[0]
+    )
+    digest = hashlib.sha256(
+        json.dumps(tuple(item.digest for item in assessments)).encode("utf-8")
+    ).hexdigest()
+    return replace(preview, digest=digest)
 
 
 def _setup_snapshot_digest(
@@ -148,6 +180,55 @@ class ServiceSetupController:
         assessment = inspect_shoko_safety_settings(self.shoko)
         return compatibility, scope, assessment
 
+    def _observed_environment(
+        self, record: OnboardingRecord | None
+    ) -> tuple[_SetupEnvironment, tuple[ImportFolder, ...] | None, bool]:
+        """Read current facts and record their effect on the preceding approved scope."""
+        environment = self._environment()
+        changed = self._observe_setup_facts(record, environment, None)
+        folders, folders_changed = self._read_observed_folders()
+        return environment, folders, changed or folders_changed
+
+    def _read_observed_folders(self) -> tuple[tuple[ImportFolder, ...] | None, bool]:
+        record = self._saved_record()
+        folders = collect_import_folders(self.shoko)
+        return folders, self._observe_setup_facts(record, None, folders)
+
+    def _observe_setup_facts(
+        self,
+        record: OnboardingRecord | None,
+        environment: _SetupEnvironment | None,
+        folders: tuple[ImportFolder, ...] | None,
+        *,
+        complete_folder_ids: bool = True,
+    ) -> bool:
+        """One observation policy for runtime and dashboard, against saved consent only."""
+        if record is None:
+            return False
+        reason: str | None = None
+        if environment is None:
+            if (
+                record.binding.selected_folders_observation is None
+                or self._observed_folders_changed(
+                    record.binding, folders, complete_ids=complete_folder_ids
+                )
+            ):
+                reason = "setup_changed"
+        else:
+            compatibility, scope, raw = environment
+            assessment = evaluate_service_safety(raw, record.binding.path_mappings, {})
+            if assessment.unsafe_settings:
+                reason = "unsafe_shoko_settings"
+            elif self._observed_setup_changed(record.binding, compatibility, scope, assessment):
+                reason = "setup_changed"
+        if reason is None:
+            return False
+        # I/O has completed. The atomic transition checks the full approved consent,
+        # so a late worker cannot invalidate a newer confirmation on another controller.
+        with open_state(self.state_path) as store:
+            self.onboarding(store).observe_review(record, reason, iso=datetime.now(UTC).isoformat())
+        return True
+
     def _saved_record(self) -> OnboardingRecord | None:
         try:
             with open_state(self.state_path) as store:
@@ -156,71 +237,47 @@ class ServiceSetupController:
             return None
         return record
 
-    def current_context(self, store: StateStore) -> tuple[ScopeBinding, SafetyAssessment] | None:
+    def current_context(self, store: StateStore) -> OnboardingContext | None:
         """Return current non-secret authorization facts only for a still-present scope."""
         try:
             if configured_bootstrap(self.bootstrap) != self.bootstrap:
                 return None
-            record = self.onboarding(store).record()
-            if record is None:
+            consent_json = store.get_onboarding_json()
+            if consent_json is None:
                 return None
-            compatibility, scope, assessment = self._environment()
-            if assessment.status is SafetyStatus.UNSAFE:
-                self.onboarding(store).evaluate(
-                    record.binding, assessment, iso=datetime.now(UTC).isoformat()
+            record = OnboardingRecord.from_json(consent_json)
+            environment, folders, changed = self._observed_environment(record)
+            compatibility, scope, assessment = environment
+            if changed or store.get_onboarding_json() != consent_json:
+                return None
+            unknown_settings_changed = any(
+                not any(
+                    fact == name or fact.startswith(f"{name} ") for fact in record.confirmed_facts
                 )
-                return None
+                for name in assessment.unknown_settings
+            )
             pause_reason: str | None = None
-            pause_message = ""
+            folders_unavailable = folders is None or any(
+                not folder.path_usable or folder.drop_folder_type == "Unknown" for folder in folders
+            )
+            assessment = evaluate_service_safety(
+                assessment,
+                record.binding.path_mappings,
+                {folder.id: folder for folder in folders or ()},
+            )
             if (
                 scope.read_status is not ScopeReadStatus.COMPLETE
                 or compatibility.sonarr_version is None
                 or compatibility.shoko_version is None
-                or (
-                    assessment.status is SafetyStatus.UNKNOWN
-                    and assessment.digest != record.binding.safety_digest
-                )
+                or folders_unavailable
+                or (assessment.status is SafetyStatus.UNKNOWN and unknown_settings_changed)
             ):
                 pause_reason = "setup_unavailable"
-                pause_message = (
-                    "Current setup checks could not be completed. Automatic linking is paused "
-                    "until the Sonarr and Shoko checks recover."
-                )
-            elif not compatibility.compatible or not set(record.binding.roots) <= {
-                candidate.path for candidate in scope.candidates
-            }:
+            elif not compatibility.compatible or assessment.status is SafetyStatus.UNSAFE:
                 pause_reason = "setup_changed"
-                pause_message = (
-                    "Current services or anime scope need review before automatic linking."
-                )
-            else:
-                folders = collect_import_folders(self.shoko)
-                if folders is None or any(
-                    not folder.path_usable or folder.drop_folder_type == "Unknown"
-                    for folder in folders
-                ):
-                    pause_reason = "setup_unavailable"
-                    pause_message = (
-                        "Current Shoko import folders could not be completely verified. Automatic "
-                        "linking is paused until the folder check recovers."
-                    )
-                else:
-                    safe_targets = {
-                        folder.path
-                        for folder in folders
-                        if folder.path_usable and folder.drop_folder_type == DROP_TYPE_NONE
-                    }
-                    if (
-                        not {mapping.shoko for mapping in record.binding.path_mappings}
-                        <= safe_targets
-                    ):
-                        pause_reason = "setup_changed"
-                        pause_message = (
-                            "Shoko import folders changed. Review setup before automatic linking."
-                        )
             if pause_reason is not None:
-                self.onboarding(store).pause_for_review(
-                    pause_reason, pause_message, iso=datetime.now(UTC).isoformat()
+                store.pause_onboarding_if_current(
+                    consent_json, pause_reason, datetime.now(UTC).isoformat()
                 )
                 return None
             assert compatibility.sonarr_version is not None
@@ -232,12 +289,91 @@ class ServiceSetupController:
                 sonarr_version=compatibility.sonarr_version,
                 shoko_version=compatibility.shoko_version,
                 capabilities=compatibility.capabilities,
+                settings_observation=tuple(assessment.observed_settings.items()),
+                selected_folders_observation=selected_service_folders(
+                    record.binding.path_mappings, {folder.id: folder for folder in folders or ()}
+                ),
                 safety_digest=assessment.digest,
                 unverifiable_facts=assessment.unverifiable_facts,
             )
-            return binding, assessment
+            return OnboardingContext(binding, assessment, consent_json)
         except (OnboardingError, OSError, PathError, StateError, ValueError):
             return None
+
+    @staticmethod
+    def _observed_setup_changed(
+        binding: ScopeBinding,
+        compatibility: ApiCompatibility,
+        scope: AnimeScopeDiscovery,
+        assessment: SafetyAssessment,
+    ) -> bool:
+        """Detect consent drift from known facts, independently of other API outages."""
+        if binding.settings_observation is None or binding.selected_folders_observation is None:
+            # Older consent lacks the independent baseline required for partial reads.
+            return True
+        previous = dict(binding.settings_observation)
+        settings_changed = any(
+            value is not None and value != previous[name]
+            for name, value in assessment.observed_settings.items()
+        )
+        return (
+            settings_changed
+            or (
+                compatibility.sonarr_version is not None
+                and compatibility.sonarr_version != binding.sonarr_version
+            )
+            or (
+                compatibility.shoko_version is not None
+                and compatibility.shoko_version != binding.shoko_version
+            )
+            or (
+                compatibility.compatible
+                and tuple(sorted(set(compatibility.capabilities))) != binding.capabilities
+            )
+            or (
+                scope.read_status is ScopeReadStatus.COMPLETE
+                and not set(binding.roots) <= {candidate.path for candidate in scope.candidates}
+            )
+        )
+
+    @staticmethod
+    def _observed_folders_changed(
+        binding: ScopeBinding,
+        folders: tuple[ImportFolder, ...] | None,
+        *,
+        complete_ids: bool = True,
+    ) -> bool:
+        """Compare positive folder facts; None means even the ID list is unavailable."""
+        if folders is None:
+            return False
+        assert binding.selected_folders_observation is not None
+        current = {folder.id: folder for folder in folders}
+        for folder_id, path, drop_type in binding.selected_folders_observation:
+            for mapping in binding.path_mappings:
+                if not is_within_root(mapping.shoko, path):
+                    continue
+                if any(
+                    other.id != folder_id
+                    and other.path_usable
+                    and (
+                        is_within_root(mapping.shoko, normalize_posix(other.path))
+                        or is_within_root(normalize_posix(other.path), mapping.shoko)
+                    )
+                    for other in folders
+                ):
+                    return True
+            folder = current.get(folder_id)
+            # Missing IDs prove removal only for a complete list. Known overlapping
+            # owners above remain evidence even when the approved row is unavailable.
+            if folder is None:
+                if complete_ids:
+                    return True
+                continue
+            if folder.path_usable and normalize_posix(folder.path) != path:
+                return True
+            if folder.drop_folder_type in VALID_DROP_TYPES and folder.drop_folder_type != drop_type:
+                return True
+        return False
 
     def _inventory(
         self, roots: tuple[str, ...]
@@ -265,7 +401,10 @@ class ServiceSetupController:
         return inventory, discovery, mapping
 
     def _mapping_state(
-        self, compatibility: ApiCompatibility, roots: tuple[str, ...], scope: AnimeScopeDiscovery
+        self,
+        compatibility: ApiCompatibility,
+        roots: tuple[str, ...],
+        scope: AnimeScopeDiscovery,
     ) -> tuple[
         SonarrInventory | None,
         ShokoDiscovery | None,
@@ -283,7 +422,7 @@ class ServiceSetupController:
                 and time.monotonic() - cached[0] < SETUP_INVENTORY_CACHE_SECONDS
                 and cached[1:4] == (roots, compatibility, scope)
             ):
-                current_folders = collect_import_folders(self.shoko)
+                current_folders, _changed = self._read_observed_folders()
                 if current_folders is None:
                     return None, None, None, (), False, ()
                 if {folder.id: folder for folder in current_folders} != cached[4][1].folders:
@@ -291,7 +430,14 @@ class ServiceSetupController:
             else:
                 cached = None
             if cached is None:
+                record = self._saved_record()
                 inventory, discovery, path_result = self._inventory(roots)
+                self._observe_setup_facts(
+                    record,
+                    None,
+                    tuple(discovery.folders.values()),
+                    complete_folder_ids=discovery.verdict.complete,
+                )
                 if inventory.verdict.complete and discovery.verdict.complete:
                     self._inventory_cache = (
                         time.monotonic(),
@@ -455,15 +601,15 @@ class ServiceSetupController:
         DashboardSetupView | None,
         tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment],
     ]:
-        compatibility, scope, assessment = self._environment()
-        environment = (compatibility, scope, assessment)
+        saved_record = self._saved_record()
+        environment, _folders, _changed = self._observed_environment(saved_record)
+        compatibility, scope, assessment = environment
         if configured_bootstrap(self.bootstrap) != self.bootstrap:
             return DashboardSetupView(
                 "Restart the container to use the saved connection URLs, then review setup.",
                 (),
                 confirmation_enabled=False,
             ), environment
-        saved_record = self._saved_record()
         with open_state(self.state_path) as store:
             encoded_draft = store.get_meta(DRAFT_ROOTS_META)
         draft_roots: tuple[str, ...] = ()
@@ -494,7 +640,17 @@ class ServiceSetupController:
         )
         current_mappings = mappings or inferred
         safe_shoko_roots = self._safe_roots(discovery)
-        required = tuple(sorted((*assessment.unknown_settings, *assessment.unverifiable_facts)))
+        candidate_options = mapping_options
+        mapping_options = tuple(
+            (source, target)
+            for source, target in candidate_options
+            if evaluate_service_safety(
+                assessment,
+                (PathMapping(source, target),),
+                {} if discovery is None else discovery.folders,
+            ).status
+            is not SafetyStatus.UNSAFE
+        )
         has_complete_inventory = (
             inventory is not None
             and inventory.verdict.complete
@@ -516,6 +672,13 @@ class ServiceSetupController:
         if mappings_verified:
             mapping_required = False
             mapping_options = ()
+        assessment = _preview_safety(
+            assessment,
+            current_mappings,
+            mapping_options or candidate_options,
+            {} if discovery is None else discovery.folders,
+        )
+        required = tuple(sorted((*assessment.unknown_settings, *assessment.unverifiable_facts)))
         confirmation_enabled = (
             compatibility.compatible
             and scope.read_status is ScopeReadStatus.COMPLETE
@@ -542,6 +705,10 @@ class ServiceSetupController:
                 capabilities=compatibility.capabilities,
                 roots=roots,
                 path_mappings=current_mappings,
+                settings_observation=tuple(assessment.observed_settings.items()),
+                selected_folders_observation=selected_service_folders(
+                    current_mappings, {} if discovery is None else discovery.folders
+                ),
                 safety_digest=assessment.digest,
                 unverifiable_facts=assessment.unverifiable_facts,
             )
@@ -609,7 +776,9 @@ class ServiceSetupController:
         if view is None or environment is None:
             raise ValueError("Refresh setup before choosing an anime folder.")
         shown_compatibility, shown_scope, shown_assessment = environment
-        compatibility, scope, _assessment = self._environment()
+        record = self._saved_record()
+        current_environment, _folders, _changed = self._observed_environment(record)
+        compatibility, scope, _assessment = current_environment
         if scope.read_status is not ScopeReadStatus.COMPLETE:
             raise ValueError(
                 "The current Sonarr anime scope check is incomplete or unavailable. Wait for it "
@@ -672,7 +841,9 @@ class ServiceSetupController:
         if environment is None:
             raise ValueError("Refresh setup before confirming the selected scope.")
         shown_compatibility, shown_scope, shown_assessment = environment
-        compatibility, scope, assessment = self._environment()
+        record = self._saved_record()
+        current_environment, folders, _changed = self._observed_environment(record)
+        compatibility, scope, assessment = current_environment
         roots = view.selected_roots
         if selected_roots and tuple(sorted(selected_roots)) != roots:
             raise ValueError(
@@ -702,8 +873,6 @@ class ServiceSetupController:
             raise ValueError(
                 "Current scope or safety changed. Review refreshed setup before confirming."
             )
-        if assessment.status is SafetyStatus.UNSAFE:
-            raise ValueError("Unsafe Shoko settings must be fixed before setup confirmation.")
         if not set(roots) <= {candidate.path for candidate in scope.candidates}:
             raise ValueError("The selected Sonarr anime folder is no longer available.")
         mappings: tuple[PathMapping, ...]
@@ -728,6 +897,22 @@ class ServiceSetupController:
             mappings = validate_mappings(
                 tuple(PathMapping(source, target) for source, target in view.inferred_mappings)
             )
+        if folders is None:
+            raise ValueError("The selected Shoko folder is no longer a safe import target.")
+        folder_context = {folder.id: folder for folder in folders}
+        preview = _preview_safety(
+            assessment,
+            () if view.mapping_required else mappings,
+            view.mapping_options,
+            folder_context,
+        )
+        if _setup_snapshot_digest(view, compatibility, scope, preview) != view.snapshot_digest:
+            raise ValueError(
+                "Current folder scope or safety changed. Review refreshed setup before confirming."
+            )
+        assessment = evaluate_service_safety(assessment, mappings, folder_context)
+        if assessment.status is SafetyStatus.UNSAFE:
+            raise ValueError(assessment.message)
         required = tuple(sorted((*assessment.unknown_settings, *assessment.unverifiable_facts)))
         if required != view.required_confirmations:
             raise ValueError(
@@ -742,20 +927,6 @@ class ServiceSetupController:
             raise ValueError("Review and confirm every listed safety fact before continuing.")
         if form.get("automatic_link_consent") != "1":
             raise ValueError("Explicit consent to automatic linking is required.")
-        folders = collect_import_folders(self.shoko)
-        safe_targets = {
-            folder.path
-            for folder in folders or ()
-            if folder.path_usable and folder.drop_folder_type == DROP_TYPE_NONE
-        }
-        if (
-            folders is None
-            or any(
-                not folder.path_usable or folder.drop_folder_type == "Unknown" for folder in folders
-            )
-            or not {mapping.shoko for mapping in mappings} <= safe_targets
-        ):
-            raise ValueError("The selected Shoko folder is no longer a safe import target.")
         if (
             not compatibility.compatible
             or compatibility.sonarr_version is None
@@ -770,6 +941,8 @@ class ServiceSetupController:
             capabilities=compatibility.capabilities,
             roots=roots,
             path_mappings=mappings,
+            settings_observation=tuple(assessment.observed_settings.items()),
+            selected_folders_observation=selected_service_folders(mappings, folder_context),
             safety_digest=assessment.digest,
             unverifiable_facts=assessment.unverifiable_facts,
         )

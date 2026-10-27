@@ -188,6 +188,14 @@ else:
 
 _O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
+META_ONBOARDING_RECONFIRMATION_REQUIRED: Final[str] = "onboarding_reconfirmation_required"
+META_SERVICE_SETTINGS: Final[str] = "normal_service_settings_v1"
+SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
+    {"setup_changed", "setup_unavailable", "unsafe_shoko_settings"}
+)
+SYSTEM_RECONFIRMATION_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
+    {"setup_changed", "unsafe_shoko_settings"}
+)
 SCHEMA_VERSION: Final[int] = 7
 MAPPING_RESOLVED_ID_COUNT: Final[int] = 2  # AniDB episode ID, Shoko episode ID
 META_MAPPING_TARGET_QUARANTINE_PREFIX: Final[str] = "file_mapping_quarantine:v1:"
@@ -2630,6 +2638,29 @@ class StateStore:
 
     # ---------------------------------------------------------- onboarding
 
+    @_mutation
+    def save_service_settings_if_current(
+        self,
+        expected_json: str | None,
+        document_json: str,
+        *,
+        connection_changed: bool,
+        iso: str,
+    ) -> bool:
+        """Publish validated preferences and their connection review hold atomically.
+
+        The controller supplies the exact raw snapshot used to validate the form,
+        including None when runtime defaults supplied the initial preferences.
+        """
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            if self.get_meta(META_SERVICE_SETTINGS) != expected_json:
+                return False
+            if connection_changed:
+                self._pause_service_for_review_tx("setup_changed", iso)
+            self._set_meta_tx(META_SERVICE_SETTINGS, document_json)
+        return True
+
     def get_dashboard_account(self) -> DashboardAccount | None:
         row = self._conn.execute(
             "SELECT username, password_hash, signing_key, created_iso"
@@ -3105,6 +3136,30 @@ class StateStore:
     @_mutation
     def save_onboarding_json(self, document_json: str, iso: str) -> None:
         """Persist a JSON object containing onboarding facts, never API-key values."""
+        with self._transaction():
+            self._save_onboarding_json_tx(document_json, iso)
+
+    @_mutation
+    def confirm_onboarding_json(self, document_json: str, iso: str) -> None:
+        """Publish validated consent and release its previous review hold atomically.
+
+        Only the onboarding manager calls this after validating explicit confirmation.
+        A review of the new consent can commit afterwards and must remain effective.
+        Read pause ownership under the writer lock so an existing user pause survives.
+        """
+        with self._transaction():
+            self._save_onboarding_json_tx(document_json, iso)
+            self._conn.execute(
+                "DELETE FROM meta WHERE key = ?", (META_ONBOARDING_RECONFIRMATION_REQUIRED,)
+            )
+            self._conn.execute(
+                "UPDATE onboarding SET paused = 0, pause_reason = '' WHERE singleton = 1"
+                " AND paused = 1 AND pause_reason IN"
+                " ('setup_changed', 'setup_unavailable', 'unsafe_shoko_settings')"
+            )
+
+    def _save_onboarding_json_tx(self, document_json: str, iso: str) -> None:
+        """Validate and save the document while the caller holds its write transaction."""
         if not isinstance(document_json, str) or len(document_json) > MAX_ONBOARDING_JSON_CHARS:
             raise StateError("onboarding document must be bounded JSON text")
         _require_iso(iso, "onboarding.updated_iso")
@@ -3114,13 +3169,89 @@ class StateStore:
             raise StateError("onboarding document must be a JSON object") from None
         if not isinstance(document, dict):
             raise StateError("onboarding document must be a JSON object")
+        self._conn.execute(
+            "INSERT INTO onboarding (singleton, document_json, updated_iso)"
+            " VALUES (1, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
+            " document_json = excluded.document_json, updated_iso = excluded.updated_iso",
+            (document_json, iso),
+        )
+
+    @_mutation
+    def pause_onboarding_if_current(
+        self, expected_document_json: str | None, reason: str, iso: str
+    ) -> bool:
+        """Atomically hold only the consent that preceded a read-only observation."""
+        if reason not in SYSTEM_PAUSE_REASONS:
+            raise StateError("unsupported observed onboarding review reason")
+        _require_iso(iso, "onboarding.updated_iso")
         with self._transaction():
-            self._conn.execute(
-                "INSERT INTO onboarding (singleton, document_json, updated_iso)"
-                " VALUES (1, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
-                " document_json = excluded.document_json, updated_iso = excluded.updated_iso",
-                (document_json, iso),
-            )
+            row = self._conn.execute(
+                "SELECT document_json FROM onboarding WHERE singleton = 1"
+            ).fetchone()
+            if (None if row is None else row[0]) != expected_document_json:
+                return False
+            self._pause_service_for_review_tx(reason, iso)
+        return True
+
+    @_mutation
+    def pause_service_for_review(self, reason: str, iso: str) -> None:
+        """Latch a system hold without replacing an intentional user pause."""
+        if reason not in SYSTEM_PAUSE_REASONS:
+            raise StateError("unsupported automatic-service review pause reason")
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            self._pause_service_for_review_tx(reason, iso)
+
+    def _pause_service_for_review_tx(self, reason: str, iso: str) -> None:
+        """Apply system-pause precedence under the caller's writer transaction."""
+        paused, existing_reason = self.get_service_pause()
+        hard_hold = reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
+        existing_hard_hold = (
+            paused and existing_reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
+        ) or self.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None
+        if hard_hold or existing_hard_hold:
+            self._set_meta_tx(META_ONBOARDING_RECONFIRMATION_REQUIRED, "1")
+        if (
+            (paused and existing_reason == "user_paused")
+            or (not hard_hold and existing_hard_hold)
+            or (paused and existing_reason == "unsafe_shoko_settings")
+        ):
+            return
+        self._conn.execute(
+            "INSERT INTO onboarding (singleton, document_json, paused, pause_reason, updated_iso)"
+            " VALUES (1, NULL, 1, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
+            " paused = 1, pause_reason = excluded.pause_reason, updated_iso = excluded.updated_iso",
+            (reason, iso),
+        )
+
+    @_mutation
+    def pause_service_for_user(self, iso: str) -> None:
+        """Pause explicitly and preserve only a currently effective hard hold.
+
+        Read legacy pause reasons under the writer lock, so fresh confirmation
+        cannot clear a hold between its observation and migration to metadata.
+        """
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            paused, reason = self.get_service_pause()
+            if paused and reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS:
+                self._set_meta_tx(META_ONBOARDING_RECONFIRMATION_REQUIRED, "1")
+            self._set_service_pause_tx(True, "user_paused", iso)
+
+    @_mutation
+    def resume_onboarding_if_current(self, expected_document_json: str, iso: str) -> bool:
+        """Resume validated consent only if it still has no hard safety hold."""
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            if self.get_onboarding_json() != expected_document_json:
+                return False
+            paused, reason = self.get_service_pause()
+            if self.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None or (
+                paused and reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
+            ):
+                return False
+            self._set_service_pause_tx(False, "", iso)
+        return True
 
     def get_service_pause(self) -> tuple[bool, str]:
         """Return the durable normal-service pause flag and reason; absent state is unpaused."""
@@ -3147,14 +3278,18 @@ class StateStore:
             raise StateError("onboarding.pause_reason: a resumed service must clear the reason")
         _require_iso(iso, "onboarding.updated_iso")
         with self._transaction():
-            self._conn.execute(
-                "INSERT INTO onboarding (singleton, document_json, paused, pause_reason,"
-                " updated_iso)"
-                " VALUES (1, NULL, ?, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
-                " paused = excluded.paused, pause_reason = excluded.pause_reason,"
-                " updated_iso = excluded.updated_iso",
-                (int(paused), _clip(reason), iso),
-            )
+            self._set_service_pause_tx(paused, reason, iso)
+
+    def _set_service_pause_tx(self, paused: bool, reason: str, iso: str) -> None:
+        """Write pause state under the caller's writer transaction."""
+        self._conn.execute(
+            "INSERT INTO onboarding (singleton, document_json, paused, pause_reason,"
+            " updated_iso)"
+            " VALUES (1, NULL, ?, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
+            " paused = excluded.paused, pause_reason = excluded.pause_reason,"
+            " updated_iso = excluded.updated_iso",
+            (int(paused), _clip(reason), iso),
+        )
 
     def disable_writes(self, reason: str) -> None:
         """Stop writes (fail closed). Persistence is best-effort; the in-memory stop is
