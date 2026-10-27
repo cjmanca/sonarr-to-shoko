@@ -78,6 +78,7 @@ class DashboardStatus:
     excluded_files: int = 0
     scope_excluded_files: int = 0
     exclusion_counts: tuple[tuple[str, int], ...] = ()
+    worker_activity: str = ""
 
 
 @dataclass(frozen=True)
@@ -486,7 +487,7 @@ class DashboardApplication:
                     self.status_provider(),
                     next_csrf,
                     paused=store.get_service_pause()[0],
-                    next_action=message,
+                    acknowledgement=message,
                     setup=None if self.setup_provider is None else self.setup_provider(),
                     settings=self.settings_provider(),
                 ),
@@ -506,7 +507,7 @@ class DashboardApplication:
                     self.status_provider(),
                     next_csrf,
                     paused=store.get_service_pause()[0],
-                    next_action=message,
+                    acknowledgement=message,
                     setup=setup,
                 ),
                 set_cookie=cookie,
@@ -662,6 +663,7 @@ class DashboardApplication:
         *,
         paused: bool,
         next_action: str | None = None,
+        acknowledgement: str = "",
         setup: DashboardSetupView | None = None,
         settings: DashboardSettingsView | None = None,
     ) -> str:
@@ -696,7 +698,9 @@ class DashboardApplication:
             '<nav class="section-nav" aria-label="Dashboard navigation">'
             f'<a href="/status"{" aria-current=\"page\"" if not settings else ""}>Overview</a>'
             f'<a href="/settings"{" aria-current=\"page\"" if settings else ""}>Settings</a></nav>'
-            + (f'<p role="status">{html.escape(next_action)}</p>' if next_action else "")
+            + '<div data-live="acknowledgement" role="status">'
+            + (f"<p>{html.escape(acknowledgement)}</p>" if acknowledgement else "")
+            + "</div>"
             + (DashboardApplication._settings_section(settings, csrf_token) if settings else "")
             + '<p id="update-status" role="status" hidden></p>'
             '<div data-live="setup">'
@@ -713,7 +717,13 @@ class DashboardApplication:
             '<section class="panel"><div class="eyebrow">Service health</div>'
             "<h2>Connections &amp; mappings</h2>"
             f'<p class="connection-message">{html.escape(status.connection_message)}</p>'
-            '<dl class="facts"><div><dt>Episode mappings</dt>'
+            + (
+                '<p class="worker-activity" role="status">'
+                f"{html.escape(status.worker_activity)}</p>"
+                if status.worker_activity
+                else ""
+            )
+            + '<dl class="facts"><div><dt>Episode mappings</dt>'
             f"<dd>{html.escape(status.mapping_cache_status)}</dd></div>"
             f"<div><dt>Latest cycle exclusions</dt><dd>{status.excluded_files}</dd></div>"
             f"<div><dt>Excluded outside scope</dt><dd>{status.scope_excluded_files}</dd></div>"

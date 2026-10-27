@@ -8010,3 +8010,60 @@ def test_drain_grant_keeps_earlier_uncertain_send_outstanding(
         campaign = store.get_campaign(campaign_id)
         assert campaign is not None
         assert campaign.drain_authorized_iso is None
+
+
+@pytest.mark.parametrize("pending_targets", [False, True], ids=["resolved-plan", "pending-plan"])
+def test_owner_quarantine_blocks_frozen_campaign_targets_after_restart_and_repair(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    pending_targets: bool,
+) -> None:
+    candidate = specs(COUNT_ONE)[0]
+    if pending_targets:
+        env.stubs.pending.add(candidate.shoko_id)
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    original = _source_xml()
+    fenced = original.replace(b";1-1;", b";40-75+0;").replace(
+        b"</anime-list>",
+        b"<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='1'/></anime-list>",
+    )
+    for body in (fenced, original):
+        env.stubs.source_xml = body
+        mapping_store = MappingStore(env.tmp_path / "mappings")
+        client = httpx.Client(
+            base_url="https://raw.githubusercontent.com/",
+            transport=httpx.MockTransport(
+                lambda request, body=body: httpx.Response(
+                    200,
+                    headers={"ETag": '"owner-fence"'},
+                    stream=httpx.ByteStream(body),
+                    request=request,
+                )
+            ),
+            follow_redirects=False,
+            timeout=httpx.Timeout(5.0),
+        )
+        endpoint = ApiEndpoint(client, lambda: {"Accept-Encoding": "identity"})
+        try:
+            outcome = mapping_refresh(
+                mapping_store,
+                endpoint,
+                now=datetime.fromisoformat(T0),
+                force=True,
+            )
+            assert outcome is RefreshOutcome.ACTIVATED
+        finally:
+            client.close()
+        result = apply(env, capsys)
+        assert result["payload"]["submitted"] == 0
+        store = env.open_store()
+        try:
+            record = store.get_file(candidate.shoko_id)
+            assert record is not None
+            assert record.state is FileState.BLOCKED_SAFETY
+            assert "mapping_target_drift" in record.state_detail
+        finally:
+            store.close()
+        assert not env.stubs.posts

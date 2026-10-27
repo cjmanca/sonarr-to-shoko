@@ -979,8 +979,10 @@ class MappingStore:
             meta = _meta_from_document(cast("dict[str, Any]", meta_document))
             body = files[0].read_bytes()
             parsed = parse_anime_lists(body)
-            if parsed.invalid_entries:
-                raise MappingError("active generation contains malformed Anime-Lists entries")
+            if not parsed.activation_eligible:
+                raise MappingError(
+                    "active generation contains non-isolatable or unusable Anime-Lists data"
+                )
             index = build_mapping_index(parsed, overrides)
         except (OSError, ValueError, ConfigError, MappingError):
             return None
@@ -1160,8 +1162,10 @@ class MappingStore:
             return
         try:
             parsed = parse_anime_lists(body)
-            if parsed.invalid_entries:
-                raise MappingError("legacy generation contains malformed Anime-Lists entries")
+            if not parsed.activation_eligible:
+                raise MappingError(
+                    "legacy generation contains non-isolatable or unusable Anime-Lists data"
+                )
             upstream_index = build_mapping_index(parsed)
             index = build_mapping_index(parsed, overrides)
         except (MappingError, ConfigError):
@@ -1249,7 +1253,7 @@ class MappingStore:
             parsed = parse_anime_lists(body)
         except (MappingError, ConfigError):
             return False
-        return parsed.invalid_entries == 0
+        return parsed.activation_eligible
 
     def _state_matches_active(self, state: _State) -> bool:
         meta = self._load_meta()
@@ -1928,7 +1932,7 @@ def _parse_accepted_index(
     try:
         overrides = load_overrides(overrides_text) if overrides_text is not None else None
         parsed = parse_anime_lists(body)
-        if parsed.invalid_entries:
+        if not parsed.activation_eligible:
             return None
         return build_mapping_index(parsed, overrides)
     except (MappingError, ConfigError):
@@ -2037,9 +2041,11 @@ def refresh(
     ``NOT_DUE`` with zero requests. On a 200 the body is size-capped, parsed, indexed
     (with ``overrides_text`` applied) and digest-compared **before** atomic activation;
     :class:`~shoko_linker.mappings.MappingError` or
-    :class:`~shoko_linker.config.ConfigError` from overrides/parsing, or any malformed semantic
-    entry, are ``FAILED_INVALID`` with the cache untouched. The documented unsupported
-    absolute-season+episodeoffset case is retained only as an ownership fence. ``ACTIVATED``
+    :class:`~shoko_linker.config.ConfigError` from overrides/parsing, or non-isolatable malformed
+    data, are ``FAILED_INVALID`` with the cache untouched. Recognized row-local semantic
+    defects with fully validated owners are retained only as whole-series ownership fences;
+    document/schema/identity/resource defects and entirely unusable snapshots still reject.
+    ``ACTIVATED``
     requires a change of the effective target/structure digests (overrides and ownership fences
     are part of the digests: same bytes +
     different overrides is a new effective generation); validators and timing refresh on

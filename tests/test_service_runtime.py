@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -14,11 +17,19 @@ import test_daemon as td
 from shoko_linker import cli
 from shoko_linker.bootstrap import BootstrapSettings
 from shoko_linker.config import SecretRef, Settings, load_settings
-from shoko_linker.daemon import CycleCounts, CycleMode, CycleReport, DaemonDeps, run_cycle
+from shoko_linker.daemon import (
+    CycleCounts,
+    CycleMode,
+    CycleReport,
+    DaemonDeps,
+    run_cycle,
+    run_daemon,
+)
 from shoko_linker.dashboard import DashboardApplication
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.linking import SendOutcome, VerificationVerdict
-from shoko_linker.mapping_store import MappingStore
+from shoko_linker.mapping_store import MappingStore, RefreshOutcome
+from shoko_linker.mapping_store import status as mapping_status
 from shoko_linker.onboarding import OnboardingContext, OnboardingManager, ScopeBinding
 from shoko_linker.paths import PathMapping
 from shoko_linker.policies import RunPolicy
@@ -270,24 +281,267 @@ def test_completed_cycle_projects_waits_and_recovers_when_healthy(
         store.record_service_canary(500, td.T0)
 
     def complete_cycle(*_args: Any, **kwargs: Any) -> None:
+        assert runtime.status().worker_activity == "Checking queued files and verifying links."
         kwargs["on_cycle_complete"](report)
 
     monkeypatch.setattr(cli, "run_daemon", complete_cycle)
     try:
-        runtime._run_daemon_cycle(cast(DaemonDeps, object()), store, td.make_settings(tmp_path))
+        deps = cast(
+            DaemonDeps,
+            SimpleNamespace(mapping_store=MappingStore(tmp_path / "mappings"), overrides_text=None),
+        )
+        runtime._run_daemon_cycle(deps, store, td.make_settings(tmp_path))
         status = runtime.status()
         assert status.automatic_linking == (condition == "healthy")
+        assert status.worker_activity == ""
         if condition == "pending":
             assert "Waiting for the initial link" in status.next_action
             store.set_service_canary_status("verified", td.T1)
         elif condition != "healthy":
             assert "retry safely" in status.next_action
         report = replace(report, failed=False, writes_suppressed=False)
-        runtime._run_daemon_cycle(cast(DaemonDeps, object()), store, td.make_settings(tmp_path))
+        runtime._run_daemon_cycle(deps, store, td.make_settings(tmp_path))
         assert runtime.status().automatic_linking
-        assert "processing eligible files" in runtime.status().next_action
+        assert "next scheduled check" in runtime.status().next_action
     finally:
         endpoint.client.close()
+        store.close()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize(
+    ("failure", "reason", "wording", "invalid_body"),
+    [
+        (
+            RefreshOutcome.FAILED_INVALID,
+            "mapping_source_invalid",
+            "failed validation",
+            b"<secret-server-response",
+        ),
+        (
+            RefreshOutcome.FAILED_INVALID,
+            "mapping_source_invalid",
+            "failed validation",
+            b"<wrong-root/>",
+        ),
+        (
+            RefreshOutcome.FAILED_TRANSPORT,
+            "mapping_source_transport_failure",
+            "Could not download",
+            b"",
+        ),
+        (RefreshOutcome.FAILED_SIZE, "mapping_source_too_large", "safe size limit", b""),
+    ],
+)
+def test_mapping_download_failure_guidance_survives_backoff_and_clears_after_activation(  # noqa: PLR0915 - full refresh/status/retry integration
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+    failure: RefreshOutcome,
+    reason: str,
+    wording: str,
+    invalid_body: bytes,
+) -> None:
+    if cached:
+        td.activate_mapping(tmp_path, td.mapping_xml())
+    store = td.open_tmp_store(tmp_path)
+    td.seed_baseline(store, [])
+    deps = td.build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[],
+        shoko_files=[],
+        xml=td.mapping_xml(),
+        monotonic=lambda: 0.0,
+        advance=lambda _: None,
+        max_submissions=0,
+    )
+    requests: list[str] = []
+    recovered = False
+
+    def source(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if recovered:
+            return httpx.Response(
+                200, stream=httpx.ByteStream(td.mapping_xml().encode()), request=request
+            )
+        if failure is RefreshOutcome.FAILED_INVALID:
+            return httpx.Response(200, stream=httpx.ByteStream(invalid_body), request=request)
+        if failure is RefreshOutcome.FAILED_SIZE:
+            return httpx.Response(200, stream=httpx.ByteStream(b"x" * 10_000_001), request=request)
+        return httpx.Response(503, text="secret-server-response", request=request)
+
+    deps.mapping_source.client.close()
+    deps = replace(
+        deps,
+        mapping_source=td.source_endpoint(source),
+        service_mode=True,
+        service_authorized=lambda: True,
+    )
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        tmp_path / "state.sqlite3",
+    )
+    runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
+    reports: list[CycleReport] = []
+    real_daemon = run_daemon
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        completed = kwargs["on_cycle_complete"]
+
+        def record(report: CycleReport) -> None:
+            reports.append(report)
+            completed(report)
+
+        kwargs["on_cycle_complete"] = record
+        return real_daemon(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_daemon", capture)
+    now = td._parse(td._due_iso() if cached else td.T0)
+    try:
+        monkeypatch.setattr(cli, "current_iso", lambda: now.isoformat())
+        runtime._run_daemon_cycle(deps, store, deps.settings)
+        failed_status = runtime.status()
+        durable = mapping_status(deps.mapping_store, now)
+        assert durable.last_outcome is failure
+        assert durable.active_present is cached
+        assert wording in failed_status.mapping_cache_status
+        assert "Next mapping check:" in failed_status.mapping_cache_status
+        assert "secret-server-response" not in str(failed_status)
+        assert td.SOURCE_URL not in str(failed_status)
+        if not cached or failure is not RefreshOutcome.FAILED_SIZE:
+            assert reason in reports[-1].reasons
+            assert wording in failed_status.next_action
+            assert not failed_status.automatic_linking
+        if failure is not RefreshOutcome.FAILED_TRANSPORT:
+            assert "mapping_source_transport_failure" not in reports[-1].reasons
+            assert not reports[-1].failed
+        _, unrelated_action = runtime._operational_status(
+            store,
+            authorized=True,
+            next_action="Ready",
+            report=replace(
+                reports[-1],
+                writes_suppressed=True,
+                reasons=("shoko_snapshot_incomplete:transport_failure",),
+            ),
+            mapping_action=failed_status.mapping_cache_status,
+        )
+        assert "A service check needs attention" in unrelated_action
+        assert wording not in unrelated_action
+        call_count = len(requests)
+        now += timedelta(seconds=1)
+        runtime._run_daemon_cycle(deps, store, deps.settings)
+        assert reports[-1].mapping_outcome is RefreshOutcome.NOT_DUE
+        assert len(requests) == call_count
+        assert wording in runtime.status().mapping_cache_status
+        assert durable.next_due_iso is not None
+        expected_time = td._parse(durable.next_due_iso).strftime("%Y-%m-%d %H:%M:%S UTC")
+        assert expected_time in runtime.status().mapping_cache_status
+        assert all(report.counts.submitted == 0 for report in reports)
+        recovered = True
+        now = td._parse(durable.next_due_iso)
+        runtime._run_daemon_cycle(deps, store, deps.settings)
+        healthy = runtime.status()
+        assert reports[-1].mapping_outcome is (
+            RefreshOutcome.UNCHANGED if cached else RefreshOutcome.ACTIVATED
+        )
+        assert "Verified episode mappings are available" in healthy.mapping_cache_status
+        assert wording not in healthy.mapping_cache_status
+        assert healthy.automatic_linking
+        assert "next scheduled check" in healthy.next_action
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+def test_empty_mapping_cache_guidance_does_not_invent_download_activity(tmp_path: Path) -> None:
+    now = td._parse(td.T0)
+    view = mapping_status(MappingStore(tmp_path / "mappings"), now)
+    message = cli._NormalServiceRuntime._mapping_guidance(view, now)
+    assert "No verified episode mappings are cached yet" in message
+    assert "Linking will wait" in message
+    assert "will check again automatically" in message
+    assert "Downloading" not in message
+    assert "failed" not in message
+    assert view.source_url not in message
+
+
+@pytest.mark.parametrize("failure_stage", ["persist", "mapping_status", "guidance", "publish"])
+def test_swallowed_completion_failure_defers_status_and_next_real_cycle_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_stage: str,
+) -> None:
+    store = td.open_tmp_store(tmp_path)
+    td.seed_baseline(store, [])
+    shoko = td.ShokoStub([])
+    deps = td.build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=[],
+        shoko_files=[],
+        xml=td.mapping_xml(),
+        monotonic=lambda: 0.0,
+        advance=lambda _: None,
+        max_submissions=0,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        tmp_path / "state.sqlite3",
+    )
+    runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
+    monkeypatch.setattr(cli, "current_iso", lambda: td.T0)
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("mock completion failure")
+
+    update_latest = runtime._update_latest
+
+    def fail_final_publication(**changes: Any) -> None:
+        if "mapping_cache" in changes:
+            fail()
+        update_latest(**changes)
+
+    try:
+        with monkeypatch.context() as injection:
+            if failure_stage == "persist":
+                injection.setattr(cli, "persist_cycle_meta", fail)
+            elif failure_stage == "mapping_status":
+                injection.setattr(cli, "mapping_status", fail)
+            elif failure_stage == "guidance":
+                injection.setattr(runtime, "_mapping_guidance", fail)
+            else:
+                injection.setattr(runtime, "_update_latest", fail_final_publication)
+            # Use the real daemon: it logs and swallows completion callback errors.
+            runtime._run_daemon_cycle(deps, store, deps.settings)
+        assert "cycle completion callback failed" in caplog.text
+        failed = runtime.status()
+        assert not failed.automatic_linking
+        assert failed.worker_activity == ""
+        assert "retry safely" in failed.next_action
+        assert "running" not in failed.next_action
+        monkeypatch.setattr(cli, "current_iso", lambda: td.T1)
+        runtime._run_daemon_cycle(deps, store, deps.settings)
+        recovered = runtime.status()
+        assert recovered.automatic_linking
+        assert recovered.worker_activity == ""
+        assert "next scheduled check" in recovered.next_action
+        assert "Verified episode mappings are available" in recovered.mapping_cache_status
+        assert shoko.posts == []
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
         store.close()
 
 
@@ -948,3 +1202,142 @@ def test_real_service_authorization_callback_cannot_mask_current_non_anime_serie
     assert record.state.value == "conflict"
     assert quarantined
     assert "service_authorization_changed" not in report.reasons
+
+
+def _confirmed_activity_runtime(
+    tmp_path: Path,
+) -> tuple[cli._NormalServiceRuntime, ApiEndpoint, OnboardingContext]:
+    state_path = tmp_path / "state.sqlite3"
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        state_path,
+    )
+    endpoint = ApiEndpoint(httpx.Client(), lambda: {})
+    runtime = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+    assessment = assess_settings_payload({"FileQualityFilterEnabled": False})
+    binding = ScopeBinding(
+        td.SONARR_BASE,
+        td.SHOKO_BASE,
+        "4.0.0",
+        "5.3.3",
+        (),
+        (td.SONARR_ROOT,),
+        (PathMapping(td.SONARR_ROOT, td.SHOKO_ROOT),),
+        assessment.digest,
+        assessment.unverifiable_facts,
+    )
+    with open_state(state_path) as store:
+        OnboardingManager(store).confirm_setup(
+            binding,
+            assessment,
+            confirmed_facts=assessment.unverifiable_facts + assessment.unknown_settings,
+            automatic_link_consent=True,
+            iso=td.T0,
+        )
+        context = OnboardingContext(binding, assessment, store.get_onboarding_json() or "")
+    return runtime, endpoint, context
+
+
+@pytest.mark.parametrize("stage", ["connection", "context", "dependencies"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_worker_publishes_activity_before_blocking_checks_and_clears_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, failure: bool
+) -> None:
+    runtime, endpoint, approved_context = _confirmed_activity_runtime(tmp_path)
+    state_path = tmp_path / "state.sqlite3"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(5), "test did not release the worker"
+        if failure:
+            raise OSError("offline test failure")
+
+    def probe(*_args: Any) -> ConnectionReport:
+        if stage == "connection":
+            block()
+            return ConnectionReport(False, False, ("Cannot connect to Shoko.",))
+        return ConnectionReport(True, True, ())
+
+    def context(store: StateStore) -> OnboardingContext | None:
+        if stage == "context":
+            block()
+            return None
+        return approved_context
+
+    def dependencies(*_args: Any, **_kwargs: Any) -> DaemonDeps:
+        block()
+        # End the mock preparation without starting a daemon or making remote writes.
+        raise ValueError("mock preparation complete")
+
+    monkeypatch.setattr(cli, "configured_bootstrap", lambda _: runtime.settings)
+    monkeypatch.setattr(cli, "probe_connections", probe)
+    monkeypatch.setattr(runtime.setup, "current_context", context)
+    monkeypatch.setattr(cli, "open_mapping_store", lambda _: object())
+    monkeypatch.setattr(cli, "read_overrides_text", lambda _: None)
+    monkeypatch.setattr(cli, "build_daemon_deps", dependencies)
+    worker = threading.Thread(target=runtime.worker_tick)
+    worker.start()
+    try:
+        assert entered.wait(5), "worker did not reach the blocking stage"
+        status = runtime.status()
+        expected = {
+            "connection": "Checking Sonarr and Shoko connections.",
+            "context": "Checking the confirmed library, mappings and Shoko safety.",
+            "dependencies": "Preparing episode mappings and automatic processing.",
+        }[stage]
+        assert status.worker_activity == expected
+        assert status.next_action == expected
+        assert not status.automatic_linking
+        # A user pause remains actionable even while read-only checks finish.
+        with open_state(state_path) as store:
+            OnboardingManager(store).pause(iso=td.T1)
+        paused_status = runtime.status()
+        assert "Resume" in paused_status.next_action
+        assert not paused_status.automatic_linking
+        assert paused_status.worker_activity == expected
+    finally:
+        release.set()
+        worker.join(5)
+        endpoint.client.close()
+    assert not worker.is_alive()
+    assert runtime.status().worker_activity == ""
+    assert "Resume" in runtime.status().next_action
+    assert not runtime.status().automatic_linking
+    with open_state(state_path) as store:
+        assert store.get_service_pause() == (True, "user_paused")
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_cycle_exit_without_completion_never_leaves_active_processing_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    runtime, endpoint, _ = _confirmed_activity_runtime(tmp_path)
+
+    def interrupted(*_args: Any, **_kwargs: Any) -> None:
+        assert runtime.status().worker_activity == "Checking queued files and verifying links."
+        if failure:
+            raise OSError("mock interrupted cycle")
+
+    monkeypatch.setattr(cli, "run_daemon", interrupted)
+    try:
+        with open_state(tmp_path / "state.sqlite3") as store:
+            if failure:
+                with pytest.raises(OSError, match="mock interrupted"):
+                    runtime._run_daemon_cycle(
+                        cast(DaemonDeps, object()), store, td.make_settings(tmp_path)
+                    )
+            else:
+                runtime._run_daemon_cycle(
+                    cast(DaemonDeps, object()), store, td.make_settings(tmp_path)
+                )
+        status = runtime.status()
+        assert status.worker_activity == ""
+        assert not status.automatic_linking
+        assert "retry safely" in status.next_action
+    finally:
+        endpoint.client.close()

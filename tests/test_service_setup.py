@@ -970,6 +970,131 @@ def test_status_polling_reuses_inventory_until_folders_change_or_refresh_is_due(
         shoko.client.close()
 
 
+def test_confirmed_setup_stays_hidden_during_repeated_background_refreshes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, form, _environment, _folders, clock, sonarr, shoko = _ready_setup_form(
+        tmp_path, monkeypatch
+    )
+    compute = controller._compute_view
+    started = threading.Event()
+    release = threading.Event()
+    inventory = controller._inventory
+    reads = 0
+
+    def counted_inventory(
+        roots: tuple[str, ...],
+    ) -> tuple[SonarrInventory, ShokoDiscovery, PathMappingDiscovery]:
+        nonlocal reads
+        reads += 1
+        return inventory(roots)
+
+    def blocked_compute(
+        roots: tuple[str, ...], mappings: tuple[PathMapping, ...]
+    ) -> tuple[
+        DashboardSetupView | None, tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]
+    ]:
+        started.set()
+        assert release.wait(timeout=5)
+        return compute(roots, mappings)
+
+    monkeypatch.setattr(controller, "_inventory", counted_inventory)
+    monkeypatch.setattr(controller, "_compute_view", blocked_compute)
+    controller._inventory_cache = None
+    try:
+        assert controller.action("confirm", form).startswith("Setup saved.")
+        for _ in range(3):
+            started.clear()
+            release.clear()
+            assert controller.view() is None
+            assert started.wait(timeout=2)
+            worker = next(
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "shoko-linker-setup-discovery"
+            )
+            try:
+                for _poll in range(10):
+                    assert controller.view() is None
+            finally:
+                release.set()
+                worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert controller.view() is None
+            clock[0] += service_setup.SETUP_VIEW_CACHE_SECONDS + 1
+        assert reads == 1  # The inventory cache survives all three view-cache expirations.
+        # Explicit editing still opens discovery and choices rather than keeping them hidden.
+        controller.action("edit", {})
+        started.clear()
+        release.clear()
+        loading = controller.view()
+        assert loading is not None
+        assert loading.loading
+        assert started.wait(timeout=2)
+        worker = next(
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "shoko-linker-setup-discovery"
+        )
+        release.set()
+        worker.join(timeout=5)
+        choices = controller.view()
+        assert choices is not None
+        assert not choices.loading
+    finally:
+        release.set()
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("drift", ["version", "settings", "folder"])
+def test_hidden_setup_refresh_publishes_real_drift_and_keeps_reconfirmation_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    controller, form, environment, folders, clock, sonarr, shoko = _ready_setup_form(
+        tmp_path, monkeypatch
+    )
+    try:
+        assert controller.action("confirm", form).startswith("Setup saved.")
+        assert controller.refresh_view() is None
+        compatibility, scope, assessment = environment
+        if drift == "version":
+            compatibility = replace(compatibility, shoko_version="5.3.3.0")
+        elif drift == "settings":
+            assessment = assess_settings_payload({"FileQualityFilterEnabled": True})
+        else:
+            folders["value"] = ["/changed-anime"]
+        monkeypatch.setattr(controller, "_environment", lambda: (compatibility, scope, assessment))
+        finished = threading.Event()
+        refresh = controller._refresh_in_background
+
+        def tracked_refresh() -> None:
+            try:
+                refresh()
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(controller, "_refresh_in_background", tracked_refresh)
+        clock[0] += service_setup.SETUP_VIEW_CACHE_SECONDS + 1
+        assert controller.view() is None
+        assert finished.wait(timeout=5)
+        view = controller.view()
+        assert view is not None
+        assert not view.loading
+        with open_state(controller.state_path) as store:
+            assert controller.onboarding(store).reconfirmation_required()
+            assert store.get_service_pause()[0]
+        # Restoring the old facts must not erase the already observed safety change.
+        folders["value"] = [SHOKO_ROOT]
+        monkeypatch.setattr(controller, "_environment", lambda: environment)
+        assert controller.refresh_view() is not None
+        with open_state(controller.state_path) as store:
+            assert controller.onboarding(store).reconfirmation_required()
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
 def test_setup_controller_requires_explicit_scope_consent_and_all_unknown_safety_facts(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

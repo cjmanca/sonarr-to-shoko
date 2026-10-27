@@ -554,6 +554,10 @@ class ServiceSetupController:
                 worker.start()
             progress = self._progress_message
             percent = self._progress_percent
+            # Refreshing confirmed setup must not reopen onboarding. This is only
+            # presentation state: current_context still checks fresh safety facts.
+            if self._view_cache is not None and self._view_cache[1] is None:
+                return None
         return self._loading_view(progress, percent)
 
     def _refresh_in_background(self) -> None:
@@ -574,7 +578,6 @@ class ServiceSetupController:
                 with self._view_lock:
                     self._view_generation += 1
                     generation = self._view_generation
-                    self._view_cache = None
                     self._view_environment = None
                     self._progress_percent = 0
                     selected_roots = self._selected_roots
@@ -587,10 +590,12 @@ class ServiceSetupController:
                     self._view_cache = (time.monotonic(), view)
                     return view
 
-    def _invalidate_view(self) -> None:
+    def _invalidate_view(self, *, hide_setup: bool = False) -> None:
         with self._view_lock:
             self._view_generation += 1
-            self._view_cache = None
+            self._view_cache = (
+                (time.monotonic() - SETUP_VIEW_CACHE_SECONDS, None) if hide_setup else None
+            )
             self._view_environment = None
 
     def _compute_view(
@@ -754,6 +759,7 @@ class ServiceSetupController:
         return view, environment
 
     def action(self, action: str, form: Mapping[str, str]) -> str:
+        confirmed = False
         try:
             if action == "edit":
                 with self._view_lock:
@@ -764,11 +770,13 @@ class ServiceSetupController:
             if action == "scope":
                 return self._select_scope(form)
             if action == "confirm":
-                return self._confirm(form)
+                message = self._confirm(form)
+                confirmed = True
+                return message
         except (ConfigError, OnboardingError, OSError, PathError, StateError, ValueError) as exc:
             return f"Setup was not saved. {exc}"
         finally:
-            self._invalidate_view()
+            self._invalidate_view(hide_setup=confirmed)
         return "That setup action is not available."
 
     def _select_scope(self, form: Mapping[str, str]) -> str:

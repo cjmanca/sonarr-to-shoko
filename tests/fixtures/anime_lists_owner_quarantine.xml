@@ -1,0 +1,47 @@
+<!-- Minimal excerpts from Anime-Lists anime-list-full.xml SHA256
+29abeffcdbd9911c4b230a1565f841c5e2ed4b51b37273da9be83c502e744b89.
+Only the declarations requiring owner isolation are retained. -->
+<anime-list>
+  <anime anidbid="69" tvdbid="81797" defaulttvdbseason="a">
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="23" start="1156" offset="-1155" />
+    </mapping-list>
+  </anime>
+  <anime anidbid="266" tvdbid="72454" defaulttvdbseason="a">
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="34" start="1187" offset="-1186" />
+    </mapping-list>
+  </anime>
+  <anime anidbid="1091" tvdbid="82971" defaulttvdbseason="1">
+    <mapping-list>
+      <mapping anidbseason="2" tvdbseason="0">;1-0;2-0;</mapping>
+    </mapping-list>
+  </anime>
+  <anime anidbid="2737" tvdbid="82737" defaulttvdbseason="1">
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="1">;40-75+0;</mapping>
+    </mapping-list>
+  </anime>
+  <anime anidbid="3427" tvdbid="79880" defaulttvdbseason="1">
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0" offset="5">;1-30;6-34;7-35;8-31;</mapping>
+    </mapping-list>
+  </anime>
+  <anime anidbid="9304" tvdbid="262954" defaulttvdbseason="1">
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0" offset="7" />
+    </mapping-list>
+  </anime>
+  <anime anidbid="9980" tvdbid="114801" defaulttvdbseason="a" episodeoffset="175" />
+  <anime anidbid="12091" tvdbid="318893" defaulttvdbseason="1">
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0" offset="1">;1-1;</mapping>
+    </mapping-list>
+  </anime>
+  <anime anidbid="13295" tvdbid="114801" defaulttvdbseason="a" episodeoffset="277" />
+  <anime anidbid="14086" tvdbid="347734" defaulttvdbseason="a">
+    <mapping-list>
+      <mapping anidbseason="1" tvdbseason="6" start="49" offset="-48" />
+    </mapping-list>
+  </anime>
+</anime-list>

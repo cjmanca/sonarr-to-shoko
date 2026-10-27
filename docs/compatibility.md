@@ -384,6 +384,27 @@ README semantics and the pinned real-data examples below were rechecked against
   once), `tvdbseason`, `tmdbseason`, `start`, `end`, `offset`. Body: individual
   pairs ` ;anidbEp-tvdbEp; … ; `.
 
+### Provider and presentation metadata validation
+
+The [upstream README](https://github.com/Anime-Lists/anime-lists#format) identifies
+non-TVDB titles with AniDB type markers in `tvdbid`: `movie`, `hentai`, `OVA`/`ova`,
+`music video`, `tv special`, `web`, and `other`. These records need no
+`defaulttvdbseason` and produce no TVDB targets. They still participate in AniDB
+ownership/duplicate validation; unknown markers and malformed structures are rejected.
+The [full-list transform](https://github.com/Anime-Lists/anime-lists/blob/master/transforms/create-anime-list-full.xsl)
+removes empty attributes, so their absence is legitimate.
+
+`<before>;1-26;</before>` orders AniDB specials for presentation. It is validated
+as text-only positive episode pairs and never supplies TVDB identity translations.
+Nested `<mapping>` elements inside `<before>` are invalid.
+
+Mapping rules containing only `tmdbseason` are validated against their numeric
+`tmdbtv` owner and the provider's attribute/pair syntax, then omitted from the
+TVDB index. They cannot suppress TVDB entry offsets or absolute fallback, nor create
+TVDB targets. Their ignored offsets are never expanded; this does not implement
+open-ended TVDB offset semantics. Rules containing both provider seasons validate
+both seasons and retain only their TVDB meaning.
+
 ### Semantics (README verbatim, all orchestrator-quoted)
 
 - Offsets are **AniDB→TVDB additions**: `tvdb_ep = anidb_ep + offset` ⇒ reverse:
@@ -438,6 +459,33 @@ README semantics and the pinned real-data examples below were rechecked against
   either season; regular explicit 101–103 remain `Episode`, while season-0 explicit
   101–103 are fenced because their type is unverified. Credits/Parody are not
   expressible by Anime-Lists → not mappable targets.
+
+### Activating snapshots with isolated semantic defects
+
+The default public snapshot inspected during the setup investigation (SHA-256
+`29abeffcdbd9911c4b230a1565f841c5e2ed4b51b37273da9be83c502e744b89`)
+contains eight invalid rows: six TVDB mapping offsets without both range bounds,
+one unverified AniDB season 2 rule, and one contradictory `40-75+0` pair. Two
+additional rows use the already unsupported absolute-season plus entry-offset form.
+These declarations remain uninterpreted and retain their parser severity/counts.
+They must not prevent unrelated, verified series from becoming available.
+
+Activation uses explicit parser issue codes, never diagnostic-string matching. Only
+these recognized semantic defects with strictly positive, fully validated AniDB and
+TVDB owners may be isolated. The entire affected TVDB series is fenced, including
+otherwise valid sibling entries and operator override additions, before any fallback
+or override lookup. Fences affect generation digests, survive cache reload/restart,
+and enter the existing per-file/campaign mapping-drift checks. Previously frozen
+targets do not become writable merely because the source is later repaired.
+
+Malformed XML, unknown schema/attributes, missing or ambiguous ownership, duplicate
+AniDB identities, resource-limit failures, and snapshots with no unfenced usable
+entries still reject the whole update, preserve the last-known-good cache, and keep
+the invalid-source write hold and bounded retry behavior. A successful accepted
+activation is required to clear that hold. Minimal excerpts are in
+`tests/fixtures/anime_lists_owner_quarantine.xml`; the full public file is not vendored.
+This is offline public-source and mocked-transport evidence, not live Sonarr/Shoko
+validation.
 
 ### Real-data regression anchor (M4 gate)
 

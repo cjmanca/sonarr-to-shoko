@@ -115,7 +115,13 @@ from .dashboard import DashboardApplication, DashboardStatus, create_dashboard_s
 from .errors import ConfigError, HttpPolicyError, LinkerError, PolicyError
 from .http import ApiEndpoint, make_shoko_client, make_sonarr_client
 from .logging_setup import configure_logging, register_secret
-from .mapping_store import MappingStore, load_active, make_source_endpoint
+from .mapping_store import (
+    MappingStatus,
+    MappingStore,
+    RefreshOutcome,
+    load_active,
+    make_source_endpoint,
+)
 from .mapping_store import (
     refresh as mapping_refresh,
 )
@@ -909,6 +915,7 @@ class _NormalServiceRuntime:
             "authorized": False,
             "next_action": self._INITIAL_ACTION,
             "diagnostics": (),
+            "worker_activity": "",
             "mapping_cache": "Available after scope and safety setup is confirmed above.",
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
@@ -928,13 +935,18 @@ class _NormalServiceRuntime:
         authorized: bool,
         next_action: str,
         report: CycleReport | None = None,
+        mapping_action: str | None = None,
     ) -> tuple[bool, str]:
         """Project write availability separately from consent and cycle success."""
         paused, pause_reason = store.get_service_pause()
         if paused:
             # A current setup/connection decision is more useful than a generic pause.
             # Before the first check, derive guidance from the durable hold instead.
-            if authorized or next_action == _NormalServiceRuntime._INITIAL_ACTION:
+            if (
+                authorized
+                or next_action == _NormalServiceRuntime._INITIAL_ACTION
+                or pause_reason == "user_paused"
+            ):
                 if pause_reason == "unsafe_shoko_settings":
                     next_action = "Review and fix Shoko safety settings, then confirm setup again."
                 elif OnboardingManager(store).reconfirmation_required():
@@ -958,7 +970,13 @@ class _NormalServiceRuntime:
         if not authorized:
             return False, next_action
         if report is not None and (report.failed or report.writes_suppressed):
-            return False, "A service check needs attention; automatic linking will retry safely."
+            next_action = "A service check needs attention; automatic linking will retry safely."
+            if mapping_action is not None and any(
+                reason == "mapping_unavailable" or reason.startswith("mapping_source_")
+                for reason in report.reasons
+            ):
+                next_action = mapping_action
+            return False, next_action
         if canary is not None and canary[1] == "pending":
             authorized = False
             next_action = (
@@ -966,6 +984,45 @@ class _NormalServiceRuntime:
                 "The service will check again automatically."
             )
         return authorized, next_action
+
+    @staticmethod
+    def _mapping_guidance(status: MappingStatus, now: datetime) -> str:
+        """Render only validated status facts, never source URLs or server responses."""
+        retry = "The service will check again automatically."
+        if status.next_due_iso is not None:
+            due = datetime.fromisoformat(status.next_due_iso).astimezone(UTC)
+            if due > now:
+                retry = f"Next mapping check: {due.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+        retained = (
+            " Last verified mappings are retained."
+            if status.active_present
+            else " Linking waits for verified episode mappings."
+        )
+        if status.invalid_source_hold or status.last_outcome is RefreshOutcome.FAILED_INVALID:
+            return (
+                "The episode mapping download failed validation; "
+                "no unverified mappings will be used."
+                + retained
+                + " Check the mapping source in Settings. "
+                + retry
+            )
+        if status.last_outcome is RefreshOutcome.FAILED_TRANSPORT:
+            return (
+                "Could not download episode mappings."
+                + retained
+                + " Check network access and the mapping source in Settings. "
+                + retry
+            )
+        if status.last_outcome is RefreshOutcome.FAILED_SIZE:
+            return (
+                "The episode mapping download exceeded the safe size limit."
+                + retained
+                + " Check the mapping source in Settings. "
+                + retry
+            )
+        if not status.active_present:
+            return "No verified episode mappings are cached yet. Linking will wait. " + retry
+        return "Verified episode mappings are available. " + retry
 
     def status(self) -> DashboardStatus:
         latest = self._latest_snapshot()
@@ -979,13 +1036,25 @@ class _NormalServiceRuntime:
         )
         path = Path(self.settings.database_path)
         if not path.exists():
-            return DashboardStatus(message, 0, 0, 0, False, latest["next_action"])
+            return DashboardStatus(
+                message,
+                0,
+                0,
+                0,
+                False,
+                latest["next_action"],
+                worker_activity=cast(str, latest["worker_activity"]),
+            )
         store = StateStore(path)
         try:
             active, next_action = self._operational_status(
                 store,
                 authorized=bool(latest["authorized"]),
-                next_action=cast(str, latest["next_action"]),
+                next_action=(
+                    self._INITIAL_ACTION
+                    if latest["worker_activity"] and store.get_service_pause()[0]
+                    else cast(str, latest["next_action"])
+                ),
             )
             counts = store.service_file_counts()
             exclusions = discovery_exclusion_payload(store)
@@ -1009,11 +1078,27 @@ class _NormalServiceRuntime:
                 excluded_files=exclusions["total"],
                 scope_excluded_files=exclusions["scope_excluded"],
                 exclusion_counts=exclusion_counts,
+                worker_activity=cast(str, latest["worker_activity"]),
             )
         finally:
             store.close()
 
+    def _checking_activity(self, message: str) -> None:
+        # Activity describes read-only work; it never grants write authorization.
+        self._update_latest(authorized=False, worker_activity=message, next_action=message)
+
     def worker_tick(self) -> None:
+        try:
+            self._worker_tick()
+        except Exception:
+            # Include failures before opening the state store (connection/configuration I/O).
+            self._cycle_deferred()
+            self.logger.error("Normal service check failed; it will be retried.")
+        finally:
+            self._update_latest(worker_activity="")
+
+    def _worker_tick(self) -> None:
+        self._checking_activity("Checking Sonarr and Shoko connections.")
         if configured_bootstrap(self.settings) != self.settings:
             self._update_latest(
                 authorized=False,
@@ -1036,6 +1121,7 @@ class _NormalServiceRuntime:
             return
         store = StateStore(Path(self.settings.database_path))
         try:
+            self._checking_activity("Checking the confirmed library, mappings and Shoko safety.")
             context = self.setup.current_context(store)
             if context is None:
                 self._update_latest(
@@ -1051,6 +1137,7 @@ class _NormalServiceRuntime:
             if decision.status is not OnboardingStatus.AUTHORIZED:
                 self._update_latest(authorized=False, next_action=decision.message)
                 return
+            self._checking_activity("Preparing episode mappings and automatic processing.")
             self._run_authorized_cycle(store, binding, manager)
         except (ConfigError, HttpPolicyError, StateError, OSError, ValueError):
             self._cycle_deferred()
@@ -1146,6 +1233,7 @@ class _NormalServiceRuntime:
 
     def _run_daemon_cycle(self, deps: DaemonDeps, store: StateStore, settings: Settings) -> None:
         cycle_key_value = "service-unstarted"
+        cycle_completed = False
 
         def begin_cycle() -> str:
             nonlocal cycle_key_value
@@ -1155,6 +1243,7 @@ class _NormalServiceRuntime:
             return started
 
         def completed(report: CycleReport) -> None:
+            nonlocal cycle_completed
             ended = current_iso()
             started = store.get_meta(META_LAST_CYCLE_START_ISO) or ended
             persist_cycle_meta(
@@ -1165,22 +1254,35 @@ class _NormalServiceRuntime:
                 interval_seconds=settings.sync.interval_seconds,
                 full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
             )
+            mapping_view = mapping_status(
+                deps.mapping_store,
+                datetime.fromisoformat(ended),
+                overrides_text=deps.overrides_text,
+            )
+            mapping_guidance = self._mapping_guidance(mapping_view, datetime.fromisoformat(ended))
+            mapping_outcome = (
+                mapping_view.last_outcome.value if mapping_view.last_outcome else "none"
+            )
             active, next_action = self._operational_status(
                 store,
                 authorized=True,
-                next_action="Automatic linking is processing eligible files.",
+                next_action="Automatic linking is ready; waiting for the next scheduled check.",
                 report=report,
+                mapping_action=mapping_guidance,
             )
             self._update_latest(
                 authorized=active,
-                diagnostics=report.reasons[:20],
-                mapping_cache=(
-                    "Available from the last service check."
-                    if report.mapping_revision > 0
-                    else "Not ready; linking will wait for verified episode mappings."
+                worker_activity="",
+                diagnostics=(
+                    *report.reasons[:20],
+                    f"mapping_refresh_outcome:{mapping_outcome}",
+                    f"mapping_next_check:{mapping_view.next_due_iso or 'due'}",
                 ),
+                mapping_cache=mapping_guidance,
                 next_action=next_action,
             )
+            # The daemon swallows callback failures; only a published status is complete.
+            cycle_completed = True
 
         active, next_action = self._operational_status(
             store,
@@ -1190,20 +1292,26 @@ class _NormalServiceRuntime:
         self._update_latest(
             authorized=active,
             next_action=next_action,
+            worker_activity="Checking queued files and verifying links.",
         )
-        run_daemon(
-            deps,
-            cycle_key=lambda _index: cycle_key_value,
-            now_iso=begin_cycle,
-            interval_seconds=settings.sync.interval_seconds,
-            stop_after_cycles=1,
-            should_stop=self.state.should_stop,
-            policy=RunPolicy.SERVICE,
-            mode=CycleMode.APPLY,
-            jitter_ratio=0.0,
-            full_cycle=lambda iso: full_cycle_due(store, iso),
-            on_cycle_complete=completed,
-        )
+        try:
+            run_daemon(
+                deps,
+                cycle_key=lambda _index: cycle_key_value,
+                now_iso=begin_cycle,
+                interval_seconds=settings.sync.interval_seconds,
+                stop_after_cycles=1,
+                should_stop=self.state.should_stop,
+                policy=RunPolicy.SERVICE,
+                mode=CycleMode.APPLY,
+                jitter_ratio=0.0,
+                full_cycle=lambda iso: full_cycle_due(store, iso),
+                on_cycle_complete=completed,
+            )
+        finally:
+            if not cycle_completed:
+                self._cycle_deferred()
+            self._update_latest(worker_activity="")
 
     def _cycle_deferred(self) -> None:
         self._update_latest(

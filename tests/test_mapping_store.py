@@ -38,6 +38,8 @@ from shoko_linker.mapping_store import (
     status,
 )
 from shoko_linker.mappings import (
+    EntryIssueCode,
+    EntryIssueKind,
     EpisodeType,
     ResolutionStatus,
     build_mapping_index,
@@ -2910,3 +2912,379 @@ def test_oversized_numeric_xml_records_failure_and_persists_retry_backoff(
     request_count = len(source.requests)
     assert refresh(reopened, endpoint, now=retry, refresh_hours=HOURS) is RefreshOutcome.NOT_DUE
     assert len(source.requests) == request_count
+
+
+OWNER_QUARANTINE_FIXTURE = Path(__file__).parent / "fixtures" / "anime_lists_owner_quarantine.xml"
+QUARANTINED_TVDB_OWNERS = frozenset(
+    {81797, 72454, 82971, 82737, 79880, 262954, 114801, 318893, 347734}
+)
+
+
+def test_real_semantic_defects_activate_with_owner_fences_and_overrides_cannot_escape(
+    tmp_path: Path,
+) -> None:
+    aot = (Path(__file__).parent / "fixtures" / "aot_real_entries.xml").read_bytes()
+    defects = OWNER_QUARANTINE_FIXTURE.read_bytes().split(b"<anime-list>", 1)[1]
+    siblings = b"".join(
+        f"<anime anidbid='{99000 + i}' tvdbid='{owner}' defaulttvdbseason='1'/>".encode()
+        for i, owner in enumerate(sorted(QUARANTINED_TVDB_OWNERS))
+    )
+    body = aot.replace(b"</anime-list>", siblings + defects)
+    parsed = parse_anime_lists(body)
+    assert parsed.invalid_entries == 8
+    assert parsed.excluded_entries == 10
+    assert parsed.activation_eligible
+    assert all(problem.owner_quarantine_eligible for problem in parsed.entry_problems)
+    malformed = [
+        issue
+        for problem in parsed.entry_problems
+        for issue in problem.issues
+        if issue.kind is EntryIssueKind.MALFORMED
+    ]
+    assert {issue.code for issue in malformed} == {
+        EntryIssueCode.UNBOUNDED_MAPPING_OFFSET,
+        EntryIssueCode.UNVERIFIED_ANIDB_SEASON,
+        EntryIssueCode.CONTRADICTORY_NO_COUNTERPART,
+    }
+    overrides_text = "add:\n" + "".join(
+        f"  - {{tvdb_series: {owner}, season: 1, episode: 1, anidb_id: 999999, "
+        "anidb_episode: 1, type: Episode}\n"
+        for owner in sorted(QUARANTINED_TVDB_OWNERS)
+    )
+    overrides = load_overrides(overrides_text)
+    store = make_store(tmp_path)
+    source = ScriptedSource()
+    source.queue(ok_response(body, ETAG_A))
+    endpoint = endpoint_for(source, store)
+    try:
+        assert (
+            refresh(store, endpoint, now=NOW, overrides_text=overrides_text)
+            is RefreshOutcome.ACTIVATED
+        )
+    finally:
+        endpoint.client.close()
+    restarted = make_store(tmp_path)
+    active = load_active(restarted, overrides)
+    assert active is not None
+    assert not restarted.invalid_source_hold()
+    assert active.index.unsafe_tvdb_ids == QUARANTINED_TVDB_OWNERS
+    for owner in QUARANTINED_TVDB_OWNERS:
+        for season, episode in ((0, 1), (1, 1), (8, 100)):
+            result = resolve(active.index, owner, season, episode, absolute=100)
+            assert result.status is ResolutionStatus.UNMAPPED
+            assert not result.targets
+    anchor = resolve(active.index, 267440, 4, 26, absolute=85)
+    assert anchor.target is not None
+    assert (anchor.target.anidb_id, anchor.target.anidb_episode_number) == (16177, 10)
+
+
+@pytest.mark.parametrize(
+    "bad_rule",
+    [
+        "<mapping anidbseason='1' tvdbseason='1' start='1' offset='0'/>",
+        "<mapping anidbseason='2' tvdbseason='0'>;1-0;</mapping>",
+        "<mapping anidbseason='1' tvdbseason='1'>;40-75+0;</mapping>",
+    ],
+    ids=["unbounded", "unverified-season", "contradictory-zero"],
+)
+def test_owner_quarantine_activation_and_repair_survive_restart(
+    tmp_path: Path,
+    bad_rule: str,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    original = load_active(store)
+    assert original is not None
+    body = (
+        "<anime-list><anime anidbid='1' tvdbid='100' defaulttvdbseason='1'>"
+        f"<mapping-list>{bad_rule}</mapping-list></anime>"
+        "<anime anidbid='2' tvdbid='200' defaulttvdbseason='1'/></anime-list>"
+    ).encode()
+    source.queue(ok_response(body, ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.ACTIVATED
+    finally:
+        endpoint.client.close()
+    reopened = make_store(tmp_path)
+    fenced = load_active(reopened)
+    assert fenced is not None
+    assert fenced.revision == original.revision + 1
+    assert fenced.targets_digest != original.targets_digest
+    assert fenced.structure_digest != original.structure_digest
+    assert resolve(fenced.index, 100, 1, 1).status is ResolutionStatus.UNMAPPED
+    assert resolve(fenced.index, 200, 1, 1).status is ResolutionStatus.RESOLVED
+    assert not reopened.invalid_source_hold()
+    fixed = body.replace(bad_rule.encode(), b"")
+    source = ScriptedSource()
+    endpoint = endpoint_for(source, reopened)
+    source.queue(ok_response(fixed, ETAG_A))
+    try:
+        assert (
+            refresh(reopened, endpoint, now=LATER + timedelta(hours=1), force=True)
+            is RefreshOutcome.ACTIVATED
+        )
+    finally:
+        endpoint.client.close()
+    repaired = load_active(make_store(tmp_path))
+    assert repaired is not None
+    assert repaired.revision == fenced.revision + 1
+    assert resolve(repaired.index, 100, 1, 1).status is ResolutionStatus.RESOLVED
+
+
+@pytest.mark.parametrize(
+    "unsafe_extra",
+    [
+        "<mapping anidbseason='1' tvdbseason='1' mystery='1'/>",
+        "<mapping tvdbseason='1'/>",
+        "<mapping anidbseason='1' tvdbseason='1'>;bad;</mapping>",
+        "<mapping anidbseason='1' tvdbseason='1'>;40-75+0;bad;</mapping>",
+        "<mapping anidbseason='2' tvdbseason='1' start='1' end='2002' offset='0'/>",
+        "<mapping anidbseason='1' tvdbseason='1' start='1' end='2002' offset='0'/>",
+    ],
+    ids=[
+        "unknown-attribute",
+        "missing-season",
+        "invalid-pair",
+        "malformed-after-semantic",
+        "unsupported-with-resource-cap",
+        "resource-cap",
+    ],
+)
+def test_owner_semantic_quarantine_never_hides_other_unsafe_declarations(
+    tmp_path: Path,
+    unsafe_extra: str,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    identity = store.active_identity()
+    body = (
+        "<anime-list><anime anidbid='1' tvdbid='100' defaulttvdbseason='1'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1' offset='0'/>"
+        f"{unsafe_extra}</mapping-list></anime>"
+        "<anime anidbid='2' tvdbid='200' defaulttvdbseason='1'/></anime-list>"
+    ).encode()
+    source.queue(ok_response(body, ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.FAILED_INVALID
+    finally:
+        endpoint.client.close()
+    reopened = make_store(tmp_path)
+    assert reopened.active_identity() == identity
+    assert reopened.invalid_source_hold()
+    assert load_active(reopened) is not None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        OWNER_QUARANTINE_FIXTURE.read_bytes(),
+        b"<anime-list/>",
+        b"<anime-list><other/><anime anidbid='1' tvdbid='100' defaulttvdbseason='1'/></anime-list>",
+        b"<anime-list><anime tvdbid='100' defaulttvdbseason='1'/></anime-list>",
+    ],
+)
+def test_no_usable_or_unknown_owner_snapshot_preserves_lkg_and_requires_valid_activation(
+    tmp_path: Path,
+    body: bytes,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    identity = store.active_identity()
+    source.queue(ok_response(body, ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.FAILED_INVALID
+        assert store.active_identity() == identity
+        assert store.invalid_source_hold()
+        # A valid accepted generation, including one with safe owner fences, clears the hold.
+        repaired = SMALL_XML.replace(
+            b"</anime-list>",
+            OWNER_QUARANTINE_FIXTURE.read_bytes().split(b"<anime-list>", 1)[1],
+        )
+        source.queue(ok_response(repaired, ETAG_A))
+        assert (
+            refresh(store, endpoint, now=LATER + timedelta(hours=1), force=True)
+            is RefreshOutcome.ACTIVATED
+        )
+        assert not store.invalid_source_hold()
+    finally:
+        endpoint.client.close()
+    restarted = make_store(tmp_path)
+    assert not restarted.invalid_source_hold()
+    assert load_active(restarted) is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        ("<anime-list>", "<anime-list mystery='new-rule'>"),
+        ("<anime-list>", "<anime-list>unexpected"),
+        ("</anime-list>", "unexpected</anime-list>"),
+        ("anidbid='1'", "anidbid='bad'"),
+        ("tvdbid='100'", "tvdbid='bad'"),
+        ("anidbid='1' ", ""),
+        ("</anime-list>", "<anime anidbid='1' tvdbid='200' defaulttvdbseason='1'/></anime-list>"),
+        ("tvdbid='100' ", ""),
+        ("defaulttvdbseason='1'>", "defaulttvdbseason='1'>unexpected"),
+        ("</mapping-list>", "</mapping-list>unexpected"),
+    ],
+)
+def test_owner_isolation_requires_complete_supported_schema_and_positive_known_owners(
+    tmp_path: Path,
+    mutation: tuple[str, str],
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    identity = store.active_identity()
+    body = (
+        "<anime-list><anime anidbid='1' tvdbid='100' defaulttvdbseason='1'>"
+        "<mapping-list><mapping anidbseason='1' tvdbseason='1' offset='0'/></mapping-list>"
+        "</anime><anime anidbid='2' tvdbid='200' defaulttvdbseason='1'/></anime-list>"
+    )
+    body = body.replace(*mutation)
+    source.queue(ok_response(body.encode(), ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.FAILED_INVALID
+        assert store.invalid_source_hold()
+        assert store.active_identity() == identity
+    finally:
+        endpoint.client.close()
+
+
+@pytest.mark.parametrize(
+    "padding",
+    [
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'/>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'><mapping-list>"
+        "<mapping anidbseason='0' tvdbseason='0'>;1-0;</mapping></mapping-list></anime>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'><mapping-list>"
+        "<mapping anidbseason='0' tvdbseason='0' start='1' end='2' offset='-2'/>"
+        "</mapping-list></anime>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'><mapping-list>"
+        "<mapping anidbseason='0' tvdbseason='0'>;1-1;101-1;</mapping></mapping-list></anime>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'><mapping-list>"
+        "<mapping anidbseason='0' tvdbseason='0' start='1' end='2' offset='0'>;1-0;2-0;</mapping>"
+        "</mapping-list></anime>",
+    ],
+)
+def test_inert_or_fully_fenced_padding_cannot_activate_or_clear_invalid_source_hold(
+    tmp_path: Path,
+    padding: str,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    identity = store.active_identity()
+    source.queue(ok_response(MALFORMED_XML, ETAG_B))
+    body = OWNER_QUARANTINE_FIXTURE.read_bytes().replace(
+        b"</anime-list>", padding.encode() + b"</anime-list>"
+    )
+    # An operator add must not manufacture usable upstream evidence.
+    override = (
+        "add:\n  - {tvdb_series: 999999, season: 0, episode: 2, anidb_id: 999999, "
+        "anidb_episode: 2, type: Special}\n"
+    )
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.FAILED_INVALID
+        assert store.invalid_source_hold()
+        source.queue(ok_response(body, ETAG_B))
+        assert (
+            refresh(
+                store, endpoint, now=LATER + timedelta(hours=1), force=True, overrides_text=override
+            )
+            is RefreshOutcome.FAILED_INVALID
+        )
+        assert store.active_identity() == identity
+    finally:
+        endpoint.client.close()
+    reopened = make_store(tmp_path)
+    assert reopened.invalid_source_hold()
+    assert reopened.active_identity() == identity
+    assert load_active(reopened) is not None
+
+
+@pytest.mark.parametrize(
+    "usable",
+    [
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='1'/>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='a'/>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'><mapping-list>"
+        "<mapping anidbseason='0' tvdbseason='0'>;1-2;</mapping></mapping-list></anime>",
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='0'><mapping-list>"
+        "<mapping anidbseason='0' tvdbseason='0' start='1' end='2' offset='0'/>"
+        "</mapping-list></anime>",
+    ],
+)
+def test_real_upstream_default_or_special_evidence_allows_owner_isolation(
+    tmp_path: Path,
+    usable: str,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    body = OWNER_QUARANTINE_FIXTURE.read_bytes().replace(
+        b"</anime-list>", usable.encode() + b"</anime-list>"
+    )
+    source.queue(ok_response(body, ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.ACTIVATED
+    finally:
+        endpoint.client.close()
+    reopened = make_store(tmp_path)
+    active = load_active(reopened)
+    assert active is not None
+    assert not reopened.invalid_source_hold()
+    season = 0 if "defaulttvdbseason='0'" in usable else 1
+    assert resolve(active.index, 999999, season, 2, absolute=2).status is ResolutionStatus.RESOLVED
+
+
+@pytest.mark.parametrize(
+    "bounds", ["start='0'", "end='0'", "start='0' end='1'", "start='1' end='0'"]
+)
+@pytest.mark.parametrize(
+    "other_semantic", ["", "<mapping anidbseason='2' tvdbseason='0'>;1-0;</mapping>"]
+)
+def test_invalid_supplied_bound_cannot_hide_behind_missing_bound_or_other_semantic(
+    tmp_path: Path,
+    bounds: str,
+    other_semantic: str,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    identity = store.active_identity()
+    body = (
+        "<anime-list><anime anidbid='999999' tvdbid='999999' defaulttvdbseason='1'>"
+        f"<mapping-list><mapping anidbseason='1' tvdbseason='1' offset='0' {bounds}/>"
+        f"{other_semantic}</mapping-list></anime>"
+        "<anime anidbid='2' tvdbid='200' defaulttvdbseason='1'/></anime-list>"
+    ).encode()
+    parsed = parse_anime_lists(body)
+    assert not parsed.activation_eligible
+    assert parsed.invalid_entries == 1
+    assert not parsed.entry_problems[0].owner_quarantine_eligible
+    assert any(
+        issue.code is EntryIssueCode.MALFORMED_ENTRY for issue in parsed.entry_problems[0].issues
+    )
+    source.queue(ok_response(body, ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.FAILED_INVALID
+    finally:
+        endpoint.client.close()
+    reopened = make_store(tmp_path)
+    assert reopened.invalid_source_hold()
+    assert reopened.active_identity() == identity
+
+
+@pytest.mark.parametrize("bounds", ["start='1'", "end='1'", "start='1' end='2'"])
+def test_positive_supplied_bounds_keep_valid_and_isolatable_offsets_working(
+    tmp_path: Path,
+    bounds: str,
+) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    body = (
+        "<anime-list><anime anidbid='999999' tvdbid='999999' defaulttvdbseason='1'>"
+        f"<mapping-list><mapping anidbseason='1' tvdbseason='1' offset='0' {bounds}/>"
+        "</mapping-list></anime>"
+        "<anime anidbid='2' tvdbid='200' defaulttvdbseason='1'/></anime-list>"
+    ).encode()
+    source.queue(ok_response(body, ETAG_B))
+    try:
+        assert refresh(store, endpoint, now=LATER, force=True) is RefreshOutcome.ACTIVATED
+    finally:
+        endpoint.client.close()
+    active = load_active(make_store(tmp_path))
+    assert active is not None
+    expected = (
+        ResolutionStatus.RESOLVED if bounds == "start='1' end='2'" else ResolutionStatus.UNMAPPED
+    )
+    assert resolve(active.index, 999999, 1, 1).status is expected

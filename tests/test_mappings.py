@@ -139,8 +139,8 @@ SEASON2_EPISODE = 3
 
 GATE_ENTRIES_INDEXED = 23
 GATE_ENTRIES_EXCLUDED = 4
-GATE_ENTRIES_WITH_PROBLEMS = 7
-GATE_MAPPING_RULES = 17
+GATE_ENTRIES_WITH_PROBLEMS = 6
+GATE_MAPPING_RULES = 16
 GATE_RANGE_RULES = 2
 GATE_ABSOLUTE_ENTRIES = 2
 
@@ -1320,18 +1320,14 @@ def test_absolute_identity_not_used_for_season_zero() -> None:
     assert resolution.status is ResolutionStatus.UNMAPPED
 
 
-def test_before_element_pairs_apply_like_explicit_pairs() -> None:
+def test_before_is_presentation_metadata_not_identity_translation() -> None:
     index = gate_index()
-    before = resolve(index, BEFORE_TVDB, 1, BEFORE_EPISODE)
-    assert before.target is not None
-    assert before.target.anidb_id == BEFORE_ANIDB
-    assert before.target.anidb_episode_number == BEFORE_ANIDB_EPISODE
-    assert before.target.source_rule is SourceRule.EXPLICIT_PAIR
-    assert "before" in before.target.origin
-    plain = resolve(index, BEFORE_TVDB, 1, BEFORE_OFFSET_EPISODE)
-    assert plain.target is not None
-    assert plain.target.anidb_episode_number == BEFORE_OFFSET_EPISODE
-    assert plain.target.source_rule is SourceRule.ENTRY_OFFSET
+    for episode in (BEFORE_EPISODE, BEFORE_OFFSET_EPISODE, BEFORE_ANIDB_EPISODE):
+        result = resolve(index, BEFORE_TVDB, 1, episode)
+        assert result.target is not None
+        assert result.target.anidb_id == BEFORE_ANIDB
+        assert result.target.anidb_episode_number == episode
+        assert result.target.source_rule is SourceRule.ENTRY_OFFSET
 
 
 def test_negative_entry_offset_reverses() -> None:
@@ -1861,17 +1857,19 @@ DUP_PAIR_ANIDB = 600
 DUP_PAIR_TVDB = 6000
 
 
-def test_identical_pair_in_both_containers_is_not_a_conflict() -> None:
+def test_nested_mapping_in_before_is_rejected() -> None:
     xml = doc(
         f"<anime anidbid='{DUP_PAIR_ANIDB}' tvdbid='{DUP_PAIR_TVDB}' defaulttvdbseason='1'>"
         "<mapping-list><mapping anidbseason='1' tvdbseason='1'>;3-3;</mapping></mapping-list>"
         "<before><mapping anidbseason='1' tvdbseason='1'>;3-3;</mapping></before>"
         "</anime>"
     )
-    resolution = resolve(index_of(xml), DUP_PAIR_TVDB, 1, 3)
-    assert resolution.status is ResolutionStatus.RESOLVED
-    assert resolution.target is not None
-    assert resolution.target.anidb_id == DUP_PAIR_ANIDB
+    parsed = parse_anime_lists(xml)
+    assert parsed.invalid_entries == 1
+    assert (
+        resolve(build_mapping_index(parsed), DUP_PAIR_TVDB, 1, 3).status
+        is ResolutionStatus.UNMAPPED
+    )
 
 
 @pytest.mark.parametrize("digits", [65, 4301])
@@ -1959,3 +1957,190 @@ def test_bounded_xml_integers_preserve_leading_zeros_and_signed_offsets() -> Non
     assert result.target is not None
     assert result.target.anidb_id == 1
     assert result.target.anidb_episode_number == 3
+
+
+@pytest.mark.parametrize(
+    "marker", ["movie", "hentai", "OVA", "ova", "music video", "tv special", "web", "other"]
+)
+def test_non_tvdb_types_without_default_season_do_not_poison_snapshot(marker: str) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            f"<anime anidbid='1' tvdbid='{marker}'><name>Non-TVDB</name></anime>"
+            "<anime anidbid='2' tvdbid='100' defaulttvdbseason='1'/>"
+        )
+    )
+    assert parsed.invalid_entries == 0
+    assert len(parsed.entries) == 1
+    assert not build_mapping_index(parsed).unsafe_all
+    assert resolve(build_mapping_index(parsed), 100, 1, 1).status is ResolutionStatus.RESOLVED
+
+
+@pytest.mark.parametrize("marker", ["movie", "unknown", "", "Movie"])
+def test_duplicate_anidb_detection_includes_non_tvdb_or_unknown_records(marker: str) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            f"<anime anidbid='1' tvdbid='{marker}'/>"
+            "<anime anidbid='1' tvdbid='100' defaulttvdbseason='1'/>"
+        )
+    )
+    assert parsed.invalid_entries == 2
+    assert not parsed.entries
+    assert any("duplicated" in p for problem in parsed.entry_problems for p in problem.problems)
+
+
+@pytest.mark.parametrize("body", [";1-26;", ";1-26;2-27;"])
+def test_before_does_not_suppress_tvdb_regular_or_special_mappings(body: str) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            "<anime anidbid='1' tvdbid='100' defaulttvdbseason='1'>"
+            f"<before>{body}</before><mapping-list>"
+            "<mapping anidbseason='0' tvdbseason='0'>;1-3;</mapping>"
+            "</mapping-list></anime>"
+        )
+    )
+    assert parsed.invalid_entries == 0
+    index = build_mapping_index(parsed)
+    for episode in (1, 26):
+        target = resolve(index, 100, 1, episode).target
+        assert target is not None
+        assert target.anidb_episode_number == episode
+    special = resolve(index, 100, 0, 3).target
+    assert special is not None
+    assert special.episode_type is EpisodeType.SPECIAL
+
+
+@pytest.mark.parametrize(
+    "tmdb_rule",
+    [
+        "<mapping anidbseason='1' tmdbseason='2' start='1' end='26' offset='100'/>",
+        "<mapping anidbseason='1' tmdbseason='2'>;1-101;</mapping>",
+        "<mapping anidbseason='1' tmdbseason='1' offset='23'/>",
+    ],
+)
+@pytest.mark.parametrize("default_season", ["1", "a"])
+def test_tmdb_rules_do_not_translate_or_suppress_tvdb_fallback(
+    tmdb_rule: str, default_season: str
+) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            f"<anime anidbid='1' tvdbid='100' defaulttvdbseason='{default_season}' tmdbtv='200'>"
+            "<mapping-list>" + tmdb_rule + "<mapping anidbseason='1' tvdbseason='2'>;2-7;</mapping>"
+            "</mapping-list></anime>"
+        )
+    )
+    assert parsed.invalid_entries == 0
+    index = build_mapping_index(parsed)
+    result = resolve(index, 100, 1, 1, absolute=1)
+    assert result.status is ResolutionStatus.RESOLVED
+    assert result.target is not None
+    assert result.target.anidb_episode_number == 1
+    assert result.target.source_rule in {SourceRule.ENTRY_OFFSET, SourceRule.ABSOLUTE_IDENTITY}
+    explicit = resolve(index, 100, 2, 7).target
+    assert explicit is not None
+    assert explicit.anidb_episode_number == 2
+    assert resolve(index, 100, 1, 2, absolute=2).status is ResolutionStatus.UNMAPPED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<before><mapping anidbseason='1' tvdbseason='1'>;1-26;</mapping></before>",
+        "<before season='1'>;1-26;</before>",
+        "<before>;1-26+27;</before>",
+        "<before>;0-26;</before>",
+        "<unrecognized>;1-26;</unrecognized>",
+        "<mapping-list><mapping anidbseason='1' tmdbseason='bad'>;1-2;</mapping></mapping-list>",
+        "<mapping-list><mapping anidbseason='1' tmdbseason='1' typo='2'>"
+        ";1-2;</mapping></mapping-list>",
+        "<mapping-list><mapping anidbseason='1' tmdbseason='1'><nested/></mapping></mapping-list>",
+    ],
+)
+def test_documented_metadata_support_keeps_unknown_structure_fail_closed(content: str) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            "<anime anidbid='1' tvdbid='100' defaulttvdbseason='1' tmdbtv='200'>"
+            + content
+            + "</anime>"
+        )
+    )
+    assert parsed.invalid_entries == 1
+    assert not parsed.entries
+
+
+@pytest.mark.parametrize(("tvdbid", "tmdbtv"), [("100", ""), ("100", "bogus"), ("unknown", "200")])
+def test_provider_rules_require_known_owner(tvdbid: str, tmdbtv: str) -> None:
+    rule = (
+        "<mapping anidbseason='1' tvdbseason='1'>;1-2;</mapping>"
+        if tvdbid == "unknown"
+        else "<mapping anidbseason='1' tmdbseason='1'>;1-2;</mapping>"
+    )
+    parsed = parse_anime_lists(
+        doc(
+            f"<anime anidbid='1' tvdbid='{tvdbid}' defaulttvdbseason='1' tmdbtv='{tmdbtv}'>"
+            "<mapping-list>" + rule + "</mapping-list></anime>"
+        )
+    )
+    assert parsed.invalid_entries == 1
+    assert not parsed.entries
+
+
+@pytest.mark.parametrize("tmdbseason", ["0", "2", "invalid"])
+def test_mapping_with_both_provider_seasons_keeps_tvdb_semantics(tmdbseason: str) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            "<anime anidbid='1' tvdbid='100' defaulttvdbseason='1' tmdbtv='200'>"
+            f"<mapping-list><mapping anidbseason='1' tvdbseason='3' tmdbseason='{tmdbseason}'>"
+            ";1-7;</mapping></mapping-list></anime>"
+        )
+    )
+    if tmdbseason == "invalid":
+        assert parsed.invalid_entries == 1
+    else:
+        assert parsed.invalid_entries == 0
+        index = build_mapping_index(parsed)
+        target = resolve(index, 100, 3, 7).target
+        assert target is not None
+        assert target.anidb_episode_number == 1
+        assert resolve(index, 100, 1, 1).status is ResolutionStatus.UNMAPPED
+
+
+@pytest.mark.parametrize("attributes", ["start='0'", "end='0'", "start='3' end='2'"])
+def test_invalid_tmdb_only_bounds_are_not_silently_ignored(attributes: str) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            "<anime anidbid='1' tvdbid='100' defaulttvdbseason='1' tmdbtv='200'>"
+            f"<mapping-list><mapping anidbseason='1' tmdbseason='1' {attributes} offset='2'/>"
+            "</mapping-list></anime>"
+        )
+    )
+    assert parsed.invalid_entries == 1
+
+
+@pytest.mark.parametrize(
+    ("extra", "content"),
+    [
+        ("typo='value'", ""),
+        ("", "<before><mapping anidbseason='1' tvdbseason='1'/></before>"),
+        ("", "<unrecognized/>"),
+    ],
+)
+def test_non_tvdb_marker_does_not_bypass_structure_validation(extra: str, content: str) -> None:
+    parsed = parse_anime_lists(doc(f"<anime anidbid='1' tvdbid='movie' {extra}>{content}</anime>"))
+    assert parsed.invalid_entries == 1
+
+
+def test_non_tvdb_record_with_legacy_tvdb_rule_has_no_unknown_owner_fence() -> None:
+    # Upstream AniDB552/movie contains this declaration but no numeric TVDB ID.
+    parsed = parse_anime_lists(
+        doc(
+            "<anime anidbid='552' tvdbid='movie'><mapping-list>"
+            "<mapping anidbseason='1' tvdbseason='0'>;1-3;2-3;3-3;4-3;</mapping>"
+            "</mapping-list></anime>"
+            "<anime anidbid='2' tvdbid='100' defaulttvdbseason='1'/>"
+        )
+    )
+    assert parsed.invalid_entries == 0
+    index = build_mapping_index(parsed)
+    assert not index.unsafe_all
+    assert resolve(index, 100, 1, 1).status is ResolutionStatus.RESOLVED
+    assert len(parsed.entries) == 1

@@ -31,7 +31,7 @@
   <!-- entry 250 -->
   <anime tvdbid="2500" anidbid="250" defaulttvdbseason="1">
     <name>Before mappings</name>
-    <before><mapping tvdbseason="1" anidbseason="1">;7-1;</mapping></before>
+    <before>;7-1;</before>
   </anime>
   <!-- entry 240 -->
   <anime defaulttvdbseason="1" tvdbid="2400" anidbid="240">
@@ -124,7 +124,6 @@
   <anime episodeoffset="0" tvdbid="1100" defaulttvdbseason="1" anidbid="110">
     <name>Explicit pair beats offset</name>
     <mapping-list><mapping tvdbseason="1" anidbseason="1">;3-9;</mapping></mapping-list>
-    <legend>unknown child (ignored)</legend>
   </anime>
   <!-- entry 101 -->
   <anime tvdbid="1000" defaulttvdbseason="2" anidbid="101"><name>Split B Season 2</name></anime>

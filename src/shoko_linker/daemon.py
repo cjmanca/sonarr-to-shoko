@@ -128,6 +128,9 @@ from .mapping_store import (
 from .mapping_store import (
     refresh as mapping_refresh,
 )
+from .mapping_store import (
+    status as mapping_status,
+)
 from .mappings import EpisodeType, MappingIndex, ResolutionStatus, effective_source_targets
 from .mappings import resolve as resolve_mapping
 from .policies import RunPolicy
@@ -573,6 +576,7 @@ class _MappingPhase:
     reactivated: bool
     churned: frozenset[int]
     churn_paused: bool
+    last_outcome: RefreshOutcome | None = None
 
 
 def _mapping_phase(deps: DaemonDeps, now_iso: str) -> _MappingPhase:
@@ -612,7 +616,14 @@ def _mapping_phase(deps: DaemonDeps, now_iso: str) -> _MappingPhase:
             if not deps.store.writes_disabled:
                 deps.store.pause_if_unpaused("mapping_churn", now_iso, origin="mapping_churn")
             churn_paused = True
-    return _MappingPhase(outcome, old, active, reactivated, churned, churn_paused)
+    last_outcome = (
+        mapping_status(
+            deps.mapping_store, _parse_iso(now_iso), overrides_text=deps.overrides_text
+        ).last_outcome
+        if outcome is RefreshOutcome.NO_ACTIVE_BUT_FAILED
+        else outcome
+    )
+    return _MappingPhase(outcome, old, active, reactivated, churned, churn_paused, last_outcome)
 
 
 def _mapping_semantics(index: MappingIndex) -> dict[str, list[str]]:
@@ -730,11 +741,18 @@ def _apply_service_budget_limits(deps: DaemonDeps) -> None:
 def _service_mapping_refresh_failed(
     deps: DaemonDeps, phase: _MappingPhase, reasons: list[str]
 ) -> bool:
-    if deps.service_mode and _is_transport_failure(phase.outcome):
-        reasons.append("mapping_source_transport_failure")
-        return True
     if deps.mapping_store.invalid_source_hold():
         reasons.append("mapping_source_invalid")
+        return True
+    if deps.service_mode and _is_transport_failure(phase.last_outcome):
+        reasons.append("mapping_source_transport_failure")
+        return True
+    if (
+        deps.service_mode
+        and phase.active is None
+        and phase.last_outcome is RefreshOutcome.FAILED_SIZE
+    ):
+        reasons.append("mapping_source_too_large")
         return True
     return False
 
@@ -3943,7 +3961,7 @@ def _unavailable_report(
         drift=(),
         existing_link_drift=(),
         deferred_planned=0,
-        failed=_is_transport_failure(phase.outcome),
+        failed=_is_transport_failure(phase.last_outcome),
     )
 
 
@@ -4178,10 +4196,7 @@ def _baseline_file(sonarr_file: SonarrFile) -> BaselineFile:
 
 
 def _is_transport_failure(outcome: RefreshOutcome | None) -> bool:
-    return outcome in (
-        RefreshOutcome.FAILED_TRANSPORT,
-        RefreshOutcome.NO_ACTIVE_BUT_FAILED,
-    )
+    return outcome is RefreshOutcome.FAILED_TRANSPORT
 
 
 def _final_counts(

@@ -13,7 +13,6 @@
     <mapping-list>
       <mapping anidbseason="1" tvdbseason="1">;3-9;</mapping>
     </mapping-list>
-    <legend>unknown child (ignored)</legend>
   </anime>
 
   <anime anidbid="120" tvdbid="1200" defaulttvdbseason="1">
@@ -131,9 +130,7 @@
 
   <anime anidbid="250" tvdbid="2500" defaulttvdbseason="1">
     <name>Before mappings</name>
-    <before>
-      <mapping anidbseason="1" tvdbseason="1">;7-1;</mapping>
-    </before>
+    <before>;7-1;</before>
   </anime>
 
   <anime anidbid="260" tvdbid="2600" defaulttvdbseason="1" episodeoffset="-10">

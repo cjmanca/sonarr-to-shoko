@@ -8610,3 +8610,82 @@ def test_restart_corrupt_target_set_holds_complete_reservation(
         finally:
             for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
                 endpoint.client.close()
+
+
+@pytest.mark.parametrize("defect", ["unbounded", "unverified-season", "contradictory-zero"])
+def test_owner_quarantine_restart_preserves_verified_links_and_quarantines_unsent_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    old_xml, _unused, files = _positional_fence_case("offset")
+    files = files[:2]
+    store, shoko, deps = _build_positional_fence_service(tmp_path, old_xml, files)
+    rules = {
+        "unbounded": "<mapping anidbseason='1' tvdbseason='1' offset='0'/>",
+        "unverified-season": "<mapping anidbseason='2' tvdbseason='1'>;1-1;</mapping>",
+        "contradictory-zero": "<mapping anidbseason='1' tvdbseason='1'>;40-75+0;</mapping>",
+    }
+    fenced_xml = (
+        f"<anime-list><anime anidbid='{ANIME_ID}' tvdbid='{TVDB_SERIES}' defaulttvdbseason='1'>"
+        f"<mapping-list>{rules[defect]}</mapping-list></anime>"
+        "<anime anidbid='999999' tvdbid='999999' defaulttvdbseason='1'/></anime-list>"
+    )
+    try:
+        first = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.SERVICE,
+            cycle_key="owner-before",
+        )
+        assert first.counts.verified == 1
+        unsent = store.get_file(files[1].shoko_id)
+        assert unsent is not None
+        assert unsent.state is FileState.PLANNED
+        before_links = list(shoko.linked[files[0].shoko_id])
+        _activate_new_generation(deps, fenced_xml, _due_iso())
+        active = load_active(deps.mapping_store)
+        assert active is not None
+        assert active.index.unsafe_tvdb_ids == frozenset({TVDB_SERIES})
+    finally:
+        store.close()
+    # Both fence activation and later repair happen across process restarts.
+    for xml, when in ((fenced_xml, _due_iso()), (old_xml, _due_iso(base=_due_iso()))):
+        reopened = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        try:
+            restarted = build_deps(
+                tmp_path,
+                store=reopened,
+                sonarr_files=files,
+                shoko_files=files,
+                xml=xml,
+                monotonic=Clock([MONO_ZERO]),
+                advance=Sleeper().advance,
+                shoko=shoko,
+                max_submissions=20,
+            )
+            restarted = replace(restarted, service_mode=True, service_authorized=lambda: True)
+            report = run_cycle(
+                restarted,
+                now_iso=when,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.SERVICE,
+                cycle_key=f"owner-restart-{when}",
+            )
+            assert report.counts.submitted == 0
+            verified = reopened.get_file(files[0].shoko_id)
+            blocked = reopened.get_file(files[1].shoko_id)
+            assert verified is not None
+            assert verified.state is FileState.VERIFIED
+            assert blocked is not None
+            assert blocked.state is FileState.CONFLICT
+            assert reopened.mapping_target_quarantined(files[1].shoko_id)
+            assert [item.shoko_file_id for item in reopened.get_service_mapping_drifts()] == [
+                files[0].shoko_id
+            ]
+            assert shoko.linked[files[0].shoko_id] == before_links
+            assert shoko.posts_count() == 1
+        finally:
+            reopened.close()

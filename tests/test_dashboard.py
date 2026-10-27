@@ -436,6 +436,67 @@ def test_resume_refusal_overrides_cached_runtime_guidance(tmp_path: Path) -> Non
         stop_server(server, thread)
 
 
+def test_setup_acknowledgement_expires_on_poll_and_worker_activity_is_live(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    current = app.status_provider()
+    current = replace(current, automatic_linking=False, worker_activity="Checking safety.")
+    app.status_provider = lambda: current
+    app.setup_action = lambda _action, _form: "Setup saved."
+    server, thread, base_url = start_server(app)
+    try:
+        with httpx.Client(follow_redirects=False) as client:
+            assert setup_account(client, base_url).status_code == 303
+            page = client.get(f"{base_url}/status")
+            confirmed = client.post(
+                f"{base_url}/setup/confirm",
+                data={"csrf_token": csrf_from(page.text)},
+                headers=same_origin(base_url),
+            )
+            assert confirmed.status_code == 200
+            assert (
+                '<div data-live="acknowledgement" role="status"><p>Setup saved.</p>'
+                in confirmed.text
+            )
+            assert '<p class="next-action">No action is needed.</p>' in confirmed.text
+            assert '<p class="worker-activity" role="status">Checking safety.</p>' in confirmed.text
+            # A completed worker stage and a genuine block both appear on normal polling.
+            for activity, automatic, action in (
+                ("Processing eligible files.", True, "Automatic linking is running."),
+                ("", False, "Fix Shoko safety settings and confirm setup again."),
+                ("<script>unsafe</script>", False, "Waiting for connections."),
+            ):
+                current = replace(
+                    current,
+                    worker_activity=activity,
+                    automatic_linking=automatic,
+                    next_action=action,
+                )
+                page = client.get(f"{base_url}/status")
+                assert 'data-live="acknowledgement" role="status"></div>' in page.text
+                assert "Setup saved." not in page.text
+                assert f'<p class="next-action">{action}</p>' in page.text
+                assert "<script>unsafe</script>" not in page.text
+                assert ('class="worker-activity"' in page.text) == bool(activity)
+            assert "&lt;script&gt;unsafe&lt;/script&gt;" in page.text
+            # The successful POST consumed its CSRF token even though only the notice changed.
+            replay = client.post(
+                f"{base_url}/setup/confirm",
+                data={"csrf_token": csrf_from(confirmed.text)},
+                headers=same_origin(base_url),
+            )
+            assert replay.status_code == 200
+            assert (
+                client.post(
+                    f"{base_url}/setup/confirm",
+                    data={"csrf_token": csrf_from(confirmed.text)},
+                    headers=same_origin(base_url),
+                ).status_code
+                == 403
+            )
+    finally:
+        stop_server(server, thread)
+
+
 def test_setup_scope_and_safety_controls_are_authenticated_and_csrf_protected(
     tmp_path: Path,
 ) -> None:

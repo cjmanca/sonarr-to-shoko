@@ -45,8 +45,9 @@ Recorded fail-closed interpretations (reported as problems, never guessed):
   (UNVERIFIED). ``start``/``end`` without ``offset`` remains the documented inert
   declaration. Such an entry contributes no targets and fences its known TVDB
   series; if its TVDB ID cannot be identified, all queries fail closed. Other valid
-  entries for unrelated series remain usable for offline inspection. Download refresh
-  rejects any snapshot with an excluded entry, preserving the last-known-good generation.
+  entries for unrelated series remain usable. Download refresh accepts only explicitly
+  classified row-local semantic defects with fully validated ownership; malformed
+  schema, identities and resource-limit failures reject the whole update.
 * A reverse query for TVDB episode ``0`` answers ``NO_EQUIVALENT`` (the
   Anime-Lists no-counterpart sentinel), never ``UNMAPPED``.
 * A mapping body above ``MAX_PAIRS_PER_RULE`` excludes the entry: a partially
@@ -103,6 +104,10 @@ _ANIME_ENTRY_ATTRIBUTES: Final[frozenset[str]] = frozenset(
 _ANIME_UNUSED_ATTRIBUTES: Final[frozenset[str]] = frozenset(
     {"tmdbtv", "tmdbseason", "tmdboffset", "tmdbid", "imdbid"}
 )
+# README: non-TVDB titles carry their AniDB type instead of a TVDB series ID.
+_NON_TVDB_TYPES: Final[frozenset[str]] = frozenset(
+    {"movie", "hentai", "OVA", "ova", "music video", "tv special", "web", "other"}
+)
 _MAPPING_ATTRIBUTES: Final[frozenset[str]] = frozenset(
     {"anidbseason", "tvdbseason", "tmdbseason", "start", "end", "offset"}
 )
@@ -143,6 +148,9 @@ class EntryIssueCode(Enum):
     """Stable machine-readable categories; diagnostics are never parsed as control flow."""
 
     MALFORMED_ENTRY = "malformed_entry"
+    UNBOUNDED_MAPPING_OFFSET = "unbounded_mapping_offset"
+    UNVERIFIED_ANIDB_SEASON = "unverified_anidb_season"
+    CONTRADICTORY_NO_COUNTERPART = "contradictory_no_counterpart"
     ABSOLUTE_SEASON_WITH_EPISODE_OFFSET = "absolute_season_with_episode_offset"
     UNVERIFIED_SEASON_ZERO_EPISODE_TYPE = "unverified_season_zero_episode_type"
     ENTRY_WARNING = "entry_warning"
@@ -212,7 +220,7 @@ class EpisodePair:
 
 @dataclass(frozen=True)
 class MappingRule:
-    """One parsed ``<mapping>`` element from ``<mapping-list>`` or ``<before>``."""
+    """One TVDB ``<mapping>`` element from ``<mapping-list>``."""
 
     origin: str
     anidbseason: int
@@ -249,6 +257,33 @@ class EntryProblem:
     fenced_tvdb_keys: tuple[QueryKey, ...] = ()
 
     @property
+    def owner_quarantine_eligible(self) -> bool:
+        """Only recognized row-local semantics with completely validated ownership.
+
+        A generic malformed finding (including schema, resource and identity defects)
+        always vetoes isolation, even alongside an otherwise isolatable finding.
+        """
+        return (
+            self.excluded
+            and self.anidbid is not None
+            and self.anidbid > 0
+            and self.tvdbid is not None
+            and self.tvdbid > 0
+            and bool(self.issues)
+            and all(
+                issue.code
+                in {
+                    EntryIssueCode.UNBOUNDED_MAPPING_OFFSET,
+                    EntryIssueCode.UNVERIFIED_ANIDB_SEASON,
+                    EntryIssueCode.CONTRADICTORY_NO_COUNTERPART,
+                    EntryIssueCode.ABSOLUTE_SEASON_WITH_EPISODE_OFFSET,
+                    EntryIssueCode.UNVERIFIED_SEASON_ZERO_EPISODE_TYPE,
+                }
+                for issue in self.issues
+            )
+        )
+
+    @property
     def known_unsupported(self) -> bool:
         """True only for the documented unsupported case, never for malformed declarations."""
         return any(
@@ -264,6 +299,26 @@ class ParsedMappings:
     entry_problems: tuple[EntryProblem, ...]
     document_problems: tuple[str, ...]
     anime_elements: int
+
+    @property
+    def activation_eligible(self) -> bool:
+        """A usable snapshot may quarantine strictly identified semantic owners."""
+        fenced = {problem.tvdbid for problem in self.entry_problems if problem.excluded}
+        if self.document_problems or any(
+            problem.excluded and not problem.owner_quarantine_eligible
+            for problem in self.entry_problems
+        ):
+            return False
+        # Regular/absolute defaults are unbounded upstream claims. Season-zero
+        # padding has no such claim and requires a genuinely resolved upstream
+        # position, including precedence, no-counterpart declarations and fences.
+        if any(
+            entry.tvdbid not in fenced and entry.defaulttvdbseason != SPECIAL_SEASON
+            for entry in self.entries
+        ):
+            return True
+        index = build_mapping_index(self)  # Never let overrides manufacture evidence.
+        return any(resolve(index, *key).targets for key in _enumerable_keys(index))
 
     @property
     def excluded_entries(self) -> int:
@@ -439,13 +494,7 @@ def parse_anime_lists(
     root = _parse_root(xml_text)
     if root.tag != ROOT_TAG:
         raise MappingError(f"root element must be <{ROOT_TAG}> (got {root.tag!r})")
-    document_problems: list[str] = []
-    anime_elements: list[Element] = []
-    for child in root:
-        if child.tag == "anime":
-            anime_elements.append(child)
-        else:
-            document_problems.append(f"unknown element <{child.tag}> under <{ROOT_TAG}> (ignored)")
+    anime_elements, document_problems = _document_elements(root)
     if max_entries > 0 and len(anime_elements) > max_entries:
         raise MappingError(
             f"{len(anime_elements)} <anime> entries exceed max_entries={max_entries}"
@@ -478,6 +527,24 @@ def parse_anime_lists(
     )
 
 
+def _document_elements(root: Element) -> tuple[list[Element], list[str]]:
+    """Keep unsupported document structure outside row-local quarantine eligibility."""
+    document_problems: list[str] = []
+    if root.attrib:
+        document_problems.append(f"unknown attributes on <{ROOT_TAG}>")
+    if root.text and root.text.strip():
+        document_problems.append(f"unmapped text inside <{ROOT_TAG}>")
+    anime_elements: list[Element] = []
+    for child in root:
+        if child.tail and child.tail.strip():
+            document_problems.append(f"unmapped text inside <{ROOT_TAG}>")
+        if child.tag == "anime":
+            anime_elements.append(child)
+        else:
+            document_problems.append(f"unknown element <{child.tag}> under <{ROOT_TAG}> (ignored)")
+    return anime_elements, document_problems
+
+
 def _parse_root(xml_text: str | bytes | bytearray) -> Element:
     try:
         # ``defusedxml`` accepts any bytes-like buffer at runtime, although its bundled
@@ -492,12 +559,13 @@ def _parse_root(xml_text: str | bytes | bytearray) -> Element:
         raise MappingError(f"Anime-Lists XML rejected as unsafe XML: {exc}") from exc
 
 
-def _parse_anime_element(
+def _parse_anime_element(  # noqa: PLR0912 -- keep one entry validation boundary
     index: int, element: Element, duplicate_anidbids: Mapping[int, tuple[int, ...]]
 ) -> tuple[AnimeEntry | None, EntryProblem | None]:
     fatal: list[str] = []
     problems: list[str] = []
     known_unsupported: list[str] = []
+    semantic_issues: list[EntryParseIssue] = []
     fenced_tvdb_keys: set[QueryKey] = set()
     issues: list[EntryParseIssue] = []
     attributes = dict(element.attrib)
@@ -505,10 +573,19 @@ def _parse_anime_element(
     unknown = tuple(name for name in sorted(attributes) if name not in allowed)
     for name in unknown:
         fatal.append(f"unknown attribute {name!r} on <anime> (entry excluded, not guessed)")
+    if element.text and element.text.strip():
+        fatal.append("unmapped text inside <anime> (entry excluded)")
+    if any(child.tail and child.tail.strip() for child in element):
+        fatal.append("unmapped text inside <anime> (entry excluded)")
 
     anidbid = _positive_int(attributes.get("anidbid"), "anidbid", fatal)
-    tvdbid = _positive_int(attributes.get("tvdbid"), "tvdbid", fatal)
-    season = _season_attr(attributes.get("defaulttvdbseason"), fatal)
+    non_tvdb = attributes.get("tvdbid") in _NON_TVDB_TYPES
+    tvdbid = None if non_tvdb else _positive_int(attributes.get("tvdbid"), "tvdbid", fatal)
+    season = (
+        None
+        if non_tvdb and "defaulttvdbseason" not in attributes
+        else _season_attr(attributes.get("defaulttvdbseason"), fatal)
+    )
     episodeoffset = _offset_attr(attributes.get("episodeoffset"), fatal)
 
     unsupported_absolute_offset = season == "a" and episodeoffset is not None
@@ -524,6 +601,7 @@ def _parse_anime_element(
         fatal,
         known_unsupported,
         fenced_tvdb_keys,
+        semantic_issues,
         tvdbid=tvdbid,
     )
 
@@ -531,12 +609,14 @@ def _parse_anime_element(
         entries = ", ".join(str(item) for item in duplicate_anidbids[anidbid])
         fatal.append(f"anidbid {anidbid} is duplicated by entries {entries}")
 
-    if fatal:
-        issues = [
-            EntryParseIssue(
-                EntryIssueKind.MALFORMED, EntryIssueCode.MALFORMED_ENTRY, "; ".join(fatal)
+    if fatal or semantic_issues:
+        issues = list(semantic_issues)
+        if fatal:
+            issues.append(
+                EntryParseIssue(
+                    EntryIssueKind.MALFORMED, EntryIssueCode.MALFORMED_ENTRY, "; ".join(fatal)
+                )
             )
-        ]
         if known_unsupported:
             issues.append(
                 EntryParseIssue(
@@ -558,10 +638,16 @@ def _parse_anime_element(
             anidbid,
             tvdbid,
             True,
-            tuple(fatal + problems + known_unsupported),
+            tuple(
+                fatal + problems + known_unsupported + [issue.detail for issue in semantic_issues]
+            ),
             tuple(issues),
             tuple(sorted(fenced_tvdb_keys)),
         )
+    if non_tvdb:
+        # Validated above, including duplicate AniDB ownership and all rule syntax.
+        # This title has no TVDB series to index; its type is not a malformed ID.
+        return None, None
     if anidbid is None or tvdbid is None or not isinstance(season, int | str):
         detail = "; ".join(problems) or "entry identity or season is incomplete"
         return None, EntryProblem(
@@ -678,6 +764,7 @@ def _parse_entry_rules(
     fatal: list[str],
     known_unsupported: list[str],
     fenced_tvdb_keys: set[QueryKey],
+    semantic_issues: list[EntryParseIssue],
     *,
     tvdbid: int | None,
 ) -> tuple[MappingRule, ...]:
@@ -686,7 +773,12 @@ def _parse_entry_rules(
         tag = child.tag
         if tag in _METADATA_CHILDREN:
             continue
-        if tag in ("mapping-list", "before"):
+        if tag == "before":
+            _validate_before(child, fatal)
+        elif tag == "mapping-list":
+            for mapping in child:
+                if "tmdbseason" in mapping.attrib:
+                    _positive_int(element.get("tmdbtv"), "TMDB mapping owner tmdbtv", fatal)
             rules.extend(
                 _parse_rule_container(
                     tag,
@@ -695,6 +787,7 @@ def _parse_entry_rules(
                     fatal,
                     known_unsupported,
                     fenced_tvdb_keys,
+                    semantic_issues,
                     tvdbid=tvdbid,
                 )
             )
@@ -702,8 +795,25 @@ def _parse_entry_rules(
             detail = f"unsupported mapping element <{tag}> inside <anime> (entry excluded)"
             fatal.append(detail)
         else:
-            problems.append(f"unknown element <{tag}> inside <anime> (ignored)")
+            fatal.append(f"unknown element <{tag}> inside <anime> (entry excluded)")
     return tuple(rules)
+
+
+def _validate_before(element: Element, fatal: list[str]) -> None:
+    """Validate presentation ordering without creating episode identity claims."""
+    if element.attrib or len(element):
+        fatal.append("<before> must contain only presentation-order text (entry excluded)")
+        return
+    tokens = [item.strip() for item in (element.text or "").split(";") if item.strip()]
+    if len(tokens) > MAX_PAIRS_PER_RULE:
+        fatal.append("<before> presentation-order pair cap exceeded (entry excluded)")
+        return
+    for token in tokens:
+        if re.fullmatch(r"[0-9]+-[0-9]+", token) is None:
+            fatal.append("invalid <before> presentation-order pair (entry excluded)")
+            continue
+        for raw in token.split("-"):
+            _positive_int(raw, "before episode", fatal)
 
 
 def _parse_rule_container(
@@ -713,6 +823,7 @@ def _parse_rule_container(
     fatal: list[str],
     known_unsupported: list[str],
     fenced_tvdb_keys: set[QueryKey],
+    semantic_issues: list[EntryParseIssue],
     *,
     tvdbid: int | None,
 ) -> Iterable[MappingRule]:
@@ -737,24 +848,27 @@ def _parse_rule_container(
             fatal,
             known_unsupported,
             fenced_tvdb_keys,
+            semantic_issues,
             tvdbid=tvdbid,
         )
         if rule is not None:
             yield rule
 
 
-def _parse_mapping_element(
+def _parse_mapping_element(  # noqa: PLR0912, PLR0915 -- one complete schema/semantic boundary
     origin: str,
     mapping: Element,
     problems: list[str],
     fatal: list[str],
     known_unsupported: list[str],
     fenced_tvdb_keys: set[QueryKey],
+    semantic_issues: list[EntryParseIssue],
     *,
     tvdbid: int | None,
 ) -> MappingRule | None:
     attributes = dict(mapping.attrib)
     rule_problems: list[str] = []
+    rule_semantics: list[EntryParseIssue] = []
     invalid = False
     unknown = sorted(set(attributes) - _MAPPING_ATTRIBUTES)
     for name in unknown:
@@ -767,7 +881,15 @@ def _parse_mapping_element(
         invalid = True
 
     anidbseason = _mapping_int(attributes.get("anidbseason"), "anidbseason", rule_problems)
-    tvdbseason = _mapping_int(attributes.get("tvdbseason"), "tvdbseason", rule_problems)
+    tmdb_only = "tvdbseason" not in attributes and "tmdbseason" in attributes
+    season_attribute = "tmdbseason" if tmdb_only else "tvdbseason"
+    tvdbseason = _mapping_int(attributes.get(season_attribute), season_attribute, rule_problems)
+    if (
+        not tmdb_only
+        and "tmdbseason" in attributes
+        and _mapping_int(attributes["tmdbseason"], "tmdbseason", rule_problems) is None
+    ):
+        invalid = True
     start = _optional_mapping_int(attributes.get("start"), "start", rule_problems)
     end = _optional_mapping_int(attributes.get("end"), "end", rule_problems)
     offset = _mapping_signed_int(attributes.get("offset"), "offset", rule_problems)
@@ -778,31 +900,66 @@ def _parse_mapping_element(
         invalid = True
     if "offset" in attributes and offset is None:
         invalid = True
+    if (start is not None and start < 1) or (end is not None and end < 1):
+        rule_problems.append("each supplied mapping start/end bound must be >= 1 (entry excluded)")
+        invalid = True
 
     pairs, pair_fatal, unsupported_pairs = _parse_pair_body(
-        "".join(mapping.itertext()), rule_problems, anidbseason=anidbseason
+        "".join(mapping.itertext()), rule_problems, rule_semantics, anidbseason=anidbseason
     )
     if pair_fatal:
         invalid = True
 
     _record_unsupported_pair_fences(
-        unsupported_pairs,
+        () if tmdb_only else unsupported_pairs,
         known_unsupported,
         fenced_tvdb_keys,
         tvdbid=tvdbid,
         tvdbseason=tvdbseason,
     )
 
-    bounds = _validated_range(anidbseason, start, end, offset, rule_problems)
-    if anidbseason is not None and anidbseason >= UNVERIFIED_ANIDBSEASON:
-        rule_problems.append(
-            f"mapping anidbseason={anidbseason} semantics are UNVERIFIED (entry excluded)"
-        )
+    # TMDB rules are syntax-checked but never expanded or used to suppress TVDB
+    # defaults. In particular their open-ended offsets need no TVDB interpretation.
+    bounds = (
+        (start, end, offset)
+        if tmdb_only
+        else _validated_range(anidbseason, start, end, offset, rule_problems)
+    )
+    if not tmdb_only and offset is not None and start is not None and end is not None:
+        bounds_ok, reason = _bounds_ok(start, end)
+        if not bounds_ok:
+            if reason not in rule_problems:
+                rule_problems.append(reason)
+            invalid = True
+    if tmdb_only and (
+        (start is not None and start < 1)
+        or (end is not None and end < (start if start is not None else 1))
+    ):
+        rule_problems.append("invalid TMDB mapping bounds (entry excluded)")
         invalid = True
+    if anidbseason is not None and anidbseason >= UNVERIFIED_ANIDBSEASON:
+        rule_semantics.append(
+            EntryParseIssue(
+                EntryIssueKind.MALFORMED,
+                EntryIssueCode.UNVERIFIED_ANIDB_SEASON,
+                f"mapping anidbseason={anidbseason} semantics are UNVERIFIED (entry excluded)",
+            )
+        )
     if anidbseason is not None and anidbseason < 0:
         invalid = True
     if offset is not None and bounds == (None, None, None):
-        invalid = True
+        if not tmdb_only and (start is None or end is None):
+            rule_semantics.append(
+                EntryParseIssue(
+                    EntryIssueKind.MALFORMED,
+                    EntryIssueCode.UNBOUNDED_MAPPING_OFFSET,
+                    "mapping offset without [start,end] bounds is unbounded (entry excluded)",
+                )
+            )
+        elif anidbseason is not None and anidbseason < UNVERIFIED_ANIDBSEASON:
+            invalid = True
+
+    semantic_issues.extend(rule_semantics)
 
     if invalid:
         fatal.extend(rule_problems)
@@ -810,11 +967,13 @@ def _parse_mapping_element(
             f"<mapping> in <{origin}> has a malformed or unsupported declaration (entry excluded)"
         )
         return None
+    if rule_semantics:
+        return None
     start_ok, end_ok, offset_ok = bounds
     problems.extend(rule_problems)
     if anidbseason is None or tvdbseason is None:
         return None
-    if anidbseason >= UNVERIFIED_ANIDBSEASON:
+    if anidbseason >= UNVERIFIED_ANIDBSEASON or tmdb_only:
         return None
     return MappingRule(
         origin=origin,
@@ -907,11 +1066,16 @@ def _mapping_signed_int(raw: str | None, name: str, problems: list[str]) -> int 
 
 
 def _parse_pair_body(
-    body: str, problems: list[str], *, anidbseason: int | None
+    body: str,
+    problems: list[str],
+    semantic_issues: list[EntryParseIssue],
+    *,
+    anidbseason: int | None,
 ) -> tuple[tuple[EpisodePair, ...], bool, tuple[EpisodePair, ...]]:
     pairs: list[EpisodePair] = []
     unsupported: list[EpisodePair] = []
     seen: set[EpisodePair] = set()
+    invalid = False
     tokens = [item.strip() for item in body.split(";") if item.strip()]
     if len(tokens) > MAX_PAIRS_PER_RULE:
         problems.append(
@@ -923,10 +1087,13 @@ def _parse_pair_body(
         left_side = token.partition("-")[0]
         if _LEFT_MULTI_RE.fullmatch(left_side):
             problems.append(f"pair {token!r}: AniDB-side multi-episode invalid (entry rejected)")
-            return tuple(pairs), True, tuple(unsupported)
-        pair = _parse_pair_token(token, problems)
+            invalid = True
+            continue
+        semantic_count = len(semantic_issues)
+        pair = _parse_pair_token(token, problems, semantic_issues)
         if pair is None:
-            return tuple(pairs), True, tuple(unsupported)
+            invalid |= len(semantic_issues) == semantic_count
+            continue
         if pair in seen:
             continue
         seen.add(pair)
@@ -934,10 +1101,12 @@ def _parse_pair_body(
             unsupported.append(pair)
             continue
         pairs.append(pair)
-    return tuple(pairs), False, tuple(unsupported)
+    return tuple(pairs), invalid, tuple(unsupported)
 
 
-def _parse_pair_token(token: str, problems: list[str]) -> EpisodePair | None:
+def _parse_pair_token(
+    token: str, problems: list[str], semantic_issues: list[EntryParseIssue]
+) -> EpisodePair | None:
     match = _PAIR_RE.fullmatch(token)
     if match is None:
         problems.append(f"invalid pair token {token!r} (entry excluded)")
@@ -955,8 +1124,12 @@ def _parse_pair_token(token: str, problems: list[str]) -> EpisodePair | None:
         problems.append(f"pair {token!r}: AniDB episode below 1 (entry excluded)")
         return None
     if len(parts) > 1 and 0 in parts:
-        problems.append(
-            f"pair {token!r}: TVDB 0 cannot combine with other episodes (entry excluded)"
+        semantic_issues.append(
+            EntryParseIssue(
+                EntryIssueKind.MALFORMED,
+                EntryIssueCode.CONTRADICTORY_NO_COUNTERPART,
+                f"pair {token!r}: TVDB 0 cannot combine with other episodes (entry excluded)",
+            )
         )
         return None
     tvdb = () if parts == [0] else tuple(sorted(set(parts)))
