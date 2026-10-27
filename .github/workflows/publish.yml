@@ -234,7 +234,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.ref }}
+          # Push history must be anchored to the immutable event revision, even
+          # when the branch has moved or been rewritten before this job starts.
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.sha }}
           fetch-depth: 0 # full history + merge-base needed for enumeration
       - name: Compute & validate lowercase GHCR image reference
         # F2: github.repository_owner (snake_case) via env indirection, lowercased
@@ -303,6 +305,8 @@ jobs:
             python3 scripts/enumerate_introduced.py "${args[@]}" > plan.json
           }
           if [ "$EVENT_NAME" = "push" ]; then
+            is_full_sha "$PUSH_SHA" || die "invalid push after SHA: not-40-hex"
+            is_full_sha "$PUSH_BEFORE" || die "invalid push before SHA: not-40-hex"
             python3 scripts/enumerate_introduced.py introduced \
               --repo . --before "$PUSH_BEFORE" --after "$PUSH_SHA" \
               --ref "$PUSH_REF" --default-branch main \

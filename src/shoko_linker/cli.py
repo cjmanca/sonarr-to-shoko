@@ -43,6 +43,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -888,6 +889,8 @@ def _run_daemon(args: argparse.Namespace) -> int:
 
 
 class _NormalServiceRuntime:
+    _INITIAL_ACTION = "Create the dashboard account and complete setup to begin."
+
     def __init__(
         self,
         settings: BootstrapSettings,
@@ -904,7 +907,7 @@ class _NormalServiceRuntime:
         self.latest: dict[str, Any] = {
             "connection": None,
             "authorized": False,
-            "next_action": "Create the dashboard account and complete setup to begin.",
+            "next_action": self._INITIAL_ACTION,
             "diagnostics": (),
             "mapping_cache": "Available after scope and safety setup is confirmed above.",
         }
@@ -917,6 +920,52 @@ class _NormalServiceRuntime:
     def _latest_snapshot(self) -> dict[str, Any]:
         with self._latest_lock:
             return self.latest.copy()
+
+    @staticmethod
+    def _operational_status(
+        store: StateStore,
+        *,
+        authorized: bool,
+        next_action: str,
+        report: CycleReport | None = None,
+    ) -> tuple[bool, str]:
+        """Project write availability separately from consent and cycle success."""
+        paused, pause_reason = store.get_service_pause()
+        if paused:
+            # A current setup/connection decision is more useful than a generic pause.
+            # Before the first check, derive guidance from the durable hold instead.
+            if authorized or next_action == _NormalServiceRuntime._INITIAL_ACTION:
+                if pause_reason == "unsafe_shoko_settings":
+                    next_action = "Review and fix Shoko safety settings, then confirm setup again."
+                elif OnboardingManager(store).reconfirmation_required():
+                    next_action = "Confirm the current scope and safety setup again."
+                elif pause_reason == "user_paused":
+                    next_action = "Automatic linking is paused. Resume when you are ready."
+                else:
+                    next_action = "Review the current scope, safety setup and connections."
+            return False, next_action
+        if store.writes_disabled or store.get_meta("requires_rebaseline") == "1":
+            return False, (
+                "Automatic linking is stopped by a safety check. "
+                "Review advanced diagnostics before retrying."
+            )
+        canary = store.get_service_canary()
+        if canary is not None and canary[1] == "failed":
+            return False, (
+                "Automatic linking is stopped because the initial link could not be verified. "
+                "Review advanced diagnostics before retrying."
+            )
+        if not authorized:
+            return False, next_action
+        if report is not None and (report.failed or report.writes_suppressed):
+            return False, "A service check needs attention; automatic linking will retry safely."
+        if canary is not None and canary[1] == "pending":
+            authorized = False
+            next_action = (
+                "Waiting for the initial link to be verified before processing more files. "
+                "The service will check again automatically."
+            )
+        return authorized, next_action
 
     def status(self) -> DashboardStatus:
         latest = self._latest_snapshot()
@@ -933,7 +982,11 @@ class _NormalServiceRuntime:
             return DashboardStatus(message, 0, 0, 0, False, latest["next_action"])
         store = StateStore(path)
         try:
-            paused, _reason = store.get_service_pause()
+            active, next_action = self._operational_status(
+                store,
+                authorized=bool(latest["authorized"]),
+                next_action=cast(str, latest["next_action"]),
+            )
             counts = store.service_file_counts()
             exclusions = discovery_exclusion_payload(store)
             exclusion_counts = tuple(sorted(exclusions["counts"].items()))
@@ -946,8 +999,8 @@ class _NormalServiceRuntime:
                 counts.verified_files,
                 counts.waiting_files,
                 counts.review_files,
-                bool(latest["authorized"]) and not paused,
-                cast(str, latest["next_action"]),
+                active,
+                next_action,
                 diagnostics=(
                     *cast(tuple[str, ...], latest["diagnostics"]),
                     *exclusion_diagnostics,
@@ -1112,23 +1165,31 @@ class _NormalServiceRuntime:
                 interval_seconds=settings.sync.interval_seconds,
                 full_reconcile_hours=settings.sync.full_reconcile_interval_hours,
             )
+            active, next_action = self._operational_status(
+                store,
+                authorized=True,
+                next_action="Automatic linking is processing eligible files.",
+                report=report,
+            )
             self._update_latest(
+                authorized=active,
                 diagnostics=report.reasons[:20],
                 mapping_cache=(
                     "Available from the last service check."
                     if report.mapping_revision > 0
                     else "Not ready; linking will wait for verified episode mappings."
                 ),
-                next_action=(
-                    "Automatic linking is processing eligible files."
-                    if not report.failed
-                    else "A service check needs attention; automatic linking will retry safely."
-                ),
+                next_action=next_action,
             )
 
-        self._update_latest(
+        active, next_action = self._operational_status(
+            store,
             authorized=True,
             next_action="Automatic linking is running for the confirmed scope.",
+        )
+        self._update_latest(
+            authorized=active,
+            next_action=next_action,
         )
         run_daemon(
             deps,
@@ -1688,9 +1749,14 @@ def _run_pause_writes(args: argparse.Namespace) -> int:
 
     def action(_settings: Settings, store: StateStore, iso: str) -> Mapping[str, Any]:
         reason = cast(str, args.reason)
-        store.pause(reason, iso)
         hours = getattr(args, "hours", None)
-        until = None if hours is None else _iso_plus(iso, float(hours) * 3600.0)
+        try:
+            until = None if hours is None else _iso_plus(iso, float(hours) * 3600.0)
+        except (ValueError, OverflowError) as exc:
+            raise ConfigError(
+                "--hours exceeds the supported resume horizon timestamp range"
+            ) from exc
+        store.pause(reason, iso)
         if until is not None:
             with contextlib.suppress(WriteDisabledError, StateError):
                 store.set_meta("paused_until_iso", until)
@@ -1817,7 +1883,10 @@ def _record_lease(
     flags = _parse_setting_flags(cast(str, args.settings))
     mounts = [item.strip() for item in cast(str, args.mounts).split(",") if item.strip()]
     inspected = current_iso()
-    expires = _iso_plus(inspected, hours * 3600.0)
+    try:
+        expires = _iso_plus(inspected, hours * 3600.0)
+    except OverflowError as exc:
+        raise AttestationError("hours exceeds the supported expiry timestamp range") from exc
     record = build_record(
         endpoint=cast(str, args.endpoint),
         version=cast(str, args.version),
@@ -2934,8 +3003,8 @@ def _positive_number(raw: str) -> float:
         value = float(raw)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{raw!r} is not a number") from None
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than 0")
     return value
 
 

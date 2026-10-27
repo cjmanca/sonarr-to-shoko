@@ -24,7 +24,15 @@ from urllib.parse import urlsplit, urlunsplit
 import yaml  # type: ignore[import-untyped]
 
 from .errors import ConfigError, PathError
-from .paths import PathMapping, normalize_posix, validate_mappings
+from .paths import (
+    PathMapping,
+    apply_mapping,
+    is_within_root,
+    normalize_posix,
+    select_mapping,
+    validate_mappings,
+)
+from .yaml_diagnostics import yaml_error_detail
 
 APPLY_ENV_VAR: Final[str] = "SHOKO_LINKER_ALLOW_APPLY"
 MAPPING_SOURCE: Final[str] = "anime-lists"
@@ -352,6 +360,7 @@ def parse_settings(text: str, *, config_path: Path | None = None) -> Settings:
     paths_section = _section(doc, "paths")
     _known_keys(paths_section, {"mappings"}, "paths")
     path_mappings = _path_mappings(paths_section)
+    _validate_scope_coverage(sonarr, shoko, path_mappings)
     mappings = _mappings(_section(doc, "mappings"))
     sync = _sync(_section(doc, "sync"))
     database = _database(_section(doc, "database"))
@@ -379,7 +388,7 @@ def _document(text: str) -> Mapping[str, Any]:
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"configuration is not valid YAML: {exc}") from exc
+        raise ConfigError(f"configuration is not valid YAML: {yaml_error_detail(exc)}") from None
     if raw is None:
         raise ConfigError("configuration file is empty")
     if not isinstance(raw, dict):
@@ -422,6 +431,17 @@ def validate_base_url(raw: Any, field_name: str) -> str:
         return _base_url(raw, field_name)
     except ValueError:
         raise ConfigError(f"{field_name}: must be a valid HTTP(S) URL") from None
+
+
+def validate_mapping_source_url(raw: Any, field_name: str = "mappings.source_url") -> str:
+    """Share the HTTPS source policy across configuration and persisted cache boundaries."""
+    url = validate_base_url(raw, field_name)
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise ConfigError(f"{field_name}: scheme must be HTTPS")
+    if not parts.path or parts.path == "/":
+        raise ConfigError(f"{field_name}: must name a file path")
+    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, "", ""))
 
 
 def _base_url(raw: Any, field_name: str) -> str:
@@ -514,6 +534,23 @@ def _path_mappings(section: Mapping[str, Any]) -> tuple[PathMapping, ...]:
         raise ConfigError(f"paths.mappings: {exc}") from exc
 
 
+def _validate_scope_coverage(
+    sonarr: ServiceSettings, shoko: ServiceSettings, mappings: tuple[PathMapping, ...]
+) -> None:
+    # validate_mappings rejects nested sources, so a mapping covering a root
+    # also covers every descendant without any competing translation.
+    for root in sonarr.allowed_roots:
+        mapping = select_mapping(root, mappings)
+        if mapping is None:
+            raise ConfigError(f"paths.mappings: does not cover Sonarr allowed root {root!r}")
+        translated = apply_mapping(root, mapping)
+        if not any(is_within_root(translated, allowed) for allowed in shoko.allowed_roots):
+            raise ConfigError(
+                f"paths.mappings: Sonarr allowed root {root!r} translates to "
+                f"{translated!r}, outside shoko.allowed_roots"
+            )
+
+
 def _mappings(section: Mapping[str, Any]) -> MappingSettings:
     _known_keys(section, _MAPPINGS_KEYS, "mappings")
     source = section.get("source")
@@ -529,7 +566,7 @@ def _mappings(section: Mapping[str, Any]) -> MappingSettings:
         source=MAPPING_SOURCE,
         refresh_hours=_positive_number(section, "refresh_hours", "mappings", DEFAULT_REFRESH_HOURS),
         overrides_file=overrides,
-        source_url=_base_url(
+        source_url=validate_mapping_source_url(
             section.get("source_url", DEFAULT_MAPPING_SOURCE_URL), "mappings.source_url"
         ),
     )

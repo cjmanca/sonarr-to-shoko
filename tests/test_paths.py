@@ -22,6 +22,36 @@ def test_normalize_posix_collapses_and_strips() -> None:
     assert normalize_posix("/data//media/./anime/") == "/data/media/anime"
 
 
+@pytest.mark.parametrize("path", ["//anime", "//./anime/", "///anime//"])
+def test_normalize_posix_collapses_leading_slashes(path: str) -> None:
+    assert normalize_posix(path) == "/anime"
+
+
+@pytest.mark.parametrize("root", ["/", "//", "//.", "//./", "///././"])
+def test_filesystem_root_aliases_fail_closed(root: str) -> None:
+    with pytest.raises(PathError, match="below the filesystem root"):
+        normalize_posix(root)
+    assert is_within_root("/live-action/file.mkv", root) is False
+    assert select_mapping("/live-action/file.mkv", [PathMapping(root, "/anime")]) is None
+    with pytest.raises(PathError, match="below the filesystem root"):
+        apply_mapping("/live-action/file.mkv", PathMapping(root, "/anime"))
+    with pytest.raises(PathError, match="below the filesystem root"):
+        validate_mappings([PathMapping("/anime", root)])
+
+
+def test_leading_slash_aliases_preserve_mapping_identity_and_root_boundaries() -> None:
+    assert is_within_root("//anime/Show/file.mkv", "/anime") is True
+    assert is_within_root("/anime-old/file.mkv", "//anime") is False
+    assert apply_mapping("//anime/Show/file.mkv", PathMapping("/anime", "//shoko")) == (
+        "/shoko/Show/file.mkv"
+    )
+    assert validate_mappings(
+        [PathMapping("//anime", "//shoko"), PathMapping("/anime", "/shoko")]
+    ) == (PathMapping("/anime", "/shoko"),)
+    with pytest.raises(PathError, match="conflicting"):
+        validate_mappings([PathMapping("//anime", "/shoko"), PathMapping("/anime", "/other")])
+
+
 def test_normalize_posix_preserves_meaningful_component_whitespace() -> None:
     path = "/anime/Series / file.mkv "
     assert normalize_posix(path) == path
@@ -134,6 +164,32 @@ def test_validate_mappings_rejects_empty_and_conflicting() -> None:
     ]
     with pytest.raises(PathError, match="conflicting"):
         validate_mappings(conflicting)
+
+
+@pytest.mark.parametrize("targets", [("/anime", "/anime/other"), ("/anime/other", "/anime")])
+def test_validate_mappings_rejects_reverse_mapping_domain_overlap(
+    targets: tuple[str, str],
+) -> None:
+    mappings = [PathMapping("/a", targets[0]), PathMapping("/b", targets[1])]
+    # Different source files can produce the exact same Shoko path. Size equality
+    # cannot disambiguate their episode identities, so refuse the configuration.
+    outer, inner = sorted(mappings, key=lambda mapping: len(path_parts(mapping.shoko)))
+    assert apply_mapping(f"{outer.sonarr}/other/file.mkv", outer) == apply_mapping(
+        f"{inner.sonarr}/file.mkv", inner
+    )
+    with pytest.raises(PathError, match="overlapping Shoko targets"):
+        validate_mappings(mappings)
+
+
+@pytest.mark.parametrize("target", ["/anime", "//anime/./"])
+def test_validate_mappings_rejects_equal_targets_from_distinct_sources(target: str) -> None:
+    with pytest.raises(PathError, match="overlapping Shoko targets"):
+        validate_mappings([PathMapping("/a", "/anime"), PathMapping("/b", target)])
+
+
+def test_validate_mappings_preserves_component_disjoint_targets() -> None:
+    mappings = (PathMapping("/a", "/anime"), PathMapping("/b", "/anime-old"))
+    assert validate_mappings(mappings) == mappings
 
 
 def test_validate_mappings_deduplicates_and_orders_by_depth() -> None:

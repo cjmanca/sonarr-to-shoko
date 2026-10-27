@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ import yaml  # type: ignore[import-untyped]
 
 from .config import normalize_service_url
 from .errors import ConfigError, LinkerError
+from .yaml_diagnostics import yaml_error_detail
 
 type AttestationStatus = Literal["valid", "absent", "invalid", "expired", "stale_version"]
 
@@ -149,7 +151,10 @@ def parse_iso(raw: str) -> datetime:
     parsed = datetime.fromisoformat(raw)
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError("timestamp is outside the supported UTC range") from exc
 
 
 def validate_scope(scope: str) -> str:
@@ -255,8 +260,8 @@ def build_record(
         raise AttestationError("note: a non-empty operator note is required")
     if len(note) > MAX_NOTE_CHARS:
         raise AttestationError(f"note: at most {MAX_NOTE_CHARS} characters")
-    inspected = parse_iso(inspected_iso)
-    expires = parse_iso(expires_iso)
+    inspected = _require_iso(inspected_iso, "inspected_iso")
+    expires = _require_iso(expires_iso, "expires_iso")
     if expires <= inspected:
         raise AttestationError("expires: must be strictly after the inspection time")
     return AttestationRecord(
@@ -322,7 +327,9 @@ def _document_mapping(text: str) -> dict[str, Any]:
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise AttestationError(f"attestation file is not valid YAML/JSON: {exc}") from exc
+        raise AttestationError(
+            f"attestation file is not valid YAML/JSON: {yaml_error_detail(exc)}"
+        ) from None
     if not isinstance(raw, dict):
         raise AttestationError("attestation file: expected a mapping of record fields")
     document = cast("dict[str, Any]", raw)
@@ -562,6 +569,10 @@ def campaign_lease_path(daemon_path: str | Path, campaign_id: str) -> Path:
 
 def lease_expiry_cap(hours: float, validity_cap_hours: float) -> tuple[bool, str]:
     """``attestation record --hours`` cap: leases never outlive the config cap."""
+    if not math.isfinite(hours):
+        return False, "hours must be finite"
+    if not math.isfinite(validity_cap_hours) or validity_cap_hours <= 0:
+        return False, "safety.attestation_validity_hours must be finite and greater than 0"
     if hours <= 0:
         return False, "hours must be greater than 0"
     if hours > validity_cap_hours:

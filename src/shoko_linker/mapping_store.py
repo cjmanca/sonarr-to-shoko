@@ -60,7 +60,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .config import DEFAULT_MAPPING_SOURCE_URL, DEFAULT_REFRESH_HOURS, Settings
+from .backoff import capped_backoff
+from .config import (
+    DEFAULT_MAPPING_SOURCE_URL,
+    DEFAULT_REFRESH_HOURS,
+    Settings,
+    validate_mapping_source_url,
+)
 from .errors import ConfigError, HttpPolicyError
 from .http import (
     ApiEndpoint,
@@ -94,7 +100,6 @@ _OK: Final[int] = 200
 _NOT_MODIFIED: Final[int] = 304
 _HEX64: Final[int] = 64
 _HEX32: Final[int] = 32
-_MIN_SOURCE_PATH_CHARS: Final[int] = 2
 
 _STATE_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -170,31 +175,16 @@ class RefreshOutcome(Enum):
 
 @dataclass(frozen=True)
 class SourceLocation:
-    """Mapping source URL split into origin + path (validators mirror ``config._base_url``)."""
+    """Validated HTTPS mapping source URL split into origin + path."""
 
     origin: str
     path: str
 
 
 def parse_source_url(url: str) -> SourceLocation:
-    """Validate the mapping source URL; reject non-http(s), credentials, query, fragment."""
-    if not isinstance(url, str) or not url.strip():
-        raise ConfigError("mappings source URL: must be a non-empty URL string")
-    parts = urlsplit(url.strip())
-    scheme = parts.scheme.lower()
-    if scheme not in {"http", "https"}:
-        raise ConfigError(
-            f"mappings source URL: scheme must be http or https (got {parts.scheme!r})"
-        )
-    if not parts.hostname:
-        raise ConfigError("mappings source URL: must include a host")
-    if parts.username or parts.password:
-        raise ConfigError("mappings source URL: must not embed credentials")
-    if parts.query or parts.fragment:
-        raise ConfigError("mappings source URL: must not include a query or fragment")
-    if not parts.path.startswith("/") or len(parts.path) < _MIN_SOURCE_PATH_CHARS:
-        raise ConfigError("mappings source URL: must name a file path")
-    origin = urlunsplit((scheme, parts.netloc.lower(), "", "", ""))
+    """Apply the shared mapping-source policy before using network or cached provenance."""
+    parts = urlsplit(validate_mapping_source_url(url))
+    origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
     return SourceLocation(origin=origin, path=parts.path)
 
 
@@ -1722,7 +1712,7 @@ def _recovery_backoff_active(state: _State, now: datetime) -> bool:
 
 
 def _backoff_hours(consecutive_failures: int) -> float:
-    return min(MAX_BACKOFF_HOURS, 2.0 ** (consecutive_failures - 1))
+    return capped_backoff(1.0, consecutive_failures - 1, MAX_BACKOFF_HOURS)
 
 
 def _record_failure(

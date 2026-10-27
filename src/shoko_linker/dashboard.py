@@ -669,7 +669,7 @@ class DashboardApplication:
         settings: DashboardSettingsView | None = None,
     ) -> str:
         active = status.automatic_linking and not paused
-        action = next_action or ("Automatic linking is paused." if paused else status.next_action)
+        action = next_action or status.next_action
         diagnostics = "".join(f"<li>{html.escape(item)}</li>" for item in status.diagnostics)
         exclusion_categories = (
             ", ".join(

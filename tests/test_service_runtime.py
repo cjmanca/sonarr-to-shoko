@@ -14,7 +14,7 @@ import test_daemon as td
 from shoko_linker import cli
 from shoko_linker.bootstrap import BootstrapSettings
 from shoko_linker.config import SecretRef, Settings, load_settings
-from shoko_linker.daemon import CycleMode, DaemonDeps, run_cycle
+from shoko_linker.daemon import CycleCounts, CycleMode, CycleReport, DaemonDeps, run_cycle
 from shoko_linker.dashboard import DashboardApplication
 from shoko_linker.http import ApiEndpoint
 from shoko_linker.linking import SendOutcome, VerificationVerdict
@@ -52,6 +52,243 @@ def _assert_scope_consent_is_not_invalidated(
 def _service_authorized_local(deps: DaemonDeps) -> bool:
     assert deps.service_authorized_local is not None
     return deps.service_authorized_local()
+
+
+def test_failed_initial_link_stays_visibly_held_after_healthy_cycle_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = [
+        td.SpecFile(series_id=1, file_id=10, shoko_id=500),
+        td.SpecFile(series_id=1, file_id=11, shoko_id=501),
+    ]
+    td.activate_mapping(tmp_path, td.mapping_xml())
+    store = td.open_tmp_store(tmp_path)
+    td.seed_baseline(store, files)
+    shoko = td.ShokoStub(files)
+    shoko.post_status = 400
+    shoko.link_on_post = False
+    deps = td.build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=td.mapping_xml(),
+        monotonic=td.Clock([0.0]),
+        advance=lambda _: None,
+        shoko=shoko,
+    )
+    deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        tmp_path / "state.sqlite3",
+    )
+    runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
+    try:
+        for iso in (td.T0, td.T1, td.T2):
+            monkeypatch.setattr(cli, "current_iso", lambda iso=iso: iso)
+            if iso == td.T2:
+                shoko.post_status = None
+                shoko.link_on_post = True
+            runtime._run_daemon_cycle(deps, store, deps.settings)
+        status = runtime.status()
+        assert store.get_service_canary() == (500, "failed")
+        assert shoko.posts_count() == 2
+        assert status.waiting_files == 2
+        assert not status.automatic_linking
+        assert "initial link could not be verified" in status.next_action
+        assert "Review advanced diagnostics" in status.next_action
+        assert "retry safely" not in status.next_action
+        page = DashboardApplication._status_page(status, "csrf-token", paused=False)
+        assert "Paused</span>" in page
+        assert "initial link could not be verified" in page
+
+        restarted = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
+        assert restarted.status().next_action == status.next_action
+        assert not restarted.status().automatic_linking
+
+        # Startup cannot briefly advertise running before the completion callback.
+        def observe_start(*_args: Any, **_kwargs: Any) -> None:
+            assert not restarted.status().automatic_linking
+            assert restarted.status().next_action == status.next_action
+
+        monkeypatch.setattr(cli, "run_daemon", observe_start)
+        restarted._run_daemon_cycle(deps, store, deps.settings)
+        assert shoko.posts_count() == 2
+    finally:
+        for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+            endpoint.client.close()
+        store.close()
+
+
+@pytest.mark.parametrize("hold", ["write_stop", "rebaseline", "pause"])
+def test_durable_safety_hold_overrides_cached_active_status(tmp_path: Path, hold: str) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        state_path,
+    )
+    endpoint = ApiEndpoint(httpx.Client(), lambda: {})
+    runtime = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+    runtime._update_latest(
+        authorized=True, next_action="Automatic linking is processing eligible files."
+    )
+    try:
+        with open_state(state_path) as store:
+            if hold == "write_stop":
+                store.disable_writes("test safety hold")
+            elif hold == "rebaseline":
+                store.set_meta("requires_rebaseline", "1")
+            else:
+                OnboardingManager(store).pause(iso=td.T0)
+        status = runtime.status()
+        assert not status.automatic_linking
+        assert "processing eligible" not in status.next_action
+        assert (
+            "Resume" in status.next_action
+            if hold == "pause"
+            else "safety check" in status.next_action
+        )
+        if hold == "pause":
+            restarted = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+            assert "Resume" in restarted.status().next_action
+    finally:
+        endpoint.client.close()
+
+
+@pytest.mark.parametrize("reason", ["setup_changed", "unsafe_shoko_settings", "setup_unavailable"])
+def test_system_pause_preserves_current_decision_and_restart_guidance(
+    tmp_path: Path, reason: str
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        state_path,
+    )
+    endpoint = ApiEndpoint(httpx.Client(), lambda: {})
+    runtime = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+    assessment = assess_settings_payload({"FileQualityFilterEnabled": False})
+    binding = ScopeBinding(
+        td.SONARR_BASE,
+        td.SHOKO_BASE,
+        "4.0.0",
+        "5.3.3",
+        (),
+        (td.SONARR_ROOT,),
+        (PathMapping(td.SONARR_ROOT, td.SHOKO_ROOT),),
+        assessment.digest,
+        assessment.unverifiable_facts,
+    )
+    try:
+        with open_state(state_path) as store:
+            manager = OnboardingManager(store)
+            manager.confirm_setup(
+                binding,
+                assessment,
+                confirmed_facts=assessment.unverifiable_facts + assessment.unknown_settings,
+                automatic_link_consent=True,
+                iso=td.T0,
+            )
+            if reason == "unsafe_shoko_settings":
+                decision = manager.evaluate(
+                    binding,
+                    assess_settings_payload({"FileQualityFilterEnabled": True}),
+                    iso=td.T1,
+                )
+            else:
+                decision = manager.pause_for_review(
+                    reason,
+                    "Confirm the changed scope and safety facts."
+                    if reason == "setup_changed"
+                    else "Cannot connect to Shoko. Check its address and API key.",
+                    iso=td.T1,
+                )
+            assert store.get_service_pause() == (True, reason)
+            runtime._update_latest(authorized=False, next_action=decision.message)
+            assert runtime.status().next_action == decision.message
+            assert not runtime.status().automatic_linking
+            fresh = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+            assert "Resume" not in fresh.status().next_action
+            if reason == "unsafe_shoko_settings":
+                assert "fix Shoko safety settings" in fresh.status().next_action
+            if reason != "setup_unavailable":
+                assert manager.reconfirmation_required()
+                assert manager.resume(binding, assessment, iso=td.T2).status.value != "authorized"
+                # A subsequent user pause cannot turn a hard hold into a resumable pause.
+                manager.pause(iso=td.T2)
+
+        restarted = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+        status = restarted.status()
+        assert not status.automatic_linking
+        assert "Resume" not in status.next_action
+        assert "setup" in status.next_action
+        if reason != "setup_unavailable":
+            assert "again" in status.next_action
+    finally:
+        endpoint.client.close()
+
+
+@pytest.mark.parametrize("condition", ["suppressed", "failed", "pending", "healthy"])
+def test_completed_cycle_projects_waits_and_recovers_when_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, condition: str
+) -> None:
+    store = td.open_tmp_store(tmp_path)
+    endpoint = ApiEndpoint(httpx.Client(), lambda: {})
+    bootstrap = BootstrapSettings(
+        td.SONARR_BASE,
+        SecretRef("SONARR_API_KEY"),
+        td.SHOKO_BASE,
+        SecretRef("SHOKO_API_KEY"),
+        tmp_path / "state.sqlite3",
+    )
+    runtime = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+    report = CycleReport(
+        mode=CycleMode.APPLY,
+        cycle_key="projection",
+        alive=True,
+        reconciliation_ready=True,
+        apply_eligible=True,
+        writes_suppressed=condition == "suppressed",
+        mapping_outcome=None,
+        mapping_revision=1,
+        counts=CycleCounts(),
+        reasons=(),
+        drift=(),
+        existing_link_drift=(),
+        deferred_planned=0,
+        failed=condition == "failed",
+    )
+    if condition == "pending":
+        store.record_service_canary(500, td.T0)
+
+    def complete_cycle(*_args: Any, **kwargs: Any) -> None:
+        kwargs["on_cycle_complete"](report)
+
+    monkeypatch.setattr(cli, "run_daemon", complete_cycle)
+    try:
+        runtime._run_daemon_cycle(cast(DaemonDeps, object()), store, td.make_settings(tmp_path))
+        status = runtime.status()
+        assert status.automatic_linking == (condition == "healthy")
+        if condition == "pending":
+            assert "Waiting for the initial link" in status.next_action
+            store.set_service_canary_status("verified", td.T1)
+        elif condition != "healthy":
+            assert "retry safely" in status.next_action
+        report = replace(report, failed=False, writes_suppressed=False)
+        runtime._run_daemon_cycle(cast(DaemonDeps, object()), store, td.make_settings(tmp_path))
+        assert runtime.status().automatic_linking
+        assert "processing eligible files" in runtime.status().next_action
+    finally:
+        endpoint.client.close()
+        store.close()
 
 
 def test_dashboard_status_reads_persisted_categorized_exclusion_counts(tmp_path: Path) -> None:

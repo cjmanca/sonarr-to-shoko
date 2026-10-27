@@ -1454,13 +1454,11 @@ def _parse_xref(raw: Any) -> FileXRef | None:
             episode = _as_mapping(raw_episode)
             anidb_episode = _positive_int(episode.get("AniDB")) if episode is not None else None
             source = episode.get("Source") if episode is not None else None
-            if anidb_episode is None or source not in XREF_SOURCES:
+            if anidb_episode is None or not isinstance(source, str) or source not in XREF_SOURCES:
                 ok = False
                 break
             assert episode is not None
-            episodes.append(
-                XrefEpisode(_positive_int(episode.get("ID")), anidb_episode, cast(str, source))
-            )
+            episodes.append(XrefEpisode(_positive_int(episode.get("ID")), anidb_episode, source))
     if not ok:
         return None
     assert series_anidb is not None
@@ -1775,6 +1773,8 @@ def _evaluate_xrefs(
 ) -> VerificationVerdict:
     if observed.file_id != plan.shoko_file_id:
         return VerificationVerdict.CONTRADICTION
+    if observed.size != plan.shoko_size:
+        return VerificationVerdict.UNKNOWN
     actual = {
         (xref.series_anidb_id, episode.anidb_episode_id, episode.shoko_episode_id)
         for xref in observed.xrefs

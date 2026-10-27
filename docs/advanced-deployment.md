@@ -399,14 +399,72 @@ Campaign rules:
 
 ## 9. Continuous operation
 
-Run the daemon in the container after the canary passes:
+The shipped `compose.example.yaml` starts the ordinary `service`, which uses
+onboarding consent. To run this runbook's advanced campaign daemon, create
+`compose.advanced.yaml` beside it with the following override:
 
-```powershell
-docker compose -f compose.example.yaml up -d
+```yaml
+services:
+  shoko-sonarr-linker:
+    # Built in section 2; alternatively use a verified immutable GHCR SHA tag.
+    image: shoko-sonarr-linker:local
+    command: ["daemon", "/config/config.yaml"]
+    environment:
+      SHOKO_LINKER_ALLOW_APPLY: "${SHOKO_LINKER_ALLOW_APPLY:-0}"
+    volumes:
+      - ./config:/config:ro
 ```
 
-Set `SHOKO_LINKER_ALLOW_APPLY=1` only for a writable daemon. Set
-`sync.apply_changes: true` only after the canary passes.
+Place the reviewed advanced YAML at `./config/config.yaml`. Also provide any
+referenced overrides file in that directory (or remove the optional
+`mappings.overrides_file` setting when unused). Paths and permissions must be
+readable by the container's `PUID:PGID`. Relative bind sources resolve from the
+base Compose file's directory.
+
+The override inherits the existing network, API-key environment variables and
+**the same persistent `/data` mount** from the base file. Keep the original
+Compose project name/directory and actual state volume or bind mount; do not
+start a fresh project or volume. `database.path` must address the same SQLite
+database used for the canary, approvals and drain authorization. Retain the
+attestation files at the configured `/data` paths, including campaign-scoped
+siblings, so the daemon sees their existing history and leases. Stop any other
+writer using that state before switching modes.
+
+Campaign approval stores an absolute plan path. Prepare and approve plans using
+container-visible paths, such as `/data/plans/plan.json`, and retain those exact
+paths for the drain. Run the earlier CLI steps in this same container environment
+and state mount. Use absolute container paths for every config, plan and output
+file argument: replace the earlier `config.yaml` with `/config/config.yaml` and
+`plan.json` with `/data/plans/plan.json`. For example, this read-only campaign
+report checks the plan digest (replace the campaign ID):
+
+```powershell
+docker compose -f compose.example.yaml -f compose.advanced.yaml run --rm --no-deps shoko-sonarr-linker `
+  campaign report /config/config.yaml --campaign-id "replace-with-campaign-id" `
+  --plan /data/plans/plan.json --json
+```
+
+A plan approved at a host-only path such as `C:\...\plan.json` cannot be drained just by
+copying it into the container. Approval is one-shot: re-approving the same plan
+cannot relocate it. Continue its manual workflow, or revoke it and prepare a new
+campaign at the container-visible path, with its own approval, canary, lease and
+drain authorization. Never edit SQLite to relocate it.
+
+After the canary and applicable safety/authorization checks pass, use both files:
+
+```powershell
+docker compose -f compose.example.yaml -f compose.advanced.yaml config --quiet
+docker compose -f compose.example.yaml -f compose.advanced.yaml up -d
+```
+
+The override forwards `SHOKO_LINKER_ALLOW_APPLY` explicitly and defaults it to
+`0` (off). Set it to `1` in the Compose process environment only for an authorized
+writable daemon; keep `sync.apply_changes: false` until the canary procedure
+requires apply. Both the YAML flag and environment gate, plus the applicable
+attestation and campaign approval/drain authorization, are required. Normal-service
+onboarding consent does not satisfy these advanced gates. Recreate the container
+with the same two-file `up -d` command after changing the environment gate;
+`docker compose restart` does not update its environment.
 
 With `campaign.daemon_auto_apply: true` (default) the daemon drains the approved backlog campaign
 you canaried above — one bounded batch per apply cycle — with **no further manual invocations**;

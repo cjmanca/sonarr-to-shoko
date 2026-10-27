@@ -312,6 +312,10 @@ class StateError(LinkerError):
     """The state store was asked something it must refuse (bad key, bad fingerprint)."""
 
 
+class CampaignDrainRefusedError(StateError):
+    """The atomic drain grant found stale approval or unsettled durable sends."""
+
+
 class CampaignSendRefusedError(StateError):
     """A campaign safety recheck definitively refused a not-yet-attempted request."""
 
@@ -1696,7 +1700,8 @@ def _parse_legacy_approved_targets(
     return frozenset(identities), tuple(sorted(episode_ids))
 
 
-def _parse_legacy_send_targets(raw: Any) -> tuple[tuple[int, int, int], ...] | None:
+def _decode_target_ids(raw: Any) -> tuple[tuple[int, int, int], ...] | None:
+    """Validate every destination and canonicalize exact repeats, or reject the set."""
     if not isinstance(raw, str):
         return None
     try:
@@ -1717,9 +1722,10 @@ def _parse_legacy_send_targets(raw: Any) -> tuple[tuple[int, int, int], ...] | N
         ):
             return None
         targets.append((target[0], target[1], target[2]))
-    if len(set(targets)) != len(targets):
-        return None
-    return tuple(targets)
+    # Multiple source episodes can legitimately share a destination. Older writers
+    # persisted each source occurrence; keep that history recoverable without ever
+    # salvaging a valid subset from a malformed row.
+    return tuple(dict.fromkeys(targets))
 
 
 def _legacy_request_fingerprint_matches(
@@ -1831,28 +1837,21 @@ def _encode_identity(snapshot: FileIdentitySnapshot | None) -> str | None:
 
 
 def _encode_target_ids(triples: Sequence[tuple[int, int, int]]) -> str:
-    payload = [[int(anidb), int(episode), int(shoko)] for anidb, episode, shoko in triples]
+    # Persist destinations, not source occurrences; LinkPlan retains the latter for preflight.
+    payload = [
+        [int(anidb), int(episode), int(shoko)] for anidb, episode, shoko in dict.fromkeys(triples)
+    ]
     return json.dumps(payload)
 
 
+def _parse_legacy_send_targets(raw: Any) -> tuple[tuple[int, int, int], ...] | None:
+    return _decode_target_ids(raw)
+
+
 def _parse_target_ids(raw: str | None) -> tuple[tuple[int, int, int], ...]:
-    if raw is None:
-        return ()
-    try:
-        document = json.loads(raw)
-    except ValueError:
-        return ()
-    if not isinstance(document, list):
-        return ()
-    parsed: list[tuple[int, int, int]] = []
-    for item in document:
-        if (
-            isinstance(item, list)
-            and len(item) == TARGET_TRIPLE_LEN
-            and all(not isinstance(value, bool) and isinstance(value, int) for value in item)
-        ):
-            parsed.append((item[0], item[1], item[2]))
-    return tuple(parsed)
+    # Recovery treats missing targets as a hold. Never salvage a partial target set:
+    # matching that subset could falsely verify a multi-episode send and free its slot.
+    return _decode_target_ids(raw) or ()
 
 
 def _parse_identity(raw: str | None) -> FileIdentitySnapshot | None:
@@ -5438,23 +5437,101 @@ class StateStore:
                 raise StateError(f"campaign {campaign_id!r} does not exist")
 
     @_mutation
-    def authorize_campaign_drain(self, campaign_id: str, digest: str, *, iso: str) -> None:
-        """F10: persist the operator's explicit drain authorization, bound to the approval digest.
+    def authorize_campaign_drain(
+        self, campaign_id: str, digest: str, *, iso: str, expected_campaign: CampaignRecord
+    ) -> int:
+        """Validate approval and settled canary under the same write lock as the grant.
 
-        The grant is durable (it survives a restart) and only the automatic daemon drain reads
-        it — manual ``campaign apply`` never consults it. A campaign whose digest later moves
-        outlives the grant: selection re-checks the binding on every cycle.
+        The caller's approval snapshot binds the operator inspection. All ledger and
+        ownership reads occur after BEGIN IMMEDIATE, fencing other store handles.
         """
         _require_iso(iso, "iso")
         _require_hex64(digest, "drain authorization digest")
         with self._transaction():
-            result = self._conn.execute(
+            campaign = self.get_campaign(campaign_id)
+            if campaign is None:
+                raise CampaignDrainRefusedError(f"campaign {campaign_id!r} does not exist")
+            if (
+                campaign.digest != digest
+                or campaign.approval_iso != expected_campaign.approval_iso
+                or campaign.bindings != expected_campaign.bindings
+                or campaign.drain_authorized_iso != expected_campaign.drain_authorized_iso
+                or campaign.drain_authorized_digest != expected_campaign.drain_authorized_digest
+                or campaign.drain_invalidated_reason != expected_campaign.drain_invalidated_reason
+            ):
+                raise CampaignDrainRefusedError(
+                    f"campaign {campaign_id} approval or drain authorization changed; "
+                    "inspect the current canary and authorize again"
+                )
+            attempted_count = self._validate_campaign_drain_canary_tx(campaign)
+            self._conn.execute(
                 "UPDATE campaigns SET drain_authorized_iso = ?, drain_authorized_digest = ?,"
                 " drain_invalidated_reason = '' WHERE campaign_id = ?",
                 (iso, digest, campaign_id),
             )
-            if result.rowcount == 0:
-                raise StateError(f"campaign {campaign_id!r} does not exist: nothing to authorize")
+        return attempted_count
+
+    def _validate_campaign_drain_canary_tx(self, campaign: CampaignRecord) -> int:
+        """Return attempted count only for settled history; caller holds write lock."""
+        campaign_id = campaign.campaign_id
+        if campaign.status == CAMPAIGN_STATUS_REVOKED:
+            raise CampaignDrainRefusedError(
+                f"campaign {campaign_id} is revoked: drain authorization is refused"
+            )
+        if campaign.status != CAMPAIGN_STATUS_APPROVED:
+            raise CampaignDrainRefusedError(
+                f"campaign {campaign_id} is {campaign.status} ({campaign.status_reason}): drain "
+                "authorization requires an approved campaign — resume it first"
+            )
+        unresolved = self.unresolved_campaign_send_history()
+        if unresolved:
+            send_ids = ", ".join(str(row.send_id) for row in unresolved)
+            raise CampaignDrainRefusedError(
+                f"campaign {campaign_id} canary is blocked by ambiguous legacy send(s) {send_ids}; "
+                "resolve each with campaign history-resolve before authorizing a drain"
+            )
+        history = self.campaign_send_history(campaign_id)
+        # A voided ``prepared_not_sent`` row is a definite zero-write (never attempted):
+        # it is durable audit history but is not a canary send and never blocks the grant.
+        attempted = [row for row in history if row.outcome != OUTCOME_VOIDED]
+        if not attempted:
+            raise CampaignDrainRefusedError(
+                f"campaign {campaign_id} has no completed canary (zero submitted files): run the "
+                "manual canary batch, verify it, inspect the physical-media side effects, then "
+                "authorize the drain"
+            )
+        # Only definite zero-write rejection/refusal may be settled by a later verified
+        # retry. A later success cannot account for an earlier uncertain request.
+        latest = {row.shoko_file_id: row for row in attempted}
+        outstanding = [
+            row
+            for row in attempted
+            if (
+                row.outcome != OUTCOME_VERIFIED
+                and not (
+                    row.outcome in (SendOutcome.REJECTED.value, SendOutcome.REFUSED.value)
+                    and latest[row.shoko_file_id].outcome == OUTCOME_VERIFIED
+                    and latest[row.shoko_file_id].file_state is FileState.VERIFIED
+                )
+            )
+            or row.file_state is not FileState.VERIFIED
+        ]
+        if outstanding:
+            listing = "; ".join(
+                f"file {row.shoko_file_id} (send {row.send_id}: outcome {row.outcome}, "
+                f"file state {row.file_state.value})"
+                for row in outstanding
+            )
+            raise CampaignDrainRefusedError(
+                f"campaign {campaign_id} canary is not settled: {len(outstanding)} attempted "
+                f"send(s) in the durable send ledger are not terminal VERIFIED — {listing}. Drain "
+                "authorization requires every attempted campaign send VERIFIED: a rejected/refused "
+                "send is not a verified association, and an in-flight/indeterminate_write/partial/"
+                "conflict send is unreviewed media-side-effect risk. Resubmit the refused file "
+                "through the normal bounded flow, verify it, inspect the side "
+                "effects, then authorize the drain"
+            )
+        return len(attempted)
 
     @_mutation
     def revoke_campaign_drain(self, campaign_id: str, reason: str, *, iso: str) -> None:

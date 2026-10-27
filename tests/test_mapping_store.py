@@ -233,16 +233,27 @@ def test_parse_source_url_splits_origin_and_path() -> None:
 @pytest.mark.parametrize(
     ("bad_url", "message"),
     [
+        ("http://example.invalid/mappings.xml", "HTTPS"),
         ("ftp://raw.githubusercontent.com/a/b.xml", "scheme"),
         ("https://user:pass@raw.githubusercontent.com/a/b.xml", "credentials"),
         ("https://raw.githubusercontent.com/a/b.xml?ref=main", "query"),
         ("https://raw.githubusercontent.com/a/b.xml#frag", "fragment"),
         ("https://raw.githubusercontent.com", "file path"),
+        ("https://example.invalid:0/mappings.xml", "port"),
+        ("https://example.invalid:bad/mappings.xml", "port"),
+        ("https://[bad/mappings.xml", "valid HTTP"),
     ],
 )
 def test_parse_source_url_rejects_bad_urls(bad_url: str, message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         parse_source_url(bad_url)
+
+
+def test_store_rejects_http_source_before_creating_cache(tmp_path: Path) -> None:
+    directory = tmp_path / "mappings"
+    with pytest.raises(ConfigError, match="HTTPS"):
+        MappingStore(directory, source_url="http://example.invalid/mappings.xml")
+    assert not directory.exists()
 
 
 def test_startup_without_cache(tmp_path: Path) -> None:
@@ -511,6 +522,40 @@ def test_oversized_body_is_size_failure_and_caps_backoff(tmp_path: Path) -> None
         assert due_delta == timedelta(hours=hours)
         assert store.active_path.read_bytes() == active_before
     assert state["consecutive_failures"] == len(expected) + ONE_FAILURE
+
+
+@pytest.mark.parametrize("failures", [1, 2, 5, 6, 1025, 10**100])
+def test_backoff_saturates_before_evaluating_large_failure_counts(failures: int) -> None:
+    expected = 2.0 ** (failures - 1) if failures < 6 else MAX_BACKOFF_HOURS
+    assert mapping_store_module._backoff_hours(failures) == expected
+
+
+def test_refresh_persists_failure_and_retry_after_long_failure_streak(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    active_before = store.active_path.read_bytes()
+    state = store._load_state()
+    state.consecutive_failures = 1024
+    store._save_pointer_scheduler_state(state)
+    store._save_state(state)
+    source.queue(status_response(500))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    assert outcome is RefreshOutcome.FAILED_TRANSPORT
+    expected_due = iso(LATER + timedelta(hours=MAX_BACKOFF_HOURS))
+    recorded = read_json(store.state_path)
+    assert recorded["consecutive_failures"] == 1025
+    assert recorded["next_due_iso"] == expected_due
+    assert store.active_path.read_bytes() == active_before
+
+    # The committed generation's scheduler also recovers the capped retry after state loss.
+    store.state_path.unlink()
+    reopened = make_store(tmp_path)
+    recovered = status(reopened, LATER)
+    assert recovered.consecutive_failures == 1025
+    assert recovered.next_due_iso == expected_due
+    assert due(reopened, LATER) is False
+    endpoint.client.close()
 
 
 def test_invalid_content_keeps_last_known_good(tmp_path: Path) -> None:
@@ -1625,6 +1670,19 @@ def test_corrupt_meta_digest_is_refused(tmp_path: Path) -> None:
     assert load_active(store) is None
 
 
+def test_http_cached_provenance_requires_unconditional_https_recovery(tmp_path: Path) -> None:
+    store, source, endpoint = activated_store(tmp_path)
+    meta = read_json(store.meta_path)
+    meta["source_url"] = SOURCE_URL.replace("https://", "http://", 1)
+    store.meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    assert load_active(store) is None
+    source.queue(ok_response(SMALL_XML, ETAG_B))
+    assert refresh(store, endpoint, now=LATER, refresh_hours=HOURS) is RefreshOutcome.ACTIVATED
+    assert str(source.requests[-1].url) == SOURCE_URL
+    assert "If-None-Match" not in source.requests[-1].headers
+    assert load_active(store) is not None
+
+
 def test_unreadable_meta_is_refused(tmp_path: Path) -> None:
     store, _, _ = activated_store(tmp_path)
     store.meta_path.write_text("[1, 2]", encoding="utf-8")
@@ -1833,21 +1891,22 @@ def redirect_to(location: str) -> Callable[[httpx.Request], httpx.Response]:
     return build
 
 
-def test_source_redirect_is_refused_and_cache_never_moves(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "location",
+    [SOURCE_PATH, "https://evil.example/data.xml", "http://raw.githubusercontent.com/data.xml"],
+)
+def test_source_redirect_is_refused_and_cache_never_moves(tmp_path: Path, location: str) -> None:
     store, source, endpoint = activated_store(tmp_path)
     before_active = store.active_path.read_bytes()
     before_meta = store.meta_path.read_bytes()
     before_etag = store._load_state().etag
-    source.queue(redirect_to(SOURCE_PATH))
-    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
-    assert outcome is RefreshOutcome.FAILED_TRANSPORT
-    source.queue(redirect_to("https://evil.example/data.xml"))
+    source.queue(redirect_to(location))
     outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
     assert outcome is RefreshOutcome.FAILED_TRANSPORT
     assert store.active_path.read_bytes() == before_active
     assert store.meta_path.read_bytes() == before_meta
     assert store._load_state().etag == before_etag
-    assert len(source.requests) == THREE_REQUESTS
+    assert len(source.requests) == TWO_REQUESTS
     assert all(str(request.url) == SOURCE_URL for request in source.requests)
 
 
@@ -2811,3 +2870,43 @@ def test_status_snapshot_is_fenced_from_concurrent_activation(
     assert status_results[0].active_present is True
     assert writer_results == [RefreshOutcome.ACTIVATED]
     assert old_generation_removed.is_set()
+
+
+@pytest.mark.parametrize("attribute", ["anidbid", "tvdbid", "defaulttvdbseason", "episodeoffset"])
+@pytest.mark.parametrize("active_cache", [False, True])
+def test_oversized_numeric_xml_records_failure_and_persists_retry_backoff(
+    tmp_path: Path, attribute: str, active_cache: bool
+) -> None:
+    if active_cache:
+        store, source, endpoint = activated_store(tmp_path)
+    else:
+        store = make_store(tmp_path)
+        source = ScriptedSource()
+        endpoint = endpoint_for(source, store)
+    old_content = store.active_path.read_bytes() if active_cache else None
+    attrs = {"anidbid": "1", "tvdbid": "100", "defaulttvdbseason": "1", "episodeoffset": "0"}
+    attrs[attribute] = "9" * 4301
+    attributes = " ".join(f'{key}="{value}"' for key, value in attrs.items())
+    bad_xml = f"<anime-list><anime {attributes}/></anime-list>".encode()
+    source.queue(ok_response(bad_xml, ETAG_B))
+
+    outcome = refresh(store, endpoint, now=LATER, refresh_hours=HOURS, force=True)
+
+    expected = (
+        RefreshOutcome.FAILED_INVALID if active_cache else RefreshOutcome.NO_ACTIVE_BUT_FAILED
+    )
+    assert outcome is expected
+    if active_cache:
+        assert store.active_path.read_bytes() == old_content
+    else:
+        assert load_active(store) is None
+    view = status(store, LATER)
+    assert view.last_outcome is RefreshOutcome.FAILED_INVALID
+    assert view.consecutive_failures == ONE_FAILURE
+    assert view.next_due_iso == iso(LATER + timedelta(hours=FIRST_BACKOFF_HOURS))
+    reopened = MappingStore(store.directory, source_url=store.source_url)
+    retry = LATER + timedelta(minutes=30)
+    assert not due(reopened, retry)
+    request_count = len(source.requests)
+    assert refresh(reopened, endpoint, now=retry, refresh_hours=HOURS) is RefreshOutcome.NOT_DUE
+    assert len(source.requests) == request_count

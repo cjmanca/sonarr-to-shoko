@@ -77,9 +77,13 @@ from defusedxml import DefusedXmlException  # type: ignore[import-untyped]
 from defusedxml import ElementTree as SafeElementTree
 
 from .errors import ConfigError, LinkerError
+from .yaml_diagnostics import yaml_error_detail
 
 ROOT_TAG: Final[str] = "anime-list"
 DEFAULT_MAX_ENTRIES: Final[int] = 50_000
+# Generous lexical ceiling for XML identifiers, seasons, episodes and signed offsets.
+# Keep conversions independent of Python's configurable integer-string limit.
+MAX_XML_INTEGER_DIGITS: Final[int] = 64
 MAX_PAIRS_PER_RULE: Final[int] = 2_000
 MAX_RANGE_SPAN: Final[int] = 2_000
 MAX_AGGREGATE_RANGE_KEYS: Final[int] = 2_000_000
@@ -451,9 +455,9 @@ def parse_anime_lists(
     declared_anidbids: dict[int, list[int]] = {}
     for index, element in enumerate(anime_elements):
         raw_anidbid = element.attrib.get("anidbid")
-        if raw_anidbid is not None and _INT_RE.fullmatch(raw_anidbid):
-            anidbid = int(raw_anidbid)
-            if anidbid > 0:
+        if raw_anidbid is not None:
+            anidbid = _xml_integer(raw_anidbid, "anidbid", [])
+            if anidbid is not None and anidbid > 0:
                 declared_anidbids.setdefault(anidbid, []).append(index)
     duplicate_anidbids = {
         anidbid: tuple(indices)
@@ -629,15 +633,25 @@ def _parse_anime_element(
     return entry, None
 
 
+def _xml_integer(raw: str, name: str, problems: list[str], *, signed: bool = False) -> int | None:
+    """Validate every XML integer before conversion, with bounded diagnostics."""
+    digits = raw[1:] if signed and raw.startswith("-") else raw
+    if len(digits) > MAX_XML_INTEGER_DIGITS:
+        problems.append(f"invalid {name}: exceeds {MAX_XML_INTEGER_DIGITS} digit limit")
+        return None
+    pattern = _SIGNED_INT_RE if signed else _INT_RE
+    if pattern.fullmatch(raw) is None:
+        problems.append(f"invalid {name} {raw!r}")
+        return None
+    return int(raw)
+
+
 def _positive_int(raw: str | None, name: str, fatal: list[str]) -> int | None:
     if raw is None:
         fatal.append(f"missing {name}")
         return None
-    if _INT_RE.fullmatch(raw) is None:
-        fatal.append(f"invalid {name} {raw!r}")
-        return None
-    value = int(raw)
-    if value <= 0:
+    value = _xml_integer(raw, name, fatal)
+    if value is not None and value <= 0:
         fatal.append(f"{name} must be positive (got {value})")
         return None
     return value
@@ -649,19 +663,13 @@ def _season_attr(raw: str | None, fatal: list[str]) -> int | str | None:
         return None
     if raw == "a":
         return "a"
-    if _INT_RE.fullmatch(raw) is None:
-        fatal.append(f"invalid defaulttvdbseason {raw!r}")
-        return None
-    return int(raw)
+    return _xml_integer(raw, "defaulttvdbseason", fatal)
 
 
 def _offset_attr(raw: str | None, fatal: list[str]) -> int | None:
     if raw is None:
         return None
-    if _SIGNED_INT_RE.fullmatch(raw) is None:
-        fatal.append(f"invalid episodeoffset {raw!r}")
-        return None
-    return int(raw)
+    return _xml_integer(raw, "episodeoffset", fatal, signed=True)
 
 
 def _parse_entry_rules(
@@ -883,28 +891,19 @@ def _mapping_int(raw: str | None, name: str, problems: list[str]) -> int | None:
     if raw is None:
         problems.append(f"mapping missing {name}")
         return None
-    if _INT_RE.fullmatch(raw) is None:
-        problems.append(f"mapping invalid {name} {raw!r}")
-        return None
-    return int(raw)
+    return _xml_integer(raw, f"mapping {name}", problems)
 
 
 def _optional_mapping_int(raw: str | None, name: str, problems: list[str]) -> int | None:
     if raw is None:
         return None
-    if _INT_RE.fullmatch(raw) is None:
-        problems.append(f"mapping invalid {name} {raw!r}")
-        return None
-    return int(raw)
+    return _xml_integer(raw, f"mapping {name}", problems)
 
 
 def _mapping_signed_int(raw: str | None, name: str, problems: list[str]) -> int | None:
     if raw is None:
         return None
-    if _SIGNED_INT_RE.fullmatch(raw) is None:
-        problems.append(f"mapping invalid {name} {raw!r}")
-        return None
-    return int(raw)
+    return _xml_integer(raw, f"mapping {name}", problems, signed=True)
 
 
 def _parse_pair_body(
@@ -943,8 +942,15 @@ def _parse_pair_token(token: str, problems: list[str]) -> EpisodePair | None:
     if match is None:
         problems.append(f"invalid pair token {token!r} (entry excluded)")
         return None
-    anidb = int(match.group(1))
-    parts = [int(item) for item in match.group(2).split("+")]
+    anidb = _xml_integer(match.group(1), "pair AniDB episode", problems)
+    parts: list[int] = []
+    for item in match.group(2).split("+"):
+        value = _xml_integer(item, "pair TVDB episode", problems)
+        if value is None:
+            return None
+        parts.append(value)
+    if anidb is None:
+        return None
     if anidb < 1:
         problems.append(f"pair {token!r}: AniDB episode below 1 (entry excluded)")
         return None
@@ -967,6 +973,20 @@ def build_mapping_index(parsed: ParsedMappings, overrides: Overrides | None = No
     upstream explicit pairs, removals subtract targets. Overrides contradicting
     upstream data are applied **and** reported in ``override_conflicts``.
     """
+    # Count inclusive spans before populating any index: forward claims expand
+    # each range even when its keys overlap or its offset yields no TVDB target.
+    range_keys = sum(
+        rule.end - rule.start + 1
+        for entry in parsed.entries
+        for rule in entry.rules
+        if rule.offset is not None and rule.start is not None and rule.end is not None
+    )
+    if range_keys > MAX_AGGREGATE_RANGE_KEYS:
+        raise MappingError(
+            f"indexed range rules expand {range_keys} enumerable keys, above the "
+            f"aggregate cap of {MAX_AGGREGATE_RANGE_KEYS} (fail closed)"
+        )
+
     explicit: dict[QueryKey, list[MappingTarget]] = {}
     season_zero: dict[QueryKey, list[MappingTarget]] = {}
     ranges: dict[SeasonKey, list[_RangeRule]] = {}
@@ -981,7 +1001,6 @@ def build_mapping_index(parsed: ParsedMappings, overrides: Overrides | None = No
         "no_counterpart": 0,
         "ranges": 0,
         "absolute": 0,
-        "range_keys": 0,
     }
     for entry in parsed.entries:
         _index_entry(
@@ -996,12 +1015,6 @@ def build_mapping_index(parsed: ParsedMappings, overrides: Overrides | None = No
             forward_precedence,
             counters,
         )
-    if counters["range_keys"] > MAX_AGGREGATE_RANGE_KEYS:
-        raise MappingError(
-            f"indexed range rules expand {counters['range_keys']} enumerable keys, above the "
-            f"aggregate cap of {MAX_AGGREGATE_RANGE_KEYS} (fail closed)"
-        )
-
     index = MappingIndex(
         explicit=MappingProxyType({key: tuple(value) for key, value in explicit.items()}),
         season_zero=MappingProxyType({key: tuple(value) for key, value in season_zero.items()}),
@@ -1070,7 +1083,6 @@ def _index_entry(
         )
         if rule.offset is not None and rule.start is not None and rule.end is not None:
             counters["ranges"] += 1
-            counters["range_keys"] += rule.end - rule.start + 1
             intervals.append((rule.start, rule.end, rule.anidbseason))
             ranges.setdefault((entry.tvdbid, rule.tvdbseason), []).append(
                 _RangeRule(
@@ -1516,7 +1528,7 @@ def load_overrides(yaml_text: str) -> Overrides:
     try:
         raw = yaml.safe_load(yaml_text)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"overrides file is not valid YAML: {exc}") from exc
+        raise ConfigError(f"overrides file is not valid YAML: {yaml_error_detail(exc)}") from None
     if raw is None:
         return Overrides((), (), None)
     if not isinstance(raw, dict):

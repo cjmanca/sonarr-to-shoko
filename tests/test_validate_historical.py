@@ -106,6 +106,46 @@ def test_malformed_config_fails(tmp_path: Path) -> None:
     assert any("config.example.yaml" in failure for failure in report["failures"])
 
 
+@pytest.mark.parametrize(
+    ("source", "error", "location"),
+    [
+        (b"synthetic_key_secret: [\n", "ParserError", True),
+        (b"url: [https://synthetic_url_secret@example.invalid\n", "ParserError", True),
+        (b"key: !synthetic_tag_secret value\n", "ConstructorError", True),
+        (b"key: *synthetic_alias_secret\n", "ComposerError", True),
+        (b"key: synthetic_reader_secret\x00\n", "ReaderError", False),
+        (b"key: synthetic_encoding_secret\xff\n", "UnicodeDecodeError", False),
+    ],
+)
+def test_yaml_failures_keep_source_out_of_report_and_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: bytes,
+    error: str,
+    location: bool,
+) -> None:
+    tree = _synthetic_commit(tmp_path)
+    (tree / "config.example.yaml").write_bytes(source)
+    report = validator.validate_historical(tree)
+    assert report["ok"] is False
+    assert len(report["failures"]) == 1
+    failure = report["failures"][0]
+    assert failure.startswith(f"config.example.yaml failed to parse: {error}")
+    if location:
+        assert " at line " in failure
+        assert ", column " in failure
+    else:
+        assert failure == f"config.example.yaml failed to parse: {error}"
+    assert "synthetic_" not in json.dumps(report)
+
+    assert validator.main(["--repo", str(tree)]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == report
+    assert captured.err == f"historical validation failed: {failure}\n"
+    assert "synthetic_" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
 def test_scripts_dir_tolerated_and_compiled(tmp_path: Path) -> None:
     tree = _synthetic_commit(tmp_path)
     scripts = tree / "scripts"

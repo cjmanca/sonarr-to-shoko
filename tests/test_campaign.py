@@ -18,6 +18,7 @@ import os
 import sqlite3
 import sys
 from collections.abc import Callable, Iterator
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -679,6 +680,78 @@ def approve(env: Env, capsys: pytest.CaptureFixture[str], digest: str) -> dict[s
     )
     assert code == EXIT_OK
     return cast("dict[str, Any]", json.loads(capsys.readouterr().out))
+
+
+@pytest.mark.parametrize(
+    ("now_iso", "deadline_hours", "message"),
+    [
+        (T0, 0.0, "finite and greater than zero"),
+        (T0, -1.0, "finite and greater than zero"),
+        (T0, float("nan"), "finite and greater than zero"),
+        (T0, float("inf"), "finite and greater than zero"),
+        (T0, -float("inf"), "finite and greater than zero"),
+        (T0, 1e100, "supported datetime range"),
+        (T0, 1e8, "supported datetime range"),
+        ("9999-12-31T23:59:59+00:00", 1.0, "supported datetime range"),
+        (T0, 1e-100, "too small"),
+    ],
+)
+def test_prepare_rejects_invalid_deadline_before_reconciliation(
+    monkeypatch: pytest.MonkeyPatch, now_iso: str, deadline_hours: float, message: str
+) -> None:
+    def unexpected_cycle(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid deadline must not reconcile or perform I/O")
+
+    monkeypatch.setattr(campaign_mod, "run_cycle", unexpected_cycle)
+    # No dependencies are needed: validation must precede any access to them.
+    with pytest.raises(CampaignError, match=message):
+        campaign_mod.prepare_campaign(
+            cast("DaemonDeps", None),
+            cast("Any", None),
+            cast("StateStore", None),
+            now_iso,
+            limit=1,
+            deadline_hours=deadline_hours,
+        )
+
+
+@pytest.mark.parametrize(
+    ("now_iso", "deadline_hours"),
+    [(T0, "1e100"), (T0, "1e8"), ("9999-12-31T23:59:59+00:00", "1")],
+)
+def test_campaign_prepare_cli_reports_unrepresentable_deadline_without_reconciling(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    now_iso: str,
+    deadline_hours: str,
+) -> None:
+    env.now_iso = now_iso
+
+    def unexpected_cycle(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid deadline must not reconcile or perform I/O")
+
+    monkeypatch.setattr(campaign_mod, "run_cycle", unexpected_cycle)
+    plan_path = env.tmp_path / "plan.json"
+    assert (
+        main(
+            [
+                "campaign",
+                "prepare",
+                str(env.config_path),
+                "--out",
+                str(plan_path),
+                "--deadline-hours",
+                deadline_hours,
+            ]
+        )
+        == EXIT_CONFIG_INVALID
+    )
+    assert "--deadline-hours exceeds the supported datetime range" in capsys.readouterr().err
+    assert not plan_path.exists()
+    assert not env.stubs.sonarr_requests
+    assert not env.stubs.shoko_requests
+    assert not env.stubs.posts
 
 
 @pytest.mark.parametrize(
@@ -3333,6 +3406,59 @@ def _campaign_sent(store: StateStore, campaign_id: str) -> int:
     campaign = store.get_campaign(campaign_id)
     assert campaign is not None
     return int(campaign.total_sent)
+
+
+@pytest.mark.parametrize(
+    ("now_iso", "seconds"),
+    [
+        (T0, 0.0),
+        (T0, -1.0),
+        (T0, float("nan")),
+        (T0, float("inf")),
+        (T0, -float("inf")),
+        (T0, 1e100),
+        (T0, 1e12),
+        (T0, 1e-100),
+        ("9999-12-31T23:59:59+00:00", 10.0),
+    ],
+)
+def test_apply_lock_invalid_lease_is_contained_before_acquisition(
+    tmp_path: Path, now_iso: str, seconds: float
+) -> None:
+    with closing(StateStore(tmp_path / "state.sqlite3")) as store:
+        deps = cast(
+            "DaemonDeps", SimpleNamespace(store=store, pid=os.getpid(), lease_seconds=seconds)
+        )
+        with pytest.raises(CampaignError, match="sync.apply_lock_lease_seconds"):
+            campaign_mod._acquire_apply_lock(deps, now_iso)
+        reason, suppressed, acquired = daemon_mod._lock_preflight(deps, CycleMode.APPLY, now_iso)
+        assert reason is not None
+        assert reason.startswith("apply_lock_invalid_lease:")
+        assert suppressed is True
+        assert acquired is False
+        assert store.lock_holder() is None
+        assert store.get_meta("apply_lock_steals") is None
+        assert not store.apply_lock_path.exists()
+
+
+def test_apply_lock_valid_lease_preserves_timestamp_and_ownership(tmp_path: Path) -> None:
+    now_iso = "2026-01-01T02:00:00+02:00"
+    seconds = 600.5
+    with closing(StateStore(tmp_path / "state.sqlite3")) as store:
+        deps = cast(
+            "DaemonDeps", SimpleNamespace(store=store, pid=os.getpid(), lease_seconds=seconds)
+        )
+        assert campaign_mod._acquire_apply_lock(deps, now_iso) == (None, True)
+        holder = store.lock_holder()
+        assert holder is not None
+        assert holder.owner_pid == os.getpid()
+        assert holder.acquired_iso == now_iso
+        assert holder.lease_expires_iso == "2026-01-01T00:10:00.500000+00:00"
+        release_apply_lock(store, os.getpid(), now_iso)
+        assert daemon_mod._lock_preflight(deps, CycleMode.APPLY, now_iso) == (None, False, True)
+        assert store.lock_holder() == holder
+        release_apply_lock(store, os.getpid(), now_iso)
+        assert store.lock_holder() is None
 
 
 def test_apply_campaign_defers_batch_when_apply_lock_held_by_foreign_pid(
@@ -7750,3 +7876,137 @@ def test_cli_authorize_drain_refuses_rejected_canary_with_visible_history(
         assert campaign.drain_authorized_iso is None
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "change", ["send", "pause", "revoke", "digest", "approval", "drain_revoke", "unknown"]
+)
+def test_drain_grant_rechecks_other_handle_changes(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """Changes committed after operator snapshot cannot pass the atomic grant guard."""
+    campaign_id = _f10_campaign(env, capsys)
+    with closing(env.open_store()) as store:
+        assert _canary(env, store, campaign_id).verified == COUNT_ONE
+        plan, _digest = read_plan_file(env.tmp_path / "plan.json")
+        original = store.authorize_campaign_drain
+
+        def interleave(*args: Any, **kwargs: Any) -> int:
+            with closing(env.open_store()) as other:
+                if change == "send":
+                    entry = next(row for row in plan.files if row.shoko_file_id == 501)
+                    token = other.prepare_send(
+                        501,
+                        entry.plan_fingerprint,
+                        entry.request_fingerprint,
+                        targets_digest=plan.targets_digest,
+                        structure_digest=plan.structure_digest,
+                        mapping_revision=plan.mapping_revision,
+                        cycle_key="drain-grant-interleave",
+                        iso=env.now_iso,
+                        policy=plan.policy,
+                        campaign_id=campaign_id,
+                    )
+                    assert not isinstance(token, BudgetRefusal)
+                    other.mark_sent(token, iso=env.now_iso)
+                elif change in ("pause", "revoke"):
+                    other.set_campaign_status(
+                        campaign_id,
+                        "paused" if change == "pause" else "revoked",
+                        "operator stop",
+                        iso=env.now_iso,
+                    )
+                elif change == "drain_revoke":
+                    other.revoke_campaign_drain(campaign_id, "operator_revoked", iso=env.now_iso)
+                elif change == "unknown":
+                    other.connection.execute(
+                        "UPDATE sends SET campaign_id = NULL, campaign_ownership = 'unknown'"
+                    )
+                else:
+                    column = "digest" if change == "digest" else "approval_iso"
+                    value = STALE_DIGEST if change == "digest" else _iso_plus(env.now_iso, 1)
+                    other.connection.execute(
+                        f"UPDATE campaigns SET {column} = ? WHERE campaign_id = ?",  # noqa: S608
+                        (value, campaign_id),
+                    )
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "authorize_campaign_drain", interleave)
+        with pytest.raises(CampaignError) as refused:
+            _authorize(env, store, campaign_id)
+        if change == "send":
+            assert "file 501" in str(refused.value)
+            assert "outcome attempted" in str(refused.value)
+            assert "request_may_have_been_sent" in str(refused.value)
+            assert campaign_report(store, campaign_id, None)["attempted_sends"][-1]["outcome"] == (
+                "attempted"
+            )
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None
+
+
+def test_drain_grant_holds_write_lock_while_reading_canary(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_id = _f10_campaign(env, capsys)
+    with closing(env.open_store()) as store, closing(env.open_store()) as other:
+        assert _canary(env, store, campaign_id).verified == COUNT_ONE
+        original = store.campaign_send_history
+        other.connection.execute("PRAGMA busy_timeout=0")
+        checked = False
+
+        def locked_history(requested_id: str) -> Any:
+            nonlocal checked
+            assert store.connection.in_transaction
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                other.connection.execute(
+                    "UPDATE campaigns SET status = 'paused' WHERE campaign_id = ?", (campaign_id,)
+                )
+            checked = True
+            return original(requested_id)
+
+        monkeypatch.setattr(store, "campaign_send_history", locked_history)
+        authorized = _authorize(env, store, campaign_id)
+        assert checked
+        assert authorized.drain_authorized_digest == authorized.digest
+        assert authorized.drain_authorized_iso == env.now_iso
+
+
+@pytest.mark.parametrize(
+    ("earlier_outcome", "earlier_verification"),
+    [
+        ("attempted", None),
+        ("ambiguous_send", None),
+        ("accepted_unverified", "partial"),
+        ("accepted_unverified", "contradiction"),
+    ],
+)
+def test_drain_grant_keeps_earlier_uncertain_send_outstanding(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    earlier_outcome: str,
+    earlier_verification: str | None,
+) -> None:
+    """A later verified file association cannot settle an earlier uncertain send."""
+    campaign_id = _f10_campaign(env, capsys)
+    with closing(env.open_store()) as store:
+        assert _canary(env, store, campaign_id).verified == COUNT_ONE
+        store.connection.execute(
+            "INSERT INTO sends (shoko_file_id, request_fingerprint, plan_fingerprint,"
+            " campaign_id, campaign_ownership, attempted_iso, outcome, verified_iso)"
+            " SELECT shoko_file_id, request_fingerprint, plan_fingerprint, campaign_id,"
+            " campaign_ownership, attempted_iso, outcome, verified_iso FROM sends"
+        )
+        store.connection.execute(
+            "UPDATE sends SET outcome = ?, verification = ?, verified_iso = NULL WHERE send_id ="
+            " (SELECT MIN(send_id) FROM sends)",
+            (earlier_outcome, earlier_verification),
+        )
+        with pytest.raises(CampaignError, match="not settled") as refused:
+            _authorize(env, store, campaign_id)
+        assert "file 500" in str(refused.value)
+        assert f"outcome {earlier_outcome}" in str(refused.value)
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.drain_authorized_iso is None

@@ -180,6 +180,136 @@ def test_force_push_non_ancestor_falls_back_to_merge_base(tmp_path: Path) -> Non
     assert any(m[:12] in note for note in result.notes)
 
 
+def test_force_push_fresh_clone_recovers_without_before_object(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    pre_boundary = _commit(repo, "pre-boundary")
+    boundary = _commit(repo, "boundary")
+    old_tip = _commit(repo, "rewritten-away")
+    _git(repo, "reset", "--hard", "-q", boundary)
+    replacement = _commit(repo, "replacement")
+    newest = _commit(repo, "newest")
+    clone = tmp_path / "runner"
+    # Transport clone, not a local object-directory copy: only reachable objects.
+    _git(tmp_path, "clone", "--no-local", str(repo), str(clone))
+    with pytest.raises(enum.GitError):
+        enum._resolve_commit(clone, old_tip)
+
+    result = enum.enumerate_introduced(
+        clone, before=old_tip, after=newest, first_buildable=boundary, max_shas=2
+    )
+
+    assert result.shas == [boundary, replacement]
+    assert result.overflow == [newest]
+    assert [(item.sha, item.reason) for item in result.skipped] == [(pre_boundary, "pre-boundary")]
+    assert any("degraded-history" in note and old_tip in note for note in result.notes)
+
+
+def test_push_event_revision_survives_later_branch_rewrite(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    before = _commit(repo, "base")
+    intermediate = _commit(repo, "event-intermediate")
+    event_after = _commit(repo, "event-after")
+    # Model checkout's event-SHA ref: branch advancement must not change HEAD.
+    _git(repo, "checkout", "--detach", event_after)
+    _git(repo, "update-ref", "refs/heads/main", before)
+    assert _git(repo, "rev-parse", "main") == before
+
+    result = enum.enumerate_introduced(repo, before=before, after=event_after)
+
+    assert result.shas == [intermediate, event_after]
+
+
+@pytest.mark.parametrize("retain_boundary_tag", [False, True])
+def test_rewritten_boundary_in_clone_skips_unbuildable_history_and_recovers(
+    tmp_path: Path, retain_boundary_tag: bool
+) -> None:
+    repo = _init_repo(tmp_path)
+    prehistory = [_commit(repo, f"pre-build-{i}") for i in range(4)]
+    boundary = _commit(repo, "old-boundary")
+    if retain_boundary_tag:
+        _git(repo, "tag", "old-buildable", boundary)
+    old_tip = _commit(repo, "old-tip")
+    _git(repo, "reset", "--hard", "-q", prehistory[-1])
+    for name in ("Dockerfile", "pyproject.toml", "uv.lock"):
+        (repo / name).write_text("synthetic input", encoding="utf-8")
+    for name in ("src", "tests"):
+        (repo / name).mkdir()
+        (repo / name / "example.py").write_text("", encoding="utf-8")
+    replacements = [_commit(repo, f"replacement-{i}") for i in range(3)]
+    clone = tmp_path / "runner"
+    _git(tmp_path, "clone", "--no-local", str(repo), str(clone))
+    if retain_boundary_tag:
+        assert enum._resolve_commit(clone, boundary) == boundary
+        assert not enum._is_ancestor(clone, boundary, replacements[-1])
+    else:
+        with pytest.raises(enum.GitError):
+            enum._resolve_commit(clone, boundary)
+    with pytest.raises(enum.GitError):
+        enum._resolve_commit(clone, old_tip)
+
+    push = enum.enumerate_introduced(
+        clone, before=old_tip, after=replacements[-1], first_buildable=boundary, max_shas=2
+    )
+    scheduled = enum.enumerate_missing(
+        clone, upto=replacements[-1], first_buildable=boundary, known_tags=set(), max_shas=2
+    )
+    for result in (push, scheduled):
+        assert result.shas == replacements[:2]
+        assert result.overflow == replacements[2:]
+        reasons = {item.sha: item.reason for item in result.skipped}
+        expected = "boundary-not-ancestor" if retain_boundary_tag else "boundary-unavailable"
+        assert reasons[boundary] == expected
+        assert all(reasons[sha] == "missing-historical-build-inputs" for sha in prehistory)
+        assert any("without guessing a cutoff" in note for note in result.notes)
+
+    recovered = enum.enumerate_missing(
+        clone,
+        upto=replacements[-1],
+        first_buildable=boundary,
+        known_tags={f"sha-{sha}" for sha in scheduled.shas},
+        max_shas=2,
+    )
+    assert recovered.shas == replacements[2:]
+    assert recovered.overflow == []
+
+
+def test_unavailable_boundary_with_no_build_inputs_has_explicit_skip_reasons(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    after = _commit(repo, "not-buildable")
+    result = enum.enumerate_missing(repo, upto=after, first_buildable="f" * 40, known_tags=set())
+    assert result.shas == []
+    assert [(item.sha, item.reason) for item in result.skipped] == [
+        ("f" * 40, "boundary-unavailable"),
+        (after, "missing-historical-build-inputs"),
+    ]
+
+
+def test_malformed_unavailable_boundary_is_not_replaced_with_history_scan(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    after = _commit(repo, "after")
+    with pytest.raises(enum.GitError):
+        enum.enumerate_introduced(repo, after=after, before="e" * 40, first_buildable="bad")
+    with pytest.raises(enum.GitError):
+        enum.enumerate_missing(repo, upto=after, known_tags=set(), first_buildable="bad")
+
+
+@pytest.mark.parametrize("before", ["not-a-sha", "f" * 39, "F" * 40, "--all"])
+def test_unresolvable_malformed_before_never_uses_recovery(tmp_path: Path, before: str) -> None:
+    repo = _init_repo(tmp_path)
+    after = _commit(repo, "after")
+    with pytest.raises(enum.GitError):
+        enum.enumerate_introduced(repo, before=before, after=after)
+
+
+def test_missing_event_after_never_uses_before_recovery(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _commit(repo, "base")
+    with pytest.raises(enum.GitError):
+        enum.enumerate_introduced(repo, before="e" * 40, after="f" * 40)
+
+
 def test_empty_push_before_equals_after(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     a = _commit(repo, "a")
@@ -258,7 +388,7 @@ def test_explicit_since_range_remains_exclusive_and_overrides_default_boundary(
     assert any("explicit backfill range" in note for note in result.notes)
 
 
-def test_default_backfill_fails_closed_when_boundary_is_not_on_selected_history(
+def test_default_backfill_audits_unbuildable_trees_when_boundary_is_unrelated(
     tmp_path: Path,
 ) -> None:
     repo = _init_repo(tmp_path)
@@ -276,7 +406,11 @@ def test_default_backfill_fails_closed_when_boundary_is_not_on_selected_history(
     assert result.shas == []
     assert result.overflow == []
     assert any(item.reason == "boundary-not-ancestor" for item in result.skipped)
-    assert any("no default history scanned" in note for note in result.notes)
+    assert any(
+        item.sha == unrelated_tip and item.reason == "missing-historical-build-inputs"
+        for item in result.skipped
+    )
+    assert any("without guessing a cutoff" in note for note in result.notes)
 
 
 def test_enumerate_missing_tolerates_ls_remote_tag_forms(tmp_path: Path) -> None:

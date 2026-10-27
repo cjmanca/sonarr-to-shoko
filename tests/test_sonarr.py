@@ -433,10 +433,48 @@ def test_series_parser_records_verified_series_type() -> None:
     assert result.series[0].series_type == "anime"
 
 
+@pytest.mark.parametrize(
+    "duplicate_fields",
+    [{}, {"tvdbId": 999999}, {"title": None}, {"seriesType": "standard"}],
+    ids=["identical", "conflicting-identity", "malformed", "conflicting-scope"],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_series_ids_exclude_all_copies_before_fetching_children(
+    base_document: dict[str, Any],
+    write_document: Writer,
+    duplicate_fields: dict[str, Any],
+    reverse: bool,
+) -> None:
+    stub = standard_stub()
+    duplicate = dict(stub.series[0], **duplicate_fields)
+    stub.series.append(duplicate)
+    safe_root = f"{ANIME_ROOT}/Safe"
+    stub.series.append(series_entry(SERIES_BROKEN, "Safe", safe_root))
+    stub.episodes[SERIES_BROKEN] = [episode_entry(50, SERIES_BROKEN, 1, 1, "E01", file_id=500)]
+    stub.files[SERIES_BROKEN] = [file_entry(500, SERIES_BROKEN, f"{safe_root}/E01.mkv", 10)]
+    if reverse:
+        stub.series.reverse()
+
+    inventory = collect(stub, settings_with_roots(base_document, write_document, [ANIME_ROOT]))
+
+    assert VerdictReason.INCONSISTENT_ENUMERATION in inventory.verdict.reasons
+    assert any("repeats series id 1" in detail for detail in inventory.verdict.details)
+    assert inventory.verdict.complete is False
+    assert inventory.verdict.auto_apply_eligible is False
+    assert {item.series.id for item in inventory.eligible_series} == {SERIES_BROKEN}
+    assert stub.secondary_series_ids() == {SERIES_BROKEN}
+    assert {(file.series_id, file.episode_file_id) for file in inventory.files} == {
+        (SERIES_BROKEN, 500)
+    }
+    assert {episode.series_id for episode in inventory.episodes} == {SERIES_BROKEN}
+
+
 def test_multiple_allowed_roots_admit_their_series(
     base_document: dict[str, Any], write_document: Writer
 ) -> None:
     toku_root = "/data/media/tokusatsu"
+    base_document["shoko"]["allowed_roots"].append("/tokusatsu")
+    base_document["paths"]["mappings"].append({"sonarr": toku_root, "shoko": "/tokusatsu"})
     stub = standard_stub()
     stub.series.append(series_entry(SERIES_TOKU, "Toku Show", f"{toku_root}/Toku Show"))
     stub.episodes[SERIES_TOKU] = [episode_entry(40, SERIES_TOKU, 1, 1, "Toku E01", file_id=400)]

@@ -4553,3 +4553,82 @@ def test_create_campaign_persists_plan_path_and_round_trips(tmp_path: Path) -> N
         assert camp2.plan_path is None
         by_id = {campaign.campaign_id: campaign.plan_path for campaign in store.list_campaigns()}
         assert by_id == {"camp-1": "/data/plan.json", "camp-2": None}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "not json",
+        "{}",
+        "[]",
+        '[[1,10101,5001],[1,10102,"5002"]]',
+        "[[1,10101,5001],[1,10102,true]]",
+        "[[1,10101,5001],[1,10102,0]]",
+        "[[1,10101,5001],[-1,10102,5002]]",
+        "[[1,10101,5001],[1,10102]]",
+        "[[1,10101,5001],[1,10101,5001],[1,10102,true]]",
+    ],
+)
+def test_persisted_send_targets_reject_entire_invalid_set(tmp_path: Path, raw: str | None) -> None:
+    path = tmp_path / "state.sqlite3"
+    with open_store(path) as store:
+        walk_to_planned(store)
+        token = _prepare_jobs(store, 101, jobs=2, target_ids=((1, 10101, 5001), (1, 10102, 5002)))
+        store.mark_sent(token, iso=T0)
+        store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T0)
+        # NULL is not a legal stored value; the adapter still handles missing legacy evidence.
+        store.connection.execute(
+            "UPDATE sends SET target_ids_json = ? WHERE send_id = ?",
+            (raw if raw is not None else "null", token.send_id),
+        )
+    with open_store(path) as reopened:
+        inspection = reopened.active_send_details(101)
+        assert inspection is not None
+        assert inspection.target_ids == ()
+        with pytest.raises(StateError, match="persisted send"):
+            reopened.record_verification(
+                101, VerificationVerdict.VERIFIED, iso=T1, inspection=inspection
+            )
+        assert state_of(reopened, 101) is FileState.VERIFYING
+        assert reopened.live_send_counts() == (1, 2)
+    assert state_module._parse_legacy_send_targets(raw) is None
+
+
+def test_target_decoders_preserve_valid_target_order() -> None:
+    targets = ((2, 10102, 5002), (1, 10101, 5001))
+    raw = json.dumps(targets)
+    assert state_module._parse_target_ids(raw) == targets
+    assert state_module._parse_legacy_send_targets(raw) == targets
+
+
+@pytest.mark.parametrize("legacy_duplicates", [False, True])
+def test_shared_destinations_verify_after_restart(tmp_path: Path, legacy_duplicates: bool) -> None:
+    path = tmp_path / "state.sqlite3"
+    targets = ((1, 10102, 5002), (1, 10101, 5001))
+    source_occurrences = (*targets, targets[0])
+    with open_store(path) as store:
+        walk_to_planned(store)
+        token = _prepare_jobs(store, 101, jobs=2, target_ids=source_occurrences)
+        stored = store.connection.execute(
+            "SELECT target_ids_json FROM sends WHERE send_id = ?", (token.send_id,)
+        ).fetchone()
+        assert json.loads(stored[0]) == [list(target) for target in targets]
+        store.mark_sent(token, iso=T0)
+        store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T0)
+        if legacy_duplicates:
+            store.connection.execute(
+                "UPDATE sends SET target_ids_json = ? WHERE send_id = ?",
+                (json.dumps(source_occurrences), token.send_id),
+            )
+    with open_store(path) as reopened:
+        inspection = reopened.active_send_details(101)
+        assert inspection is not None
+        assert inspection.target_ids == targets
+        assert reopened.live_send_counts() == (1, 2)
+        reopened.record_verification(
+            101, VerificationVerdict.VERIFIED, iso=T1, inspection=inspection
+        )
+        assert state_of(reopened, 101) is FileState.VERIFIED
+        assert reopened.live_send_counts() == (0, 0)
+    assert state_module._parse_legacy_send_targets(json.dumps(source_occurrences)) == targets

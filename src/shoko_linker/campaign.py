@@ -39,6 +39,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -53,6 +54,7 @@ from .daemon import (
     CycleMode,
     CycleReport,
     DaemonDeps,
+    apply_lock_lease_expiry,
     attestation_gate,
     check_plan_sonarr_source,
     compute_eligibility,
@@ -90,22 +92,19 @@ from .state import (
     CAMPAIGN_QUARANTINE_PROGRESS_PENDING_MARKER,
     CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER,
     CAMPAIGN_STATUS_APPROVED,
-    CAMPAIGN_STATUS_REVOKED,
     META_CAMPAIGN_ATTESTATION_GATE,
     META_CAMPAIGN_DEFERRED_UNTIL,
     META_CAMPAIGN_ZERO_PROGRESS,
-    OUTCOME_VERIFIED,
-    OUTCOME_VOIDED,
     ApplyLockUnavailableError,
     BudgetRefusal,
     CampaignBinding,
+    CampaignDrainRefusedError,
     CampaignRecord,
     CampaignSendRefusedError,
     CampaignSubmissionLimitError,
     Cohort,
     FileState,
     LockHeldError,
-    SendHistoryRow,
     SendToken,
     StateError,
     StateStore,
@@ -610,6 +609,18 @@ def _plan_entry(plan: LinkPlan, mapping_targets_digest: str) -> CampaignFile:
     )
 
 
+def _campaign_deadline(created: datetime, hours: float) -> datetime:
+    if not math.isfinite(hours) or hours <= 0:
+        raise CampaignError("--deadline-hours must be finite and greater than zero")
+    try:
+        deadline = created + timedelta(hours=hours)
+    except OverflowError as exc:
+        raise CampaignError("--deadline-hours exceeds the supported datetime range") from exc
+    if deadline <= created:
+        raise CampaignError("--deadline-hours is too small to produce a future deadline")
+    return deadline
+
+
 def prepare_campaign(
     deps: DaemonDeps,
     settings: Settings,
@@ -631,6 +642,8 @@ def prepare_campaign(
     """
     if limit < 1:
         raise CampaignError("--limit must be at least 1")
+    created = _parse_iso(now_iso)
+    deadline = _campaign_deadline(created, deadline_hours)
     cap = min(limit, settings.campaign.max_campaign_files)
     report = run_cycle(
         deps,
@@ -675,7 +688,6 @@ def prepare_campaign(
             "no backlog candidates are plan-frozen right now: the dry-run cycle found no "
             "eligible planned files (missing/ambiguous mappings never enter a plan)"
         )
-    created = _parse_iso(now_iso)
     plan = CampaignPlan(
         schema=PLAN_SCHEMA,
         campaign_id=str(uuid.uuid4()),
@@ -686,7 +698,7 @@ def prepare_campaign(
         structure_digest=active.structure_digest,
         files=tuple(entries),
         max_submissions=len(entries),
-        deadline_iso=(created + timedelta(hours=deadline_hours)).isoformat(),
+        deadline_iso=deadline.isoformat(),
         rate_limits=MappingProxyType(
             {
                 "per_cycle_new": float(settings.sync.max_new_per_cycle),
@@ -862,11 +874,12 @@ def _acquire_apply_lock(deps: DaemonDeps, now_iso: str) -> tuple[str | None, boo
     stays approved and no candidate is sent. ``deps.pid``/``deps.lease_seconds`` carry the
     CLI-wired ``os.getpid()``/``sync.apply_lock_lease_seconds``.
     """
-    lease = _parse_iso(now_iso) + timedelta(seconds=deps.lease_seconds)
     try:
-        acquire_or_steal_apply_lock(
-            deps.store, deps.pid, now_iso, lease_expires_iso=lease.isoformat()
-        )
+        lease_iso = apply_lock_lease_expiry(now_iso, deps.lease_seconds)
+    except ValueError as exc:
+        raise CampaignError(str(exc)) from exc
+    try:
+        acquire_or_steal_apply_lock(deps.store, deps.pid, now_iso, lease_expires_iso=lease_iso)
     except LockHeldError as exc:
         holder = exc.holder.owner_pid if exc.holder is not None else "?"
         return (f"apply_lock_contended:{holder}", False)
@@ -2536,8 +2549,8 @@ def authorize_campaign_drain(
     ledger** (``store.campaign_send_history``), never from current file states alone: a
     REJECTED/REFUSED send returns its file to ``waiting`` while the send row stays durable,
     and it is accounted here. Refuses a campaign that is unknown, paused, revoked, has no
-    attempted send (no canary), or whose latest send per attempted file is not terminal
-    VERIFIED — the refusal lists every outstanding send (file id, outcome, file state)
+    attempted send (no canary), or whose attempted sends are not settled by terminal
+    VERIFIED associations — the refusal lists every outstanding send (file id, outcome, file state)
     so the operator sees exactly what is unaccounted. A zero-write documented REJECTED
     request is NOT a verified association; the file must be resubmitted and
     verified through the normal bounded flows before the grant succeeds.
@@ -2548,66 +2561,19 @@ def authorize_campaign_drain(
             "(physical-media side effects — renames/deletions/MyList writes — reviewed)"
         )
     campaign = _require_campaign(store, campaign_id)
-    if campaign.status == CAMPAIGN_STATUS_REVOKED:
-        raise CampaignError(f"campaign {campaign_id} is revoked: drain authorization is refused")
-    if campaign.status != CAMPAIGN_STATUS_APPROVED:
-        raise CampaignError(
-            f"campaign {campaign_id} is {campaign.status} ({campaign.status_reason}): drain "
-            "authorization requires an approved campaign — resume it first"
+    try:
+        attempted_count = store.authorize_campaign_drain(
+            campaign_id, campaign.digest, iso=now_iso, expected_campaign=campaign
         )
-    unresolved = store.unresolved_campaign_send_history()
-    if unresolved:
-        send_ids = ", ".join(str(row.send_id) for row in unresolved)
-        raise CampaignError(
-            f"campaign {campaign_id} canary is blocked by ambiguous legacy send(s) {send_ids}; "
-            "resolve each with campaign history-resolve before authorizing a drain"
-        )
-    history = store.campaign_send_history(campaign_id)
-    # A voided ``prepared_not_sent`` row is a definite zero-write (never attempted):
-    # it is durable audit history but is not a canary send and never blocks the grant.
-    attempted = [row for row in history if row.outcome != OUTCOME_VOIDED]
-    if not attempted:
-        raise CampaignError(
-            f"campaign {campaign_id} has no completed canary (zero submitted files): run the "
-            "manual canary batch, verify it, inspect the physical-media side effects, then "
-            "authorize the drain"
-        )
-    # Every attempted file is accounted only by its LATEST send being terminal VERIFIED (a
-    # rejected send resubmitted and verified is settled; the earlier rejected row stays
-    # visible in the audit). In-flight/indeterminate/conflict/partial/rejected/refused rows
-    # are unaccounted.
-    latest: dict[int, SendHistoryRow] = {row.shoko_file_id: row for row in attempted}
-    outstanding = sorted(
-        (
-            row
-            for row in latest.values()
-            if row.outcome != OUTCOME_VERIFIED or row.file_state is not FileState.VERIFIED
-        ),
-        key=lambda row: row.shoko_file_id,
-    )
-    if outstanding:
-        listing = "; ".join(
-            f"file {row.shoko_file_id} (send {row.send_id}: outcome {row.outcome}, "
-            f"file state {row.file_state.value})"
-            for row in outstanding
-        )
-        raise CampaignError(
-            f"campaign {campaign_id} canary is not settled: {len(outstanding)} attempted "
-            f"send(s) in the durable send ledger are not terminal VERIFIED — {listing}. Drain "
-            "authorization requires every attempted campaign send VERIFIED: a rejected/refused "
-            "send is not a verified association, and an in-flight/indeterminate_write/partial/"
-            "conflict send is unreviewed media-side-effect risk. Resubmit the refused file "
-            "through the normal bounded flow, verify it, inspect the side "
-            "effects, then authorize the drain"
-        )
-    store.authorize_campaign_drain(campaign_id, campaign.digest, iso=now_iso)
+    except CampaignDrainRefusedError as exc:
+        raise CampaignError(str(exc)) from exc
     logger.info(
-        "campaign %s drain authorized against digest %s at %s (%d attempted send(s), all "
-        "terminal VERIFIED)",
+        "campaign %s drain authorized against digest %s at %s (%d attempted send(s), "
+        "settled by VERIFIED associations)",
         campaign_id,
         campaign.digest,
         now_iso,
-        len(attempted),
+        attempted_count,
     )
     updated = store.get_campaign(campaign_id)
     assert updated is not None

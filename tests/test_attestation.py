@@ -173,6 +173,24 @@ def test_malformed_lease_is_invalid(tmp_path: Path) -> None:
     assert "missing field" in verdict.reason
 
 
+@pytest.mark.parametrize("field_name", ["inspected_iso", "expires_iso"])
+@pytest.mark.parametrize("timestamp", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
+def test_out_of_range_utc_lease_is_invalid(tmp_path: Path, field_name: str, timestamp: str) -> None:
+    document = canonical_record(_record())
+    document[field_name] = timestamp
+    path = tmp_path / "lease.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    verdict = _load(None, path)
+
+    assert verdict.status == "invalid"
+    assert not verdict.valid_for_apply
+    assert field_name in verdict.reason
+    assert "supported UTC range" in verdict.reason
+    with pytest.raises(AttestationError, match=field_name):
+        _record(**{field_name: timestamp})
+
+
 def test_endpoint_scope_and_expiry_matrix(tmp_path: Path) -> None:
     path, _digest, _warning = write_attestation(tmp_path / "lease.yaml", _record())
     mismatch = load_attestation(
@@ -208,6 +226,14 @@ def test_lease_cannot_exceed_validity_cap() -> None:
     ok, reason = lease_expiry_cap(200.0, 168.0)
     assert ok is False
     assert "exceeds" in reason
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_lease_duration_or_cap_is_refused(value: float) -> None:
+    for hours, cap in ((value, 168.0), (24.0, value)):
+        ok, reason = lease_expiry_cap(hours, cap)
+        assert not ok
+        assert "finite" in reason
 
 
 def test_settings_flags_are_the_only_allowed_summary(tmp_path: Path) -> None:
@@ -667,31 +693,70 @@ def test_record_requires_confirm_and_writes_lease(
     assert verdict["record"]["mount_fingerprint"] == ["/anime read-only"]
 
 
-def test_record_refuses_hours_beyond_cap(env: StubEnv, capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(
-        [
-            "attestation",
-            "record",
-            str(env.config_path),
-            "--endpoint",
-            SHOKO_BASE,
-            "--version",
-            "5.3.3",
-            "--mounts",
-            "/anime read-only",
-            "--settings",
-            "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false",
-            "--hours",
-            "500",
-            "--note",
-            "n",
-            "--confirm",
-        ]
-    )
-    out = capsys.readouterr().out
+@pytest.mark.parametrize(
+    ("hours", "cap", "reason"),
+    [
+        ("500", 168.0, "exceeds"),
+        ("nan", 168.0, "finite"),
+        ("inf", 168.0, "finite"),
+        ("100000000", 100000000.0, "supported expiry timestamp range"),
+        ("1e308", 1e308, "supported expiry timestamp range"),
+    ],
+)
+def test_record_refuses_invalid_hours(
+    env: StubEnv, capsys: pytest.CaptureFixture[str], hours: str, cap: float, reason: str
+) -> None:
+    document = _document(env.lease_path)
+    document["safety"]["attestation_validity_hours"] = cap
+    env.config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    args = [
+        "attestation",
+        "record",
+        str(env.config_path),
+        "--endpoint",
+        SHOKO_BASE,
+        "--version",
+        "5.3.3",
+        "--mounts",
+        "/anime read-only",
+        "--settings",
+        "FileQualityFilterEnabled=false,RenameOnImport=false,MoveOnImport=false,MyListAddFiles=false",
+        f"--hours={hours}",
+        "--note",
+        "n",
+        "--confirm",
+    ]
+    if hours in {"nan", "inf"}:
+        with pytest.raises(SystemExit) as excinfo:
+            main(args)
+        code = excinfo.value.code
+    else:
+        code = main(args)
+    captured = capsys.readouterr()
     assert code == EXIT_CONFIG_INVALID
-    assert "exceeds" in out
+    assert reason in (captured.err if hours in {"nan", "inf"} else captured.out)
+    assert "Traceback" not in captured.out + captured.err
     assert not env.lease_path.exists()
+    assert env.posts == []
+
+
+@pytest.mark.parametrize("timestamp", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
+def test_status_reports_invalid_utc_lease_without_writes(
+    env: StubEnv, capsys: pytest.CaptureFixture[str], timestamp: str
+) -> None:
+    document = canonical_record(_record())
+    document["inspected_iso"] = timestamp
+    env.lease_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    before = env.lease_path.read_bytes()
+
+    code = main(["attestation", "status", str(env.config_path), "--json"])
+
+    captured = capsys.readouterr()
+    assert code == EXIT_OK  # status reports the verdict; record/apply enforce refusal
+    assert json.loads(captured.out)["status"] == "invalid"
+    assert "Traceback" not in captured.out + captured.err
+    assert env.lease_path.read_bytes() == before
+    assert env.posts == []
 
 
 def test_record_cli_refuses_file_quality_filter_true(

@@ -32,6 +32,20 @@ EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "config.example.yaml"
 DUMMY_SHOKO_KEY = "dummy-shoko-key-value-00000000"
 
 
+def test_validate_malformed_yaml_does_not_print_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "invalid.yaml"
+    config_path.write_text(
+        "sonarr:\n  url: [http://user:synthetic-password@host\n", encoding="utf-8"
+    )
+
+    assert main(["validate", str(config_path)]) == EXIT_CONFIG_INVALID
+    captured = capsys.readouterr()
+    assert "ParserError at line 3, column 1" in captured.err
+    assert "synthetic-password" not in captured.out + captured.err
+
+
 def test_service_command_requires_no_yaml_path() -> None:
     try:
         args = cli.build_parser().parse_args(["service"])

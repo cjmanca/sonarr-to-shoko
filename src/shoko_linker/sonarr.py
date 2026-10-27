@@ -336,8 +336,14 @@ def select_eligible_series(
 
 
 def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
-    """Parse ``/api/v3/series`` entries; a malformed required field fails that entry closed."""
+    """Parse series, excluding every copy of repeated IDs before any scope selection.
+
+    Even identical duplicates invalidate the enumeration. Record identifiable IDs
+    before field validation so a malformed duplicate cannot leave a trusted copy.
+    """
     series: list[SonarrSeries] = []
+    seen_ids: set[int] = set()
+    duplicate_ids: set[int] = set()
     reasons: list[VerdictReason] = []
     details: list[str] = []
     for index, item in enumerate(raw):
@@ -347,6 +353,12 @@ def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
             details.append(f"series entry {index} is not an object")
             continue
         series_id = _required_int(entry, "id")
+        if series_id is not None and series_id > 0:
+            if series_id in seen_ids:
+                duplicate_ids.add(series_id)
+                reasons.append(VerdictReason.INCONSISTENT_ENUMERATION)
+                details.append(f"series entry {index} repeats series id {series_id}")
+            seen_ids.add(series_id)
         title = _required_str(entry, "title")
         root = _required_str(entry, "rootFolderPath")
         tvdb_id, tvdb_ok = _optional_int(entry, "tvdbId")
@@ -368,7 +380,11 @@ def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
                 series_type=series_type,
             )
         )
-    return SeriesParseResult(tuple(series), tuple(reasons), tuple(details))
+    return SeriesParseResult(
+        tuple(item for item in series if item.id not in duplicate_ids),
+        tuple(reasons),
+        tuple(details),
+    )
 
 
 def parse_episode_entries(raw: Sequence[Any], series_id: int) -> EpisodeParseResult:

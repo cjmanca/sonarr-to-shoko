@@ -197,6 +197,7 @@ class ShokoStub:
         self.on_post: Callable[[], None] | None = None
         self.unmaterialized: set[int] = set()  # AniDB episode ids whose Shoko metadata is not ready
         self.ed2k_overrides: dict[int, str] = {}
+        self.size_overrides: dict[int, int] = {}
         self.file_id_overrides: dict[int, int] = {}
         self.target_episode_overrides: dict[int, int] = {}
         self.target_read_failures: dict[str, tuple[int, int | None]] = {}
@@ -333,7 +334,7 @@ class ShokoStub:
         hashes["ED2K"] = self.ed2k_overrides.get(shoko_id, hashes["ED2K"])
         return {
             "ID": self.file_id_overrides.get(shoko_id, shoko_id),
-            "Size": FILE_SIZE,
+            "Size": self.size_overrides.get(shoko_id, FILE_SIZE),
             "IsIgnored": False,
             "IsVariation": False,
             "Imported": "2024-01-01T00:00:00",
@@ -2446,8 +2447,9 @@ def test_new_arrival_policy_does_not_submit_backlog_even_in_service_mode(
     assert record.state is FileState.PLANNED
 
 
+@pytest.mark.parametrize("size_drift", [False, True])
 def test_service_canary_holds_expansion_until_async_verification_is_complete(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size_drift: bool
 ) -> None:
     monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
     files = [
@@ -2481,6 +2483,9 @@ def test_service_canary_holds_expansion_until_async_verification_is_complete(
             deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="svc-1"
         )
         store.close()
+        if size_drift:
+            shoko.materialize(500)
+            shoko.size_overrides[500] = FILE_SIZE + 1
         store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
         deps = build_deps(
             tmp_path,
@@ -2929,8 +2934,9 @@ def test_restart_preserves_original_ed2k_and_rejects_reused_shoko_id(
     assert any("source_hash_identity_drift" in reason for reason in report.reasons)
 
 
-def test_inline_verification_holds_when_posted_file_ed2k_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("drift", ["ed2k", "size"])
+def test_inline_verification_holds_when_posted_file_identity_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
 ) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     candidate = SpecFile(series_id=1, file_id=10, shoko_id=101)
@@ -2938,9 +2944,12 @@ def test_inline_verification_holds_when_posted_file_ed2k_changes(
     store = open_tmp_store(tmp_path)
     seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
     shoko = ShokoStub([candidate])
-    shoko.on_post = lambda: shoko.ed2k_overrides.__setitem__(
-        candidate.shoko_id, hf.hex32(candidate.shoko_id + 1)
-    )
+    if drift == "ed2k":
+        shoko.on_post = lambda: shoko.ed2k_overrides.__setitem__(
+            candidate.shoko_id, hf.hex32(candidate.shoko_id + 1)
+        )
+    else:
+        shoko.on_post = lambda: shoko.size_overrides.__setitem__(candidate.shoko_id, FILE_SIZE + 1)
     try:
         deps = build_deps(
             tmp_path,
@@ -2967,8 +2976,10 @@ def test_inline_verification_holds_when_posted_file_ed2k_changes(
     assert view.pending_file_requests == 1
 
 
-def test_restart_ed2k_drift_keeps_materialized_async_send_recoverable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("drift", ["ed2k", "size"])
+@pytest.mark.parametrize("crash_after_send", [False, True])
+def test_restart_identity_drift_keeps_materialized_async_send_recoverable(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str, crash_after_send: bool
 ) -> None:
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     candidate = SpecFile(series_id=1, file_id=10, shoko_id=102)
@@ -2978,6 +2989,8 @@ def test_restart_ed2k_drift_keeps_materialized_async_send_recoverable(
     seed_baseline(first_store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
     shoko = ShokoStub([candidate])
     shoko.link_on_post = False  # Accepted job has not materialized its XRefs yet.
+    if crash_after_send:
+        shoko.fail_post = RuntimeError("crash after send")
     try:
         first_deps = build_deps(
             tmp_path,
@@ -2989,25 +3002,39 @@ def test_restart_ed2k_drift_keeps_materialized_async_send_recoverable(
             advance=Sleeper().advance,
             shoko=shoko,
         )
-        first_report = run_cycle(
-            first_deps,
-            now_iso=T0,
-            mode=CycleMode.APPLY,
-            policy=RunPolicy.NEW_ARRIVAL,
-            cycle_key="c1",
+        expectation = (
+            pytest.raises(RuntimeError, match="crash after send")
+            if crash_after_send
+            else contextlib.nullcontext()
+        )
+        with expectation:
+            first_report = run_cycle(
+                first_deps,
+                now_iso=T0,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.NEW_ARRIVAL,
+                cycle_key="c1",
+            )
+            assert first_report.live_held_sends == 1
+        expected_state = (
+            FileState.REQUEST_MAY_HAVE_BEEN_SENT if crash_after_send else FileState.VERIFYING
         )
         first_record = first_store.get_file(candidate.shoko_id)
         assert first_record is not None
-        assert first_record.state is FileState.VERIFYING
-        assert first_report.live_held_sends == 1
+        assert first_record.state is expected_state
     finally:
         first_store.close()
 
-    # The async job materializes the original targets after the restart, but this is now a
-    # different file reusing the same Shoko ID/path/size.
+    # Exact targets materialize after restart, but frozen file identity has drifted.
+    shoko.fail_post = None
     shoko.materialize(candidate.shoko_id)
-    shoko.ed2k_overrides[candidate.shoko_id] = hf.hex32(candidate.shoko_id + 1)
+    if drift == "ed2k":
+        shoko.ed2k_overrides[candidate.shoko_id] = hf.hex32(candidate.shoko_id + 1)
+    else:
+        shoko.size_overrides[candidate.shoko_id] = FILE_SIZE + 1
     reopened = StateStore(path, budget_limits=WIDE_LIMITS)
+    if crash_after_send:
+        release_apply_lock(reopened, pid=4242, iso=T1)
     try:
         deps = build_deps(
             tmp_path,
@@ -3034,12 +3061,14 @@ def test_restart_ed2k_drift_keeps_materialized_async_send_recoverable(
     assert shoko.posts_count() == 1
     assert report.counts.submitted == 0
     assert candidate.shoko_id not in report.plans
-    assert any("source_hash_identity_drift" in reason for reason in report.reasons)
+    if drift == "ed2k":
+        assert any("source_hash_identity_drift" in reason for reason in report.reasons)
     assert record is not None
-    assert record.state is FileState.VERIFYING
+    assert record.state is expected_state
     assert record.identity is not None
     assert record.identity.ed2k == hf.hex32(candidate.shoko_id)
-    assert [row.shoko_file_id for row in recovery.continue_polling] == [candidate.shoko_id]
+    recoverable = recovery.resubmit_forbidden if crash_after_send else recovery.continue_polling
+    assert [row.shoko_file_id for row in recoverable] == [candidate.shoko_id]
     assert report.live_held_sends == 1
     assert report.live_held_slots == 1
 
@@ -4767,6 +4796,43 @@ def test_two_processes_contended_lock_is_read_only(
     assert report.writes_suppressed is True
 
 
+@pytest.mark.parametrize(
+    ("now_iso", "lease_seconds"),
+    [(T0, 1e100), (T0, float("nan")), ("9999-12-31T23:59:59+00:00", 10.0)],
+)
+def test_invalid_apply_lock_lease_cycle_preserves_reason_with_healthy_store(
+    tmp_path: Path, now_iso: str, lease_seconds: float
+) -> None:
+    shoko = ShokoStub([])
+    with contextlib.closing(open_tmp_store(tmp_path)) as store:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[],
+            shoko_files=[],
+            xml=mapping_xml(),
+            monotonic=lambda: 0.0,
+            advance=lambda _seconds: None,
+            shoko=shoko,
+        )
+        deps = replace(deps, lease_seconds=lease_seconds)
+        report = run_cycle(
+            deps,
+            now_iso=now_iso,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="invalid-lease",
+            campaign_quarantine_limit=0,
+        )
+        assert report.reasons[0].startswith("apply_lock_invalid_lease:")
+        assert "sync.apply_lock_lease_seconds" in report.reasons[0]
+        assert report.writes_suppressed is True
+        assert store.writes_disabled is False
+        assert store.lock_holder() is None
+        assert not store.apply_lock_path.exists()
+        assert shoko.posts_count() == 0
+
+
 def test_unavailable_apply_lock_defers_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4863,6 +4929,29 @@ def test_dry_run_zero_posts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ------------------------------------------------------------------ gate: backoff + SIGTERM
+
+
+@pytest.mark.parametrize(
+    ("base", "failures", "expected"),
+    [
+        (60.0, 0, 60.0),
+        (60.0, 1, 60.0),
+        (60.0, 2, 120.0),
+        (60.0, 11, 61440.0),
+        (60.0, 12, 86400.0),
+        (60.0, 1025, 86400.0),
+        (60.0, 10**100, 86400.0),
+        (86400.0, 1, 86400.0),
+        (172800.0, 0, 172800.0),
+        (172800.0, 1, 86400.0),
+    ],
+)
+@pytest.mark.parametrize("random_value", [0.0, 0.5, 1.0])
+def test_sleep_backoff_saturates_and_preserves_jitter(
+    base: float, failures: int, expected: float, random_value: float
+) -> None:
+    actual = daemon_module._compute_sleep(base, failures, 0.1, lambda: random_value)
+    assert actual == pytest.approx(expected * (1.0 + 0.1 * (random_value - 0.5)))
 
 
 def test_backoff_grows_sleeps_and_success_resets(
@@ -6293,7 +6382,7 @@ def _seed_verifying_rows(store: StateStore, count: int) -> None:
                     file_id % 50 + 1,
                     file_id,
                     f"/data/media/anime/series{file_id}/f{file_id}.mkv",
-                    1000 + file_id,
+                    FILE_SIZE,
                     T0,
                     T0,
                     json.dumps(
@@ -8436,3 +8525,88 @@ def test_cycle_deadline_at_final_local_guard_leaves_no_send_or_budget_debt(
     assert record is not None
     assert record.state is FileState.PLANNED
     assert any("cycle_time_budget_exhausted" in reason for reason in report.reasons)
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("corrupt_targets", ["partial", "missing"])
+def test_restart_corrupt_target_set_holds_complete_reservation(
+    tmp_path: Path, accepted: bool, corrupt_targets: str
+) -> None:
+    candidate, _, _ = _two_target_file()
+    path = tmp_path / "state.sqlite3"
+    targets = tuple((candidate.anime_id, ep[2], ep[3]) for ep in candidate.episodes)
+    with contextlib.closing(StateStore(path, budget_limits=WIDE_LIMITS)) as store:
+        store.record_file(
+            candidate.shoko_id,
+            sonarr_series_id=candidate.series_id,
+            sonarr_file_id=candidate.file_id,
+            sonarr_path=_sonarr_path(candidate),
+            sonarr_size=FILE_SIZE,
+            cohort=Cohort.NEW_ARRIVAL,
+            iso=T0,
+        )
+        for target in (FileState.MATCHED, FileState.MAPPED, FileState.PLANNED):
+            store.advance(candidate.shoko_id, target, "walk", iso=T0)
+        token = store.prepare_send(
+            candidate.shoko_id,
+            "a" * 64,
+            "b" * 64,
+            targets_digest="d" * 64,
+            structure_digest="e" * 64,
+            mapping_revision="7",
+            cycle_key="seed",
+            iso=T0,
+            expected_episode_jobs=2,
+            target_ids=targets,
+        )
+        assert isinstance(token, SendToken)
+        store.mark_sent(token, iso=T0)
+        if accepted:
+            store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T0)
+        raw = json.dumps([targets[0], [*targets[1][:2], str(targets[1][2])]])
+        store.connection.execute(
+            "UPDATE sends SET target_ids_json = ? WHERE send_id = ?",
+            (raw if corrupt_targets == "partial" else "[]", token.send_id),
+        )
+    shoko = ShokoStub([candidate])
+    # The one valid persisted tuple has landed; it must not count as the complete set.
+    shoko.materialize(candidate.shoko_id, candidate.episodes[:1])
+    with contextlib.closing(StateStore(path, budget_limits=WIDE_LIMITS)) as reopened:
+        deps = build_deps(
+            tmp_path,
+            store=reopened,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        try:
+            recovery = reopened.recover_after_restart()
+            rows = recovery.continue_polling if accepted else recovery.hold_for_verification
+            assert len(rows) == 1
+            handler = (
+                daemon_module._recovery_poll_row if accepted else daemon_module._recovery_hold_row
+            )
+            result = handler(deps, rows[0], T1)
+            assert result.reason == (
+                f"recovery_poll_skipped:{candidate.shoko_id}"
+                if accepted
+                else f"recovery_hold_targets_missing:{candidate.shoko_id}"
+            )
+            assert reopened.live_send_counts() == (1, 2)
+            record = reopened.get_file(candidate.shoko_id)
+            assert record is not None
+            assert record.state is (
+                FileState.VERIFYING if accepted else FileState.REQUEST_MAY_HAVE_BEEN_SENT
+            )
+            assert _raw_read(
+                path,
+                "SELECT outcome, slot_released FROM sends WHERE send_id = ?",
+                (token.send_id,),
+            ) == [("accepted_unverified" if accepted else "attempted", 0)]
+            assert shoko.posts_count() == 0
+        finally:
+            for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
+                endpoint.client.close()

@@ -20,6 +20,13 @@ Enumeration semantics (see AGENTS/PROJECT §6 delivery policy):
 * Force-push / non-ancestor (``before`` not an ancestor of ``after``):
   fall back to ``merge-base(before, after)..after`` with a ``non-ancestor``
   note; the rewritten commits are new SHAs and are published as such.
+  If a validated full ``before`` SHA is unavailable in a fresh clone after a
+  rewrite, conservatively enumerate reachable ``after`` history from the
+  first-buildable boundary. Registry provenance gates still deduplicate tags;
+  the normal cap and explicit degraded-history note remain in effect.
+  If the recorded boundary is unavailable or outside the event history, inspect all reachable trees
+  and exclude those lacking required historical build inputs before capping.
+  This is a necessary-input filter, never a substitute for per-SHA validation.
 * Backfill (``enumerate_missing``): SHAs reachable from ``upto`` (optionally
   after ``since``) that lack a ``sha-<fullsha>`` tag, given the tag set the
   caller fetched from the GHCR registry (``scripts/ghcr_tags.py``; the
@@ -50,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -189,13 +197,9 @@ def _enumerate_from_boundary(
             "first push: no first-buildable boundary recorded; enumerated full history"
         )
         return
-    boundary_full = _resolve_commit(repo_dir, first_buildable)
-    if not _is_ancestor(repo_dir, boundary_full, after_full):
-        result.shas = _rev_list(repo_dir, after_full)
-        result.skipped.append(SkippedCommit(boundary_full, "boundary-not-ancestor"))
-        result.notes.append(
-            "first push: boundary is not an ancestor of after; enumerated full history"
-        )
+    boundary_full = _usable_boundary(repo_dir, first_buildable, after_full, result)
+    if boundary_full is None:
+        result.shas = _history_with_build_inputs(repo_dir, after_full, result)
         return
     ancestors = _rev_list(repo_dir, boundary_full)
     result.skipped = [
@@ -206,6 +210,55 @@ def _enumerate_from_boundary(
         "first push to default branch: enumerated from first-buildable boundary "
         "(inclusive); older history skipped as pre-boundary, never published"
     )
+
+
+def _usable_boundary(
+    repo_dir: Path, boundary: str, after_full: str, result: EnumerationResult
+) -> str | None:
+    try:
+        boundary_full = _resolve_commit(repo_dir, boundary)
+    except GitError:
+        if re.fullmatch(r"[0-9a-f]{40}", boundary) is None:
+            raise
+        reason = "boundary-unavailable"
+    else:
+        if _is_ancestor(repo_dir, boundary_full, after_full):
+            return boundary_full
+        boundary = boundary_full
+        reason = "boundary-not-ancestor"
+    result.skipped.append(SkippedCommit(boundary, reason))
+    result.notes.append(
+        f"degraded-history: first-buildable boundary {boundary}: {reason}; "
+        "scan reachable history without guessing a cutoff, excluding only commits "
+        "missing required historical build inputs; candidates still require their own checks"
+    )
+    return None
+
+
+def _history_with_build_inputs(
+    repo_dir: Path, after_full: str, result: EnumerationResult
+) -> list[str]:
+    # Necessary inputs already required by the historical validator / install leg.
+    # Presence is not a successful build or test result; each leg still validates.
+    required = {
+        "Dockerfile": "blob",
+        "pyproject.toml": "blob",
+        "uv.lock": "blob",
+        "src": "tree",
+        "tests": "tree",
+    }
+    candidates: list[str] = []
+    for sha in _rev_list(repo_dir, after_full):
+        entries = _git(repo_dir, "ls-tree", sha, "--", *required)
+        observed = {}
+        for entry in entries.splitlines():
+            metadata, name = entry.split("\t", 1)
+            observed[name] = metadata.split()[1]
+        if all(observed.get(name) == kind for name, kind in required.items()):
+            candidates.append(sha)
+        else:
+            result.skipped.append(SkippedCommit(sha, "missing-historical-build-inputs"))
+    return candidates
 
 
 def _enumerate_new_branch(
@@ -263,9 +316,20 @@ def enumerate_introduced(
     repo = Path(repo_dir)
     result = EnumerationResult()
     after_full = _resolve_commit(repo, after)
-    if before is not None and before != ZERO_SHA:
-        before_full = _resolve_commit(repo, before)
-        _enumerate_range(repo, before_full, after_full, result)
+    if before and before != ZERO_SHA:
+        try:
+            before_full = _resolve_commit(repo, before)
+        except GitError:
+            if re.fullmatch(r"[0-9a-f]{40}", before) is None:
+                raise
+            _enumerate_from_boundary(repo, after_full, first_buildable, result)
+            result.notes.append(
+                f"degraded-history: before SHA {before} is unavailable (possibly rewritten); "
+                "conservatively enumerated reachable event-after history without guessing "
+                "a merge-base; registry provenance gates deduplicate existing tags"
+            )
+        else:
+            _enumerate_range(repo, before_full, after_full, result)
     elif ref in (f"refs/heads/{default_branch}", default_branch):
         _enumerate_from_boundary(repo, after_full, first_buildable, result)
     else:
@@ -298,6 +362,8 @@ def enumerate_missing(
     and records older history as skipped. An explicit ``since`` restricts the
     scan to ``since..upto`` (exclusive of ``since``) and takes precedence over
     the default buildable boundary for targeted recovery.
+    If a full boundary SHA is unavailable or unrelated after a rewrite, scan reachable trees
+    with the same necessary-build-input filter used by degraded push planning.
     """
     repo = Path(repo_dir)
     _validate_max_shas(max_shas)
@@ -317,22 +383,19 @@ def enumerate_missing(
             "first-buildable boundary not applied"
         )
     elif first_buildable:
-        boundary_full = _resolve_commit(repo, first_buildable)
-        if not _is_ancestor(repo, boundary_full, upto_full):
-            result.skipped.append(SkippedCommit(boundary_full, "boundary-not-ancestor"))
+        boundary_full = _usable_boundary(repo, first_buildable, upto_full, result)
+        if boundary_full is None:
+            commits = _history_with_build_inputs(repo, upto_full, result)
+            scan = f"{upto_full} (reachable history; boundary unusable)"
+        else:
+            earlier = [sha for sha in _rev_list(repo, boundary_full) if sha != boundary_full]
+            result.skipped.extend(SkippedCommit(sha, "pre-boundary") for sha in earlier)
+            commits = [boundary_full, *_rev_list(repo, f"{boundary_full}..{upto_full}")]
+            scan = f"{boundary_full} (inclusive)..{upto_full}"
             result.notes.append(
-                f"backfill boundary {boundary_full} is not an ancestor of {upto_full}; "
-                "no default history scanned (use an explicit --since range for targeted recovery)"
+                f"backfill starts at first-buildable boundary {boundary_full} (inclusive); "
+                f"{len(earlier)} earlier commit(s) skipped as pre-boundary"
             )
-            return _apply_cap(result, max_shas)
-        earlier = [sha for sha in _rev_list(repo, boundary_full) if sha != boundary_full]
-        result.skipped.extend(SkippedCommit(sha, "pre-boundary") for sha in earlier)
-        commits = [boundary_full, *_rev_list(repo, f"{boundary_full}..{upto_full}")]
-        scan = f"{boundary_full} (inclusive)..{upto_full}"
-        result.notes.append(
-            f"backfill starts at first-buildable boundary {boundary_full} (inclusive); "
-            f"{len(earlier)} earlier commit(s) skipped as pre-boundary"
-        )
     else:
         scan = upto_full
         commits = _rev_list(repo, scan)
@@ -415,7 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         known = Path(args.known_tags_file).read_text(encoding="utf-8").splitlines()
         unverified: set[str] = set()
         if args.unverified_file:
-            unverified = Path(args.unverified_file).read_text(encoding="utf-8").splitlines()
+            unverified = set(Path(args.unverified_file).read_text(encoding="utf-8").splitlines())
         result = enumerate_missing(
             args.repo,
             upto=args.upto,

@@ -70,6 +70,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -84,6 +85,7 @@ import httpx
 
 from . import mappings as _mappings
 from .attestation import SCOPE_DAEMON, AttestationVerdict
+from .backoff import capped_backoff
 from .config import Settings, apply_gate
 from .errors import HttpPolicyError
 from .http import ApiEndpoint, resolve_and_send
@@ -2210,12 +2212,16 @@ def _apply_generation_change(
 
 
 def _xref_fetcher(
-    endpoint: ApiEndpoint, file_id: int, *, expected_ed2k: str | None = None
+    endpoint: ApiEndpoint,
+    file_id: int,
+    *,
+    expected_ed2k: str | None = None,
+    expected_size: int | None = None,
 ) -> Callable[[], ShokoFileXRefs | None]:
     """Build the verification poll: ``GET File/{id}?include=XRefs`` (read-only).
 
-    When an expected ED2K is supplied, the same File response must still identify the
-    frozen file before its XRefs can be used as verification evidence.
+    Expected ED2K and size bind the same File response to the frozen file before
+    its XRefs can be used as verification evidence.
     """
 
     def fetch() -> ShokoFileXRefs | None:
@@ -2243,7 +2249,10 @@ def _xref_fetcher(
             )
             if expected is None or current_ed2k != expected:
                 return None
-        return parse_file_xrefs(payload)
+        observed = parse_file_xrefs(payload)
+        if observed is not None and expected_size is not None and observed.size != expected_size:
+            return None
+        return observed
 
     return fetch
 
@@ -2312,7 +2321,9 @@ def _verify_and_close(
 
     def fetch_xrefs() -> ShokoFileXRefs | None:
         nonlocal same_file_observation
-        observed = _xref_fetcher(deps.shoko, file_id, expected_ed2k=expected_ed2k)()
+        observed = _xref_fetcher(
+            deps.shoko, file_id, expected_ed2k=expected_ed2k, expected_size=plan.shoko_size
+        )()
         same_file_observation = observed is not None and observed.file_id == file_id
         return observed
 
@@ -2363,7 +2374,9 @@ def inspect_send_state(deps: DaemonDeps, file_id: int) -> ShokoFileXRefs | None:
     expected_ed2k = canonical_ed2k(record.identity.ed2k)
     if expected_ed2k is None:
         return None
-    return _xref_fetcher(deps.shoko, file_id, expected_ed2k=expected_ed2k)()
+    return _xref_fetcher(
+        deps.shoko, file_id, expected_ed2k=expected_ed2k, expected_size=record.sonarr_size
+    )()
 
 
 def _xref_triples(observed: ShokoFileXRefs) -> frozenset[tuple[int, int, int | None]]:
@@ -3430,6 +3443,22 @@ def _drain_campaign(
     return _CampaignDrainOutcome(selected=True, apply_eligible=True, report=report)
 
 
+def apply_lock_lease_expiry(now_iso: str, seconds: float) -> str:
+    """Compute a usable lease before either apply entry point acquires ownership."""
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("sync.apply_lock_lease_seconds must be finite and greater than zero")
+    now = _parse_iso(now_iso)
+    try:
+        expiry = now + timedelta(seconds=seconds)
+    except OverflowError as exc:
+        raise ValueError(
+            "sync.apply_lock_lease_seconds exceeds the supported datetime range"
+        ) from exc
+    if expiry <= now:
+        raise ValueError("sync.apply_lock_lease_seconds is too small to produce a future lease")
+    return expiry.isoformat()
+
+
 def _lock_preflight(
     deps: DaemonDeps, mode: CycleMode, now_iso: str
 ) -> tuple[str | None, bool, bool]:
@@ -3441,19 +3470,19 @@ def _lock_preflight(
     whole cycle, so a lease timeout can never hand ownership to a second live process.
     """
     writes_suppressed = deps.store.writes_disabled
-    if mode is not CycleMode.APPLY:
-        return (None, writes_suppressed, False)
-    if writes_suppressed:
-        return ("writes_disabled", True, False)
-    lease = _parse_iso(now_iso) + timedelta(seconds=deps.lease_seconds)
+    if mode is not CycleMode.APPLY or writes_suppressed:
+        reason = "writes_disabled" if mode is CycleMode.APPLY else None
+        return (reason, writes_suppressed, False)
+    try:
+        lease_iso = apply_lock_lease_expiry(now_iso, deps.lease_seconds)
+    except ValueError as exc:
+        return (f"apply_lock_invalid_lease: {exc}", True, False)
     try:
         # F5: exclusive ownership is the OS advisory lock, taken FIRST; a live owner
         # (kernel-held lock) is contended — a meta lease expiry never fences it out. The
         # meta lease is audit/visibility only; an expired lease + a free OS lock steals the
         # lease of a DEAD owner (audit-recorded). Contention → read-only cycle, holder named.
-        acquire_or_steal_apply_lock(
-            deps.store, deps.pid, now_iso, lease_expires_iso=lease.isoformat()
-        )
+        acquire_or_steal_apply_lock(deps.store, deps.pid, now_iso, lease_expires_iso=lease_iso)
     except LockHeldError as exc:
         holder = exc.holder.owner_pid if exc.holder else "?"
         return (f"apply_lock_contended: holder {holder}", False, False)
@@ -3604,7 +3633,7 @@ def run_cycle(
         campaign_quarantine_limit = 0
     lock_reason, writes_suppressed, lock_acquired = _lock_preflight(deps, mode, now_iso)
     if writes_suppressed:
-        return _read_only_report(mode, cycle_key, "writes_disabled", None)
+        return _read_only_report(mode, cycle_key, lock_reason or "writes_disabled", None)
     if lock_reason is not None:
         return _read_only_report(mode, cycle_key, lock_reason, None)
     original_budget_limits = deps.store.budget_limits
@@ -4200,7 +4229,7 @@ def _compute_sleep(
     if consecutive_failures <= 0:
         seconds = base_seconds
     else:
-        seconds = min(MAX_BACKOFF_SECONDS, base_seconds * 2.0 ** (consecutive_failures - 1))
+        seconds = capped_backoff(base_seconds, consecutive_failures - 1, MAX_BACKOFF_SECONDS)
     jitter = 1.0 + jitter_ratio * (rng() - 0.5)
     return seconds * jitter
 

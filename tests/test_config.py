@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import traceback
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -170,6 +171,25 @@ def test_missing_sonarr_allowed_roots_is_rejected(
         load_settings(write_document(base_document))
 
 
+@pytest.mark.parametrize("service", ["sonarr", "shoko"])
+@pytest.mark.parametrize("root", ["//", "//.", "//./", "///././"])
+def test_filesystem_root_aliases_are_rejected_in_allowed_roots(
+    base_document: dict[str, Any], service: str, root: str
+) -> None:
+    base_document[service]["allowed_roots"] = [root]
+    with pytest.raises(ConfigError, match=rf"{service}\.allowed_roots"):
+        parse_settings(_dump(base_document))
+
+
+@pytest.mark.parametrize("service", ["sonarr", "shoko"])
+def test_filesystem_root_aliases_are_rejected_in_mappings(
+    base_document: dict[str, Any], service: str
+) -> None:
+    base_document["paths"]["mappings"][0][service] = "//./"
+    with pytest.raises(ConfigError, match="below the filesystem root"):
+        parse_settings(_dump(base_document))
+
+
 def test_missing_paths_mapping_section_is_rejected(
     base_document: dict[str, Any],
     write_document: Callable[[dict[str, Any]], Path],
@@ -186,6 +206,63 @@ def test_empty_paths_mapping_list_is_rejected(
     base_document["paths"]["mappings"] = []
     with pytest.raises(ConfigError, match="paths.mappings"):
         load_settings(write_document(base_document))
+
+
+@pytest.mark.parametrize(
+    "source", ["/unrelated", "/data/media/anime-old", "/data/media/anime/subfolder"]
+)
+def test_every_eligible_sonarr_root_requires_complete_mapping_coverage(
+    base_document: dict[str, Any], source: str
+) -> None:
+    base_document["paths"]["mappings"] = [{"sonarr": source, "shoko": "/anime"}]
+    with pytest.raises(ConfigError, match="paths.mappings.*does not cover"):
+        parse_settings(_dump(base_document))
+
+
+def test_each_sonarr_root_requires_coverage(base_document: dict[str, Any]) -> None:
+    base_document["sonarr"]["allowed_roots"].append("/data/media/more-anime")
+    with pytest.raises(ConfigError, match="paths.mappings.*does not cover"):
+        parse_settings(_dump(base_document))
+
+
+@pytest.mark.parametrize("target", ["/unrelated", "/anime-old", "/media"])
+def test_translated_eligible_root_must_be_inside_shoko_scope(
+    base_document: dict[str, Any], target: str
+) -> None:
+    base_document["paths"]["mappings"][0]["shoko"] = target
+    with pytest.raises(ConfigError, match="paths.mappings.*outside shoko.allowed_roots"):
+        parse_settings(_dump(base_document))
+
+
+def test_broader_mapping_translates_nested_allowed_roots(base_document: dict[str, Any]) -> None:
+    base_document["sonarr"]["allowed_roots"] = [
+        "/data/media/anime",
+        "/data/media/anime/specials",
+    ]
+    base_document["paths"]["mappings"] = [{"sonarr": "/data", "shoko": "/shoko"}]
+    base_document["shoko"]["allowed_roots"] = ["/shoko/media/anime", "/unused"]
+    settings = parse_settings(_dump(base_document))
+    assert settings.path_mappings[0].sonarr == "/data"
+    assert settings.shoko.allowed_roots == ("/shoko/media/anime", "/unused")
+
+
+@pytest.mark.parametrize("target", ["/anime", "/anime/other"])
+def test_multiple_disjoint_roots_cannot_map_into_overlapping_shoko_targets(
+    base_document: dict[str, Any], target: str
+) -> None:
+    base_document["sonarr"]["allowed_roots"].append("/more-anime")
+    base_document["paths"]["mappings"].append({"sonarr": "/more-anime", "shoko": target})
+    with pytest.raises(ConfigError, match="paths.mappings.*overlapping Shoko targets"):
+        parse_settings(_dump(base_document))
+
+
+def test_multiple_disjoint_roots_can_map_into_disjoint_shoko_targets(
+    base_document: dict[str, Any],
+) -> None:
+    base_document["sonarr"]["allowed_roots"].append("/more-anime")
+    base_document["shoko"]["allowed_roots"].append("/anime-old")
+    base_document["paths"]["mappings"].append({"sonarr": "/more-anime", "shoko": "/anime-old"})
+    assert len(parse_settings(_dump(base_document)).path_mappings) == 2
 
 
 def test_nested_path_mappings_are_rejected(
@@ -300,11 +377,17 @@ def test_custom_source_url_is_preserved(base_document: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     "raw_url",
     [
+        "http://example.invalid/mappings.xml",
         "https://user@host.example/anime-list-full.xml",
         "https://host.example/anime-list-full.xml?ref=main",
         "https://host.example/anime-list-full.xml#fragment",
         "ftp://host.example/anime-list-full.xml",
         "not a url",
+        "https://example.invalid",
+        "https://example.invalid/",
+        "https://example.invalid:0/mappings.xml",
+        "https://example.invalid:bad/mappings.xml",
+        "https://[bad/mappings.xml",
     ],
 )
 def test_invalid_source_url_is_rejected(base_document: dict[str, Any], raw_url: str) -> None:
@@ -327,6 +410,33 @@ def test_empty_document_is_rejected() -> None:
 def test_malformed_yaml_becomes_a_config_error() -> None:
     with pytest.raises(ConfigError, match="not valid YAML"):
         parse_settings("sonarr:\n  url: [unclosed\n")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "sonarr:\n  url: [http://user:synthetic-password@host\n",
+        "sonarr:\n  api_key: [synthetic-password\n",
+        "sonarr: !synthetic-password value\n",
+        "sonarr: *synthetic-password\n",
+        "sonarr: synthetic-password\x00\n",
+    ],
+)
+def test_yaml_errors_do_not_expose_source_or_chained_diagnostics(source: str) -> None:
+    with pytest.raises(ConfigError, match="not valid YAML") as caught:
+        parse_settings(source)
+
+    assert "synthetic-password" not in str(caught.value)
+    assert "synthetic-password" not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+
+
+def test_yaml_error_preserves_source_free_type_and_location() -> None:
+    with pytest.raises(ConfigError) as caught:
+        parse_settings("sonarr:\n  url: [unclosed\n")
+
+    assert str(caught.value) == ("configuration is not valid YAML: ParserError at line 3, column 1")
 
 
 def test_unsafe_yaml_tags_are_refused() -> None:

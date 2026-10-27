@@ -394,18 +394,21 @@ def test_plan_validates_dispatch_shas_and_gates_range() -> None:
     assert "refs/heads/*" in run
 
 
-def test_dispatch_uses_trusted_plan_checkout_and_fetches_selected_branch() -> None:
+def test_plan_pins_event_sha_and_dispatch_uses_trusted_main_checkout() -> None:
     plan_checkout = next(
         step
         for step in publish["jobs"]["plan"]["steps"]
         if str(step.get("uses", "")).startswith("actions/checkout@")
     )
     assert plan_checkout.get("with", {}).get("ref") == (
-        "${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.ref }}"
+        "${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.sha }}"
     )
     assert plan_checkout["with"]["fetch-depth"] == 0
 
     run = _plan_run()
+    introduced = run.index("python3 scripts/enumerate_introduced.py introduced")
+    assert run.index('is_full_sha "$PUSH_SHA" || die') < introduced
+    assert run.index('is_full_sha "$PUSH_BEFORE" || die') < introduced
     dispatch = run.find('if [ "$EVENT_NAME" = "workflow_dispatch" ]; then')
     branch_guard = run.find('case "$PUSH_REF" in', dispatch)
     fetch_selected = run.find('git fetch --no-tags origin "$PUSH_REF"', branch_guard)

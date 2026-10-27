@@ -356,6 +356,31 @@ def test_audit_classifies_existing_links_exactly(stubs: AuditStubs, tmp_path: Pa
     assert report.transport_failed is False
 
 
+@pytest.mark.parametrize("source", [[], {}])
+def test_audit_continues_after_malformed_xref_source(
+    stubs: AuditStubs, tmp_path: Path, source: Any
+) -> None:
+    store = _seed_mapping(tmp_path)
+    active = load_active(store)
+    assert active is not None
+    settings = load_settings(stubs.config_path)  # type: ignore[attr-defined]
+    malformed = stubs.file_row(stubs.specs()[0])
+    malformed["SeriesIDs"][0]["EpisodeIDs"][0]["Source"] = source
+    valid = stubs.file_row(stubs.specs()[2])
+    stubs.file_pages = {1: (2, [malformed, valid])}
+
+    report = _run(stubs, settings, active)
+
+    assert len(report.findings) == 2
+    malformed_finding = next(item for item in report.findings if item.shoko_file_id == 0)
+    assert malformed_finding.classification is AuditClass.AUDIT_INCOMPLETE
+    assert malformed_finding.detail == "malformed linked-file row"
+    valid_finding = next(item for item in report.findings if item.shoko_file_id == 602)
+    assert valid_finding.classification is AuditClass.LINKED_CONSISTENT
+    assert report.transport_failed is False
+    assert {request.method for request in stubs.shoko_requests} == {"GET"}
+
+
 def test_audit_exact_set_rule(stubs: AuditStubs, tmp_path: Path) -> None:
     store = _seed_mapping(tmp_path)
     active = load_active(store)

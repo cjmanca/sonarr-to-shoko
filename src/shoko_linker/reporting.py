@@ -128,6 +128,27 @@ def json_payload(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def _redact_report_values(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Scrub legacy diagnostics at the shared human/JSON report boundary.
+
+    Preserve keys and non-string values; new nested report fields inherit the
+    same protection without a growing list of individually scrubbed fields.
+    """
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            return redact(value)
+        if isinstance(value, Mapping):
+            return {key: scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(scrub(item) for item in value)
+        return value
+
+    return {key: scrub(value) for key, value in payload.items()}
+
+
 def _iso(moment: datetime) -> str:
     return (moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)).isoformat()
 
@@ -664,7 +685,7 @@ def report_payload(
         affected=None if store is None else _mapping_affected(store),
     )
     if store is None:
-        return {
+        payload: dict[str, Any] = {
             "state": {"present": False, "path": settings.database.path},
             "mapping": mapping,
             "coverage": {
@@ -693,9 +714,10 @@ def report_payload(
             },
             "generated_iso": _iso(now),
         }
+        return _redact_report_values(payload)
     rollup = state_rollup(store)
     meta = rollup["meta"]
-    return {
+    payload = {
         "state": {"present": True, "path": str(store.path)},
         "counts_by_state": rollup["counts_by_state"],
         "counts_queued": rollup["counts_queued"],
@@ -763,6 +785,7 @@ def report_payload(
         },
         "generated_iso": _iso(now),
     }
+    return _redact_report_values(payload)
 
 
 def health_payload(

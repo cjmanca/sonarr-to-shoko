@@ -46,6 +46,7 @@ from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.linking import SendOutcome
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome
 from shoko_linker.state import (
+    META_LAST_REFUSAL,
     SCHEMA_VERSION,
     BaselineFile,
     Cohort,
@@ -1043,6 +1044,7 @@ def test_offline_report_redacts_legacy_runtime_keys_with_fresh_registry(
         store.connection.execute(
             "UPDATE files SET state_detail = ?", (f"legacy refusal: {keys[0]} {keys[1]}",)
         )
+        store.set_meta(META_LAST_REFUSAL, f"legacy metadata refusal: {keys[0]} {keys[1]}")
     assert registered_secret_count() == 0
 
     def forbid_client(*_args: Any, **_kwargs: Any) -> Any:
@@ -1054,9 +1056,66 @@ def test_offline_report_redacts_legacy_runtime_keys_with_fresh_registry(
         captured = capsys.readouterr()
         assert code == EXIT_OK
         assert "legacy refusal" in captured.out
+        assert "legacy metadata refusal" in captured.out
         assert all(key not in captured.out + captured.err for key in keys)
         assert registered_secret_count() == 2
         assert env.stubs.all_service_requests() == []
+    finally:
+        clear_registered_secrets()
+
+
+@pytest.mark.parametrize("state_present", [False, True])
+def test_report_boundary_redacts_new_nested_diagnostics_without_changing_structure(
+    env: Env, monkeypatch: pytest.MonkeyPatch, state_present: bool
+) -> None:
+    from shoko_linker import reporting
+    from shoko_linker.logging_setup import (
+        REDACTED,
+        clear_registered_secrets,
+        register_secret,
+    )
+    from shoko_linker.mapping_store import status as mapping_status
+
+    clear_registered_secrets()
+    secret = "synthetic-nested-report-key-0000"
+    assert register_secret(secret)
+    settings = load_settings(env.config_path)
+    mapping = mapping_status(cli.open_mapping_store(settings), _parse(T0))
+    original_mapping_payload = reporting.mapping_status_payload
+    diagnostic: dict[str, Any] = {
+        "errors": [{"detail": f"upstream failure: {secret}", "count": 3}],
+        "path": "/anime/series/file.mkv",
+        "retryable": True,
+        "next_retry": None,
+        "ratio": 0.5,
+    }
+
+    def mapping_with_new_diagnostic(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = original_mapping_payload(*args, **kwargs)
+        payload["new_diagnostic"] = diagnostic
+        return payload
+
+    monkeypatch.setattr(reporting, "mapping_status_payload", mapping_with_new_diagnostic)
+    try:
+        with closing(env.open_store()) as store:
+            payload = reporting.report_payload(
+                store if state_present else None,
+                mapping,
+                settings,
+                now=_parse(T0),
+                refresh_hours=168.0,
+            )
+        actual = payload["mapping"]["new_diagnostic"]
+        assert actual == {
+            **diagnostic,
+            "errors": [{"detail": f"upstream failure: {REDACTED}", "count": 3}],
+        }
+        assert secret not in reporting.json_payload(payload)
+        # The output backstop must not mutate the underlying source diagnostic.
+        assert diagnostic["errors"][0]["detail"] == f"upstream failure: {secret}"
+        assert type(actual["errors"][0]["count"]) is int
+        assert type(actual["retryable"]) is bool
+        assert type(actual["ratio"]) is float
     finally:
         clear_registered_secrets()
 
@@ -1308,6 +1367,75 @@ def test_pause_writes_allows_an_operator_reason(
     assert payload["result"]["paused_reason"] == "disk_review"
 
 
+@pytest.mark.parametrize("hours", ["nan", "inf", "-inf", "0", "-1"])
+@pytest.mark.parametrize(
+    ("command", "duration_flag"),
+    [
+        (["pause-writes"], "--hours"),
+        (["attestation", "record"], "--hours"),
+        (["campaign", "prepare"], "--deadline-hours"),
+    ],
+)
+def test_cli_duration_arguments_reject_nonfinite_or_nonpositive_values(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+    duration_flag: str,
+    hours: str,
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main([*command, str(env.config_path), f"{duration_flag}={hours}"])
+    assert excinfo.value.code == EXIT_CONFIG_INVALID
+    captured = capsys.readouterr()
+    assert "must be finite and greater than 0" in captured.err
+    assert not captured.out
+    assert env.state_open_calls == []
+
+
+@pytest.mark.parametrize("already_paused", [False, True])
+@pytest.mark.parametrize(
+    ("hours", "now_iso"),
+    [("1e100", T0), ("1e8", T0), ("2", "9999-12-31T23:00:00+00:00")],
+)
+def test_pause_writes_rejects_unrepresentable_horizon_before_mutating_state(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    hours: str,
+    now_iso: str,
+    already_paused: bool,
+) -> None:
+    env.now_iso = now_iso
+    with closing(env.open_store()) as store:
+        if already_paused:
+            store.pause("existing_review", T0)
+            store.set_meta("paused_until_iso", "2026-01-01T01:00:00+00:00")
+        before_pause = store.budget_view().paused_reason
+        before_horizon = store.get_meta("paused_until_iso")
+        before_actions = store.get_meta("operator_actions")
+
+    code = main(
+        [
+            "pause-writes",
+            str(env.config_path),
+            "--reason",
+            "maintenance",
+            f"--hours={hours}",
+            "--note",
+            "ops",
+            "--confirm",
+            "--json",
+        ]
+    )
+    assert code == EXIT_CONFIG_INVALID
+    captured = capsys.readouterr()
+    assert "--hours exceeds the supported resume horizon timestamp range" in captured.err
+    assert not captured.out
+    with closing(env.open_store()) as store:
+        assert store.budget_view().paused_reason == before_pause
+        assert store.get_meta("paused_until_iso") == before_horizon
+        assert store.get_meta("operator_actions") == before_actions
+
+
 def test_pause_resume_and_clear_rebaseline_persist(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1332,7 +1460,10 @@ def test_pause_resume_and_clear_rebaseline_persist(
     store = env.open_store()
     try:
         assert store.budget_view().paused_reason == "lease_exhaustion"
-        assert store.get_meta("paused_until_iso") is not None
+        assert store.get_meta("paused_until_iso") == "2026-01-01T02:00:00+00:00"
+        actions = json.loads(str(store.get_meta("operator_actions")))
+        assert actions[-1]["command"] == "pause-writes"
+        assert payload["result"]["paused_until_iso"] == "2026-01-01T02:00:00+00:00"
     finally:
         store.close()
 

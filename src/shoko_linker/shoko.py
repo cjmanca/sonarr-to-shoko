@@ -49,6 +49,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from itertools import chain
 from pathlib import PurePosixPath
 from typing import Any, Final, cast
 
@@ -869,12 +870,12 @@ def _collect_resumable_shoko_discovery(  # noqa: PLR0911, PLR0912, PLR0915
     if cursor <= 0 or cursor >= expected_pages:
         cursor = 1
 
-    rotation = [
-        *range(cursor + 1, expected_pages + 1),
-        *range(1, cursor + 1),
-    ]
-    order = [page for page in rotation if page not in swept]
-    for page in order:
+    # Total is server-controlled: visit at most cached swept pages plus this
+    # cycle's page budget, without allocating the entire expected page range.
+    rotation = chain(range(cursor + 1, expected_pages + 1), range(1, cursor + 1))
+    for page in rotation:
+        if page in swept:
+            continue
         if pages_fetched >= max_pages:
             _append(reasons, SnapshotReason.MAX_PAGES_EXCEEDED)
             details.append(f"page cap of {max_pages} reached before page {page}")
@@ -991,11 +992,11 @@ def _finish_resumable_discovery(
     absolute_paths_missing = False
     xrefs_missing = False
     expected_pages = None if total is None else max(1, (total + page_size - 1) // page_size)
+    cached_pages = []
     if expected_pages is not None:
-        for page in range(1, expected_pages + 1):
-            raw_rows = pages.get(page)
-            if raw_rows is None:
-                continue
+        cached_pages = sorted(page for page in pages if 1 <= page <= expected_pages)
+        for page in cached_pages:
+            raw_rows = pages[page]
             parsed, entry_reasons, entry_details, paths_missing, xrefs_missing_page = (
                 parse_file_entries(raw_rows, page)
             )
@@ -1005,8 +1006,9 @@ def _finish_resumable_discovery(
             xrefs_missing |= xrefs_missing_page
             _merge_page(parsed, page, seen, files, reasons, details)
     _include_flags_verdict(absolute_paths_missing, xrefs_missing, reasons, details)
-    required = set(range(1, expected_pages + 1)) if expected_pages is not None else set()
-    complete = bool(required) and required.issubset(pages) and required.issubset(swept)
+    # Distinct cached keys in the valid range cover every page exactly when their
+    # count matches the expected count. Check freshness only for those keys.
+    complete = len(cached_pages) == expected_pages and all(page in swept for page in cached_pages)
     complete = complete and len(files) == total and not reasons
     if not complete and not reasons:
         _append(reasons, SnapshotReason.DISCOVERY_IN_PROGRESS)

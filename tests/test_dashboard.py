@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+from shoko_linker import cli
 from shoko_linker.bootstrap import BootstrapSettings
 from shoko_linker.config import SecretRef
 from shoko_linker.dashboard import (
@@ -38,6 +39,7 @@ from shoko_linker.safety_check import (
     assess_settings_payload,
     inspect_shoko_safety_settings,
 )
+from shoko_linker.service_settings import ServiceSettingsController
 from shoko_linker.service_setup import ServiceSetupController
 from shoko_linker.setup import (
     AnimeRootCandidate,
@@ -328,6 +330,100 @@ def test_pause_resume_require_one_time_csrf_and_resume_rechecks_onboarding(
             with open_state(tmp_path / "state.sqlite3") as store:
                 assert store.get_service_pause() == (False, "")
                 assert OnboardingManager(store).record() is not None
+    finally:
+        stop_server(server, thread)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["unsafe_shoko_settings", "setup_changed", "connection_url", "user_paused", "running"],
+)
+def test_authenticated_status_and_poll_preserve_runtime_next_action(
+    tmp_path: Path, condition: str
+) -> None:
+    app = make_app(tmp_path, onboarding=True)
+    binding = scope_binding(safe_assessment())
+    bootstrap = BootstrapSettings(
+        binding.sonarr_url,
+        SecretRef("SONARR_API_KEY"),
+        binding.shoko_url,
+        SecretRef("SHOKO_API_KEY"),
+        tmp_path / "state.sqlite3",
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected remote I/O"))
+    ) as remote:
+        endpoint = ApiEndpoint(remote, lambda: {})
+        runtime = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
+        runtime._update_latest(
+            authorized=True, next_action="Automatic linking is processing eligible files."
+        )
+        if condition == "connection_url":
+            preferences = ServiceSettingsController(bootstrap, lambda: None)
+            view = preferences.view()
+            form = {
+                **{name: value for name, _label, value in view.values},
+                "advanced_yaml": view.advanced_yaml,
+                "settings_digest": view.digest,
+            }
+            form["sonarr_url"] = "http://changed-sonarr:8989"
+            assert preferences.save(form).startswith("Settings saved.")
+            runtime.worker_tick()
+            expected = "Restart the container to use saved connection URLs, then confirm setup."
+        elif condition == "running":
+            expected = "Automatic linking is processing eligible files."
+        else:
+            with open_state(bootstrap.database_path) as store:
+                manager = OnboardingManager(store)
+                if condition == "user_paused":
+                    manager.pause(iso=T0.isoformat())
+                    expected = "Automatic linking is paused. Resume when you are ready."
+                else:
+                    expected = (
+                        "Fix Shoko safety settings and confirm setup again."
+                        if condition == "unsafe_shoko_settings"
+                        else "Confirm the changed scope and safety facts."
+                    )
+                    manager.pause_for_review(condition, expected, iso=T0.isoformat())
+                    runtime._update_latest(authorized=False, next_action=expected)
+        assert runtime.status().next_action == expected
+        app.status_provider = runtime.status
+        server, thread, base_url = start_server(app)
+        try:
+            with httpx.Client(follow_redirects=False) as client:
+                assert client.get(f"{base_url}/status").status_code == 303
+                assert setup_account(client, base_url).status_code == 303
+                for path in ("/status", "/settings"):
+                    # Polling fetches these same HTML routes without a page reload.
+                    for headers in ({}, {"Cache-Control": "no-cache"}):
+                        page = client.get(f"{base_url}{path}", headers=headers)
+                        assert page.status_code == 200
+                        assert f'<p class="next-action">{expected}</p>' in page.text
+                        badge = "Running" if condition == "running" else "Paused"
+                        assert f"{badge}</span>" in page.text
+        finally:
+            stop_server(server, thread)
+
+
+def test_resume_refusal_overrides_cached_runtime_guidance(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.onboarding_context = None
+    server, thread, base_url = start_server(app)
+    try:
+        with httpx.Client(follow_redirects=False) as client:
+            assert setup_account(client, base_url).status_code == 303
+            page = client.get(f"{base_url}/status")
+            response = client.post(
+                f"{base_url}/resume",
+                data={"csrf_token": csrf_from(page.text)},
+                headers=same_origin(base_url),
+            )
+            assert response.status_code == 200
+            assert (
+                '<p class="next-action">Complete setup before automatic linking can resume.</p>'
+                in response.text
+            )
+            assert "Paused</span>" in response.text
     finally:
         stop_server(server, thread)
 

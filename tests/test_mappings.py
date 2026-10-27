@@ -12,6 +12,7 @@ fixtures are synthetic and authored for these tests.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1805,24 +1806,55 @@ def test_override_add_cannot_authorize_declared_no_counterpart_identity() -> Non
 
 AGGREGATE_TVDB_BASE = 5000
 AGGREGATE_ANIDB_BASE = 9000
-AGGREGATE_RULE_COUNT = 1002
 
 
-def test_aggregate_range_key_cap_fails_closed() -> None:
-    rules = "".join(
-        "<mapping anidbseason='1' tvdbseason='1' start='1' end='2000' offset='0'>;</mapping>"
-        for _ in range(AGGREGATE_RULE_COUNT)
-    )
+@pytest.mark.parametrize("cap", [5, 6])
+def test_aggregate_range_key_cap_inclusive_boundary(cap: int) -> None:
     xml = doc(
         "".join(
             f"<anime anidbid='{AGGREGATE_ANIDB_BASE + i}' tvdbid='{AGGREGATE_TVDB_BASE + i}' "
-            f"defaulttvdbseason='1'><mapping-list>{rules}</mapping-list></anime>"
-            for i in range(1)
+            "defaulttvdbseason='1'><mapping-list>"
+            "<mapping anidbseason='1' tvdbseason='1' start='1' end='3' offset='0'/>"
+            # Bounds without an offset are inert and must not consume the budget.
+            "<mapping anidbseason='1' tvdbseason='1' start='1' end='2000'/>"
+            "</mapping-list></anime>"
+            for i in range(2)
         )
     )
     parsed = parse_anime_lists(xml)
-    with pytest.raises(MappingError, match="aggregate cap"):
+    with patch("shoko_linker.mappings.MAX_AGGREGATE_RANGE_KEYS", cap):
+        if cap < 6:
+            with pytest.raises(MappingError, match="expand 6 enumerable keys.*aggregate cap of 5"):
+                build_mapping_index(parsed)
+        else:
+            index = build_mapping_index(parsed)
+            assert index.range_rules == 2
+            assert len(index.forward) == 6
+            assert resolve(index, AGGREGATE_TVDB_BASE + 1, 1, 3).status is (
+                ResolutionStatus.RESOLVED
+            )
+
+
+@pytest.mark.parametrize("offset", [0, -10])
+def test_aggregate_range_key_cap_rejects_before_index_population(offset: int) -> None:
+    parsed = parse_anime_lists(
+        doc(
+            "".join(
+                f"<anime anidbid='{AGGREGATE_ANIDB_BASE + i}' "
+                f"tvdbid='{AGGREGATE_TVDB_BASE + i}' defaulttvdbseason='1'>"
+                "<mapping-list><mapping anidbseason='1' tvdbseason='1' "
+                f"start='1' end='3' offset='{offset}'/></mapping-list></anime>"
+                for i in range(3)
+            )
+        )
+    )
+    with (
+        patch("shoko_linker.mappings.MAX_AGGREGATE_RANGE_KEYS", 4),
+        patch("shoko_linker.mappings._index_entry") as index_entry,
+        pytest.raises(MappingError, match="expand 9 enumerable keys.*aggregate cap of 4"),
+    ):
         build_mapping_index(parsed)
+    index_entry.assert_not_called()
 
 
 DUP_PAIR_ANIDB = 600
@@ -1840,3 +1872,90 @@ def test_identical_pair_in_both_containers_is_not_a_conflict() -> None:
     assert resolution.status is ResolutionStatus.RESOLVED
     assert resolution.target is not None
     assert resolution.target.anidb_id == DUP_PAIR_ANIDB
+
+
+@pytest.mark.parametrize("digits", [65, 4301])
+@pytest.mark.parametrize(
+    "location",
+    [
+        "anidbid",
+        "tvdbid",
+        "defaulttvdbseason",
+        "episodeoffset",
+        "anidbseason",
+        "tvdbseason",
+        "start",
+        "end",
+        "offset",
+        "pair_anidb",
+        "pair_tvdb",
+    ],
+)
+def test_oversized_xml_integers_exclude_entry_and_fence_queries(location: str, digits: int) -> None:
+    oversized = "9" * digits
+    entry_attrs = {"anidbid": "1", "tvdbid": "100", "defaulttvdbseason": "1", "episodeoffset": "0"}
+    rule_attrs = {"anidbseason": "1", "tvdbseason": "1", "start": "1", "end": "2", "offset": "0"}
+    body = ";1-1;"
+    if location in entry_attrs:
+        entry_attrs[location] = oversized
+    elif location in rule_attrs:
+        rule_attrs[location] = oversized
+    elif location == "pair_anidb":
+        body = f";{oversized}-1;"
+    else:
+        body = f";1-1+{oversized};"
+    entry = " ".join(f'{key}="{value}"' for key, value in entry_attrs.items())
+    rule = " ".join(f'{key}="{value}"' for key, value in rule_attrs.items())
+    xml = (
+        f"<anime-list><anime {entry}><mapping-list><mapping {rule}>{body}"
+        "</mapping></mapping-list></anime>"
+        '<anime anidbid="2" tvdbid="200" defaulttvdbseason="1"/></anime-list>'
+    )
+
+    parsed = parse_anime_lists(xml)
+
+    assert parsed.invalid_entries == 1
+    assert len(parsed.entries) == 1
+    problem = parsed.entry_problems[0]
+    assert problem.excluded
+    assert any("digit limit" in detail for detail in problem.problems)
+    assert all(len(detail) < 300 for detail in problem.problems)
+    index = build_mapping_index(parsed)
+    rejected = resolve(index, 100, 1, 1)
+    assert rejected.status is ResolutionStatus.UNMAPPED
+    assert "fenced" in rejected.detail
+    assert rejected.targets == ()
+    expected = ResolutionStatus.UNMAPPED if location == "tvdbid" else ResolutionStatus.RESOLVED
+    assert resolve(index, 200, 1, 1).status is expected
+
+
+@pytest.mark.parametrize("location", ["episodeoffset", "offset"])
+def test_oversized_negative_xml_offsets_exclude_entry(location: str) -> None:
+    value = "-" + "9" * 4301
+    attrs = f'episodeoffset="{value}"' if location == "episodeoffset" else ""
+    mapping = (
+        f'<mapping-list><mapping anidbseason="1" tvdbseason="1" start="1" end="2" '
+        f'offset="{value}"/></mapping-list>'
+        if location == "offset"
+        else ""
+    )
+    parsed = parse_anime_lists(
+        f'<anime-list><anime anidbid="1" tvdbid="100" defaulttvdbseason="1" {attrs}>'
+        f"{mapping}</anime></anime-list>"
+    )
+    assert parsed.invalid_entries == 1
+    assert any("digit limit" in detail for detail in parsed.entry_problems[0].problems)
+
+
+def test_bounded_xml_integers_preserve_leading_zeros_and_signed_offsets() -> None:
+    value = "0" * 63 + "1"
+    parsed = parse_anime_lists(
+        f'<anime-list><anime anidbid="{value}" tvdbid="100" defaulttvdbseason="01" '
+        'episodeoffset="-2"/></anime-list>'
+    )
+    assert parsed.invalid_entries == 0
+    result = resolve(build_mapping_index(parsed), 100, 1, 1)
+    assert result.status is ResolutionStatus.RESOLVED
+    assert result.target is not None
+    assert result.target.anidb_id == 1
+    assert result.target.anidb_episode_number == 3

@@ -38,7 +38,9 @@ def normalize_posix(path: str) -> str:
         raise PathError(f"path must use POSIX separators, not backslashes: {candidate!r}")
     if not candidate.startswith("/"):
         raise PathError(f"path must be an absolute POSIX path starting with '/': {candidate!r}")
-    pure = PurePosixPath(candidate)
+    # PurePosixPath preserves exactly two leading slashes as a distinct anchor.
+    # Container paths use one root; collapse that alias before validating it.
+    pure = PurePosixPath("/" + candidate.lstrip("/"))
     if ".." in pure.parts:
         raise PathError(f"path must not contain '..' segments: {candidate!r}")
     normalized = str(pure)
@@ -109,14 +111,15 @@ def select_mapping(path: str, mappings: Sequence[PathMapping]) -> PathMapping | 
 
 
 def validate_mappings(mappings: Sequence[PathMapping]) -> tuple[PathMapping, ...]:
-    """Normalize a mapping set and reject nested or conflicting definitions.
+    """Normalize mappings and require unique domains in both path spaces.
 
     Returns the mappings ordered from least to most specific source.
 
     Raises:
         PathError: when the set is empty, a path is unusable, one source maps to
-            several targets, or one source is nested inside another (the nesting makes
-            coverage ambiguous, so it is refused instead of guessed).
+            several targets, sources are nested, or targets overlap. Exact duplicate
+            entries are deduplicated; all other overlaps make forward or reverse
+            correspondence ambiguous and are refused instead of guessed.
     """
     if not mappings:
         raise PathError("must contain at least one {sonarr, shoko} mapping")
@@ -141,5 +144,11 @@ def validate_mappings(mappings: Sequence[PathMapping]) -> tuple[PathMapping, ...
             if is_within_root(inner.sonarr, outer.sonarr):
                 raise PathError(
                     f"nested mappings are ambiguous: {outer.sonarr!r} contains {inner.sonarr!r}"
+                )
+            # Source ordering says nothing about target depth. Check both directions
+            # to prevent distinct Sonarr files from collapsing to one Shoko path.
+            if is_within_root(inner.shoko, outer.shoko) or is_within_root(outer.shoko, inner.shoko):
+                raise PathError(
+                    f"overlapping Shoko targets are ambiguous: {outer.shoko!r} and {inner.shoko!r}"
                 )
     return tuple(ordered)

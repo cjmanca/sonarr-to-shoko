@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import yaml  # type: ignore[import-untyped]
 from shoko_linker.bootstrap import BootstrapSettings
 from shoko_linker.config import SecretRef
 from shoko_linker.dashboard import DashboardApplication
+from shoko_linker.errors import ConfigError
 from shoko_linker.onboarding import OnboardingManager
 from shoko_linker.paths import PathMapping
 from shoko_linker.service import settings_for_scope
@@ -102,6 +104,29 @@ def test_invalid_preferences_do_not_persist_or_change_consent(tmp_path: Path, ch
         assert store.get_meta(SETTINGS_META) is None
         assert store.get_onboarding_json() is None
         assert store.get_service_pause() == (False, "")
+
+
+def test_http_mapping_source_is_rejected_on_save_load_and_runtime_apply(tmp_path: Path) -> None:
+    preferences = controller(tmp_path)
+    form = settings_form(preferences)
+    advanced = yaml.safe_load(form["advanced_yaml"])
+    advanced["mappings"]["source_url"] = "http://example.invalid/mappings.xml"
+    form["advanced_yaml"] = yaml.safe_dump(advanced)
+    assert "HTTPS" in preferences.save(form)
+    with open_state(preferences.bootstrap.database_path) as store:
+        assert store.get_meta(SETTINGS_META) is None
+        document = load_service_settings(store, preferences.bootstrap)
+        document["mappings"]["source_url"] = "http://example.invalid/mappings.xml"
+        # A saved document from an older version cannot bypass the current source policy.
+        store.set_meta(SETTINGS_META, json.dumps(document))
+        with pytest.raises(ConfigError, match="HTTPS"):
+            load_service_settings(store, preferences.bootstrap)
+    binding = dashboard_tests.scope_binding(dashboard_tests.safe_assessment())
+    settings = settings_for_scope(
+        preferences.bootstrap, roots=binding.roots, mappings=binding.path_mappings
+    )
+    with pytest.raises(ConfigError, match="HTTPS"):
+        apply_service_settings(settings, document)
 
 
 def test_connection_change_holds_writes_until_restart_and_new_confirmation(tmp_path: Path) -> None:

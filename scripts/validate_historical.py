@@ -64,7 +64,13 @@ def _check_config_example(tree: Path, checks: list[str], failures: list[str]) ->
     try:
         loaded = yaml.safe_load(example.read_text(encoding="utf-8"))
     except Exception as exc:
-        failures.append(f"config.example.yaml failed to parse: {exc}")
+        # Keep this pinned artifact standalone: old trees need not contain our package.
+        # Parser messages, marks and ReaderError text can expose source credentials.
+        detail = type(exc).__name__
+        if isinstance(exc, yaml.MarkedYAMLError) and exc.problem_mark is not None:
+            mark = exc.problem_mark
+            detail += f" at line {mark.line + 1}, column {mark.column + 1}"
+        failures.append(f"config.example.yaml failed to parse: {detail}")
         return
     if not isinstance(loaded, dict):
         failures.append("config.example.yaml does not parse to a mapping")

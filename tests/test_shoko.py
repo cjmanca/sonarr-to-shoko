@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -327,6 +328,119 @@ def test_resumable_discovery_finishes_a_paged_sweep_across_calls() -> None:
     assert resumed.refresh_sweep_complete is True
     assert [item.id for item in resumed.files] == [1, 2, 3]
     assert [request.url.params["page"] for request in stub.file_requests()] == ["1", "1", "2"]
+
+
+@pytest.mark.parametrize("total", [10**9, 10**100])
+def test_resumable_discovery_large_total_obeys_page_budget(total: int) -> None:
+    stub = ShokoStub()
+    rows = [shoko_file(i, 100 + i, []) for i in range(1, 4)]
+    stub.pages = {i: envelope([row], total) for i, row in enumerate(rows, 1)}
+    first = discover(stub, page_size=1, max_pages=1, endpoint_identity=SHOKO_BASE)
+    assert not first.verdict.complete
+    assert first.pages_fetched == 1
+    assert first.progress is not None
+    assert first.progress.total == total
+    assert first.progress.swept_pages == frozenset({1})
+    assert SnapshotReason.MAX_PAGES_EXCEEDED in first.verdict.reasons
+
+    resumed = discover(
+        stub,
+        page_size=1,
+        max_pages=2,
+        endpoint_identity=SHOKO_BASE,
+        cached_progress=first.progress,
+    )
+    assert not resumed.verdict.complete
+    assert resumed.progress is not None
+    assert resumed.progress.cursor == 2
+    assert resumed.progress.swept_pages == frozenset({1, 2})
+    assert [item.id for item in resumed.files] == [1, 2]
+
+    # A checkpoint at the end of the rotation wraps lazily and skips cached pages.
+    wrapped = discover(
+        stub,
+        page_size=1,
+        max_pages=2,
+        endpoint_identity=SHOKO_BASE,
+        cached_progress=replace(
+            resumed.progress, cursor=total - 1, swept_pages=frozenset({1, 2, total})
+        ),
+    )
+    assert not wrapped.verdict.complete
+    assert wrapped.progress is not None
+    assert wrapped.progress.cursor == 3
+    assert [request.url.params["page"] for request in stub.file_requests()] == [
+        "1",
+        "1",
+        "2",
+        "1",
+        "3",
+    ]
+
+
+def test_resumable_discovery_requires_every_page_and_invalidates_changed_cache() -> None:
+    stub = ShokoStub()
+    rows = [shoko_file(i, 100 + i, []) for i in range(1, 4)]
+    stub.pages = {i: envelope([row], 3) for i, row in enumerate(rows, 1)}
+    complete = discover(stub, page_size=1, max_pages=3, endpoint_identity=SHOKO_BASE)
+    assert complete.verdict.complete
+    assert complete.progress is not None
+
+    # An out-of-range cached key cannot substitute for a missing required page.
+    gap = replace(
+        complete.progress,
+        pages={1: (rows[0],), 3: (rows[2],), 4: (rows[1],)},
+        swept_pages=frozenset({1, 3, 4}),
+    )
+    incomplete = discover(
+        stub,
+        page_size=1,
+        max_pages=0,
+        endpoint_identity=SHOKO_BASE,
+        cached_progress=gap,
+    )
+    assert not incomplete.verdict.complete
+    assert [item.id for item in incomplete.files] == [1, 3]
+
+    # A new sweep must compare stale observations before making them complete again.
+    stub.pages[2] = envelope([shoko_file(4, 104, [])], 3)
+    changed = discover(
+        stub,
+        page_size=1,
+        max_pages=3,
+        endpoint_identity=SHOKO_BASE,
+        cached_progress=complete.progress,
+    )
+    assert not changed.verdict.complete
+    assert SnapshotReason.PAGE_CHANGED in changed.verdict.reasons
+    assert changed.progress is not None
+    assert set(changed.progress.pages) == {1}
+    assert changed.progress.swept_pages == frozenset({1})
+
+
+@pytest.mark.parametrize("total", [0, 1])
+def test_resumable_discovery_total_shrink_discards_old_checkpoint(total: int) -> None:
+    stub = ShokoStub()
+    row = shoko_file(1, 101, [])
+    stub.pages = {1: envelope([row], 10**100)}
+    first = discover(stub, page_size=1, max_pages=1, endpoint_identity=SHOKO_BASE)
+    assert first.progress is not None
+    stub.pages = {1: envelope([row] if total else [], total)}
+    shrunk = discover(
+        stub,
+        page_size=1,
+        max_pages=1,
+        endpoint_identity=SHOKO_BASE,
+        cached_progress=first.progress,
+    )
+    assert shrunk.verdict.complete
+    assert shrunk.refresh_sweep_complete
+    assert len(shrunk.files) == total
+    assert shrunk.total_reported == total
+    assert shrunk.progress is not None
+    assert shrunk.progress.total == total
+    assert shrunk.progress.swept_pages == frozenset()
+    assert set(shrunk.progress.pages) == {1}
 
 
 @pytest.mark.parametrize("failure", ["changed_total", "failed_page"])
@@ -748,51 +862,25 @@ def test_unmapped_shoko_location_is_refused(
     ]
 
 
-def test_nested_reverse_mapping_tie_is_ambiguity_not_a_guess(
-    base_document: dict[str, Any], write_document: Writer
-) -> None:
-    stub = ShokoStub()
-    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
-    entry = shoko_file(89, 1000, [location(890, 89, 1, "a.mkv", f"{SHOKO_ROOT}/a.mkv")])
-    stub.pages = {1: envelope([entry], 1)}
-    discovery = discover(stub)
-    settings = shoko_settings(
-        base_document,
-        write_document,
-        mappings=[
-            {"sonarr": SONARR_ROOT, "shoko": SHOKO_ROOT},
-            {"sonarr": "/data/media/tv", "shoko": SHOKO_ROOT},
-        ],
-    )
-    result = reconcile(discovery, (), settings)
-    assert [(item.shoko_file_id, item.reason) for item in result.exclusions] == [
-        (89, ExclusionReason.AMBIGUOUS_MAPPING)
+def test_raw_reverse_mapping_tie_is_ambiguity_not_a_guess() -> None:
+    # Validated settings reject overlapping targets before discovery. The pure
+    # selector still fails closed if called directly with an equal-depth tie.
+    mappings = [
+        PathMapping(SONARR_ROOT, SHOKO_ROOT),
+        PathMapping("/data/media/tv", SHOKO_ROOT),
     ]
-    assert any("ambiguous Shoko path mappings" in item.detail for item in result.exclusions)
+    with pytest.raises(PathError, match="ambiguous Shoko path mappings"):
+        select_reverse_mapping(f"{SHOKO_ROOT}/a.mkv", mappings)
 
 
-def test_more_specific_reverse_mapping_wins(
-    base_document: dict[str, Any], write_document: Writer
-) -> None:
-    stub = ShokoStub()
-    stub.folders = [folder(1, "Sonarr", SHOKO_ROOT)]
-    entry = shoko_file(90, 1000, [location(900, 90, 1, "deep/x.mkv", "/anime/deep/x.mkv")])
-    stub.pages = {1: envelope([entry], 1)}
-    discovery = discover(stub)
-    settings = shoko_settings(
-        base_document,
-        write_document,
-        roots=[SHOKO_ROOT, "/anime/deep"],
-        mappings=[
-            {"sonarr": SONARR_ROOT, "shoko": SHOKO_ROOT},
-            {"sonarr": "/data/media/tv", "shoko": "/anime/deep"},
-        ],
-    )
-    files = sonarr_files((3, 30, "/data/media/tv/x.mkv", 1000))
-    result = reconcile(discovery, files, settings)
-    assert [(match.shoko_file_id, match.sonarr_file.path) for match in result.matches] == [
-        (90, "/data/media/tv/x.mkv")
+def test_raw_reverse_mapping_selector_prefers_most_specific() -> None:
+    # This helper's specificity rule is not proof of unambiguous correspondence;
+    # validate_mappings rejects this overlap at configuration/setup boundaries.
+    mappings = [
+        PathMapping(SONARR_ROOT, SHOKO_ROOT),
+        PathMapping("/data/media/tv", "/anime/deep"),
     ]
+    assert select_reverse_mapping("/anime/deep/x.mkv", mappings) == mappings[1]
 
 
 def test_reverse_mapping_helpers_are_component_exact() -> None:

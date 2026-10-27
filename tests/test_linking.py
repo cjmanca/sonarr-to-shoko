@@ -1217,6 +1217,15 @@ def test_verification_exact_full_set_is_verified() -> None:
     assert verdict is VerificationVerdict.VERIFIED
 
 
+@pytest.mark.parametrize("now", [10.0, 200.0])
+def test_verification_size_drift_never_verifies_exact_targets(now: float) -> None:
+    plan = linkable_plan()
+    observed = observed_xrefs((ANIME_ID, 5501, 777), (ANIME_ID, 5502, 778))
+    assert verify_with(replace(observed, size=SONARR_SIZE + 1), plan, now) is (
+        VerificationVerdict.UNKNOWN
+    )
+
+
 def test_verification_subset_within_deadline_is_pending() -> None:
     plan = linkable_plan()
     verdict = verify_with(observed_xrefs((ANIME_ID, 5501, 777)), plan, 10.0)
@@ -1312,6 +1321,25 @@ def test_parse_file_xrefs_reads_the_wire_shape_and_rejects_malformed() -> None:
         ],
     }
     assert parse_file_xrefs(broken) is None
+
+
+@pytest.mark.parametrize("source", [[], {}, None, True, 1, "Unknown"])
+def test_parse_file_xrefs_rejects_invalid_source_without_raising(source: Any) -> None:
+    episode = xref_episode(777, 5501)
+    episode["Source"] = source
+    payload = file_json(xrefs=[xref(ANIME_ID, [episode])])
+
+    assert parse_file_xrefs(payload) is None
+
+
+@pytest.mark.parametrize("source", ["AniDB", "User"])
+def test_parse_file_xrefs_preserves_supported_sources(source: str) -> None:
+    payload = file_json(xrefs=[xref(ANIME_ID, [xref_episode(777, 5501, source)])])
+
+    parsed = parse_file_xrefs(payload)
+
+    assert parsed is not None
+    assert parsed.xrefs[0].episodes[0].source == source
 
 
 # ----------------------------------------------------------------- fingerprint

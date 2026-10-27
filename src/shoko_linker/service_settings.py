@@ -58,7 +58,7 @@ def _validate(document: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("Unsupported service settings fields.")
     for name in ("sonarr_url", "shoko_url"):
         document[name] = validate_base_url(document[name], name)
-    sync, mappings, _safety, _campaign = parse_runtime_options(
+    sync, _mappings, _safety, _campaign = parse_runtime_options(
         {name: document[name] for name in ("sync", "mappings", "safety", "campaign")}
     )
     if (
@@ -74,8 +74,6 @@ def _validate(document: dict[str, Any]) -> dict[str, Any]:
             "at most 20 links per cycle, 5,000 per window of at least 168 hours, "
             "and 10 pending episode jobs. Scope consent authorizes automatic linking."
         )
-    if not mappings.source_url.startswith("https://"):
-        raise ConfigError("The episode mapping source must use HTTPS.")
     return document
 
 
