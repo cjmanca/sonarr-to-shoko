@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +23,8 @@ from .onboarding import (
     OnboardingManager,
     OnboardingRecord,
     ScopeBinding,
+    current_metadata_maintenance_policy,
+    required_confirmation_facts,
 )
 from .paths import PathMapping, is_within_root, normalize_posix, validate_mappings
 from .safety_check import (
@@ -53,11 +55,17 @@ from .shoko import (
     collect_shoko_discovery,
 )
 from .sonarr import SonarrInventory, collect_sonarr_inventory
-from .state import StateError, StateStore, open_state
+from .state import (
+    META_SERVICE_DRAFT_ROOTS,
+    META_SERVICE_SETTINGS,
+    StateError,
+    StateStore,
+    open_state,
+)
 
 SETUP_VIEW_CACHE_SECONDS = 30.0
 SETUP_INVENTORY_CACHE_SECONDS = 3600.0
-DRAFT_ROOTS_META = "normal_service_draft_roots_v1"
+DRAFT_ROOTS_META = META_SERVICE_DRAFT_ROOTS
 type _SetupEnvironment = tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]
 type _SetupInventory = tuple[SonarrInventory, ShokoDiscovery, PathMappingDiscovery]
 
@@ -113,6 +121,8 @@ def _setup_snapshot_digest(
         "mapping_options": view.mapping_options,
         "mapping_required": view.mapping_required,
         "required_confirmations": view.required_confirmations,
+        "metadata_maintenance_policy": view.metadata_maintenance_policy,
+        "authorization_revision": view.authorization_revision,
         "confirmation_enabled": view.confirmation_enabled,
         "safety": {
             "api_available": assessment.api_available,
@@ -171,28 +181,68 @@ class ServiceSetupController:
 
     def _environment(
         self,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]:
         self._set_progress("Checking current Sonarr and Shoko setup and service versions.", 2)
-        compatibility = inspect_api_compatibility(self.sonarr, self.shoko)
+        compatibility = inspect_api_compatibility(
+            self.sonarr, self.shoko, deadline=deadline, clock=clock
+        )
         self._set_progress("Discovering Sonarr anime folders and eligible series.", 8)
-        scope = discover_sonarr_scope(self.sonarr)
+        scope = discover_sonarr_scope(self.sonarr, deadline=deadline, clock=clock)
         self._set_progress("Checking Shoko safety settings.", 15)
-        assessment = inspect_shoko_safety_settings(self.shoko)
+        assessment = inspect_shoko_safety_settings(self.shoko, deadline=deadline, clock=clock)
         return compatibility, scope, assessment
 
     def _observed_environment(
-        self, record: OnboardingRecord | None
+        self,
+        record: OnboardingRecord | None,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> tuple[_SetupEnvironment, tuple[ImportFolder, ...] | None, bool]:
         """Read current facts and record their effect on the preceding approved scope."""
+        revision = self._authorization_revision()
+        if deadline is not None:
+            if clock() >= deadline:
+                raise TimeoutError("authorization deadline exceeded")
+            environment = self._environment(deadline=deadline, clock=clock)
+            folder_record = self._saved_record()
+            folder_revision = self._authorization_revision()
+            folders = collect_import_folders(self.shoko, deadline=deadline, monotonic=clock)
+            # Do not persist a partial/late read as observed settings drift. Both channels
+            # retain their pre-I/O snapshots and normal atomic consent/revision guards.
+            if clock() >= deadline:
+                raise TimeoutError("authorization deadline exceeded")
+            changed = self._observe_setup_facts(
+                record, environment, None, expected_authorization_revision=revision
+            )
+            folders_changed = self._observe_setup_facts(
+                folder_record,
+                None,
+                folders,
+                expected_authorization_revision=folder_revision,
+            )
+            return environment, folders, changed or folders_changed
         environment = self._environment()
-        changed = self._observe_setup_facts(record, environment, None)
+        changed = self._observe_setup_facts(
+            record, environment, None, expected_authorization_revision=revision
+        )
         folders, folders_changed = self._read_observed_folders()
         return environment, folders, changed or folders_changed
 
     def _read_observed_folders(self) -> tuple[tuple[ImportFolder, ...] | None, bool]:
         record = self._saved_record()
+        revision = self._authorization_revision()
         folders = collect_import_folders(self.shoko)
-        return folders, self._observe_setup_facts(record, None, folders)
+        return folders, self._observe_setup_facts(
+            record, None, folders, expected_authorization_revision=revision
+        )
+
+    def _authorization_revision(self) -> str | None:
+        with open_state(self.state_path) as store:
+            return store.get_service_authorization_revision()
 
     def _observe_setup_facts(
         self,
@@ -201,6 +251,7 @@ class ServiceSetupController:
         folders: tuple[ImportFolder, ...] | None,
         *,
         complete_folder_ids: bool = True,
+        expected_authorization_revision: str | None,
     ) -> bool:
         """One observation policy for runtime and dashboard, against saved consent only."""
         if record is None:
@@ -221,13 +272,42 @@ class ServiceSetupController:
                 reason = "unsafe_shoko_settings"
             elif self._observed_setup_changed(record.binding, compatibility, scope, assessment):
                 reason = "setup_changed"
-        if reason is None:
-            return False
+        # Hash only bounded product identities, never transport errors or credentials.
+        facts = (
+            (
+                complete_folder_ids,
+                tuple(
+                    sorted(
+                        (folder.id, folder.path, folder.drop_folder_type, folder.path_usable)
+                        for folder in folders or ()
+                    )
+                ),
+            )
+            if environment is None
+            else (
+                compatibility.sonarr_version,
+                compatibility.shoko_version,
+                compatibility.compatible,
+                compatibility.capabilities,
+                scope.read_status.value,
+                tuple(sorted(candidate.path for candidate in scope.candidates)),
+                assessment.digest,
+                tuple(sorted(assessment.observed_settings.items())),
+            )
+        )
+        fingerprint = hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
         # I/O has completed. The atomic transition checks the full approved consent,
         # so a late worker cannot invalidate a newer confirmation on another controller.
         with open_state(self.state_path) as store:
-            self.onboarding(store).observe_review(record, reason, iso=datetime.now(UTC).isoformat())
-        return True
+            applied = store.observe_onboarding_facts(
+                record.to_json(),
+                expected_authorization_revision=expected_authorization_revision,
+                channel="folders" if environment is None else "environment",
+                fingerprint=fingerprint,
+                reason=reason,
+                iso=datetime.now(UTC).isoformat(),
+            )
+        return reason is not None or not applied
 
     def _saved_record(self) -> OnboardingRecord | None:
         try:
@@ -237,16 +317,31 @@ class ServiceSetupController:
             return None
         return record
 
-    def current_context(self, store: StateStore) -> OnboardingContext | None:
+    def current_context(
+        self,
+        store: StateStore,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> OnboardingContext | None:
         """Return current non-secret authorization facts only for a still-present scope."""
         try:
+            if deadline is not None and clock() >= deadline:
+                raise TimeoutError("authorization deadline exceeded")
             if configured_bootstrap(self.bootstrap) != self.bootstrap:
                 return None
+            settings_json = store.get_meta(META_SERVICE_SETTINGS)
+            authorization_revision = store.get_service_authorization_revision()
+            policy = current_metadata_maintenance_policy(store)
             consent_json = store.get_onboarding_json()
             if consent_json is None:
                 return None
             record = OnboardingRecord.from_json(consent_json)
-            environment, folders, changed = self._observed_environment(record)
+            environment, folders, changed = (
+                self._observed_environment(record)
+                if deadline is None
+                else self._observed_environment(record, deadline=deadline, clock=clock)
+            )
             compatibility, scope, assessment = environment
             if changed or store.get_onboarding_json() != consent_json:
                 return None
@@ -295,8 +390,17 @@ class ServiceSetupController:
                 ),
                 safety_digest=assessment.digest,
                 unverifiable_facts=assessment.unverifiable_facts,
+                metadata_maintenance_policy=policy,
             )
-            return OnboardingContext(binding, assessment, consent_json)
+            return (
+                OnboardingContext(binding, assessment, consent_json, authorization_revision)
+                if (
+                    (deadline is None or clock() < deadline)
+                    and store.get_meta(META_SERVICE_SETTINGS) == settings_json
+                    and store.get_service_authorization_revision() == authorization_revision
+                )
+                else None
+            )
         except (OnboardingError, OSError, PathError, StateError, ValueError):
             return None
 
@@ -431,12 +535,14 @@ class ServiceSetupController:
                 cached = None
             if cached is None:
                 record = self._saved_record()
+                revision = self._authorization_revision()
                 inventory, discovery, path_result = self._inventory(roots)
                 self._observe_setup_facts(
                     record,
                     None,
                     tuple(discovery.folders.values()),
                     complete_folder_ids=discovery.verdict.complete,
+                    expected_authorization_revision=revision,
                 )
                 if inventory.verdict.complete and discovery.verdict.complete:
                     self._inventory_cache = (
@@ -602,10 +708,42 @@ class ServiceSetupController:
         self,
         selected_roots: tuple[str, ...],
         selected_mappings: tuple[PathMapping, ...],
+    ) -> tuple[DashboardSetupView | None, _SetupEnvironment]:
+        # Discovery itself may latch a new review hold. Build again against that
+        # generation, rather than publishing a form whose token is already stale.
+        # A second change fails closed; concurrent edits must not cause an
+        # unbounded sequence of remote reads or retag older facts as current.
+        for _attempt in range(2):
+            before = self._view_state_token()
+            view, environment = self._compute_view_once(selected_roots, selected_mappings)
+            if self._view_state_token() == before:
+                return view, environment
+        return DashboardSetupView(
+            "Setup changed during discovery. Refresh setup before continuing.",
+            (),
+            confirmation_enabled=False,
+        ), environment
+
+    def _view_state_token(self) -> tuple[str | None, str | None, str | None, str | None]:
+        with open_state(self.state_path) as store:
+            return (
+                store.get_service_authorization_revision(),
+                store.get_meta(META_SERVICE_SETTINGS),
+                store.get_onboarding_json(),
+                store.get_meta(DRAFT_ROOTS_META),
+            )
+
+    def _compute_view_once(
+        self,
+        selected_roots: tuple[str, ...],
+        selected_mappings: tuple[PathMapping, ...],
     ) -> tuple[
         DashboardSetupView | None,
         tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment],
     ]:
+        with open_state(self.state_path) as store:
+            policy = current_metadata_maintenance_policy(store)
+            authorization_revision = store.get_service_authorization_revision()
         saved_record = self._saved_record()
         environment, _folders, _changed = self._observed_environment(saved_record)
         compatibility, scope, assessment = environment
@@ -626,11 +764,11 @@ class ServiceSetupController:
                 raise StateError("Saved library selection is invalid.")
             draft_roots = tuple(raw_draft)
         roots = (
-            selected_roots
-            or draft_roots
+            draft_roots
+            or (selected_roots if self._editing_scope or saved_record is None else ())
             or (() if saved_record is None else saved_record.binding.roots)
         )
-        mappings = selected_mappings or (
+        mappings = (selected_mappings if self._editing_scope or saved_record is None else ()) or (
             saved_record.binding.path_mappings
             if (
                 saved_record is not None
@@ -683,7 +821,7 @@ class ServiceSetupController:
             mapping_options or candidate_options,
             {} if discovery is None else discovery.folders,
         )
-        required = tuple(sorted((*assessment.unknown_settings, *assessment.unverifiable_facts)))
+        required = required_confirmation_facts(None, assessment, metadata_maintenance_policy=policy)
         confirmation_enabled = (
             compatibility.compatible
             and scope.read_status is ScopeReadStatus.COMPLETE
@@ -716,6 +854,7 @@ class ServiceSetupController:
                 ),
                 safety_digest=assessment.digest,
                 unverifiable_facts=assessment.unverifiable_facts,
+                metadata_maintenance_policy=policy,
             )
             if current_binding.digest == saved_record.binding_digest and set(required) <= set(
                 saved_record.confirmed_facts
@@ -751,6 +890,8 @@ class ServiceSetupController:
             required_confirmations=required,
             confirmation_enabled=confirmation_enabled,
             progress_percent=100,
+            metadata_maintenance_policy=policy,
+            authorization_revision=authorization_revision,
         )
         view = replace(
             view,
@@ -827,13 +968,11 @@ class ServiceSetupController:
             self._assert_snapshot_current_locked(view, generation)
             selected_scope = tuple(sorted(set(selected)))
             with open_state(self.state_path) as store:
-                if self.onboarding(store).record() is not None:
-                    self.onboarding(store).pause_for_review(
-                        "setup_changed",
-                        "Library selection needs confirmation.",
-                        iso=datetime.now(UTC).isoformat(),
-                    )
-                store.set_meta(DRAFT_ROOTS_META, json.dumps(selected_scope))
+                store.save_service_scope_selection(
+                    json.dumps(selected_scope),
+                    expected_authorization_revision=view.authorization_revision,
+                    iso=datetime.now(UTC).isoformat(),
+                )
             self._selected_roots = selected_scope
             self._selected_mappings = ()
         return "Anime scope selected. Checking exact file paths and folder correspondence."
@@ -842,18 +981,26 @@ class ServiceSetupController:
         self, form: Mapping[str, str]
     ) -> str:
         view, environment, generation = self._submitted_view(form)
-        with self._view_lock:
-            selected_roots = self._selected_roots
         if view is None or not view.confirmation_enabled:
             raise ValueError("Current scope, file correspondence, or safety checks are not ready.")
         if environment is None:
             raise ValueError("Refresh setup before confirming the selected scope.")
+        with open_state(self.state_path) as store:
+            settings_json = store.get_meta(META_SERVICE_SETTINGS)
+            draft_json = store.get_meta(DRAFT_ROOTS_META)
+            authorization_revision = store.get_service_authorization_revision()
+            policy = current_metadata_maintenance_policy(store)
+        if (
+            policy != view.metadata_maintenance_policy
+            or authorization_revision != view.authorization_revision
+        ):
+            raise ValueError("Setup choice changed. Review refreshed setup first.")
         shown_compatibility, shown_scope, shown_assessment = environment
         record = self._saved_record()
         current_environment, folders, _changed = self._observed_environment(record)
         compatibility, scope, assessment = current_environment
         roots = view.selected_roots
-        if selected_roots and tuple(sorted(selected_roots)) != roots:
+        if draft_json is not None and tuple(json.loads(draft_json)) != roots:
             raise ValueError(
                 "The selected scope changed. Review refreshed setup before confirming."
             )
@@ -921,7 +1068,7 @@ class ServiceSetupController:
         assessment = evaluate_service_safety(assessment, mappings, folder_context)
         if assessment.status is SafetyStatus.UNSAFE:
             raise ValueError(assessment.message)
-        required = tuple(sorted((*assessment.unknown_settings, *assessment.unverifiable_facts)))
+        required = required_confirmation_facts(None, assessment, metadata_maintenance_policy=policy)
         if required != view.required_confirmations:
             raise ValueError(
                 "Current safety facts changed. Review refreshed setup before confirming."
@@ -953,6 +1100,7 @@ class ServiceSetupController:
             selected_folders_observation=selected_service_folders(mappings, folder_context),
             safety_digest=assessment.digest,
             unverifiable_facts=assessment.unverifiable_facts,
+            metadata_maintenance_policy=policy,
         )
         with self._view_lock:
             self._assert_snapshot_current_locked(view, generation)
@@ -960,11 +1108,14 @@ class ServiceSetupController:
                 self.onboarding(store).confirm_setup(
                     binding,
                     assessment,
+                    expected_settings_json=settings_json,
+                    check_settings=True,
+                    expected_authorization_revision=authorization_revision,
+                    expected_draft_json=draft_json,
                     confirmed_facts=confirmed,
                     automatic_link_consent=True,
                     iso=datetime.now(UTC).isoformat(),
                 )
-                store.clear_meta(DRAFT_ROOTS_META)
             self._selected_roots = roots
             self._selected_mappings = mappings
             self._editing_scope = False

@@ -105,7 +105,7 @@ def test_concurrent_forms_compare_and_save_atomically(
         expected_json: str | None,
         document_json: str,
         *,
-        connection_changed: bool,
+        authorization_changed: bool,
         iso: str,
     ) -> bool:
         nonlocal interleaved
@@ -114,7 +114,11 @@ def test_concurrent_forms_compare_and_save_atomically(
             # Another controller/SQLite handle wins after the stale form's read.
             assert preferences.save(winner).startswith("Settings saved.")
         return original(
-            store, expected_json, document_json, connection_changed=connection_changed, iso=iso
+            store,
+            expected_json,
+            document_json,
+            authorization_changed=authorization_changed,
+            iso=iso,
         )
 
     monkeypatch.setattr(StateStore, "save_service_settings_if_current", save)
@@ -147,7 +151,7 @@ def test_concurrent_connection_change_keeps_review_and_user_pause(
         expected_json: str | None,
         document_json: str,
         *,
-        connection_changed: bool,
+        authorization_changed: bool,
         iso: str,
     ) -> bool:
         nonlocal interleaved
@@ -160,7 +164,11 @@ def test_concurrent_connection_change_keeps_review_and_user_pause(
                 "Settings saved."
             )
         return original(
-            store, expected_json, document_json, connection_changed=connection_changed, iso=iso
+            store,
+            expected_json,
+            document_json,
+            authorization_changed=authorization_changed,
+            iso=iso,
         )
 
     monkeypatch.setattr(StateStore, "save_service_settings_if_current", save)
@@ -222,21 +230,23 @@ def test_failed_settings_commit_rolls_back_preferences_and_review(
         store.connection.set_authorizer(deny_commit)
         with pytest.raises(WriteDisabledError, match="state writes stopped"):
             store.save_service_settings_if_current(
-                original_json, json.dumps(document), connection_changed=True, iso=iso
+                original_json, json.dumps(document), authorization_changed=True, iso=iso
             )
         assert denied
         assert store.get_meta(SETTINGS_META) == original_json
+        assert store.get_service_authorization_revision() is None
         assert store.get_service_pause() == (False, "")
         assert not OnboardingManager(store).reconfirmation_required()
         assert store.writes_disabled
     with open_state(preferences.bootstrap.database_path) as reopened:
         assert reopened.get_meta(SETTINGS_META) == original_json
+        assert reopened.get_service_authorization_revision() is None
         assert reopened.get_service_pause() == (False, "")
         assert not OnboardingManager(reopened).reconfirmation_required()
         assert reopened.writes_disabled
         with pytest.raises(WriteDisabledError):
             reopened.save_service_settings_if_current(
-                original_json, json.dumps(document), connection_changed=True, iso=iso
+                original_json, json.dumps(document), authorization_changed=True, iso=iso
             )
 
 
@@ -450,9 +460,13 @@ def test_mapping_editor_replaces_saved_mapping_for_unchanged_root(
         setup.action("edit", {})
         view = setup.refresh_view()
         assert view is not None
-        setup.action(
+        assert "selected" in setup.action(
             "scope", {"setup_digest": view.snapshot_digest, "root_0": setup_tests.ANIME_ROOT}
         )
+        with open_state(setup.state_path) as store:
+            assert json.loads(store.get_meta(DRAFT_ROOTS_META) or "null") == [
+                setup_tests.ANIME_ROOT
+            ]
         restarted = ServiceSetupController(setup.bootstrap, sonarr, shoko, setup.state_path)
         monkeypatch.setattr(restarted, "_environment", setup._environment)
         monkeypatch.setattr(restarted, "_inventory", setup._inventory)
@@ -472,6 +486,9 @@ def test_mapping_editor_replaces_saved_mapping_for_unchanged_root(
             assert record.binding.path_mappings == (
                 PathMapping(setup_tests.ANIME_ROOT, "/new-anime"),
             )
+            context = restarted.current_context(store)
+            assert context is not None
+            assert context.binding.path_mappings == record.binding.path_mappings
     finally:
         sonarr.client.close()
         shoko.client.close()

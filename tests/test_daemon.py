@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 import hash_fixtures as hf
 import httpx
 import pytest
+import queue_fixtures as qf
 import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import daemon as daemon_module
@@ -56,6 +57,7 @@ from shoko_linker.daemon import (
 from shoko_linker.dashboard import DashboardApplication, DashboardStatus, create_dashboard_server
 from shoko_linker.http import ApiEndpoint, make_timeout
 from shoko_linker.linking import EpisodeIdResolver, SendOutcome, VerificationVerdict
+from shoko_linker.linking import preflight_file as original_file_preflight
 from shoko_linker.mapping_store import (
     ActiveMappings,
     MappingStore,
@@ -191,6 +193,8 @@ class ShokoStub:
         self.posts: list[dict[str, Any]] = []
         self.fail_post: Exception | None = None
         self.fail_queue = False
+        self.queue_items: list[dict[str, Any]] | None = None
+        self.queue_items_status = 200
         self.blocked_count = blocked_count
         self.link_on_post = True
         self.post_status: int | None = None
@@ -226,13 +230,13 @@ class ShokoStub:
     def _queue(self, request: httpx.Request) -> httpx.Response:
         if self.fail_queue:
             return httpx.Response(503, request=request)
-        return self._json(
-            request,
-            {
-                "WaitingCount": 5,
-                "BlockedCount": self.blocked_count,
-                "TotalCount": 20,
-            },
+        return self._json(request, qf.summary(self._queue_items()))
+
+    def _queue_items(self) -> list[dict[str, Any]]:
+        return (
+            self.queue_items
+            if self.queue_items is not None
+            else qf.unrelated(5, self.blocked_count, 20)
         )
 
     def _respond(self, request: httpx.Request) -> httpx.Response:
@@ -251,6 +255,11 @@ class ShokoStub:
         response: httpx.Response | None = None
         if path == "/api/v3/ImportFolder":
             response = self._json(request, [self._folder()])
+        elif path == "/api/v3/Queue/Items":
+            items = self._queue_items()
+            response = httpx.Response(
+                self.queue_items_status, json={"Total": len(items), "List": items}, request=request
+            )
         elif path == "/api/v3/Queue":
             response = self._queue(request)
         elif path.startswith("/api/v3/Series/AniDB/"):
@@ -1622,7 +1631,7 @@ def test_ninety_day_inventory_cache_cannot_complete_before_expired_series_is_ref
 
     def advance_for_child_gets(request: httpx.Request) -> None:
         if request.url.path in ("/api/v3/episode", "/api/v3/episodefile"):
-            elapsed[0] += 1.0
+            elapsed[0] += 0.9
 
     sonarr.on_get = advance_for_child_gets
     activate_mapping(tmp_path, mapping)
@@ -1719,7 +1728,10 @@ def test_ninety_day_inventory_cache_cannot_complete_before_expired_series_is_ref
         if offset < 3:
             assert not reports[-1].reconciliation_ready
             assert reports[-1].counts.submitted == 0
-            assert child_gets(1) == series_one_child_gets_before_expiry
+            # A deadline may interrupt its first child read, but that partial
+            # response must not count as a complete refreshed series fragment.
+            assert child_gets(1) <= series_one_child_gets_before_expiry + 1
+            assert mapping_snapshot(501) == original_targets
 
     assert reports[-1].reconciliation_ready
     assert child_gets(1) > series_one_child_gets_before_expiry
@@ -1792,7 +1804,7 @@ def test_shoko_discovery_resumes_across_restarts_within_cycle_budget(  # noqa: P
 
     shoko = PagedShokoStub(files)
     shoko.on_get = lambda path: elapsed.__setitem__(
-        0, elapsed[0] + (25.0 if path == "/api/v3/File" else 0.0)
+        0, elapsed[0] + (18.0 if path == "/api/v3/File" else 0.0)
     )
     sonarr = SonarrStub(files)
     activate_mapping(tmp_path, xml)
@@ -3328,14 +3340,13 @@ def test_partial_past_deadline_keeps_slot(tmp_path: Path, monkeypatch: pytest.Mo
     store = open_tmp_store(tmp_path)
     seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
     shoko = _PartialStub([multi])
-    monotonic_ticks = iter(range(0, 10_000, 100))
     deps = build_deps(
         tmp_path,
         store=store,
         sonarr_files=[multi],
         shoko_files=[multi],
         xml=mapping_xml(),
-        monotonic=lambda: next(monotonic_ticks),
+        monotonic=lambda: MONO_ZERO,
         advance=Sleeper().advance,
         shoko=shoko,
         verification_timeout=VERIFICATION_TIMEOUT,
@@ -3345,6 +3356,15 @@ def test_partial_past_deadline_keeps_slot(tmp_path: Path, monkeypatch: pytest.Mo
         run_cycle(
             deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c1"
         )
+        pending = store.get_file(500)
+        assert pending is not None
+        assert pending.state is FileState.VERIFYING
+        assert store.budget_view().pending_file_requests == 1
+        # Recover after the immutable send deadline, with time left for an actual
+        # read. Merely calling the clock must not consume an entire I/O budget.
+        run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.NEW_ARRIVAL, cycle_key="c2"
+        )
         record = store.get_file(500)
         view = store.budget_view()
     finally:
@@ -3352,6 +3372,7 @@ def test_partial_past_deadline_keeps_slot(tmp_path: Path, monkeypatch: pytest.Mo
     assert record is not None
     assert record.state is FileState.PARTIAL
     assert view.pending_file_requests == 1
+    assert shoko.posts_count() == 1
 
 
 class _PartialStub(ShokoStub):
@@ -7959,6 +7980,135 @@ def test_campaign_pending_target_deferrals_defer_and_resume(
         store.close()
 
 
+def _assert_cycle_budget_deferral(
+    store: StateStore,
+    campaign_id: str,
+    now_iso: str,
+    shoko: ShokoStub,
+    original_sends: int,
+    original_rolling: int,
+) -> datetime:
+    campaign = store.get_campaign(campaign_id)
+    assert campaign is not None
+    assert campaign.status == "approved"
+    assert campaign.drain_authorized_iso is not None
+    retry = store.get_meta(f"campaign_deferred_until:{campaign_id}")
+    expected = datetime.fromisoformat(now_iso) + timedelta(seconds=1500)
+    assert retry == expected.isoformat()
+    assert store.get_meta(f"campaign_zero_progress:{campaign_id}") == "0"
+    record = store.get_file(501)
+    assert record is not None
+    assert record.state is FileState.PLANNED
+    assert len(shoko.posts) == 1
+    assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == original_sends
+    budget = store.budget_view()
+    assert budget.pending_file_requests == budget.pending_episode_jobs == 0
+    assert budget.rolling_new_submissions == original_rolling
+    assert campaign_send_progress(store, campaign_id) == 1
+    return expected
+
+
+def test_campaign_cycle_time_budget_defers_across_restart_then_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slow final preflight yields without spending authorization, sends, or budget."""
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    files = [
+        SpecFile(series_id=index + 1, file_id=10 + index, shoko_id=500 + index)
+        for index in range(2)
+    ]
+    activate_mapping(tmp_path, mapping_xml())
+    settings = _drain_settings(tmp_path, batch=1)
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, files)
+    shoko = ShokoStub(files)
+    clock = {"now": 0.0}
+    deps = build_deps(
+        tmp_path,
+        store=store,
+        sonarr_files=files,
+        shoko_files=files,
+        xml=mapping_xml(),
+        monotonic=lambda: clock["now"],
+        advance=Sleeper().advance,
+        settings=settings,
+        shoko=shoko,
+        max_submissions=10,
+        max_cycle_seconds=10.0,
+    )
+    plan, digest = prepare_campaign(deps, settings, store, T0, limit=2, deadline_hours=168.0)
+    write_plan_file(tmp_path / "plan.json", plan)
+    approve_campaign(store, tmp_path / "plan.json", digest, T0)
+    campaign_id = plan.campaign_id
+    current = datetime.fromisoformat(T0)
+
+    def slow_final_read(path: str) -> None:
+        if path == "/api/v3/File/501":
+            clock["now"] += 10.0
+
+    try:
+        canary = apply_campaign(deps, settings, store, tmp_path / "plan.json", T0, batch_size=1)
+        assert canary.submitted == canary.verified == 1
+        authorize_campaign_drain(store, campaign_id, T0, note="canary inspected")
+        original_sends = store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0]
+        original_budget = store.budget_view()
+        shoko.on_get = slow_final_read
+
+        for index in range(daemon_module.ZERO_PROGRESS_PAUSE_CYCLES + 1):
+            now_iso = current.isoformat()
+            stalled = run_cycle(
+                deps,
+                now_iso=now_iso,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.BACKLOG,
+                cycle_key=f"slow-{index}",
+            )
+            assert stalled.campaign is not None
+            assert stalled.campaign.submitted == stalled.campaign.progress == 0
+            assert "cycle_time_budget_exhausted" in stalled.campaign.reasons
+            expected = _assert_cycle_budget_deferral(
+                store,
+                campaign_id,
+                now_iso,
+                shoko,
+                original_sends,
+                original_budget.rolling_new_submissions,
+            )
+            # Reopen the durable database while the window is closed: no preflight or POST.
+            if index == 0:
+                store.close()
+                store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+                deps = replace(deps, store=store)
+            reads_before = len(shoko.requests)
+            idle = run_cycle(
+                deps,
+                now_iso=now_iso,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.BACKLOG,
+                cycle_key=f"idle-{index}",
+            )
+            assert idle.campaign is None
+            assert all(
+                request.url.path != "/api/v3/File/501" for request in shoko.requests[reads_before:]
+            )
+            assert len(shoko.posts) == 1
+            current = expected
+        shoko.on_get = None
+        resumed = run_cycle(
+            deps,
+            now_iso=current.isoformat(),
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.BACKLOG,
+            cycle_key="recovered",
+        )
+        assert resumed.campaign is not None
+        assert resumed.campaign.submitted == resumed.campaign.verified == 1
+        assert len(shoko.posts) == 2
+        assert campaign_send_progress(store, campaign_id) == 2
+    finally:
+        store.close()
+
+
 #: Finding 1: the stall-yield cooldown is ``STALL_YIELD_COOLDOWN_CYCLES`` daemon cycle intervals
 #: (the default ``sync.interval_seconds`` in :func:`_drain_settings` is 300.0 → 1500.0). The
 #: production daemon sleeps ``interval x (1 + jitter)`` AFTER each cycle (upper bound
@@ -8482,6 +8632,12 @@ def test_cycle_deadline_at_final_local_guard_leaves_no_send_or_budget_debt(
         return True
 
     shoko.on_get = slow_final_file_read
+
+    def bounded_file_preflight(*args: Any, **kwargs: Any) -> Any:
+        assert (kwargs["deadline"], kwargs["clock"]()) == (10.0, clock["now"])
+        return original_file_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "preflight_file", bounded_file_preflight)
     try:
         deps = build_deps(
             tmp_path,
@@ -8799,4 +8955,102 @@ def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: P
     finally:
         for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
             endpoint.client.close()
+        store.close()
+
+
+@pytest.mark.parametrize("service_mode", [False, True])
+@pytest.mark.parametrize("job", ["file", "anime", "unknown"])
+def test_foreign_queue_work_defers_without_send_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mode: bool, job: str
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
+    shoko = ShokoStub([candidate])
+    key = (
+        "Import.ManualLinkJob_VideoLocalID:500_EpisodeID:999_Percentage:50"
+        if job == "file"
+        else f"AniDB.GetAniDBAnimeJob_AnimeID:{ANIME_ID}"
+    )
+    shoko.queue_items = [qf.item(key)] if job != "unknown" else []
+    shoko.queue_items_status = 403 if job == "unknown" else 200
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        if service_mode:
+            deps = replace(deps, service_mode=True, service_authorized=lambda: True)
+        report = run_cycle(
+            deps,
+            now_iso=T0,
+            mode=CycleMode.APPLY,
+            policy=RunPolicy.NEW_ARRIVAL,
+            cycle_key="foreign",
+        )
+        assert store.live_send_counts() == (0, 0)
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        assert store.get_file(500).state is FileState.PLANNED  # type: ignore[union-attr]
+        assert report.counts.submitted == 0
+        assert shoko.posts_count() == 0
+        assert any("queue_" in reason for reason in report.reasons)
+    finally:
+        store.close()
+
+
+def test_own_sent_verification_survives_unknown_foreign_queue_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHOKO_LINKER_ALLOW_APPLY", raising=False)
+    candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
+    activate_mapping(tmp_path, mapping_xml())
+    store = open_tmp_store(tmp_path)
+    seed_baseline(store, [candidate])
+    shoko = ShokoStub([candidate])
+    shoko.link_on_post = False
+    try:
+        deps = build_deps(
+            tmp_path,
+            store=store,
+            sonarr_files=[candidate],
+            shoko_files=[candidate],
+            xml=mapping_xml(),
+            monotonic=Clock([MONO_ZERO]),
+            advance=Sleeper().advance,
+            shoko=shoko,
+        )
+        deps = replace(
+            deps,
+            service_mode=True,
+            service_authorized=lambda: True,
+            verification_timeout_seconds=10_000,
+        )
+        first = run_cycle(
+            deps, now_iso=T0, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="own-first"
+        )
+        assert first.counts.submitted == 1
+        assert store.live_send_counts() == (1, 1)
+        shoko.materialize(500)
+        shoko.queue_items_status = 403
+        before = sum(request.url.path.endswith("/Queue/Items") for request in shoko.requests)
+        run_cycle(
+            deps, now_iso=T1, mode=CycleMode.APPLY, policy=RunPolicy.SERVICE, cycle_key="own-verify"
+        )
+        record = store.get_file(500)
+        assert record is not None
+        assert record.state is FileState.VERIFIED
+        assert store.live_send_counts() == (0, 0)
+        assert shoko.posts_count() == 1
+        assert (
+            sum(request.url.path.endswith("/Queue/Items") for request in shoko.requests) == before
+        )
+    finally:
         store.close()

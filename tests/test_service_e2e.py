@@ -415,7 +415,7 @@ def test_mixed_library_selected_folder_identity_drift_before_write_prevents_post
         original_context = runtime._service_authorization_context
         refreshes = 0
 
-        def drift_before_send(store: Any) -> Any:
+        def drift_before_send(store: Any, **kwargs: Any) -> Any:
             nonlocal refreshes
             refreshes += 1
             if refreshes == 2:
@@ -423,11 +423,13 @@ def test_mixed_library_selected_folder_identity_drift_before_write_prevents_post
                     world.shoko.folders[7] = world.shoko.folders.pop(1)
                 elif drift == "settings_during_folder_outage":
                     cast(ServiceShokoStub, world.shoko).renamer_enabled = False
-                    monkeypatch.setattr(service_setup, "collect_import_folders", lambda *_: None)
+                    monkeypatch.setattr(
+                        service_setup, "collect_import_folders", lambda *_, **__: None
+                    )
                 else:
                     world.shoko.folders[1] = (SHOKO_ROOT, "Source")
                     world.shoko.folders[2] = ("/drop", "Unknown")
-            return original_context(store)
+            return original_context(store, **kwargs)
 
         monkeypatch.setattr(runtime, "_service_authorization_context", drift_before_send)
         runtime.worker_tick()

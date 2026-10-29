@@ -22,6 +22,7 @@ from shoko_linker.daemon import (
     CycleMode,
     CycleReport,
     DaemonDeps,
+    _bind_service_authorization,
     run_cycle,
     run_daemon,
 )
@@ -843,8 +844,9 @@ def test_worker_runs_service_policy_only_with_current_durable_consent(
     captured: dict[str, Any] = {}
 
     def run_one_cycle(deps: DaemonDeps, **kwargs: Any) -> object:
-        captured["deps"] = deps
-        captured.update(kwargs)
+        # The real daemon binds production authorization at its cycle boundary.
+        deps = _bind_service_authorization(deps, deps.monotonic() + deps.max_cycle_seconds)
+        captured.update(kwargs, deps=deps)
         captured["authorized_initially"] = deps.service_authorized()
         current_setup.binding = replace(
             binding,
@@ -876,7 +878,7 @@ def test_worker_runs_service_policy_only_with_current_durable_consent(
         available = True
         binding: ScopeBinding
 
-        def current_context(self, _store: StateStore) -> OnboardingContext | None:
+        def current_context(self, _store: StateStore, **_kwargs: Any) -> OnboardingContext | None:
             return (
                 OnboardingContext(self.binding, assessment, _store.get_onboarding_json() or "")
                 if self.available

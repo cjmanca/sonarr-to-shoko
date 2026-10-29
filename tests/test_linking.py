@@ -10,7 +10,7 @@ every failure shows zero additional POSTs.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, TypeVar
@@ -18,6 +18,7 @@ from typing import Any, TypeVar
 import hash_fixtures as hf
 import httpx
 import pytest
+import queue_fixtures as qf
 
 from shoko_linker.config import Settings, load_settings
 from shoko_linker.errors import ConfigError
@@ -42,6 +43,7 @@ from shoko_linker.linking import (
     parse_file_xrefs,
     plan_fingerprint,
     preflight,
+    preflight_file,
     reconcile_link_plan,
     request_fingerprint,
     resolve_episode_ids,
@@ -350,6 +352,13 @@ def linkable_plan(**kwargs: Any) -> LinkPlan:
 
 def preflight_ok_routes() -> dict[tuple[str, str], Any]:
     return {
+        ("GET", "/api/v3/Queue"): {
+            "WaitingCount": 0,
+            "BlockedCount": 0,
+            "TotalCount": 0,
+            "CurrentlyExecuting": [],
+        },
+        ("GET", "/api/v3/Queue/Items"): {"Total": 0, "List": []},
         ("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"): anidb_list(
             [
                 anidb_episode(5501, ANIME_ID, "Episode", 10),
@@ -694,6 +703,94 @@ def test_resolved_target_without_shoko_id_is_skipped() -> None:
 
 
 # --------------------------------------------------------------- preflight gates
+
+
+class DripFileBody(httpx.SyncByteStream):
+    """Advance a fake clock on small chunks without sleeping or live I/O."""
+
+    def __init__(self, payload: bytes, clock: list[float]) -> None:
+        self.payload = payload
+        self.clock = clock
+        self.chunks = 0
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for offset in range(0, len(self.payload), 10):
+            self.clock[0] += 0.5
+            self.chunks += 1
+            yield self.payload[offset : offset + 10]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_final_file_preflight_honors_absolute_body_deadline(
+    base_document: dict[str, Any], write_document: Writer, expired: bool
+) -> None:
+    settings = base_settings(base_document, write_document)
+    clock = [100.0 if expired else 99.0]
+    body = DripFileBody(json.dumps(file_json()).encode(), clock)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, stream=body, request=request)
+
+    with httpx.Client(
+        base_url=SHOKO_BASE,
+        transport=httpx.MockTransport(handler),
+        timeout=httpx.Timeout(connect=0.25, read=30.0, write=0.75, pool=2.0),
+    ) as client:
+        verdict = preflight_file(
+            ApiEndpoint(client, lambda: shoko_headers(FAKE_KEY)),
+            linkable_plan(),
+            settings,
+            FOLDERS,
+            deadline=100.0,
+            clock=lambda: clock[0],
+        )
+    assert not verdict.ok
+    assert verdict.reasons == (PreflightReason.TRANSPORT_FAILURE,)
+    assert "deadline exceeded" in verdict.details[0]
+    if expired:
+        assert requests == []
+        assert body.chunks == 0
+    else:
+        assert len(requests) == 1
+        assert requests[0].extensions["timeout"] == {
+            "connect": 0.25,
+            "read": 1.0,
+            "write": 0.75,
+            "pool": 1.0,
+        }
+        assert clock[0] == 100.0
+        assert body.chunks == 2
+        assert body.closed
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_final_file_preflight_without_budget_preserves_identity_protection(
+    base_document: dict[str, Any], write_document: Writer, protected: bool
+) -> None:
+    settings = base_settings(base_document, write_document)
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    if protected:
+        stub.routes[("GET", f"/api/v3/File/{SHOKO_FILE_ID}")] = file_json(xrefs=[{}])
+    verdict = with_endpoint(
+        stub, lambda endpoint: preflight_file(endpoint, linkable_plan(), settings, FOLDERS)
+    )
+    assert verdict.ok is not protected
+    if protected:
+        assert PreflightReason.EXISTING_LINK in verdict.reasons
+    assert stub.methods() == ["GET"]
+    assert stub.requests[0].extensions["timeout"] == {
+        "connect": 1.0,
+        "read": 1.0,
+        "write": 1.0,
+        "pool": 1.0,
+    }
 
 
 def test_preflight_ok_reads_file_fresh_and_revalidates_targets(
@@ -1820,3 +1917,88 @@ def test_preflight_dedups_target_rereads_sharing_an_anidb_episode(
     assert verdict.ok is True
     episode_reads = [p for p in stub.paths() if p == "/api/v3/Episode/AniDB/5501/Episode"]
     assert len(episode_reads) == 1
+
+
+@pytest.mark.parametrize("state", ["waiting", "running", "blocked"])
+@pytest.mark.parametrize("kind", ["same_file", "target_anime", "unknown"])
+def test_apply_waits_for_relevant_jobs_before_target_and_file_reads(
+    base_document: dict[str, Any], write_document: Writer, state: str, kind: str
+) -> None:
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    key = (
+        f"Import.ManualLinkJob_VideoLocalID:{plan.shoko_file_id}_EpisodeID:999_Percentage:12"
+        if kind == "same_file"
+        else f"AniDB.GetAniDBAnimeJob_AnimeID:{ANIME_ID}_CacheOnly:true"
+    )
+    items = [qf.item(key, state)]
+    stub.routes[("GET", "/api/v3/Queue")] = qf.summary(items)
+    stub.routes[("GET", "/api/v3/Queue/Items")] = {"Total": len(items), "List": items}
+    if kind == "unknown":
+        stub.routes[("GET", "/api/v3/Queue")] = qf.summary([])
+        stub.statuses[("GET", "/api/v3/Queue/Items")] = 403
+    result = reconcile(stub, plan, settings, dry_run=False)
+    assert result.stage is ReconcileStage.PREFLIGHT_BLOCKED
+    assert result.preflight is not None
+    assert set(result.preflight.reasons) <= {
+        PreflightReason.QUEUE_BLOCKED,
+        PreflightReason.QUEUE_UNKNOWN,
+    }
+    assert stub.posts() == []
+    assert not any("/Episode" in path or "/File/" in path for path in stub.paths())
+
+
+def test_apply_checks_all_split_anime_and_reverifies_ids_after_queue(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = base_settings(base_document, write_document)
+    original = linkable_plan()
+    second_anime = ANIME_ID + 1
+    plan = replace(
+        original,
+        targets=(original.targets[0], replace(original.targets[1], anidb_anime_id=second_anime)),
+    )
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    items = [qf.item(f"AniDB.GetAniDBAnimeJob_AnimeID:{second_anime}")]
+    stub.routes[("GET", "/api/v3/Queue")] = qf.summary(items)
+    stub.routes[("GET", "/api/v3/Queue/Items")] = {"Total": 1, "List": items}
+    assert reconcile(stub, plan, settings, dry_run=False).stage is ReconcileStage.PREFLIGHT_BLOCKED
+    assert stub.posts() == []
+
+    # Refresh has finished: current episode ID differs from the frozen plan.
+    stub.requests.clear()
+    stub.routes = preflight_ok_routes()
+    stub.routes[("GET", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode")] = anidb_list(
+        [anidb_episode(9901, ANIME_ID, "Episode", 10), anidb_episode(5502, ANIME_ID, "Episode", 11)]
+    )
+    result = reconcile(stub, original, settings, dry_run=False)
+    assert result.preflight is not None
+    assert PreflightReason.TARGET_DRIFT in result.preflight.reasons
+    assert stub.posts() == []
+    assert stub.paths().index("/api/v3/Queue/Items") < stub.paths().index(
+        f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"
+    )
+    assert f"/api/v3/File/{SHOKO_FILE_ID}" not in stub.paths()
+
+
+def test_apply_unrelated_jobs_allow_send_and_protected_file_is_last_read(
+    base_document: dict[str, Any], write_document: Writer
+) -> None:
+    settings = base_settings(base_document, write_document)
+    plan = linkable_plan()
+    stub = LinkStub()
+    stub.routes = preflight_ok_routes()
+    items = [
+        qf.item("Import.ManualLinkJob_VideoLocalID:99999_EpisodeID:1"),
+        qf.item("AniDB.GetAniDBAnimeJob_AnimeID:99999", "running"),
+    ]
+    stub.routes[("GET", "/api/v3/Queue")] = qf.summary(items)
+    stub.routes[("GET", "/api/v3/Queue/Items")] = {"Total": len(items), "List": items}
+    assert reconcile(stub, plan, settings, dry_run=False).stage is ReconcileStage.SUBMITTED
+    assert stub.paths()[-2:] == [
+        f"/api/v3/File/{SHOKO_FILE_ID}",
+        f"/api/v3/File/{SHOKO_FILE_ID}/Link",
+    ]

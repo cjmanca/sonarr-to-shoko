@@ -410,9 +410,17 @@ def _shoko_handler(env: StubEnv) -> Any:
         if path == "/api/v3/Queue":
             return httpx.Response(
                 200,
-                json={"WaitingCount": 0, "BlockedCount": 0, "TotalCount": 0, "ThreadCount": 1},
+                json={
+                    "WaitingCount": 0,
+                    "BlockedCount": 0,
+                    "TotalCount": 0,
+                    "ThreadCount": 1,
+                    "CurrentlyExecuting": [],
+                },
                 request=request,
             )
+        if path == "/api/v3/Queue/Items":
+            return httpx.Response(200, json={"Total": 0, "List": []}, request=request)
         if path.startswith("/api/v3/Series/AniDB/"):
             return httpx.Response(
                 200,

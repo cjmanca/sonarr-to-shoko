@@ -42,7 +42,7 @@ import httpx
 
 from .config import Settings
 from .errors import HttpPolicyError, PathError
-from .http import ApiEndpoint, resolve_and_send
+from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .paths import is_within_root, normalize_posix
 
 SERIES_PATH: Final[str] = "api/v3/series"
@@ -721,6 +721,7 @@ def collect_sonarr_inventory(
     series_cursor: int = 0,
     swept_series_ids: frozenset[int] = frozenset(),
     series_deadline: float | None = None,
+    deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> SonarrInventory:
@@ -729,7 +730,8 @@ def collect_sonarr_inventory(
     Requests use relative API paths through :func:`shoko_linker.http.resolve_and_send`.
     Transport or shape failures are recorded as verdict reasons, never raised,
     so one broken series response cannot crash the inventory; per-series fetches
-    stop at that series.
+    stop at that series. ``deadline`` bounds all reads using the supplied monotonic
+    clock; ``series_deadline`` retains its legacy between-child-stage limit.
     """
     if settings is None:
         effective_roots = _setup_inventory_roots(allowed_roots, anime_only)
@@ -742,7 +744,7 @@ def collect_sonarr_inventory(
     warnings: list[str] = []
     reasons: list[VerdictReason] = []
     details: list[str] = []
-    outcome = _fetch_json_list(endpoint, SERIES_PATH)
+    outcome = _fetch_json_list(endpoint, SERIES_PATH, deadline=deadline, monotonic=monotonic)
     if outcome.payload is None:
         _append(reasons, VerdictReason.SERIES_ENUMERATION_FAILED)
         details.append(f"cannot enumerate Sonarr series: {outcome.detail}")
@@ -758,7 +760,17 @@ def collect_sonarr_inventory(
         anime_only=True,
     )
 
-    warnings.extend(_collect_root_folder_warnings(endpoint, effective_roots))
+    warnings.extend(
+        _collect_root_folder_warnings(
+            endpoint, effective_roots, deadline=deadline, monotonic=monotonic
+        )
+    )
+    if deadline is not None and monotonic() >= deadline:
+        _append(reasons, VerdictReason.INCOMPLETE_SNAPSHOT)
+        details.append("Sonarr inventory exceeded its I/O time budget")
+    children_deadline = series_deadline if series_deadline is not None else deadline
+    if deadline is not None and children_deadline is not None:
+        children_deadline = min(children_deadline, deadline)
     children = _collect_series_children(
         endpoint,
         eligible,
@@ -767,7 +779,8 @@ def collect_sonarr_inventory(
         cached_series_children=cached_series_children,
         series_cursor=series_cursor,
         swept_series_ids=swept_series_ids,
-        series_deadline=series_deadline,
+        io_deadline=deadline,
+        series_deadline=children_deadline,
         monotonic=monotonic,
         reasons=reasons,
         details=details,
@@ -843,7 +856,9 @@ def check_current_file_relationship(  # noqa: PLR0911, PLR0912
             SourceRelationshipStatus.UNAVAILABLE,
             "Sonarr source check deferred before episode read by the apply time budget",
         )
-    episodes_outcome = _fetch_json_list(endpoint, EPISODE_PATH, {"seriesId": series_id})
+    episodes_outcome = _fetch_json_list(
+        endpoint, EPISODE_PATH, {"seriesId": series_id}, deadline=deadline, monotonic=monotonic
+    )
     if episodes_outcome.payload is None:
         return SourceRelationshipVerdict(
             SourceRelationshipStatus.UNAVAILABLE,
@@ -854,7 +869,9 @@ def check_current_file_relationship(  # noqa: PLR0911, PLR0912
             SourceRelationshipStatus.UNAVAILABLE,
             "Sonarr source check deferred before episode-file read by the apply time budget",
         )
-    files_outcome = _fetch_json_list(endpoint, EPISODE_FILE_PATH, {"seriesId": series_id})
+    files_outcome = _fetch_json_list(
+        endpoint, EPISODE_FILE_PATH, {"seriesId": series_id}, deadline=deadline, monotonic=monotonic
+    )
     if files_outcome.payload is None:
         return SourceRelationshipVerdict(
             SourceRelationshipStatus.UNAVAILABLE,
@@ -938,7 +955,7 @@ def _check_current_series_identity(  # noqa: PLR0911
     monotonic: Callable[[], float],
 ) -> SourceRelationshipVerdict:
     """Verify that this exact current series is still eligible for the frozen source file."""
-    series_outcome = _fetch_json_list(endpoint, SERIES_PATH)
+    series_outcome = _fetch_json_list(endpoint, SERIES_PATH, deadline=deadline, monotonic=monotonic)
     if series_outcome.payload is None:
         return SourceRelationshipVerdict(
             SourceRelationshipStatus.UNAVAILABLE,
@@ -1024,6 +1041,7 @@ def _collect_series_children(
     series_cursor: int,
     swept_series_ids: frozenset[int],
     series_deadline: float | None,
+    io_deadline: float | None,
     monotonic: Callable[[], float],
     reasons: list[VerdictReason],
     details: list[str],
@@ -1047,6 +1065,7 @@ def _collect_series_children(
     for index, item in enumerate(ordered, start=1):
         if series_deadline is not None and monotonic() >= series_deadline:
             break
+        previous_cursor = cursor
         cursor = item.series.id
         episodes, files = _fetch_series_children(
             endpoint,
@@ -1054,6 +1073,7 @@ def _collect_series_children(
             reasons,
             details,
             deadline=series_deadline,
+            io_deadline=io_deadline,
             monotonic=monotonic,
         )
         if on_progress is not None:
@@ -1062,6 +1082,11 @@ def _collect_series_children(
             cache.pop(item.series.id, None)
             swept.discard(item.series.id)
             invalidated.add(item.series.id)
+            if io_deadline is not None and monotonic() >= io_deadline:
+                # Retry the interrupted series first next cycle instead of rotating
+                # past it forever when each bounded slice ends in a partial read.
+                cursor = previous_cursor
+                break
             continue
         children = (tuple(episodes), tuple(files))
         cache[item.series.id] = children
@@ -1198,9 +1223,13 @@ def _deduplicate_records(
 
 
 def _collect_root_folder_warnings(
-    endpoint: ApiEndpoint, allowed_roots: Sequence[str]
+    endpoint: ApiEndpoint,
+    allowed_roots: Sequence[str],
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[str, ...]:
-    outcome = _fetch_json_list(endpoint, ROOTFOLDER_PATH)
+    outcome = _fetch_json_list(endpoint, ROOTFOLDER_PATH, deadline=deadline, monotonic=monotonic)
     if outcome.payload is None:
         return (f"{ROOTFOLDER_UNAVAILABLE_DETAIL}: {outcome.detail}",)
     observed = _root_folder_paths(outcome.payload)
@@ -1216,10 +1245,13 @@ def _fetch_series_children(
     details: list[str],
     *,
     deadline: float | None = None,
+    io_deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[list[Any] | None, list[Any] | None]:
     series_id = item.series.id
-    episodes = _fetch_json_list(endpoint, EPISODE_PATH, {"seriesId": series_id})
+    episodes = _fetch_json_list(
+        endpoint, EPISODE_PATH, {"seriesId": series_id}, deadline=io_deadline, monotonic=monotonic
+    )
     if episodes.payload is None:
         _append(reasons, episodes.reason or VerdictReason.TRANSPORT_FAILURE)
         details.append(f"series {series_id} episodes: {episodes.detail}")
@@ -1229,7 +1261,13 @@ def _fetch_series_children(
         _append(reasons, VerdictReason.INCOMPLETE_SNAPSHOT)
         details.append(f"series {series_id} episode-file fetch deferred by inventory time budget")
         return None, None
-    files = _fetch_json_list(endpoint, EPISODE_FILE_PATH, {"seriesId": series_id})
+    files = _fetch_json_list(
+        endpoint,
+        EPISODE_FILE_PATH,
+        {"seriesId": series_id},
+        deadline=io_deadline,
+        monotonic=monotonic,
+    )
     if files.payload is None:
         _append(reasons, files.reason or VerdictReason.TRANSPORT_FAILURE)
         details.append(f"series {series_id} episode files: {files.detail}")
@@ -1247,27 +1285,21 @@ def _fetch_json_list(
     endpoint: ApiEndpoint,
     path: str,
     params: Mapping[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> _FetchOutcome:
     """GET one relative API path requiring a JSON array body; failures are recorded, not raised."""
     try:
-        response = resolve_and_send(endpoint, "GET", path, params=params)
-    except (HttpPolicyError, httpx.HTTPError) as exc:
-        return _FetchOutcome(None, VerdictReason.TRANSPORT_FAILURE, f"{path}: {exc}")
-    try:
-        if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-            return _FetchOutcome(
-                None,
-                VerdictReason.TRANSPORT_FAILURE,
-                f"{path}: HTTP {response.status_code}",
-            )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            return _FetchOutcome(
-                None, VerdictReason.MALFORMED_RESPONSE, f"{path}: invalid JSON ({exc})"
-            )
-    finally:
-        response.close()
+        status, payload = get_bounded_json(
+            endpoint, path, params, deadline=deadline, clock=monotonic
+        )
+    except BoundedJsonError as exc:
+        return _FetchOutcome(None, VerdictReason.MALFORMED_RESPONSE, f"{path}: {exc}")
+    except (HttpPolicyError, httpx.HTTPError, httpx.StreamError):
+        return _FetchOutcome(None, VerdictReason.TRANSPORT_FAILURE, f"{path}: request failed")
+    if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
+        return _FetchOutcome(None, VerdictReason.TRANSPORT_FAILURE, f"{path}: HTTP {status}")
     if not isinstance(payload, list):
         return _FetchOutcome(
             None, VerdictReason.MALFORMED_RESPONSE, f"{path}: expected a JSON array"

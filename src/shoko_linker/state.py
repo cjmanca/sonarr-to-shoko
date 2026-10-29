@@ -97,7 +97,7 @@ already has the columns upgrades cleanly. The step, the ``PRAGMA user_version=2`
 ``schema_version`` audit row commit in **one transaction**: a failing step rolls back whole, the
 store refuses to open with a recoverable :class:`StateError`, and the file stays usable at its
 original version with every history row intact. At F17, fresh databases initialized directly at
-v2; current fresh databases initialize at v7, and older databases upgrade in place. A
+v2; current fresh databases initialize at v9, and older databases upgrade in place. A
 ``user_version > SCHEMA_VERSION`` is refused (fail closed). The 5 → 6 migration does not infer
 campaign ownership from mutable file rows; 6 → 7 records immutable per-send ownership. Legacy
 attempts compatible with a persisted campaign approval stay unknown until explicit operator
@@ -109,6 +109,11 @@ the table without changing any existing row.
 
 **M5.1 (schema v4):** empty dashboard-account and dashboard-session tables are added by the
 `3 → 4` migration. Existing installs never inherit an account or session.
+
+**Metadata operations (schema v8):** a separate anime-level ledger shares the existing
+reservation budget and write-stop fence without inventing file sends or campaign progress.
+Possibly delivered identities survive restarts and consent changes; uncertain reservations
+remain held until verified readiness.
 
 **Trailing budgets (schema v5):** the `4 → 5` migration adds timestamped reservation
 counts, recovers debt from send history, and retains anonymous legacy counter debt
@@ -154,11 +159,13 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal, ParamSpec, TypeVar, cast
+from typing import Any, Final, Literal, LiteralString, ParamSpec, TypeVar, cast
 
 from .errors import LinkerError
 from .linking import SendOutcome, VerificationVerdict
 from .logging_setup import redact
+from .mappings import EpisodeType
+from .metadata_identity import metadata_source_key_for_url
 
 # Platform shim for the OS advisory apply lock (the F5 ownership fence). The kernel
 # releases an advisory lock when the owning process exits, so a crash frees it; a meta
@@ -190,13 +197,16 @@ _O_BINARY: Final[int] = getattr(os, "O_BINARY", 0)
 
 META_ONBOARDING_RECONFIRMATION_REQUIRED: Final[str] = "onboarding_reconfirmation_required"
 META_SERVICE_SETTINGS: Final[str] = "normal_service_settings_v1"
+SERVICE_AUTHORIZATION_REVISION_CHARS: Final[int] = 32
+META_SERVICE_DRAFT_ROOTS: Final[str] = "normal_service_draft_roots_v1"
+META_SERVICE_AUTHORIZATION_REVISION: Final[str] = "normal_service_authorization_revision_v1"
 SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
     {"setup_changed", "setup_unavailable", "unsafe_shoko_settings"}
 )
 SYSTEM_RECONFIRMATION_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
     {"setup_changed", "unsafe_shoko_settings"}
 )
-SCHEMA_VERSION: Final[int] = 7
+SCHEMA_VERSION: Final[int] = 9
 MAPPING_RESOLVED_ID_COUNT: Final[int] = 2  # AniDB episode ID, Shoko episode ID
 META_MAPPING_TARGET_QUARANTINE_PREFIX: Final[str] = "file_mapping_quarantine:v1:"
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
@@ -767,6 +777,47 @@ class SendToken:
     request_fingerprint: str
 
 
+MetadataEpisodeIdentity = tuple[int, EpisodeType, int]
+_METADATA_TARGET_FIELDS: Final[int] = 3
+
+
+class MetadataOperationState(str, Enum):
+    PREPARED = "prepared"
+    POSSIBLY_DELIVERED = "possibly_delivered"
+    ACCEPTED_WAITING = "accepted_waiting"
+    READY = "ready"
+    DEFINITELY_REJECTED = "definitely_rejected"
+    NEEDS_ATTENTION = "needs_attention"
+
+
+@dataclass(frozen=True)
+class MetadataOperation:
+    """Durable anime-level identity; claim fences stale senders and unsent retries.
+
+    No state with possible delivery is eligible for automatic replay, even after
+    consent changes. External observations own no reservation. Deadlines are supplied
+    by the caller, never extended by polling. Fingerprints contain no raw endpoints.
+    """
+
+    source_key: str
+    anidb_anime_id: int
+    claim: str
+    demand_fingerprint: str
+    request_fingerprint: str
+    request_version: int
+    state: MetadataOperationState
+    created_iso: str
+    updated_iso: str
+    attempted_iso: str | None
+    verification_deadline_iso: str | None
+    transport_admitted: bool
+    reservation_owned: bool
+    slot_released: bool
+    required_targets: tuple[MetadataEpisodeIdentity, ...] | None = None
+    missing_targets: tuple[MetadataEpisodeIdentity, ...] | None = None
+    verified_required_targets: tuple[MetadataEpisodeIdentity, ...] | None = None
+
+
 @dataclass(frozen=True)
 class BudgetView:
     """Current persisted budget counters (window_key = last-used cycle)."""
@@ -912,6 +963,14 @@ class RecoveryPlan:
 
 
 @dataclass(frozen=True)
+class RecoveryBatch:
+    """Bounded identities plus a SQL count, without decoding persisted payloads."""
+
+    ids: tuple[int, ...]
+    total: int
+
+
+@dataclass(frozen=True)
 class EligibilityVerdict:
     """Composed auto-apply eligibility with every refusal reason recorded."""
 
@@ -1031,6 +1090,7 @@ class ApplyProcessLock:
         self.path = path
         self._fd: int | None = None
         self.held = False
+        self.owner_process: int | None = None
 
     def acquire(self) -> bool:
         """Non-blocking take. ``False`` on contention (never raises on a busy lock).
@@ -1054,6 +1114,7 @@ class ApplyProcessLock:
             return False
         self._fd = fd
         self.held = True
+        self.owner_process = os.getpid()
         return True
 
     def release(self) -> None:
@@ -1061,6 +1122,7 @@ class ApplyProcessLock:
         fd = self._fd
         self._fd = None
         self.held = False
+        self.owner_process = None
         if fd is None:
             return
         with contextlib.suppress(OSError):
@@ -1079,7 +1141,58 @@ class ApplyProcessLock:
 # ----------------------------------------------------------------- schema
 
 
-_SCHEMA_SQL: Final[str] = """
+_METADATA_SCHEMA_SQL: Final[str] = """
+CREATE TABLE metadata_operations (
+    source_key TEXT NOT NULL CHECK (length(source_key) = 64),
+    anidb_anime_id INTEGER NOT NULL CHECK (anidb_anime_id > 0),
+    claim TEXT NOT NULL,
+    demand_fingerprint TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    request_version INTEGER NOT NULL CHECK (request_version > 0),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'possibly_delivered',
+        'accepted_waiting', 'ready', 'definitely_rejected', 'needs_attention')),
+    created_iso TEXT NOT NULL,
+    updated_iso TEXT NOT NULL,
+    attempted_iso TEXT,
+    verification_deadline_iso TEXT,
+    transport_admitted INTEGER NOT NULL DEFAULT 0 CHECK (transport_admitted IN (0, 1)),
+    reservation_owned INTEGER NOT NULL CHECK (reservation_owned IN (0, 1)),
+    slot_released INTEGER NOT NULL DEFAULT 0 CHECK (slot_released IN (0, 1)),
+    PRIMARY KEY (source_key, anidb_anime_id)
+);
+"""
+
+
+_METADATA_V9_SCHEMA_SQL: Final[str] = """
+ALTER TABLE metadata_operations ADD COLUMN required_targets_json TEXT;
+ALTER TABLE metadata_operations ADD COLUMN missing_targets_json TEXT;
+ALTER TABLE metadata_operations ADD COLUMN verified_targets_json TEXT;
+CREATE TABLE metadata_operation_history (
+    source_key TEXT NOT NULL,
+    anidb_anime_id INTEGER NOT NULL,
+    claim TEXT PRIMARY KEY,
+    demand_fingerprint TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    request_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state = 'ready'),
+    created_iso TEXT NOT NULL,
+    updated_iso TEXT NOT NULL,
+    attempted_iso TEXT,
+    verification_deadline_iso TEXT,
+    transport_admitted INTEGER NOT NULL,
+    reservation_owned INTEGER NOT NULL,
+    slot_released INTEGER NOT NULL CHECK (slot_released = 1),
+    required_targets_json TEXT NOT NULL,
+    missing_targets_json TEXT NOT NULL,
+    verified_targets_json TEXT NOT NULL
+);
+CREATE INDEX idx_metadata_history_identity
+    ON metadata_operation_history (source_key, anidb_anime_id);
+"""
+
+
+_SCHEMA_SQL: Final[str] = (
+    """
 CREATE TABLE schema_version (
     version INTEGER NOT NULL,
     applied_iso TEXT NOT NULL,
@@ -1216,6 +1329,9 @@ CREATE INDEX idx_sends_file ON sends (shoko_file_id);
 CREATE INDEX idx_baseline_files_identity ON baseline_files (sonarr_series_id, sonarr_file_id);
 CREATE INDEX idx_dashboard_sessions_expiry ON dashboard_sessions (expires_epoch);
 """
+    + _METADATA_SCHEMA_SQL
+    + _METADATA_V9_SCHEMA_SQL
+)
 
 
 def _execute_schema_statements(conn: sqlite3.Connection, script: str) -> None:
@@ -1752,6 +1868,14 @@ def _legacy_request_fingerprint_matches(
     return actual == request_fingerprint
 
 
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    _execute_schema_statements(conn, _METADATA_SCHEMA_SQL)
+
+
+def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    _execute_schema_statements(conn, _METADATA_V9_SCHEMA_SQL)
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
 # v5 adds timestamped reservations; v6 preserves data without inferring campaign ownership.
 # v7 adds immutable send ownership, fail-closed legacy attribution, and monotonic attempt totals.
@@ -1764,6 +1888,8 @@ _MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {
     4: _migrate_v4_to_v5,
     5: _migrate_v5_to_v6,
     6: _migrate_v6_to_v7,
+    7: _migrate_v7_to_v8,
+    8: _migrate_v8_to_v9,
 }
 
 
@@ -1825,6 +1951,76 @@ def _require_iso(value: str, name: str) -> None:
         _parse_iso(value)
     except ValueError as exc:
         raise StateError(f"{name}: not a valid ISO-8601 timestamp: {exc}") from exc
+
+
+def _canonical_metadata_targets(
+    targets: Sequence[MetadataEpisodeIdentity],
+    anime_id: int,
+) -> tuple[MetadataEpisodeIdentity, ...]:
+    for target in targets:
+        if (
+            not isinstance(target, tuple)
+            or len(target) != _METADATA_TARGET_FIELDS
+            or type(target[0]) is not int
+            or target[0] != anime_id
+            or not isinstance(target[1], EpisodeType)
+            or type(target[2]) is not int
+            or target[2] <= 0
+        ):
+            raise StateError(
+                "metadata targets require matching anime, EpisodeType, positive number"
+            )
+    return tuple(sorted(set(targets), key=lambda target: (target[0], target[1].value, target[2])))
+
+
+def _canonical_metadata_demand(
+    required_targets: Sequence[MetadataEpisodeIdentity] | None,
+    missing_targets: Sequence[MetadataEpisodeIdentity] | None,
+    anime_id: int,
+) -> tuple[tuple[MetadataEpisodeIdentity, ...] | None, tuple[MetadataEpisodeIdentity, ...] | None]:
+    required = (
+        None
+        if required_targets is None
+        else _canonical_metadata_targets(required_targets, anime_id)
+    )
+    missing = (
+        None if missing_targets is None else _canonical_metadata_targets(missing_targets, anime_id)
+    )
+    if (required is None) != (missing is None) or (
+        required is not None
+        and (not required or not missing or not set(missing).issubset(required))
+    ):
+        raise StateError("metadata demand requires nonempty required and missing target subsets")
+    return required, missing
+
+
+def _encode_metadata_targets(targets: tuple[MetadataEpisodeIdentity, ...] | None) -> str | None:
+    return (
+        None
+        if targets is None
+        else json.dumps(
+            [(anime, kind.value, number) for anime, kind, number in targets], separators=(",", ":")
+        )
+    )
+
+
+def _decode_metadata_targets(
+    raw: str | None, anime_id: int
+) -> tuple[MetadataEpisodeIdentity, ...] | None:
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("expected target list")
+        targets = []
+        for target in data:
+            if not isinstance(target, list) or len(target) != _METADATA_TARGET_FIELDS:
+                raise ValueError("expected target triple")
+            targets.append((target[0], EpisodeType(target[1]), target[2]))
+        return _canonical_metadata_targets(targets, anime_id)
+    except (TypeError, ValueError) as exc:
+        raise StateError("invalid persisted metadata target coverage") from exc
 
 
 def _clip(detail: str) -> str:
@@ -2078,6 +2274,8 @@ class StateStore:
         self._writes_disabled = False
         self._writes_reason = ""
         self._apply_lock: ApplyProcessLock | None = None
+        # Ephemeral permission only narrows durable admission; restart never restores it.
+        self._metadata_transport_claims: set[str] = set()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         try:
@@ -2381,6 +2579,69 @@ class StateStore:
             )
 
     @_mutation
+    def save_metadata_status_if_current(
+        self,
+        *,
+        key: str,
+        source_key: str,
+        anime_id: int,
+        expected_claim: str | None,
+        expected_document_json: str | None,
+        document_json: str,
+    ) -> bool:
+        """Atomically fence an observational document against generation/source races.
+
+        The lightweight claim query deliberately does not decode another operation
+        against recovery's row budget. No observation grants transport permission.
+        """
+        self._metadata_identity(source_key, anime_id)
+        with self._transaction():
+            if self.get_meta(key) != expected_document_json:
+                return False
+            row = self._conn.execute(
+                "SELECT claim FROM metadata_operations WHERE source_key=? AND anidb_anime_id=?",
+                (source_key, anime_id),
+            ).fetchone()
+            if (None if row is None else _as_str(row[0], "metadata claim")) != expected_claim:
+                return False
+            if not self._metadata_status_source_current_tx(source_key, expected_document_json):
+                return False
+            self._set_meta_tx(key, document_json)
+            return True
+
+    def _metadata_status_source_current_tx(  # noqa: PLR0911 - ordered source fallbacks
+        self, source_key: str, previous_status: str | None
+    ) -> bool:
+        """Use the current saved endpoint, falling back to legacy setup binding."""
+        try:
+            encoded = self.get_meta(META_SERVICE_SETTINGS)
+            settings = {} if encoded is None else json.loads(encoded)
+            if not isinstance(settings, dict):
+                return False
+            url = settings.get("shoko_url")
+            if "shoko_url" in settings and not isinstance(url, str):
+                return False
+            if url is None:
+                encoded = self.get_onboarding_json()
+                onboarding = {} if encoded is None else json.loads(encoded)
+                if not isinstance(onboarding, dict):
+                    return False
+                binding = onboarding.get("binding", {})
+                if not isinstance(binding, dict):
+                    return False
+                url = binding.get("shoko_url")
+            if url is not None:
+                return isinstance(url, str) and metadata_source_key_for_url(url) == source_key
+            # Without any durable endpoint, accept the first source but never let
+            # an unverified different source displace a current status document.
+            if previous_status is None:
+                return True
+            previous = json.loads(previous_status)
+            return isinstance(previous, dict) and previous.get("source_key") == source_key
+        except (ValueError, TypeError, RecursionError):
+            return False
+
+    @_mutation
     def clear_meta(self, key: str) -> None:
         """Delete one meta key (bounded terminal-state bookkeeping cleanup; no-op if absent)."""
         with self._transaction():
@@ -2644,10 +2905,10 @@ class StateStore:
         expected_json: str | None,
         document_json: str,
         *,
-        connection_changed: bool,
+        authorization_changed: bool,
         iso: str,
     ) -> bool:
-        """Publish validated preferences and their connection review hold atomically.
+        """Publish validated preferences and their authorization review hold atomically.
 
         The controller supplies the exact raw snapshot used to validate the form,
         including None when runtime defaults supplied the initial preferences.
@@ -2656,10 +2917,39 @@ class StateStore:
         with self._transaction():
             if self.get_meta(META_SERVICE_SETTINGS) != expected_json:
                 return False
-            if connection_changed:
+            if authorization_changed:
                 self._pause_service_for_review_tx("setup_changed", iso)
             self._set_meta_tx(META_SERVICE_SETTINGS, document_json)
         return True
+
+    @_mutation
+    def save_service_scope_selection(
+        self, draft_json: str, *, expected_authorization_revision: str | None, iso: str
+    ) -> None:
+        """Atomically replace user scope intent and revoke older setup forms."""
+        _require_iso(iso, "onboarding.updated_iso")
+        roots = json.loads(draft_json)
+        if (
+            not isinstance(roots, list)
+            or not roots
+            or not all(isinstance(root, str) and root for root in roots)
+        ):
+            raise StateError("Saved library selection is invalid.")
+        with self._transaction():
+            if self.get_service_authorization_revision() != expected_authorization_revision:
+                raise StateError("Setup choices changed; review setup again.")
+            self._pause_service_for_review_tx("setup_changed", iso)
+            self._set_meta_tx(META_SERVICE_DRAFT_ROOTS, draft_json)
+
+    def get_service_authorization_revision(self) -> str | None:
+        """Private generation of authorization intent and newly observed hard safety holds."""
+        value = self.get_meta(META_SERVICE_AUTHORIZATION_REVISION)
+        if value is not None and (
+            len(value) != SERVICE_AUTHORIZATION_REVISION_CHARS
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise StateError("service authorization revision is malformed")
+        return value
 
     def get_dashboard_account(self) -> DashboardAccount | None:
         row = self._conn.execute(
@@ -3140,7 +3430,16 @@ class StateStore:
             self._save_onboarding_json_tx(document_json, iso)
 
     @_mutation
-    def confirm_onboarding_json(self, document_json: str, iso: str) -> None:
+    def confirm_onboarding_json(
+        self,
+        document_json: str,
+        iso: str,
+        *,
+        expected_settings_json: str | None = None,
+        check_settings: bool = False,
+        expected_authorization_revision: str | None = None,
+        expected_draft_json: str | None = None,
+    ) -> None:
         """Publish validated consent and release its previous review hold atomically.
 
         Only the onboarding manager calls this after validating explicit confirmation.
@@ -3148,7 +3447,18 @@ class StateStore:
         Read pause ownership under the writer lock so an existing user pause survives.
         """
         with self._transaction():
+            if check_settings and (
+                self.get_meta(META_SERVICE_SETTINGS) != expected_settings_json
+                or self.get_service_authorization_revision() != expected_authorization_revision
+                or self.get_meta(META_SERVICE_DRAFT_ROOTS) != expected_draft_json
+            ):
+                raise StateError("Service settings changed during setup; review setup again.")
             self._save_onboarding_json_tx(document_json, iso)
+            if check_settings:
+                self._conn.execute("DELETE FROM meta WHERE key = ?", (META_SERVICE_DRAFT_ROOTS,))
+                # Consume this reviewed intent, including mapping choices submitted
+                # directly with consent, so a competing form cannot overwrite it.
+                self._set_meta_tx(META_SERVICE_AUTHORIZATION_REVISION, uuid.uuid4().hex)
             self._conn.execute(
                 "DELETE FROM meta WHERE key = ?", (META_ONBOARDING_RECONFIRMATION_REQUIRED,)
             )
@@ -3194,6 +3504,46 @@ class StateStore:
         return True
 
     @_mutation
+    def observe_onboarding_facts(
+        self,
+        expected_document_json: str,
+        *,
+        expected_authorization_revision: str | None,
+        channel: str,
+        fingerprint: str,
+        reason: str | None,
+        iso: str,
+    ) -> bool:
+        """Fence a bounded, credential-free observation against its pre-I/O snapshot.
+
+        Repeated facts are idempotent. Recording intervening safe/different facts
+        means a returning hazard is new even when its reason is unchanged. Both
+        positive and negative observations reject stale consent or generations.
+        """
+        if channel not in {"environment", "folders", "evaluation"}:
+            raise StateError("unsupported onboarding observation channel")
+        _require_hex64(fingerprint, "onboarding observation fingerprint")
+        if reason is not None and reason not in SYSTEM_RECONFIRMATION_PAUSE_REASONS:
+            raise StateError("unsupported observed onboarding review reason")
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            if (
+                self.get_onboarding_json() != expected_document_json
+                or self.get_service_authorization_revision() != expected_authorization_revision
+            ):
+                return False
+            key = "onboarding_observation_v1:" + channel
+            identity = hashlib.sha256(
+                (expected_document_json + "\n" + fingerprint + "\n" + str(reason)).encode()
+            ).hexdigest()
+            if self.get_meta(key) == identity:
+                return True
+            self._set_meta_tx(key, identity)
+            if reason is not None:
+                self._pause_service_for_review_tx(reason, iso)
+        return True
+
+    @_mutation
     def pause_service_for_review(self, reason: str, iso: str) -> None:
         """Latch a system hold without replacing an intentional user pause."""
         if reason not in SYSTEM_PAUSE_REASONS:
@@ -3209,6 +3559,10 @@ class StateStore:
         existing_hard_hold = (
             paused and existing_reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS
         ) or self.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None
+        if hard_hold:
+            # Every new hard observation/explicit intent invalidates forms which
+            # preceded it, even if a hold with the same reason was already set.
+            self._set_meta_tx(META_SERVICE_AUTHORIZATION_REVISION, uuid.uuid4().hex)
         if hard_hold or existing_hard_hold:
             self._set_meta_tx(META_ONBOARDING_RECONFIRMATION_REQUIRED, "1")
         if (
@@ -3963,6 +4317,7 @@ class StateStore:
     def release_slot(self, cycle_key: str, iso: str, *, episode_jobs: int = 1) -> None:
         """Release an anonymous slot reserved by :meth:`try_reserve_slot` (no send row).
 
+        Metadata-owned slots are released only by verified readiness or proven rejection.
         Send-bound slots are owned by the single-release funnels (``record_verification``,
         ``record_send_outcome``, ``void_prepared_send``, ``resolve_send``),
         which mark the send row ``slot_released``. A raw release here that would drive
@@ -3974,7 +4329,7 @@ class StateStore:
         _require_iso(iso, "iso")
         with self._transaction():
             self._ensure_global_budget_tx()
-            live_sends, live_jobs = self.live_send_counts()
+            live_sends, live_jobs = self._owned_pending_counts_tx()
             row = self._conn.execute(
                 "SELECT pending_file_requests, pending_episode_jobs FROM budgets"
                 " WHERE window_key = ?",
@@ -3985,10 +4340,10 @@ class StateStore:
             jobs_after = _as_int(row[1], "pending_episode_jobs") - episode_jobs
             if files_after < live_sends or jobs_after < live_jobs:
                 raise StateError(
-                    f"release_slot refused: live unreleased sends ({live_sends} files / "
-                    f"{live_jobs} jobs) outnumber the release; send-bound slots are released "
+                    f"release_slot refused: live owned sends/metadata ({live_sends} requests / "
+                    f"{live_jobs} jobs) outnumber the release; owned slots are released "
                     "only through record_verification / record_send_outcome / "
-                    "void_prepared_send / resolve_send (F1 ledger guard)"
+                    "void_prepared_send / resolve_send / record_metadata_operation (ledger guard)"
                 )
             self._adjust_pending_tx(-1, -episode_jobs)
 
@@ -4932,6 +5287,548 @@ class StateStore:
         assert row is not None
         return _as_int(row[0], "live_held_sends"), _as_int(row[1], "live_held_slots")
 
+    def _owned_pending_counts_tx(self) -> tuple[int, int]:
+        files, jobs = self.live_send_counts()
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM metadata_operations"
+            " WHERE reservation_owned = 1 AND slot_released = 0"
+        ).fetchone()
+        assert row is not None
+        owned = _as_int(row[0], "metadata reservations")
+        return files + owned, jobs + owned
+
+    @staticmethod
+    def _metadata_identity(source_key: str, anidb_anime_id: int) -> None:
+        _require_hex64(source_key, "source_key")
+        if type(anidb_anime_id) is not int or anidb_anime_id <= 0:
+            raise StateError("anidb_anime_id must be a positive integer")
+
+    def get_metadata_operation(
+        self, source_key: str, anidb_anime_id: int
+    ) -> MetadataOperation | None:
+        self._metadata_identity(source_key, anidb_anime_id)
+        row = self._conn.execute(
+            "SELECT source_key, anidb_anime_id, claim, demand_fingerprint,"
+            " request_fingerprint, request_version, state, created_iso, updated_iso,"
+            " attempted_iso, verification_deadline_iso, transport_admitted,"
+            " reservation_owned, slot_released, required_targets_json, missing_targets_json,"
+            " verified_targets_json FROM metadata_operations"
+            " WHERE source_key = ? AND anidb_anime_id = ?",
+            (source_key, anidb_anime_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return MetadataOperation(
+            source_key=_as_str(row[0], "source_key"),
+            anidb_anime_id=_as_int(row[1], "anidb_anime_id"),
+            claim=_as_str(row[2], "claim"),
+            demand_fingerprint=_as_str(row[3], "demand_fingerprint"),
+            request_fingerprint=_as_str(row[4], "request_fingerprint"),
+            request_version=_as_int(row[5], "request_version"),
+            state=MetadataOperationState(_as_str(row[6], "metadata state")),
+            created_iso=_as_str(row[7], "created_iso"),
+            updated_iso=_as_str(row[8], "updated_iso"),
+            attempted_iso=_as_optional_str(row[9]),
+            verification_deadline_iso=_as_optional_str(row[10]),
+            transport_admitted=bool(row[11]),
+            reservation_owned=bool(row[12]),
+            slot_released=bool(row[13]),
+            required_targets=_decode_metadata_targets(_as_optional_str(row[14]), anidb_anime_id),
+            missing_targets=_decode_metadata_targets(_as_optional_str(row[15]), anidb_anime_id),
+            verified_required_targets=_decode_metadata_targets(
+                _as_optional_str(row[16]), anidb_anime_id
+            ),
+        )
+
+    def metadata_operations(self, source_key: str) -> tuple[MetadataOperation, ...]:
+        """Read-only recovery inventory, including terminal replay-protection rows."""
+        result = (
+            self.get_metadata_operation(source_key, anime_id)
+            for anime_id in self.metadata_operation_ids(source_key)
+        )
+        return tuple(operation for operation in result if operation is not None)
+
+    def metadata_operation_ids(self, source_key: str) -> tuple[int, ...]:
+        """Ordered recovery identities; decode each row separately to isolate corruption."""
+        _require_hex64(source_key, "source_key")
+        ids = self._conn.execute(
+            "SELECT anidb_anime_id FROM metadata_operations WHERE source_key=?"
+            " ORDER BY anidb_anime_id",
+            (source_key,),
+        ).fetchall()
+        return tuple(_as_int(row[0], "anidb_anime_id") for row in ids)
+
+    def _recovery_batch(
+        self, query: LiteralString, parameters: tuple[object, ...], *, after_id: int, limit: int
+    ) -> RecoveryBatch:
+        """Rotate pending SQL identities; LIMIT applies before any payload decoding.
+
+        Queries supply only id and immutable ordering anchor. If the cursor is no
+        longer present, rotation resumes from the oldest pending identity.
+        """
+        if type(limit) is not int or limit < 0:
+            raise ValueError("recovery limit must be nonnegative")
+        if limit == 0:
+            total_row = self._conn.execute(
+                f"SELECT COUNT(*) FROM ({query}) WHERE pending",  # noqa: S608 -- private literal SQL only
+                parameters,
+            ).fetchone()
+            return RecoveryBatch((), _as_int(total_row[0], "pending recovery count"))
+        rows = self._conn.execute(
+            f"WITH candidates AS ({query}),"  # noqa: S608 -- private literal SQL only
+            " anchor AS (SELECT sort_key, id FROM candidates WHERE id=?)"
+            " SELECT id,COUNT(*) OVER() FROM candidates WHERE pending"
+            " ORDER BY CASE WHEN (sort_key,id) <="
+            " (SELECT sort_key,id FROM anchor) THEN 1 ELSE 0 END, sort_key,id LIMIT ?",
+            (*parameters, after_id, limit),
+        ).fetchall()
+        # Count and batch share one SQLite snapshot, including concurrent state handles.
+        total = _as_int(rows[0][1], "pending recovery count") if rows else 0
+        return RecoveryBatch(tuple(_as_int(row[0], "recovery id") for row in rows), total)
+
+    def metadata_recovery_batch(
+        self, source_key: str, *, after_id: int, limit: int
+    ) -> RecoveryBatch:
+        """Keep terminal replay history out of the bounded recovery decode allowance."""
+        _require_hex64(source_key, "source_key")
+        return self._recovery_batch(
+            "SELECT anidb_anime_id AS id, anidb_anime_id AS sort_key,"
+            " state NOT IN ('ready','definitely_rejected') AS pending"
+            " FROM metadata_operations WHERE source_key=?"
+            " AND (state NOT IN ('ready','definitely_rejected') OR anidb_anime_id=?)",
+            (source_key, after_id),
+            after_id=after_id,
+            limit=limit,
+        )
+
+    def file_recovery_batch(self, *, after_id: int, limit: int) -> RecoveryBatch:
+        """Global read-only recovery, retaining campaign rows and oldest-send order."""
+        return self._recovery_batch(
+            "SELECT shoko_file_id AS id, COALESCE((SELECT attempted_iso FROM sends"
+            " WHERE sends.shoko_file_id=files.shoko_file_id AND outcome IN"
+            " ('prepared','attempted','accepted_unverified','ambiguous_send')"
+            " ORDER BY send_id DESC LIMIT 1),updated_iso) AS sort_key,"
+            " 1 AS pending FROM files WHERE state IN"
+            " ('prepared_not_sent','request_may_have_been_sent','indeterminate_write')"
+            " OR (state IN ('verifying','partial','conflict') AND EXISTS"
+            " (SELECT 1 FROM sends WHERE sends.shoko_file_id=files.shoko_file_id"
+            " AND outcome IN ('prepared','attempted','accepted_unverified','ambiguous_send')))",
+            (),
+            after_id=after_id,
+            limit=limit,
+        )
+
+    def recovery_re_evaluate_count(self) -> int:
+        """Summary only: reconcile consumes these rows without recovery decoding."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM files WHERE state NOT IN"
+            " ('prepared_not_sent','request_may_have_been_sent','indeterminate_write',"
+            " 'blocked_safety','verified','verifying','partial','conflict')"
+            " OR (state IN ('verifying','partial','conflict') AND NOT EXISTS"
+            " (SELECT 1 FROM sends WHERE sends.shoko_file_id=files.shoko_file_id"
+            " AND outcome IN ('prepared','attempted','accepted_unverified','ambiguous_send')))"
+        ).fetchone()
+        return _as_int(row[0], "re-evaluate count")
+
+    @_mutation
+    def observe_external_metadata_operation(
+        self,
+        source_key: str,
+        anidb_anime_id: int,
+        *,
+        demand_fingerprint: str,
+        request_fingerprint: str,
+        request_version: int,
+        iso: str,
+        required_targets: Sequence[MetadataEpisodeIdentity] | None = None,
+        missing_targets: Sequence[MetadataEpisodeIdentity] | None = None,
+    ) -> MetadataOperation:
+        """Track somebody else's queued work without claiming our transport/budget.
+
+        Typed demand uses the same canonical validation and verified READY coverage
+        as own requests, allowing later genuinely new episodes after external completion.
+        Existing own history is never replaced. If this external job later vanishes
+        without readiness, the caller may explicitly adopt its exact claim in prepare
+        after fresh queue/safety checks. State does not infer queue absence or readiness.
+        """
+        self._metadata_identity(source_key, anidb_anime_id)
+        _require_hex64(demand_fingerprint, "demand_fingerprint")
+        _require_hex64(request_fingerprint, "request_fingerprint")
+        _require_iso(iso, "iso")
+        if type(request_version) is not int or request_version <= 0:
+            raise StateError("request_version must be a positive integer")
+        required, missing = _canonical_metadata_demand(
+            required_targets, missing_targets, anidb_anime_id
+        )
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO metadata_operations (source_key, anidb_anime_id, claim,"
+                " demand_fingerprint, request_fingerprint, request_version, state,"
+                " created_iso, updated_iso, reservation_owned, slot_released,"
+                " required_targets_json, missing_targets_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)"
+                " ON CONFLICT (source_key, anidb_anime_id) DO NOTHING",
+                (
+                    source_key,
+                    anidb_anime_id,
+                    uuid.uuid4().hex,
+                    demand_fingerprint,
+                    request_fingerprint,
+                    request_version,
+                    MetadataOperationState.ACCEPTED_WAITING.value,
+                    iso,
+                    iso,
+                    _encode_metadata_targets(required),
+                    _encode_metadata_targets(missing),
+                ),
+            )
+            result = self.get_metadata_operation(source_key, anidb_anime_id)
+            assert result is not None
+            return result
+
+    def _metadata_owner_tx(self, operation: MetadataOperation) -> MetadataOperation:
+        current = self.get_metadata_operation(operation.source_key, operation.anidb_anime_id)
+        if current is None or current.claim != operation.claim:
+            raise StateError("stale metadata operation claim")
+        return current
+
+    def _metadata_consent_tx(self, expected_document_json: str | None) -> None:
+        if expected_document_json is not None:
+            row = self._conn.execute(
+                "SELECT document_json, paused FROM onboarding WHERE singleton = 1"
+            ).fetchone()
+            if row is None or row[0] != expected_document_json or row[1]:
+                raise StateError("metadata operation authorization changed or paused")
+
+    def _metadata_ready_rearm_tx(
+        self,
+        prior: MetadataOperation | None,
+        after_ready_claim: str | None,
+        missing: tuple[MetadataEpisodeIdentity, ...] | None,
+    ) -> bool:
+        if after_ready_claim is None or prior is None:
+            return False
+        if (
+            prior.claim != after_ready_claim
+            or prior.state != MetadataOperationState.READY
+            or not prior.slot_released
+        ):
+            return False
+        if prior.verified_required_targets is None or prior.required_targets is None:
+            raise StateError("legacy READY metadata coverage is unknown; manual attention required")
+        if not missing:
+            return False
+        covered = set(prior.verified_required_targets)
+        for row in self._conn.execute(
+            "SELECT verified_targets_json FROM metadata_operation_history"
+            " WHERE source_key=? AND anidb_anime_id=?",
+            (prior.source_key, prior.anidb_anime_id),
+        ):
+            targets = _decode_metadata_targets(_as_optional_str(row[0]), prior.anidb_anime_id)
+            if targets is None:
+                raise StateError("historical READY metadata coverage is unknown")
+            covered.update(targets)
+        return bool(set(missing) - covered)
+
+    @_mutation
+    def prepare_metadata_operation(
+        self,
+        source_key: str,
+        anidb_anime_id: int,
+        *,
+        demand_fingerprint: str,
+        request_fingerprint: str,
+        request_version: int,
+        cycle_key: str,
+        iso: str,
+        expected_document_json: str | None = None,
+        retry_unsent_claim: str | None = None,
+        adopt_external_claim: str | None = None,
+        after_ready_claim: str | None = None,
+        required_targets: Sequence[MetadataEpisodeIdentity] | None = None,
+        missing_targets: Sequence[MetadataEpisodeIdentity] | None = None,
+    ) -> MetadataOperation | BudgetRefusal:
+        """Reserve one request/one parent job, without inventing a file send.
+
+        The caller proves current scope/opt-in/physical safety and queue absence before
+        preparing. An explicit retry is possible only for a proven zero-delivery row
+        and must name its prior claim. A later verified-ready generation additionally
+        requires exact after_ready_claim and a genuinely new missing episode outside
+        accumulated verified coverage. File/demand/consent changes alone do not qualify.
+        Caller supplies fresh verified support and complete queue absence; no external
+        I/O occurs in this transaction. Consent never changes operation identity.
+        """
+        self._metadata_identity(source_key, anidb_anime_id)
+        _require_hex64(demand_fingerprint, "demand_fingerprint")
+        _require_hex64(request_fingerprint, "request_fingerprint")
+        _require_iso(iso, "iso")
+        self._require_cycle_key(cycle_key)
+        if type(request_version) is not int or request_version <= 0:
+            raise StateError("request_version must be a positive integer")
+        required, missing = _canonical_metadata_demand(
+            required_targets, missing_targets, anidb_anime_id
+        )
+        with self._transaction():
+            self._metadata_consent_tx(expected_document_json)
+            prior = self.get_metadata_operation(source_key, anidb_anime_id)
+            ready_rearm = self._metadata_ready_rearm_tx(prior, after_ready_claim, missing)
+            if (
+                prior is not None
+                and not ready_rearm
+                and not (
+                    prior.state == MetadataOperationState.DEFINITELY_REJECTED
+                    and prior.slot_released
+                    and retry_unsent_claim == prior.claim
+                    and (
+                        prior.required_targets is None
+                        or (required == prior.required_targets and missing == prior.missing_targets)
+                    )
+                )
+                and not (
+                    not prior.reservation_owned
+                    and prior.attempted_iso is None
+                    and prior.state == MetadataOperationState.ACCEPTED_WAITING
+                    and adopt_external_claim == prior.claim
+                )
+            ):
+                return BudgetRefusal(False, "metadata_operation_exists", "anime operation retained")
+            decision = self._reserve_tx(cycle_key, iso, expected_episode_jobs=1)
+            if isinstance(decision, BudgetRefusal):
+                return decision
+            if ready_rearm:
+                assert prior is not None
+                self._conn.execute(
+                    "INSERT INTO metadata_operation_history SELECT * FROM metadata_operations"
+                    " WHERE source_key=? AND anidb_anime_id=? AND claim=?",
+                    (source_key, anidb_anime_id, prior.claim),
+                )
+            self._conn.execute(
+                "INSERT INTO metadata_operations (source_key, anidb_anime_id, claim,"
+                " demand_fingerprint, request_fingerprint, request_version, state,"
+                " created_iso, updated_iso, reservation_owned,"
+                " required_targets_json, missing_targets_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)"
+                " ON CONFLICT (source_key, anidb_anime_id) DO UPDATE SET"
+                " claim=excluded.claim, demand_fingerprint=excluded.demand_fingerprint,"
+                " request_fingerprint=excluded.request_fingerprint,"
+                " request_version=excluded.request_version, state=excluded.state,"
+                " updated_iso=excluded.updated_iso, attempted_iso=NULL,"
+                " verification_deadline_iso=NULL, transport_admitted=0,"
+                " reservation_owned=1, slot_released=0,"
+                " required_targets_json=excluded.required_targets_json,"
+                " missing_targets_json=excluded.missing_targets_json, verified_targets_json=NULL",
+                (
+                    source_key,
+                    anidb_anime_id,
+                    uuid.uuid4().hex,
+                    demand_fingerprint,
+                    request_fingerprint,
+                    request_version,
+                    MetadataOperationState.PREPARED.value,
+                    iso,
+                    iso,
+                    _encode_metadata_targets(required),
+                    _encode_metadata_targets(missing),
+                ),
+            )
+            result = self.get_metadata_operation(source_key, anidb_anime_id)
+            assert result is not None
+            return result
+
+    @_mutation
+    def mark_metadata_possibly_delivered(
+        self,
+        operation: MetadataOperation,
+        *,
+        iso: str,
+        verification_deadline_iso: str,
+        expected_document_json: str | None = None,
+    ) -> MetadataOperation:
+        """Commit before HTTP. A crash after this boundary must only inspect/verify."""
+        _require_iso(iso, "iso")
+        _require_iso(verification_deadline_iso, "verification_deadline_iso")
+        if _parse_iso(verification_deadline_iso) <= _parse_iso(iso):
+            raise StateError("metadata verification deadline must follow attempt")
+        with self._transaction():
+            self._metadata_consent_tx(expected_document_json)
+            current = self._metadata_owner_tx(operation)
+            if current.state != MetadataOperationState.PREPARED:
+                raise StateError("metadata operation is not prepared")
+            self._conn.execute(
+                "UPDATE metadata_operations SET state=?, attempted_iso=?, updated_iso=?,"
+                " verification_deadline_iso=? WHERE source_key=? AND anidb_anime_id=?",
+                (
+                    MetadataOperationState.POSSIBLY_DELIVERED.value,
+                    iso,
+                    iso,
+                    verification_deadline_iso,
+                    operation.source_key,
+                    operation.anidb_anime_id,
+                ),
+            )
+            result = self.get_metadata_operation(operation.source_key, operation.anidb_anime_id)
+            assert result is not None
+        self._metadata_transport_claims.add(result.claim)
+        return result
+
+    @_mutation
+    def admit_metadata_transport(
+        self, operation: MetadataOperation, *, expected_document_json: str | None = None
+    ) -> None:
+        """One-shot transport fence after durable mark; no external I/O in transaction.
+
+        Only the caller that successfully returns may invoke HTTP, immediately. A crash
+        after admission remains possibly delivered, never a reason to replay. Later
+        write stops apply to subsequent operations, as for file transport admission.
+        """
+        if operation.claim not in self._metadata_transport_claims:
+            raise StateError("metadata transport requires this handle's successful durable mark")
+        with self._transaction():
+            self._metadata_consent_tx(expected_document_json)
+            current = self._metadata_owner_tx(operation)
+            if (
+                current.state != MetadataOperationState.POSSIBLY_DELIVERED
+                or current.transport_admitted
+            ):
+                raise StateError("metadata transport already admitted or not durably marked")
+            self._conn.execute(
+                "UPDATE metadata_operations SET transport_admitted=1"
+                " WHERE source_key=? AND anidb_anime_id=?",
+                (operation.source_key, operation.anidb_anime_id),
+            )
+        self._metadata_transport_claims.discard(operation.claim)
+
+    def _release_metadata_slot_tx(self, operation: MetadataOperation) -> None:
+        if operation.reservation_owned and not operation.slot_released:
+            self._adjust_pending_tx(-1, -1)
+        self._conn.execute(
+            "UPDATE metadata_operations SET slot_released=1"
+            " WHERE source_key=? AND anidb_anime_id=?",
+            (operation.source_key, operation.anidb_anime_id),
+        )
+
+    def _cancel_prepared_metadata_tx(self, operation: MetadataOperation, iso: str) -> None:
+        """Cancel only the exact still-unsent claim under the caller's writer lock."""
+        current = self._metadata_owner_tx(operation)
+        if current.state != MetadataOperationState.PREPARED:
+            raise StateError("prepared cleanup refuses possibly delivered metadata")
+        self._release_metadata_slot_tx(current)
+        self._conn.execute(
+            "UPDATE metadata_operations SET state=?, updated_iso=?"
+            " WHERE source_key=? AND anidb_anime_id=?",
+            (
+                MetadataOperationState.DEFINITELY_REJECTED.value,
+                iso,
+                current.source_key,
+                current.anidb_anime_id,
+            ),
+        )
+
+    @_mutation
+    def cancel_prepared_metadata_operation(self, operation: MetadataOperation, *, iso: str) -> None:
+        """Release a definitely-unsent claim, refusing concurrent marking/admission.
+
+        A PREPARED snapshot is insufficient proof: recheck the current state and
+        exact claim atomically before releasing capacity or allowing an unsent retry.
+        """
+        _require_iso(iso, "iso")
+        with self._transaction():
+            self._cancel_prepared_metadata_tx(operation, iso)
+
+    def void_prepared_metadata_after_write_stop(
+        self,
+        operation: MetadataOperation,
+        *,
+        iso: str,
+    ) -> None:
+        """Stop-only cleanup, like file sends: never void possible delivery or clear stop.
+
+        This deliberately bypasses the ordinary mutation guard only to release a
+        durably prepared, definitely unsent row after a stop prevents its mark.
+        """
+        if not self.writes_disabled:
+            raise StateError("stop-only metadata cleanup requires a latched write stop")
+        _require_iso(iso, "iso")
+        try:
+            self._begin_immediate_tx(None)
+            try:
+                self._cancel_prepared_metadata_tx(operation, iso)
+            except BaseException:
+                self._rollback_tx()
+                raise
+            self._commit_tx()
+        except sqlite3.Error as exc:
+            raise StateError("stop-only metadata cleanup could not be persisted") from exc
+
+    @_mutation
+    def record_metadata_operation(
+        self,
+        operation: MetadataOperation,
+        state: MetadataOperationState,
+        *,
+        iso: str,
+        verified_required_targets: Sequence[MetadataEpisodeIdentity] | None = None,
+    ) -> MetadataOperation:
+        """Observe completion or hold uncertainty. Rejection means proven zero delivery.
+
+        READY must mean verified required metadata is present, not merely HTTP success.
+        NEEDS_ATTENTION retains owned capacity, matching uncertain file-send policy.
+        """
+        _require_iso(iso, "iso")
+        with self._transaction():
+            current = self._metadata_owner_tx(operation)
+            if state == current.state:
+                return current
+            if state == MetadataOperationState.ACCEPTED_WAITING and not current.transport_admitted:
+                raise StateError("own metadata request was not admitted to transport")
+            allowed = {
+                MetadataOperationState.PREPARED: {
+                    MetadataOperationState.DEFINITELY_REJECTED,
+                    MetadataOperationState.READY,
+                    MetadataOperationState.NEEDS_ATTENTION,
+                },
+                MetadataOperationState.POSSIBLY_DELIVERED: {
+                    MetadataOperationState.ACCEPTED_WAITING,
+                    MetadataOperationState.READY,
+                    MetadataOperationState.DEFINITELY_REJECTED,
+                    MetadataOperationState.NEEDS_ATTENTION,
+                },
+                MetadataOperationState.ACCEPTED_WAITING: {
+                    MetadataOperationState.READY,
+                    MetadataOperationState.NEEDS_ATTENTION,
+                },
+                MetadataOperationState.NEEDS_ATTENTION: {MetadataOperationState.READY},
+            }
+            if state not in allowed.get(current.state, set()):
+                raise StateError("invalid metadata operation transition")
+            verified = None
+            if state == MetadataOperationState.READY and current.required_targets is not None:
+                if verified_required_targets is None:
+                    raise StateError("READY requires verified required metadata coverage")
+                verified = _canonical_metadata_targets(
+                    verified_required_targets, current.anidb_anime_id
+                )
+                if verified != current.required_targets:
+                    raise StateError("READY requires exactly verified required metadata coverage")
+            elif verified_required_targets is not None:
+                raise StateError("verified coverage is only valid for typed READY metadata")
+            if state in {MetadataOperationState.READY, MetadataOperationState.DEFINITELY_REJECTED}:
+                self._release_metadata_slot_tx(current)
+            self._conn.execute(
+                "UPDATE metadata_operations SET state=?, updated_iso=?, verified_targets_json=?"
+                " WHERE source_key=? AND anidb_anime_id=?",
+                (
+                    state.value,
+                    iso,
+                    _encode_metadata_targets(verified),
+                    current.source_key,
+                    current.anidb_anime_id,
+                ),
+            )
+            result = self.get_metadata_operation(current.source_key, current.anidb_anime_id)
+            assert result is not None
+            return result
+
     # -------------------------------------------------------------- recovery
 
     def recover_after_restart(self) -> RecoveryPlan:
@@ -5328,6 +6225,23 @@ class StateStore:
     def apply_lock_path(self) -> Path:
         """The OS advisory lock file path (sibling of the state DB)."""
         return self.path.parent / APPLY_LOCK_FILENAME
+
+    def owns_apply_ownership(self, pid: int, now_iso: str) -> bool:
+        """Read-only proof of this handle's live OS lock and matching current lease.
+
+        A persisted PID/lease alone is not ownership. Inherited handles after a fork
+        cannot grant the child permission to send on its parent's lock.
+        """
+        lock = self._apply_lock
+        holder = self.lock_holder()
+        return (
+            lock is not None
+            and lock.held
+            and lock.owner_process == os.getpid()
+            and holder is not None
+            and holder.owner_pid == pid
+            and _parse_iso(holder.lease_expires_iso) > _parse_iso(now_iso)
+        )
 
     def _process_lock(self) -> ApplyProcessLock:
         lock = self._apply_lock

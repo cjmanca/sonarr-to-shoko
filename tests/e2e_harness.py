@@ -28,6 +28,7 @@ from typing import Any, cast
 
 import hash_fixtures as hf
 import httpx
+import queue_fixtures as qf
 import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import cli
@@ -313,6 +314,7 @@ class ShokoStub:
         routes: dict[str, Callable[[], httpx.Response]] = {
             "/api/v3/ImportFolder": lambda: self._folders(request),
             "/api/v3/Queue": lambda: self._queue(request),
+            "/api/v3/Queue/Items": lambda: self._queue_items(request),
             "/api/v3/File": lambda: self._listing(request),
         }
         if path in routes:
@@ -343,7 +345,18 @@ class ShokoStub:
         waiting, blocked, total = self.queue
         return httpx.Response(
             200,
-            json={"WaitingCount": waiting, "BlockedCount": blocked, "TotalCount": total},
+            json=qf.summary(qf.unrelated(waiting, blocked, total)),
+            request=request,
+        )
+
+    def _queue_items(self, request: httpx.Request) -> httpx.Response:
+        items = qf.unrelated(*self.queue)
+        page = int(request.url.params.get("page", "1"))
+        size = int(request.url.params["pageSize"])
+        assert size > 0
+        return httpx.Response(
+            200,
+            json={"Total": len(items), "List": items[(page - 1) * size : page * size]},
             request=request,
         )
 

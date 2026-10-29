@@ -44,6 +44,7 @@ def _defaults(bootstrap: BootstrapSettings) -> dict[str, Any]:
         "read_seconds": sync_doc.pop("read_timeout_seconds"),
     }
     return {
+        "allow_missing_metadata_refresh": False,
         "sonarr_url": bootstrap.sonarr_url,
         "shoko_url": bootstrap.shoko_url,
         "sync": sync_doc,
@@ -54,7 +55,18 @@ def _defaults(bootstrap: BootstrapSettings) -> dict[str, Any]:
 
 
 def _validate(document: dict[str, Any]) -> dict[str, Any]:
-    if set(document) != {"sonarr_url", "shoko_url", "sync", "mappings", "safety", "campaign"}:
+    document.setdefault("allow_missing_metadata_refresh", False)
+    if not isinstance(document["allow_missing_metadata_refresh"], bool):
+        raise ConfigError("allow_missing_metadata_refresh must be a boolean.")
+    if set(document) != {
+        "allow_missing_metadata_refresh",
+        "sonarr_url",
+        "shoko_url",
+        "sync",
+        "mappings",
+        "safety",
+        "campaign",
+    }:
         raise ConfigError("Unsupported service settings fields.")
     for name in ("sonarr_url", "shoko_url"):
         document[name] = validate_base_url(document[name], name)
@@ -160,13 +172,14 @@ class ServiceSettingsController:
             _digest(document),
             "Restart the container to use the saved connection URLs, then confirm setup."
             if pending
-            else "Settings take effect on the next service check. URL changes need a restart.",
+            else "Settings take effect on the next service check.",
             str(self.bootstrap.database_path),
             self.bootstrap.secret_env_vars,
             () if record is None else record.binding.roots,
             ()
             if record is None
             else tuple((item.sonarr, item.shoko) for item in record.binding.path_mappings),
+            allow_missing_metadata_refresh=document["allow_missing_metadata_refresh"],
         )
 
     def save(self, form: Mapping[str, str]) -> str:
@@ -196,8 +209,11 @@ class ServiceSettingsController:
                 raise ConfigError(
                     "Use the normal controls for the displayed timing and budget fields."
                 )
+            if form.get("allow_missing_metadata_refresh", "") not in ("", "1"):
+                raise ConfigError("Invalid metadata retrieval choice.")
             document = {
                 **advanced,
+                "allow_missing_metadata_refresh": form.get("allow_missing_metadata_refresh") == "1",
                 "sonarr_url": form.get("sonarr_url", ""),
                 "shoko_url": form.get("shoko_url", ""),
             }
@@ -209,16 +225,30 @@ class ServiceSettingsController:
                 if not store.save_service_settings_if_current(
                     expected_json,
                     json.dumps(document, sort_keys=True),
-                    connection_changed=any(
-                        document[name] != current[name] for name in ("sonarr_url", "shoko_url")
-                    ),
+                    authorization_changed=(
+                        document["allow_missing_metadata_refresh"]
+                        != current["allow_missing_metadata_refresh"]
+                    )
+                    or any(document[name] != current[name] for name in ("sonarr_url", "shoko_url")),
                     iso=datetime.now(UTC).isoformat(),
                 ):
                     raise ConfigError(
                         "Settings changed in another window. Review the current values."
                     )
             self.wake()
-            return "Settings saved. " + self.view().message
+            changed = (
+                document["allow_missing_metadata_refresh"]
+                != current["allow_missing_metadata_refresh"]
+            )
+            return (
+                "Settings saved. "
+                + (
+                    "Confirm setup again for the changed metadata retrieval choice. "
+                    if changed
+                    else ""
+                )
+                + self.view().message
+            )
         except ConfigError as exc:
             return f"Settings were not saved. {exc}"
         except (ValueError, TypeError, yaml.YAMLError):

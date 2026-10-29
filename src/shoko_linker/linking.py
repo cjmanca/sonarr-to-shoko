@@ -42,6 +42,8 @@ endpoints are never called.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -53,12 +55,19 @@ import httpx
 
 from .config import Settings
 from .errors import ConfigError, HttpPolicyError, PathError
-from .http import ApiEndpoint, resolve_and_send
+from .http import (
+    ApiEndpoint,
+    BoundedJsonError,
+    get_bounded_json,
+    read_bounded_json,
+    resolve_and_send,
+)
 from .logging_setup import redact
 from .mappings import EpisodeType, MappingIndex, ResolutionStatus
 from .mappings import resolve as resolve_mapping
 from .paths import is_within_root, normalize_posix
 from .policies import RunPolicy
+from .queue_inventory import Presence, QueueJobKind, fetch_queue_inventory
 from .shoko import (
     DROP_TYPE_NONE,
     FileMatch,
@@ -79,6 +88,8 @@ MAX_SUCCESS_STATUS: Final[int] = 300
 NOT_FOUND_STATUS: Final[int] = 404
 CLIENT_ERROR_MIN: Final[int] = 400
 CLIENT_ERROR_MAX: Final[int] = 500
+# ProblemDetails contains short validation messages, never an episode inventory.
+MAX_LINK_PROBLEM_BYTES: Final[int] = 64 * 1024
 PLAN_VERSION: Final[str] = "2"
 FILE_INCLUDE_FLAGS: Final[str] = "XRefs,AbsolutePaths"
 VERIFY_INCLUDE_FLAGS: Final[str] = "XRefs"
@@ -226,6 +237,67 @@ class SonarrEpisodeIdentity:
 
 
 @dataclass(frozen=True)
+class MappedEpisodeTarget:
+    """Verified mapping identity, independent of Shoko's current metadata cache."""
+
+    source: SonarrEpisodeIdentity
+    tvdb_series: int
+    anidb_anime_id: int
+    episode_type: EpisodeType
+    anidb_episode_number: int
+    source_rule: str
+
+    @property
+    def identity(self) -> tuple[int, EpisodeType, int]:
+        return self.anidb_anime_id, self.episode_type, self.anidb_episode_number
+
+
+@dataclass(frozen=True)
+class MetadataNeed:
+    """A typed, read-only observation of missing anime or internal episode metadata."""
+
+    target: MappedEpisodeTarget
+    missing: EpisodeResolutionStatus
+    known_anidb_episode_id: int | None
+
+
+@dataclass(frozen=True)
+class MetadataDemand:
+    """Complete eligible file demand; never a partially resolved link mutation.
+
+    The fingerprint deliberately excludes needs and resolved IDs. A fresh pass
+    rebuilds the entire LinkPlan when metadata arrives, rather than patching this record.
+    """
+
+    policy: str
+    scope_fingerprint: str
+    sonarr_series_id: int
+    sonarr_episode_file_id: int
+    sonarr_path: str
+    sonarr_size: int
+    shoko_file_id: int
+    shoko_size: int
+    shoko_ed2k: str
+    shoko_paths: tuple[str, ...]
+    episodes: tuple[SonarrEpisodeIdentity, ...]
+    mapped_targets: tuple[MappedEpisodeTarget, ...]
+    needs: tuple[MetadataNeed, ...]
+    targets_digest: str
+    structure_digest: str
+    mapping_revision: str
+    overrides_active: bool
+    fingerprint: str
+
+    @property
+    def required_targets(self) -> frozenset[tuple[int, EpisodeType, int]]:
+        return frozenset(target.identity for target in self.mapped_targets)
+
+    @property
+    def missing_targets(self) -> frozenset[tuple[int, EpisodeType, int]]:
+        return frozenset(need.target.identity for need in self.needs)
+
+
+@dataclass(frozen=True)
 class LinkTarget:
     """One fully resolved link target: mapping provenance + resolved Shoko internal ID."""
 
@@ -310,6 +382,7 @@ class EpisodeTargetResolution:
     shoko_episode_id: int | None = None
     pending_metadata: bool = False
     detail: str = ""
+    metadata_status: EpisodeResolutionStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -408,10 +481,14 @@ class EpisodeIdResolver:
         *,
         clock: Callable[[], float] = time.monotonic,
         ttl_seconds: float = DEFAULT_RESOLVE_TTL_SECONDS,
+        deadline: float | None = None,
     ) -> None:
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("episode resolution deadline must be finite")
         self._endpoint = endpoint
         self._clock = clock
         self._ttl = ttl_seconds
+        self._deadline = deadline
         self._cache: dict[tuple[int, str, int], _CacheEntry] = {}
         self._listings: dict[tuple[int, str], tuple[_GetOutcome, float]] = {}
 
@@ -420,7 +497,11 @@ class EpisodeIdResolver:
         key = (anime_id, episode_type, number)
         now = self._clock()
         cached = self._cache.get(key)
-        if cached is not None and now - cached.resolved_at < self._ttl:
+        if (
+            cached is not None
+            and now - cached.resolved_at < self._ttl
+            and (self._deadline is None or now < self._deadline)
+        ):
             return cached.value
         result = self._chain(key, now)
         if result.status is EpisodeResolutionStatus.RESOLVED:
@@ -448,15 +529,14 @@ class EpisodeIdResolver:
             if cached is not None and now - cached[1] < self._ttl:
                 listing = cached[0]
             else:
-                listing = _get(
-                    self._endpoint,
+                listing = self._read(
                     f"api/v3/Series/AniDB/{anime_id}/Episode",
                     {"type": type_name},
                 )
                 self._listings[listing_key] = (listing, now)
             anidb_episode_id, status, detail = _chain_first(listing, anime_id, type_name, number)
             if anidb_episode_id is not None:
-                episode = _get(self._endpoint, f"api/v3/Episode/AniDB/{anidb_episode_id}/Episode")
+                episode = self._read(f"api/v3/Episode/AniDB/{anidb_episode_id}/Episode")
                 shoko_episode_id, status, detail = _chain_second(episode, anidb_episode_id)
                 if status is EpisodeResolutionStatus.RESOLVED:
                     detail = (
@@ -472,6 +552,17 @@ class EpisodeIdResolver:
             status=status,
             detail=detail,
         )
+
+    def _read(self, path: str, params: Mapping[str, Any] | None = None) -> _GetOutcome:
+        if self._deadline is None:
+            return _get(self._endpoint, path, params)
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            return _GetOutcome(None, None, "episode resolution deadline")
+        result = _get(self._endpoint, path, params, deadline=self._deadline, clock=self._clock)
+        if self._clock() >= self._deadline:
+            return _GetOutcome(None, None, "episode resolution deadline")
+        return result
 
 
 def _chain_first(
@@ -542,6 +633,172 @@ def resolve_episode_ids(
 
 
 # --------------------------------------------------------------- plan freeze
+
+
+def freeze_metadata_demand(
+    match: FileMatch,
+    resolutions: Sequence[EpisodeTargetResolution],
+    *,
+    scope_fingerprint: str,
+    policy: RunPolicy,
+    targets_digest: str,
+    structure_digest: str,
+    shoko_paths: Sequence[str],
+    mapping_revision: str,
+    overrides_active: bool,
+) -> MetadataDemand | PlanSkip:
+    """Freeze complete mappings and source identity without inventing episode IDs."""
+    for name, digest in (
+        ("scope_fingerprint", scope_fingerprint),
+        ("targets_digest", targets_digest),
+        ("structure_digest", structure_digest),
+    ):
+        _require_digest(digest, name)
+    validated = _validate_resolution_set(match, resolutions)
+    if isinstance(validated, PlanSkip):
+        return validated
+    ed2k = canonical_ed2k(match.hashes.ed2k)
+    paths = tuple(sorted({normalize_posix(path) for path in shoko_paths}))
+    if ed2k is None or not paths:
+        return PlanSkip(
+            "metadata_identity_invalid", "metadata demand requires ED2K and Shoko paths"
+        )
+    targets: list[MappedEpisodeTarget] = []
+    needs: dict[tuple[int, EpisodeType, int], MetadataNeed] = {}
+    for item in resolutions:
+        target = _metadata_mapping_target(item)
+        if isinstance(target, PlanSkip):
+            return target
+        targets.append(target)
+        if item.metadata_status is not None:
+            needs.setdefault(
+                target.identity, MetadataNeed(target, item.metadata_status, item.anidb_episode_id)
+            )
+    if not needs:
+        return PlanSkip("metadata_not_missing", "all required metadata is already available")
+    ordered = tuple(
+        sorted(
+            targets,
+            key=lambda target: (
+                target.source.episode_id,
+                target.anidb_anime_id,
+                target.episode_type.value,
+                target.anidb_episode_number,
+                target.source_rule,
+            ),
+        )
+    )
+    episodes = tuple(dict.fromkeys(target.source for target in ordered))
+    draft = MetadataDemand(
+        policy=policy.value,
+        scope_fingerprint=scope_fingerprint,
+        sonarr_series_id=match.sonarr_file.series_id,
+        sonarr_episode_file_id=match.sonarr_file.episode_file_id,
+        sonarr_path=normalize_posix(match.sonarr_file.path),
+        sonarr_size=match.sonarr_file.size,
+        shoko_file_id=match.shoko_file_id,
+        shoko_size=match.sonarr_file.size,
+        shoko_ed2k=ed2k,
+        shoko_paths=paths,
+        episodes=episodes,
+        mapped_targets=ordered,
+        needs=tuple(
+            needs[key] for key in sorted(needs, key=lambda key: (key[0], key[1].value, key[2]))
+        ),
+        targets_digest=targets_digest,
+        structure_digest=structure_digest,
+        mapping_revision=mapping_revision,
+        overrides_active=overrides_active,
+        fingerprint="",
+    )
+    return replace(draft, fingerprint=metadata_demand_fingerprint(draft))
+
+
+def _metadata_mapping_target(item: EpisodeTargetResolution) -> MappedEpisodeTarget | PlanSkip:
+    if (
+        item.status is not ResolutionStatus.RESOLVED
+        or type(item.anidb_anime_id) is not int
+        or item.anidb_anime_id <= 0
+        or type(item.anidb_episode_number) is not int
+        or item.anidb_episode_number <= 0
+        or not item.source_rule
+        or item.episode_type not in {kind.value for kind in EpisodeType}
+    ):
+        return PlanSkip("target_provenance_invalid", "metadata demand requires complete mappings")
+    missing = item.metadata_status
+    if missing is EpisodeResolutionStatus.ANIME_NOT_CACHED:
+        valid = item.anidb_episode_id is None and item.shoko_episode_id is None
+    elif missing is EpisodeResolutionStatus.PENDING_METADATA:
+        valid = (
+            type(item.anidb_episode_id) is int
+            and item.anidb_episode_id > 0
+            and item.shoko_episode_id is None
+        )
+    elif missing is None:
+        valid = (
+            type(item.anidb_episode_id) is int
+            and item.anidb_episode_id > 0
+            and type(item.shoko_episode_id) is int
+            and item.shoko_episode_id > 0
+        )
+    else:
+        valid = False
+    if not valid:
+        return PlanSkip(
+            "target_resolution_invalid", "missing or contradictory metadata observation"
+        )
+    episode = item.episode
+    return MappedEpisodeTarget(
+        SonarrEpisodeIdentity(
+            episode.id,
+            episode.tvdb_id,
+            episode.season_number,
+            episode.episode_number,
+            episode.absolute_episode_number,
+        ),
+        item.tvdb_series,
+        item.anidb_anime_id,
+        EpisodeType(item.episode_type),
+        item.anidb_episode_number,
+        item.source_rule,
+    )
+
+
+def metadata_demand_fingerprint(demand: MetadataDemand) -> str:
+    """Canonical whole-file identity, stable as a Shoko metadata queue progresses."""
+    payload = (
+        "metadata_demand_v1",
+        demand.policy,
+        demand.scope_fingerprint,
+        demand.sonarr_series_id,
+        demand.sonarr_episode_file_id,
+        demand.sonarr_path,
+        demand.sonarr_size,
+        demand.shoko_file_id,
+        demand.shoko_size,
+        demand.shoko_ed2k,
+        demand.shoko_paths,
+        tuple(
+            (
+                target.source.episode_id,
+                target.source.tvdb_episode_id,
+                target.source.season_number,
+                target.source.episode_number,
+                target.source.absolute_episode_number,
+                target.tvdb_series,
+                target.anidb_anime_id,
+                target.episode_type.value,
+                target.anidb_episode_number,
+                target.source_rule,
+            )
+            for target in demand.mapped_targets
+        ),
+        demand.targets_digest,
+        demand.structure_digest,
+        demand.mapping_revision,
+        demand.overrides_active,
+    )
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def freeze_plan(
@@ -790,9 +1047,14 @@ def _build_targets(
 # --------------------------------------------------------------------- preflight
 
 
-def fetch_queue(endpoint: ApiEndpoint) -> QueueSnapshot | None:
+def fetch_queue(
+    endpoint: ApiEndpoint,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> QueueSnapshot | None:
     """Read-only queue occupancy (`GET api/v3/Queue`); None on any failure (fail closed)."""
-    outcome = _get(endpoint, "api/v3/Queue")
+    outcome = _get(endpoint, "api/v3/Queue", deadline=deadline, clock=clock)
     if outcome.payload is None:
         return None
     entry = _as_mapping(outcome.payload)
@@ -860,6 +1122,7 @@ def preflight(
     service_mode: bool = False,
     service_authorized: bool | None = None,
     check_file: bool = True,
+    check_targets: bool = True,
 ) -> PreflightVerdict:
     """The fresh gate immediately before the single POST; every check fails closed.
 
@@ -868,9 +1131,10 @@ def preflight(
     then the queue anomaly input, then the **pure** generation checks (mapping digests and
     active-index candidate set), and only then fresh target network reads (one per unique AniDB
     episode ID). The protected-link ``File/{id}?include=XRefs,AbsolutePaths`` read is last. Send
-    callers with additional source/authorization network checks pass ``check_file=False`` and call
-    :func:`preflight_file` after those checks; it must be the final network guard before the
-    durable send intent.
+    callers with additional source/authorization network checks pass ``check_file=False``
+    and ``check_targets=False``. After those checks they call
+    :func:`preflight_link_jobs_and_targets`, then :func:`preflight_file`; the protected
+    file read must be the final network guard before the durable send intent.
     """
     reasons: list[PreflightReason] = []
     details: list[str] = []
@@ -916,17 +1180,69 @@ def preflight(
     if not reasons and mapping_index is not None:
         _preflight_candidates(plan, mapping_index, add)
     if not reasons:
-        _preflight_targets(endpoint, plan, add)
+        if check_targets:
+            _preflight_targets(endpoint, plan, add)
         if not reasons and check_file:
             _preflight_file(endpoint, plan, settings, folders, add)
     return PreflightVerdict(not reasons, tuple(reasons), tuple(details))
 
 
-def preflight_file(
+def preflight_link_jobs_and_targets(
     endpoint: ApiEndpoint,
     plan: LinkPlan,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> PreflightVerdict:
+    """Fresh job absence, THEN target identities; caller reads protected file last.
+
+    Never reuse an absence observation as authority for another submission. An
+    external refresh may recreate episode IDs, so reads made before this queue
+    observation cannot authorize delivery. Foreign schedulers can still race us.
+    """
+    inventory = fetch_queue_inventory(
+        endpoint, deadline=deadline if deadline is not None else clock() + 30.0, clock=clock
+    )
+    subjects = [(QueueJobKind.MANUAL_LINK, plan.shoko_file_id)] + [
+        (QueueJobKind.ANIME_METADATA, anime_id)
+        for anime_id in sorted({target.anidb_anime_id for target in plan.targets})
+    ]
+    details: list[str] = []
+    reasons: list[PreflightReason] = []
+    for kind, subject_id in subjects:
+        observed = inventory.lookup(kind, subject_id)
+        if observed.presence is Presence.ABSENT:
+            continue
+        reason = (
+            PreflightReason.QUEUE_BLOCKED
+            if observed.presence is Presence.PRESENT
+            else PreflightReason.QUEUE_UNKNOWN
+        )
+        if reason not in reasons:
+            reasons.append(reason)
+        details.append(
+            f"{kind.value} {subject_id}: {observed.presence.value} "
+            f"({observed.reason.value}); waiting for fresh queue absence"
+        )
+    if not reasons:
+
+        def add(reason: PreflightReason, detail: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+            details.append(detail)
+
+        _preflight_targets(endpoint, plan, add, deadline=deadline, clock=clock)
+    return PreflightVerdict(not reasons, tuple(reasons), tuple(details))
+
+
+def preflight_file(
+    endpoint: ApiEndpoint,
+    plan: LinkPlan | MetadataDemand,
     settings: Settings,
     folders: Mapping[int, ImportFolder],
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> PreflightVerdict:
     """Perform the final fresh protected-link/file identity read, with no later network checks."""
     reasons: list[PreflightReason] = []
@@ -937,7 +1253,7 @@ def preflight_file(
             reasons.append(reason)
         details.append(detail)
 
-    _preflight_file(endpoint, plan, settings, folders, add)
+    _preflight_file(endpoint, plan, settings, folders, add, deadline=deadline, clock=clock)
     return PreflightVerdict(not reasons, tuple(reasons), tuple(details))
 
 
@@ -946,16 +1262,21 @@ type AddReason = Callable[[PreflightReason, str], None]
 
 def _preflight_file(
     endpoint: ApiEndpoint,
-    plan: LinkPlan,
+    plan: LinkPlan | MetadataDemand,
     settings: Settings,
     folders: Mapping[int, ImportFolder],
     add: AddReason,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Fresh file read: existence, zero XRefs, unchanged identity, all-location ownership."""
     outcome = _get(
         endpoint,
         f"api/v3/File/{plan.shoko_file_id}",
         {"include": FILE_INCLUDE_FLAGS},
+        deadline=deadline,
+        clock=clock,
     )
     if outcome.payload is None:
         if outcome.status == NOT_FOUND_STATUS:
@@ -1029,7 +1350,7 @@ def _preflight_file(
     _preflight_ownership(item, plan, settings, folders, add)
 
 
-def _preflight_ed2k(item: ShokoFile, plan: LinkPlan, add: AddReason) -> None:
+def _preflight_ed2k(item: ShokoFile, plan: LinkPlan | MetadataDemand, add: AddReason) -> None:
     """Refuse fresh content identity drift, comparing ED2K only (optional hashes are metadata)."""
     if canonical_ed2k(item.hashes.ed2k) != plan.shoko_ed2k.lower():
         add(
@@ -1041,7 +1362,7 @@ def _preflight_ed2k(item: ShokoFile, plan: LinkPlan, add: AddReason) -> None:
 
 def _preflight_ownership(
     item: ShokoFile,
-    plan: LinkPlan,
+    plan: LinkPlan | MetadataDemand,
     settings: Settings,
     folders: Mapping[int, ImportFolder],
     add: AddReason,
@@ -1147,6 +1468,9 @@ def _preflight_targets(  # noqa: PLR0912 - verify the full identity chain before
     endpoint: ApiEndpoint,
     plan: LinkPlan,
     add: AddReason,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Freshly revalidate mapped AniDB identities and their Shoko internal IDs."""
     source_targets: dict[tuple[int, str], dict[int, set[int]]] = {}
@@ -1177,6 +1501,8 @@ def _preflight_targets(  # noqa: PLR0912 - verify the full identity chain before
             endpoint,
             f"api/v3/Series/AniDB/{anime_id}/Episode",
             {"type": type_name},
+            deadline=deadline,
+            clock=clock,
         )
         if outcome.payload is None:
             source_failed = True
@@ -1209,7 +1535,12 @@ def _preflight_targets(  # noqa: PLR0912 - verify the full identity chain before
         return
 
     for target_anidb_id, expected_pairs in _group_expected_targets(plan):
-        outcome = _get(endpoint, f"api/v3/Episode/AniDB/{target_anidb_id}/Episode")
+        outcome = _get(
+            endpoint,
+            f"api/v3/Episode/AniDB/{target_anidb_id}/Episode",
+            deadline=deadline,
+            clock=clock,
+        )
         if outcome.payload is None:
             reason, detail = _target_read_unavailable(
                 outcome,
@@ -1335,6 +1666,7 @@ def submit_link(
     plan: LinkPlan,
     *,
     clock: Callable[[], float] = time.monotonic,
+    deadline: float | None = None,
 ) -> SendResult:
     """The single, isolated POST call site: exactly one delivery attempt, never retried.
 
@@ -1342,8 +1674,9 @@ def submit_link(
     ``AMBIGUOUS_SEND`` with ``retry_forbidden=True`` and an inspection instruction;
     timeouts, connection failures, and 5xx are recorded the same way. 2xx =
     ``ACCEPTED_UNVERIFIED`` (the endpoint enqueues async jobs and returns before they
-    run); 4xx = ``REJECTED`` (server-side validation refuses with zero writes per the
-    pinned endpoint docs). Every field needed for M6 intent persistence is exposed;
+    run); bounded, valid 4xx ProblemDetails = ``REJECTED`` (server-side validation
+    refuses with zero writes per the pinned endpoint docs). Unusable refusal bodies
+    remain ambiguous. Every field needed for M6 intent persistence is exposed;
     this function performs no disk I/O.
     """
     attempted_at = clock()
@@ -1354,7 +1687,7 @@ def submit_link(
         if not plan.episode_ids:
             detail = "empty EpisodeIDs are never POSTed"
         else:
-            outcome, http_status, detail = _deliver(endpoint, plan)
+            outcome, http_status, detail = _deliver(endpoint, plan, deadline=deadline, clock=clock)
     return SendResult(
         outcome=outcome,
         shoko_file_id=plan.shoko_file_id,
@@ -1368,7 +1701,13 @@ def submit_link(
     )
 
 
-def _deliver(endpoint: ApiEndpoint, plan: LinkPlan) -> tuple[SendOutcome, int | None, str]:
+def _deliver(
+    endpoint: ApiEndpoint,
+    plan: LinkPlan,
+    *,
+    deadline: float | None,
+    clock: Callable[[], float],
+) -> tuple[SendOutcome, int | None, str]:
     """Exactly one delivery attempt; redirects/timeouts/5xx are ambiguous, never retried."""
     path = f"api/v3/File/{plan.shoko_file_id}/Link"
     body = {"EpisodeIDs": list(plan.episode_ids)}
@@ -1378,7 +1717,17 @@ def _deliver(endpoint: ApiEndpoint, plan: LinkPlan) -> tuple[SendOutcome, int | 
         "before considering anything further; automatic retries are forbidden"
     )
     try:
-        response = resolve_and_send(endpoint, "POST", path, json=body, max_redirects=0)
+        response = resolve_and_send(
+            endpoint,
+            "POST",
+            path,
+            json=body,
+            max_redirects=0,
+            stream=True,
+            headers={"Accept-Encoding": "identity"},
+            deadline=deadline,
+            clock=clock,
+        )
     except HttpPolicyError as exc:
         return (
             SendOutcome.AMBIGUOUS_SEND,
@@ -1401,10 +1750,25 @@ def _deliver(endpoint: ApiEndpoint, plan: LinkPlan) -> tuple[SendOutcome, int | 
                 "is NOT verified (poll with verify_link)",
             )
         if CLIENT_ERROR_MIN <= status < CLIENT_ERROR_MAX:
+            try:
+                problem = _extract_problem(
+                    read_bounded_json(
+                        response, max_bytes=MAX_LINK_PROBLEM_BYTES, deadline=deadline, clock=clock
+                    ),
+                    status,
+                )
+            except (BoundedJsonError, httpx.HTTPError, httpx.StreamError):
+                problem = None
+            if problem is None:
+                return (
+                    SendOutcome.AMBIGUOUS_SEND,
+                    status,
+                    f"HTTP {status} with an unusable refusal response. {inspect}",
+                )
             return (
                 SendOutcome.REJECTED,
                 status,
-                f"Shoko refused the request: {_extract_problem(response)} (zero writes assumed "
+                f"Shoko refused the request: {problem} (zero writes assumed "
                 "per the pinned endpoint contract)",
             )
         return SendOutcome.AMBIGUOUS_SEND, status, f"HTTP {status} during delivery. {inspect}"
@@ -1558,7 +1922,13 @@ def reconcile_link_plan(
         active_structure_digest=active_structure_digest,
         blocked_over=blocked_over,
         mapping_index=mapping_index,
+        check_file=dry_run,
+        check_targets=dry_run,
     )
+    if verdict.ok and not dry_run:
+        verdict = preflight_link_jobs_and_targets(endpoint, plan, clock=clock)
+        if verdict.ok:
+            verdict = preflight_file(endpoint, plan, settings, folders)
     if not verdict.ok:
         return ReconcileResult(
             stage=ReconcileStage.PREFLIGHT_BLOCKED,
@@ -1739,21 +2109,22 @@ def _parse_shoko_episode(payload: Any) -> tuple[int | None, int | None, str]:
     return internal, anidb, ""
 
 
-def _get(endpoint: ApiEndpoint, path: str, params: Mapping[str, Any] | None = None) -> _GetOutcome:
+def _get(
+    endpoint: ApiEndpoint,
+    path: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> _GetOutcome:
     try:
-        response = resolve_and_send(endpoint, "GET", path, params=params)
+        status, payload = get_bounded_json(endpoint, path, params, deadline=deadline, clock=clock)
+    except BoundedJsonError as exc:
+        return _GetOutcome(None, exc.status_code, f"{path}: {exc}")
     except (HttpPolicyError, httpx.HTTPError) as exc:
         return _GetOutcome(None, None, f"{path}: {type(exc).__name__}")
-    try:
-        status = response.status_code
-        if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
-            return _GetOutcome(None, status, f"{path}: HTTP {status}")
-        try:
-            payload = response.json()
-        except ValueError:
-            return _GetOutcome(None, status, f"{path}: invalid JSON")
-    finally:
-        response.close()
+    if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
+        return _GetOutcome(None, status, f"{path}: HTTP {status}")
     return _GetOutcome(payload, status, "")
 
 
@@ -1801,36 +2172,42 @@ def _subset_verdict(now: float, deadline: float, *, empty: bool) -> Verification
     return VerificationVerdict.CONTRADICTION if empty else VerificationVerdict.PARTIAL
 
 
-def _extract_problem(response: httpx.Response) -> str:
+def _extract_problem(payload: Any, status: int) -> str | None:
     """Minimal, credential-free extraction of a Shoko refusal message (ProblemDetails)."""
     message = ""
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
     entry = _as_mapping(payload)
-    if entry is not None:
-        parts: list[str] = []
-        for key in ("title", "detail"):
-            value = entry.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value.strip())
-        errors = _as_mapping(entry.get("errors"))
-        if errors is not None:
-            for field_name in sorted(key for key in errors if isinstance(key, str)):
-                value = errors[field_name]
-                messages = value if isinstance(value, list) else [value]
-                texts = [
-                    item.strip() for item in messages if isinstance(item, str) and item.strip()
-                ]
-                if texts:
-                    parts.append(f"{field_name}: {'; '.join(texts[:3])}")
-        message = " | ".join(parts)
-    if not message:
-        raw = redact(response.text)
-        single = "".join(char for char in raw if char.isprintable() or char == " ")
-        message = single.strip()
-    return redact(message)[:200] if message else "no message"
+    if entry is None:
+        return None
+    if "status" in entry and (type(entry["status"]) is not int or entry["status"] != status):
+        return None
+    if any(
+        key in entry and not isinstance(entry[key], str)
+        for key in ("title", "detail", "type", "instance")
+    ):
+        return None
+    if "errors" in entry:
+        errors = _as_mapping(entry["errors"])
+        if errors is None or any(
+            not isinstance(value, str)
+            and not (isinstance(value, list) and all(isinstance(item, str) for item in value))
+            for value in errors.values()
+        ):
+            return None
+    parts: list[str] = []
+    for key in ("title", "detail"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    errors = _as_mapping(entry.get("errors"))
+    if errors is not None:
+        for field_name in sorted(key for key in errors if isinstance(key, str)):
+            value = errors[field_name]
+            messages = value if isinstance(value, list) else [value]
+            texts = [item.strip() for item in messages if isinstance(item, str) and item.strip()]
+            if texts:
+                parts.append(f"{field_name}: {'; '.join(texts[:3])}")
+    message = " | ".join(parts)
+    return redact(message)[:200] if message else None
 
 
 def _require_digest(value: str, name: str) -> None:

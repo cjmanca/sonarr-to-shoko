@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,7 +47,8 @@ from shoko_linker.daemon import (
     CycleMode,
     run_cycle,
 )
-from shoko_linker.linking import SendOutcome, fetch_queue
+from shoko_linker.http import ApiEndpoint
+from shoko_linker.linking import QueueSnapshot, SendOutcome, fetch_queue
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
@@ -1420,8 +1422,13 @@ def test_f_campaign_defers_if_generation_changes_during_queue_read(
     _refresh_generation(env, changed)
     original_fetch = fetch_queue
 
-    def fetch_then_restore(endpoint: Any) -> Any:
-        queue = original_fetch(endpoint)
+    def fetch_then_restore(
+        endpoint: ApiEndpoint,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> QueueSnapshot | None:
+        queue = original_fetch(endpoint, deadline=deadline, clock=clock)
         _refresh_generation(env, base_xml)
         return queue
 

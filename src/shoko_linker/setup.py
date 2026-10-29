@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -10,7 +11,7 @@ from typing import Any
 import httpx
 
 from .errors import HttpPolicyError, PathError
-from .http import ApiEndpoint, resolve_and_send
+from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .paths import (
     PathMapping,
     apply_mapping,
@@ -155,22 +156,29 @@ class _JsonRead:
     payload: Any = None
 
 
-def _get_json(endpoint: ApiEndpoint, path: str) -> _JsonRead:
+def _get_json(
+    endpoint: ApiEndpoint,
+    path: str,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> _JsonRead:
     """GET one documented setup endpoint and preserve read completeness evidence."""
     try:
-        response = resolve_and_send(endpoint, "GET", path)
+        status_code, payload = get_bounded_json(endpoint, path, deadline=deadline, clock=clock)
+    except BoundedJsonError as exc:
+        status = (
+            ScopeReadStatus.INCOMPLETE
+            if exc.status_code is not None
+            and MIN_SUCCESS_STATUS <= exc.status_code < MAX_SUCCESS_STATUS
+            else ScopeReadStatus.UNAVAILABLE
+        )
+        return _JsonRead(status)
     except (HttpPolicyError, httpx.HTTPError):
         return _JsonRead(ScopeReadStatus.UNAVAILABLE)
-    try:
-        if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-            return _JsonRead(ScopeReadStatus.UNAVAILABLE)
-        try:
-            payload = response.json()
-        except ValueError:
-            return _JsonRead(ScopeReadStatus.INCOMPLETE)
-        return _JsonRead(ScopeReadStatus.COMPLETE, payload)
-    finally:
-        response.close()
+    if not MIN_SUCCESS_STATUS <= status_code < MAX_SUCCESS_STATUS:
+        return _JsonRead(ScopeReadStatus.UNAVAILABLE)
+    return _JsonRead(ScopeReadStatus.COMPLETE, payload)
 
 
 def _sonarr_version_supported(version: str) -> bool:
@@ -180,14 +188,22 @@ def _sonarr_version_supported(version: str) -> bool:
     return int(parts[0]) in SUPPORTED_SONARR_MAJOR_VERSIONS
 
 
-def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCompatibility:
+def inspect_api_compatibility(
+    sonarr: ApiEndpoint,
+    shoko: ApiEndpoint,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> ApiCompatibility:
     """Read metadata through the required v3 endpoints without pinning a Shoko release.
 
     Sonarr's `/api/v3/system/status` and Shoko's `/api/v3/Init/Version` expose only the
     version/capability metadata needed here. Shoko's settings endpoint is deliberately
     not used: it is admin-only and returns secret-bearing server configuration.
     """
-    sonarr_payload = _get_json(sonarr, "api/v3/system/status").payload
+    sonarr_payload = _get_json(
+        sonarr, "api/v3/system/status", deadline=deadline, clock=clock
+    ).payload
     sonarr_version_raw = sonarr_payload.get("version") if isinstance(sonarr_payload, dict) else None
     sonarr_version = (
         sonarr_version_raw.strip()
@@ -198,7 +214,7 @@ def inspect_api_compatibility(sonarr: ApiEndpoint, shoko: ApiEndpoint) -> ApiCom
         False if sonarr_version is None else _sonarr_version_supported(sonarr_version)
     )
 
-    shoko_payload = _get_json(shoko, "api/v3/Init/Version").payload
+    shoko_payload = _get_json(shoko, "api/v3/Init/Version", deadline=deadline, clock=clock).payload
     server = shoko_payload.get("Server") if isinstance(shoko_payload, dict) else None
     shoko_version_raw = server.get("Version") if isinstance(server, dict) else None
     shoko_version = (
@@ -384,9 +400,12 @@ def select_anime_roots(
 
 def discover_sonarr_scope(  # noqa: PLR0911 - ordered fail-closed API read validation
     endpoint: ApiEndpoint,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> AnimeScopeDiscovery:
     """Fetch only the Sonarr series/root-folder inventories and determine safe anime roots."""
-    series_read = _get_json(endpoint, SERIES_PATH)
+    series_read = _get_json(endpoint, SERIES_PATH, deadline=deadline, clock=clock)
     if series_read.status is not ScopeReadStatus.COMPLETE:
         return _blocked(
             "Cannot safely read Sonarr series. Check the address, API key, and API version.",
@@ -406,7 +425,7 @@ def discover_sonarr_scope(  # noqa: PLR0911 - ordered fail-closed API read valid
             read_status=ScopeReadStatus.INCOMPLETE,
         )
 
-    root_read = _get_json(endpoint, ROOTFOLDER_PATH)
+    root_read = _get_json(endpoint, ROOTFOLDER_PATH, deadline=deadline, clock=clock)
     if root_read.status is not ScopeReadStatus.COMPLETE:
         return _blocked(
             "Cannot safely read Sonarr root folders. Check the address, API key, and API version.",

@@ -41,7 +41,9 @@ def test_slow_inventory_still_leaves_resolution_and_apply_headroom(tmp_path: Pat
     sonarr = td.SonarrStub(files)
 
     def slow_inventory(request: httpx.Request) -> httpx.Response:
-        elapsed[0] += 40.0
+        # Four inventory GETs must finish inside the 150-second inventory slice;
+        # the later fresh source checks still consume the shared cycle budget.
+        elapsed[0] += 30.0
         return sonarr.handler(request)
 
     with open_state(tmp_path / "state.sqlite3", budget_limits=td.WIDE_LIMITS) as store:
@@ -443,11 +445,10 @@ def test_upgrade_recovers_recent_send_debt_without_double_counting(
             store.void_prepared_send(
                 file_id, token.request_fingerprint, iso=ts.T0, reason="not sent"
             )
+        ts._simulate_legacy_schema(store, 4)
     # Reconstruct the v4 schema: no timestamp ledger, only the old fixed counter.
     with sqlite3.connect(path) as conn:
         conn.execute("DROP TABLE budget_reservations")
-        conn.execute("DELETE FROM schema_version WHERE version = 5")
-        conn.execute("PRAGMA user_version = 4")
         conn.execute(
             "UPDATE budgets SET rolling_new_submissions = ? WHERE window_key = '_global'",
             (3 if anonymous else 2,),
@@ -494,10 +495,9 @@ def test_upgrade_failure_rolls_back_schema_and_timestamp_debt(
     with open_state(path, budget_limits=LIMITS) as store:
         ts.walk_to_planned(store)
         assert isinstance(ts.prepare(store), SendToken)
+        ts._simulate_legacy_schema(store, 4)
     with sqlite3.connect(path) as conn:
         conn.execute("DROP TABLE budget_reservations")
-        conn.execute("DELETE FROM schema_version WHERE version = 5")
-        conn.execute("PRAGMA user_version = 4")
     migrate = state_module._MIGRATIONS[4]
 
     def fail_after_ledger(conn: sqlite3.Connection) -> None:

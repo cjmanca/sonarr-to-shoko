@@ -248,6 +248,14 @@ def cycle_report_payload(
         "new_arrival_submitted": report.new_arrival_submitted,
         "campaign_submitted": report.campaign_submitted,
         "total_link_requests_attempted": report.total_link_requests_attempted,
+        "metadata": {
+            "requests_attempted": report.metadata_requests_attempted,
+            "deferred_anime": report.metadata_deferred,
+            "observations": [
+                {"anime_id": anime, "reason": diagnostic_text(reason, limit=128)}
+                for anime, reason in report.metadata_observations[:20]
+            ],
+        },
         "mapping_outcome": report.mapping_outcome.value if report.mapping_outcome else None,
         "mapping_revision": report.mapping_revision,
         "counts": asdict(report.counts),

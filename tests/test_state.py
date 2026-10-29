@@ -589,9 +589,9 @@ def test_f17_v1_migration_preserves_rows_and_holds_incoherent_ownership(tmp_path
     # not-authorized defaults; no campaign row is rewritten.
     assert [row[:13] for row in after["campaigns"]] == [row[:13] for row in before["campaigns"]]
     assert all(row[13:] == (None, None, "") for row in after["campaigns"])
-    # schema_version audit history: the v1 row survives, and v2-v7 are appended.
+    # schema_version audit history: the v1 row survives, and v2-v9 are appended.
     assert after["schema_version"][0] == before["schema_version"][0]
-    assert len(after["schema_version"]) == len(before["schema_version"]) + 6
+    assert len(after["schema_version"]) == len(before["schema_version"]) + 8
     assert [row[0:3:2] for row in after["schema_version"][1:]] == [
         (2, "migrated from 1"),
         (3, "migrated from 2"),
@@ -599,6 +599,8 @@ def test_f17_v1_migration_preserves_rows_and_holds_incoherent_ownership(tmp_path
         (5, "migrated from 4"),
         (6, "migrated from 5"),
         (7, "migrated from 6"),
+        (8, "migrated from 7"),
+        (9, "migrated from 8"),
     ]
     assert second_view(path, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
     assert second_view(
@@ -880,6 +882,8 @@ def test_f17_interim_v1_with_drain_columns_upgrades_cleanly(tmp_path: Path) -> N
     conn = sqlite3.connect(path)
     try:
         conn.executescript(state_module._SCHEMA_SQL)
+        conn.execute("DROP TABLE metadata_operation_history")
+        conn.execute("DROP TABLE metadata_operations")
         conn.execute(
             "INSERT INTO campaigns (campaign_id, digest, plan_fingerprint_set,"
             " max_submissions, deadline_iso, attestation_scope, approval_iso, status,"
@@ -1246,6 +1250,8 @@ def test_v7_migration_holds_compatible_attempts_until_explicit_owner_resolution(
 def _simulate_legacy_schema(store: StateStore, version: int) -> None:
     """Turn the fresh test DB's rows into pre-send-ownership history for migration tests."""
     connection = store.connection
+    connection.execute("DROP TABLE metadata_operation_history")
+    connection.execute("DROP TABLE metadata_operations")
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(sends)")}
     for name in (
         "campaign_ownership_note",

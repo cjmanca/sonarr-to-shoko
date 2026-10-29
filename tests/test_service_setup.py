@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from collections.abc import Iterator
 from dataclasses import replace
@@ -37,7 +38,13 @@ from shoko_linker.setup import (
 )
 from shoko_linker.shoko import ImportFolder, ShokoDiscovery, ShokoVerdict
 from shoko_linker.sonarr import InventoryVerdict, SonarrInventory
-from shoko_linker.state import open_state
+from shoko_linker.state import (
+    META_SERVICE_SETTINGS,
+    StateError,
+    StateStore,
+    WriteDisabledError,
+    open_state,
+)
 
 ANIME_ROOT = "/data/media/anime"
 SHOKO_ROOT = "/anime"
@@ -1122,12 +1129,12 @@ def test_setup_controller_requires_explicit_scope_consent_and_all_unknown_safety
         0,
         1000,
     )
-    monkeypatch.setattr(service_setup, "inspect_api_compatibility", lambda *_: compatibility)
-    monkeypatch.setattr(service_setup, "discover_sonarr_scope", lambda *_: scope)
+    monkeypatch.setattr(service_setup, "inspect_api_compatibility", lambda *_, **__: compatibility)
+    monkeypatch.setattr(service_setup, "discover_sonarr_scope", lambda *_, **__: scope)
     monkeypatch.setattr(
         service_setup,
         "inspect_shoko_safety_settings",
-        lambda *_: current_assessment["value"],
+        lambda *_, **__: current_assessment["value"],
     )
     inventory_calls = 0
 
@@ -1777,3 +1784,499 @@ def test_late_temporary_context_hold_cannot_pause_new_confirmation(
             .status.value
             == "authorized"
         )
+
+
+@pytest.mark.parametrize("interleave", ["before_commit", "after_commit", "remote_io"])
+def test_other_controller_scope_selection_cannot_be_lost(  # noqa: PLR0915 - deterministic interleavings
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interleave: str
+) -> None:
+    controller, _, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    other_root = "/other-anime"
+    expanded = (
+        environment[0],
+        replace(
+            environment[1],
+            candidates=(
+                AnimeRootCandidate(ANIME_ROOT, (41,)),
+                AnimeRootCandidate(other_root, (42,)),
+            ),
+        ),
+        environment[2],
+    )
+    monkeypatch.setattr(controller, "_environment", lambda: expanded)
+    other = ServiceSetupController(controller.bootstrap, sonarr, shoko, controller.state_path)
+    monkeypatch.setattr(other, "_environment", lambda: expanded)
+    monkeypatch.setattr(other, "_inventory", controller._inventory)
+    other._selected_roots = (ANIME_ROOT,)
+    old = controller.refresh_view()
+    offered = other.refresh_view()
+    assert old is not None
+    assert offered is not None
+    original = StateStore.confirm_onboarding_json
+    changed = False
+
+    def select() -> None:
+        nonlocal changed
+        if changed:
+            return
+        changed = True
+        current_offered = offered
+        if interleave == "after_commit":
+            other.action("edit", {})
+            refreshed = other.refresh_view()
+            assert refreshed is not None
+            current_offered = refreshed
+        assert "selected" in other.action(
+            "scope", {"setup_digest": current_offered.snapshot_digest, "root_1": other_root}
+        )
+
+    def confirm(store: StateStore, document_json: str, iso: str, **kwargs: object) -> None:
+        if interleave == "before_commit":
+            select()
+        original(store, document_json, iso, **kwargs)  # type: ignore[arg-type]
+        if interleave == "after_commit":
+            select()
+
+    monkeypatch.setattr(StateStore, "confirm_onboarding_json", confirm)
+    if interleave == "remote_io":
+
+        def collect() -> tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]:
+            select()
+            return expanded
+
+        monkeypatch.setattr(controller, "_environment", collect)
+    try:
+        result = controller.action("confirm", _consent_form(old))
+        assert ("Setup saved" in result) is (interleave == "after_commit")
+        with open_state(controller.state_path) as store:
+            assert json.loads(str(store.get_meta(service_setup.DRAFT_ROOTS_META))) == [other_root]
+            assert controller.onboarding(store).reconfirmation_required()
+            assert store.get_service_pause() == (True, "setup_changed")
+            if interleave != "after_commit":
+                assert store.get_onboarding_json() is None
+        # A restarted controller renders and consumes only the surviving selection.
+        monkeypatch.setattr(StateStore, "confirm_onboarding_json", original)
+        restarted = ServiceSetupController(
+            controller.bootstrap, sonarr, shoko, controller.state_path
+        )
+        monkeypatch.setattr(restarted, "_environment", lambda: expanded)
+        monkeypatch.setattr(restarted, "_inventory", controller._inventory)
+        fresh = restarted.refresh_view()
+        assert fresh is not None
+        assert fresh.selected_roots == (other_root,)
+        assert "Setup saved" in restarted.action("confirm", _consent_form(fresh))
+        with open_state(controller.state_path) as store:
+            assert store.get_meta(service_setup.DRAFT_ROOTS_META) is None
+            assert not controller.onboarding(store).reconfirmation_required()
+            record = controller.onboarding(store).record()
+            assert record is not None
+            assert record.binding.roots == (other_root,)
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("different_root", [False, True])
+def test_scope_roundtrip_and_same_selection_revoke_old_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, different_root: bool
+) -> None:
+    controller, _, _, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    environment = controller._environment()
+    expanded = (
+        environment[0],
+        replace(
+            environment[1],
+            candidates=(
+                AnimeRootCandidate(ANIME_ROOT, (41,)),
+                AnimeRootCandidate("/other-anime", (42,)),
+            ),
+        ),
+        environment[2],
+    )
+    monkeypatch.setattr(controller, "_environment", lambda: expanded)
+    old = controller.refresh_view()
+    assert old is not None
+    other = ServiceSetupController(controller.bootstrap, sonarr, shoko, controller.state_path)
+    monkeypatch.setattr(other, "_environment", controller._environment)
+    monkeypatch.setattr(other, "_inventory", controller._inventory)
+    other._selected_roots = (ANIME_ROOT,)
+    try:
+        revisions = {old.authorization_revision}
+        for index in range(2):
+            view = other.refresh_view()
+            assert view is not None
+            choice = 1 if different_root and index == 0 else 0
+            assert "selected" in other.action(
+                "scope",
+                {"setup_digest": view.snapshot_digest, f"root_{choice}": view.root_options[choice]},
+            )
+            with open_state(controller.state_path) as store:
+                revision = store.get_service_authorization_revision()
+                assert revision not in revisions
+                revisions.add(revision)
+        assert "changed" in controller.action("confirm", _consent_form(old))
+        with open_state(controller.state_path) as store:
+            assert store.get_onboarding_json() is None
+            assert controller.onboarding(store).reconfirmation_required()
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+def test_scope_selection_atomic_rollback_and_user_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, _, _, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    original = StateStore._set_meta_tx
+    try:
+        with open_state(controller.state_path) as store:
+            controller.onboarding(store).pause(iso="2026-10-29T00:00:00Z")
+
+            def fail(store: StateStore, key: str, value: str) -> None:
+                if key == service_setup.DRAFT_ROOTS_META:
+                    raise StateError("injected failure")
+                original(store, key, value)
+
+            monkeypatch.setattr(StateStore, "_set_meta_tx", fail)
+            with pytest.raises(StateError, match="injected"):
+                store.save_service_scope_selection(
+                    json.dumps([ANIME_ROOT]),
+                    expected_authorization_revision=None,
+                    iso="2026-10-29T00:00:00Z",
+                )
+        monkeypatch.setattr(StateStore, "_set_meta_tx", original)
+        with open_state(controller.state_path) as store:
+            assert store.get_meta(service_setup.DRAFT_ROOTS_META) is None
+            assert store.get_service_authorization_revision() is None
+            assert not controller.onboarding(store).reconfirmation_required()
+            assert store.get_service_pause() == (True, "user_paused")
+            store.save_service_scope_selection(
+                json.dumps([ANIME_ROOT]),
+                expected_authorization_revision=None,
+                iso="2026-10-29T00:00:00Z",
+            )
+        view = controller.refresh_view()
+        assert view is not None
+        assert "Setup saved" in controller.action("confirm", _consent_form(view))
+        with open_state(controller.state_path) as store:
+            assert store.get_meta(service_setup.DRAFT_ROOTS_META) is None
+            assert store.get_service_pause() == (True, "user_paused")
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("losing_mapping", ["0", "1"])
+def test_confirmation_consumes_mapping_intent_and_keeps_worker_context_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, losing_mapping: str
+) -> None:
+    controller, _, _, folders, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    folders["value"].append("/other-shoko")
+    controller._inventory_cache = None
+    other = ServiceSetupController(controller.bootstrap, sonarr, shoko, controller.state_path)
+    monkeypatch.setattr(other, "_environment", controller._environment)
+    monkeypatch.setattr(other, "_inventory", controller._inventory)
+    other._selected_roots = (ANIME_ROOT,)
+    first = controller.refresh_view()
+    second = other.refresh_view()
+    assert first is not None
+    assert second is not None
+    losing = _consent_form(second)
+    losing["mapping_0"] = losing_mapping
+    try:
+        assert "Setup saved" in controller.action("confirm", _consent_form(first))
+        with open_state(controller.state_path) as store:
+            expected = store.get_onboarding_json()
+            assert store.get_service_authorization_revision() != first.authorization_revision
+        assert "changed" in other.action("confirm", losing)
+        with open_state(controller.state_path) as store:
+            assert store.get_onboarding_json() == expected
+            assert not controller.onboarding(store).reconfirmation_required()
+            current = controller.current_context(store)
+            assert current is not None
+            assert (
+                controller.onboarding(store)
+                .evaluate_context(current, iso="2026-10-29T01:00:00Z")
+                .status.value
+                == "authorized"
+            )
+        assert controller.refresh_view() is None
+        assert other.refresh_view() is None
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+def test_confirmation_rollback_preserves_scope_draft_revision_and_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, _, _, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    view = controller.refresh_view()
+    assert view is not None
+    assert "selected" in controller.action(
+        "scope", {"setup_digest": view.snapshot_digest, "root_0": ANIME_ROOT}
+    )
+    view = controller.refresh_view()
+    assert view is not None
+    original = StateStore._set_meta_tx
+
+    def fail(store: StateStore, key: str, value: str) -> None:
+        if key == "normal_service_authorization_revision_v1":
+            raise StateError("injected consent failure")
+        original(store, key, value)
+
+    monkeypatch.setattr(StateStore, "_set_meta_tx", fail)
+    try:
+        assert "injected consent failure" in controller.action("confirm", _consent_form(view))
+        with open_state(controller.state_path) as store:
+            assert store.get_onboarding_json() is None
+            assert store.get_service_authorization_revision() == view.authorization_revision
+            assert json.loads(str(store.get_meta(service_setup.DRAFT_ROOTS_META))) == [ANIME_ROOT]
+            assert controller.onboarding(store).reconfirmation_required()
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+def test_scope_selection_respects_other_handles_durable_write_stop(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with open_state(path) as store, open_state(path) as stopper:
+        stopper.disable_writes("injected durable stop")
+        with pytest.raises(WriteDisabledError):
+            store.save_service_scope_selection(
+                json.dumps([ANIME_ROOT]),
+                expected_authorization_revision=None,
+                iso="2026-10-29T00:00:00Z",
+            )
+    with open_state(path) as store:
+        assert store.writes_disabled
+        assert store.get_service_authorization_revision() is None
+        assert store.get_meta(service_setup.DRAFT_ROOTS_META) is None
+
+
+@pytest.mark.parametrize("interleave", ["before_commit", "remote_io"])
+def test_new_observed_hard_hold_vetoes_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interleave: str
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    try:
+        assert "Setup saved" in controller.action("confirm", form)
+        controller.action("edit", {})
+        view = controller.refresh_view()
+        assert view is not None
+        original = StateStore.confirm_onboarding_json
+        injected = False
+
+        def hold() -> None:
+            nonlocal injected
+            if injected:
+                return
+            injected = True
+            with open_state(controller.state_path) as other:
+                manager = controller.onboarding(other)
+                record = manager.record()
+                assert record is not None
+                assert manager.observe_review(
+                    record, "unsafe_shoko_settings", iso="2026-10-29T05:00:00Z"
+                )
+
+        def confirm(store: StateStore, document: str, iso: str, **kwargs: object) -> None:
+            if interleave == "before_commit":
+                hold()
+            original(store, document, iso, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(StateStore, "confirm_onboarding_json", confirm)
+        if interleave == "remote_io":
+
+            def collect() -> tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment]:
+                hold()
+                return environment
+
+            monkeypatch.setattr(controller, "_environment", collect)
+        assert "changed" in controller.action("confirm", _consent_form(view))
+        assert injected
+        with open_state(controller.state_path) as store:
+            assert store.get_service_pause() == (True, "unsafe_shoko_settings")
+            assert controller.onboarding(store).reconfirmation_required()
+            assert store.get_service_authorization_revision() != view.authorization_revision
+        monkeypatch.setattr(StateStore, "confirm_onboarding_json", original)
+        fresh = controller.refresh_view()
+        assert fresh is not None
+        assert "Setup saved" in controller.action("confirm", _consent_form(fresh))
+        with open_state(controller.state_path) as store:
+            assert not controller.onboarding(store).reconfirmation_required()
+            assert controller.current_context(store) is not None
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("user_paused", [False, True])
+def test_known_drift_is_idempotent_and_can_be_reconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, user_paused: bool
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    try:
+        assert "Setup saved" in controller.action("confirm", form)
+        changed = (replace(environment[0], shoko_version="5.3.3.0"), *environment[1:])
+        monkeypatch.setattr(controller, "_environment", lambda: changed)
+        if user_paused:
+            with open_state(controller.state_path) as store:
+                controller.onboarding(store).pause(iso="2026-10-29T05:00:00Z")
+        controller.action("edit", {})
+        # Discovery's own hold must be reflected in its first published form.
+        view = controller.refresh_view()
+        assert view is not None
+        for _ in range(3):
+            with open_state(controller.state_path) as store:
+                assert controller.current_context(store) is None
+                assert store.get_service_authorization_revision() == view.authorization_revision
+        assert "Setup saved" in controller.action("confirm", _consent_form(view))
+        with open_state(controller.state_path) as store:
+            assert not controller.onboarding(store).reconfirmation_required()
+            assert store.get_service_pause() == (
+                (True, "user_paused") if user_paused else (False, "")
+            )
+            assert controller.current_context(store) is not None
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("change", ["hold", "settings", "scope"])
+def test_view_retries_once_then_refuses_concurrent_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    try:
+        assert "Setup saved" in controller.action("confirm", form)
+        controller.action("edit", {})
+        changed = (replace(environment[0], shoko_version="5.3.3.0"), *environment[1:])
+        monkeypatch.setattr(controller, "_environment", lambda: changed)
+        compute = controller._compute_view_once
+        attempts = 0
+
+        def interleaved(
+            roots: tuple[str, ...], mappings: tuple[PathMapping, ...]
+        ) -> tuple[
+            DashboardSetupView | None,
+            tuple[ApiCompatibility, AnimeScopeDiscovery, SafetyAssessment],
+        ]:
+            nonlocal attempts
+            attempts += 1
+            result = compute(roots, mappings)
+            # The first pass discovers its own drift; another controller changes
+            # state after the second pass has collected all of its facts.
+            if attempts == 2:
+                with open_state(controller.state_path) as other:
+                    if change == "hold":
+                        other.pause_service_for_review("setup_changed", "2026-10-29T05:00:00Z")
+                    elif change == "settings":
+                        other.set_meta(META_SERVICE_SETTINGS, "changed-settings")
+                    else:
+                        other.save_service_scope_selection(
+                            json.dumps(["/other-anime"]),
+                            expected_authorization_revision=other.get_service_authorization_revision(),
+                            iso="2026-10-29T05:00:00Z",
+                        )
+            return result
+
+        monkeypatch.setattr(controller, "_compute_view_once", interleaved)
+        view = controller.refresh_view()
+        assert attempts == 2
+        assert view is not None
+        assert not view.confirmation_enabled
+        assert not view.snapshot_digest
+        assert "changed during discovery" in view.message
+        with open_state(controller.state_path) as store:
+            revision = store.get_service_authorization_revision()
+            assert controller.onboarding(store).reconfirmation_required()
+        assert "not saved" in controller.action("confirm", _consent_form(view))
+        assert "not saved" in controller.action(
+            "scope", {"setup_digest": view.snapshot_digest, "root_0": ANIME_ROOT}
+        )
+        with open_state(controller.state_path) as store:
+            assert store.get_service_authorization_revision() == revision
+            assert controller.onboarding(store).reconfirmation_required()
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("action", ["evaluate_context", "resume_context"])
+def test_collected_safe_context_cannot_acknowledge_newer_same_consent_hazard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    controller, form, _, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    try:
+        assert "Setup saved" in controller.action("confirm", form)
+        with open_state(controller.state_path) as store, open_state(controller.state_path) as other:
+            safe = controller.current_context(store)
+            assert safe is not None
+            unsafe = safe._replace(
+                assessment=assess_settings_payload({"FileQualityFilterEnabled": True})
+            )
+            assert (
+                controller.onboarding(other)
+                .evaluate_context(unsafe, iso="2026-10-29T05:00:00Z")
+                .status.value
+                == "unsafe"
+            )
+            revision = other.get_service_authorization_revision()
+            assert revision != safe.authorization_revision
+            decision = getattr(controller.onboarding(store), action)(
+                safe, iso="2026-10-29T05:00:00Z"
+            )
+            assert decision.status.value == "needs_confirmation"
+            # The stale safe context did not reset the known hazard's identity.
+            fresh_unsafe = unsafe._replace(authorization_revision=revision)
+            assert (
+                controller.onboarding(other)
+                .evaluate_context(fresh_unsafe, iso="2026-10-29T05:00:00Z")
+                .status.value
+                == "unsafe"
+            )
+            assert other.get_service_authorization_revision() == revision
+            assert controller.onboarding(store).reconfirmation_required()
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+def test_returning_same_reason_hazard_after_fresh_check_revokes_form(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    other = ServiceSetupController(controller.bootstrap, sonarr, shoko, controller.state_path)
+    unsafe_environment = (
+        *environment[:2],
+        assess_settings_payload({"FileQualityFilterEnabled": True}),
+    )
+    monkeypatch.setattr(other, "_environment", lambda: unsafe_environment)
+    try:
+        assert "Setup saved" in controller.action("confirm", form)
+        with open_state(controller.state_path) as store:
+            record = controller.onboarding(store).record()
+            assert record is not None
+        other._observed_environment(record)
+        first = other._authorization_revision()
+        controller.action("edit", {})
+        view = controller.refresh_view()
+        assert view is not None
+        assert view.authorization_revision == first
+        original = StateStore.confirm_onboarding_json
+
+        def confirm(store: StateStore, document: str, iso: str, **kwargs: object) -> None:
+            other._observed_environment(record)
+            original(store, document, iso, **kwargs)  # type: ignore[arg-type]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(StateStore, "confirm_onboarding_json", confirm)
+            assert "changed" in controller.action("confirm", _consent_form(view))
+        with open_state(controller.state_path) as store:
+            assert store.get_service_authorization_revision() != first
+            assert store.get_service_pause() == (True, "unsafe_shoko_settings")
+            assert controller.onboarding(store).reconfirmation_required()
+    finally:
+        sonarr.client.close()
+        shoko.client.close()

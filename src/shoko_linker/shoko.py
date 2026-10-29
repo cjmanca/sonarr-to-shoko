@@ -57,7 +57,7 @@ import httpx
 
 from .config import Settings
 from .errors import HttpPolicyError, PathError
-from .http import ApiEndpoint, resolve_and_send
+from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .logging_setup import diagnostic_text
 from .paths import PathMapping, is_within_root, normalize_posix, path_parts
 from .sonarr import SonarrFile
@@ -718,7 +718,9 @@ def _collect_resumable_shoko_discovery(  # noqa: PLR0911, PLR0912, PLR0915
     reasons: list[SnapshotReason] = []
     details: list[str] = []
     effective_size = _effective_page_size(page_size, details)
-    folders, folder_reasons, folder_details = _fetch_import_folders(endpoint)
+    folders, folder_reasons, folder_details = _fetch_import_folders(
+        endpoint, deadline=deadline, monotonic=monotonic
+    )
     reasons.extend(folder_reasons)
     details.extend(folder_details)
     if folder_reasons:
@@ -783,7 +785,7 @@ def _collect_resumable_shoko_discovery(  # noqa: PLR0911, PLR0912, PLR0915
             details,
         )
 
-    first = _fetch_page(endpoint, effective_size, 1)
+    first = _fetch_page(endpoint, effective_size, 1, deadline=deadline, monotonic=monotonic)
     pages_fetched += 1
     if first.rows is None or first.total is None:
         _append(reasons, first.reason or SnapshotReason.MALFORMED_ENVELOPE)
@@ -885,7 +887,9 @@ def _collect_resumable_shoko_discovery(  # noqa: PLR0911, PLR0912, PLR0915
             _append(reasons, SnapshotReason.PAGE_BUDGET_EXHAUSTED)
             details.append(f"Shoko discovery reached its cycle time budget before page {page}")
             break
-        outcome = _fetch_page(endpoint, effective_size, page)
+        outcome = _fetch_page(
+            endpoint, effective_size, page, deadline=deadline, monotonic=monotonic
+        )
         pages_fetched += 1
         if outcome.rows is None or outcome.total is None:
             _append(reasons, outcome.reason or SnapshotReason.MALFORMED_ENVELOPE)
@@ -1198,7 +1202,14 @@ class _PageOutcome:
     detail: str
 
 
-def _fetch_page(endpoint: ApiEndpoint, page_size: int, page: int) -> _PageOutcome:
+def _fetch_page(
+    endpoint: ApiEndpoint,
+    page_size: int,
+    page: int,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> _PageOutcome:
     outcome = _fetch_json(
         endpoint,
         FILE_PATH,
@@ -1208,6 +1219,8 @@ def _fetch_page(endpoint: ApiEndpoint, page_size: int, page: int) -> _PageOutcom
             "pageSize": page_size,
             "page": page,
         },
+        deadline=deadline,
+        monotonic=monotonic,
     )
     if outcome.payload is None:
         return _PageOutcome(None, None, outcome.reason, outcome.detail)
@@ -1223,8 +1236,11 @@ def _fetch_page(endpoint: ApiEndpoint, page_size: int, page: int) -> _PageOutcom
 
 def _fetch_import_folders(
     endpoint: ApiEndpoint,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[dict[int, ImportFolder], list[SnapshotReason], list[str]]:
-    outcome = _fetch_json(endpoint, IMPORT_FOLDER_PATH)
+    outcome = _fetch_json(endpoint, IMPORT_FOLDER_PATH, deadline=deadline, monotonic=monotonic)
     if outcome.payload is None:
         reason = outcome.reason or SnapshotReason.MALFORMED_ENVELOPE
         return {}, [reason], [f"cannot enumerate import folders: {outcome.detail}"]
@@ -1238,34 +1254,39 @@ def _fetch_import_folders(
     return parse_import_folders(payload)
 
 
-def collect_import_folders(endpoint: ApiEndpoint) -> tuple[ImportFolder, ...] | None:
+def collect_import_folders(
+    endpoint: ApiEndpoint,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[ImportFolder, ...] | None:
     """Read the validated import-folder list without paging through Shoko's files."""
-    folders, reasons, _details = _fetch_import_folders(endpoint)
+    folders, reasons, _details = _fetch_import_folders(
+        endpoint, deadline=deadline, monotonic=monotonic
+    )
     if reasons:
         return None
     return tuple(sorted(folders.values(), key=lambda folder: (folder.path, folder.id)))
 
 
 def _fetch_json(
-    endpoint: ApiEndpoint, path: str, params: Mapping[str, Any] | None = None
+    endpoint: ApiEndpoint,
+    path: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> _JsonOutcome:
     try:
-        response = resolve_and_send(endpoint, "GET", path, params=params)
-    except (HttpPolicyError, httpx.HTTPError) as exc:
-        return _JsonOutcome(None, SnapshotReason.TRANSPORT_FAILURE, f"{path}: {exc}")
-    try:
-        if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-            return _JsonOutcome(
-                None, SnapshotReason.TRANSPORT_FAILURE, f"{path}: HTTP {response.status_code}"
-            )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            return _JsonOutcome(
-                None, SnapshotReason.MALFORMED_ENVELOPE, f"{path}: invalid JSON ({exc})"
-            )
-    finally:
-        response.close()
+        status, payload = get_bounded_json(
+            endpoint, path, params, deadline=deadline, clock=monotonic
+        )
+    except BoundedJsonError as exc:
+        return _JsonOutcome(None, SnapshotReason.MALFORMED_ENVELOPE, f"{path}: {exc}")
+    except (HttpPolicyError, httpx.HTTPError, httpx.StreamError):
+        return _JsonOutcome(None, SnapshotReason.TRANSPORT_FAILURE, f"{path}: request failed")
+    if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
+        return _JsonOutcome(None, SnapshotReason.TRANSPORT_FAILURE, f"{path}: HTTP {status}")
     return _JsonOutcome(payload, None, "")
 
 

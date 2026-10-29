@@ -28,8 +28,10 @@ from shoko_linker.sonarr import (
     SonarrFileRecord,
     SonarrInventory,
     SonarrSeries,
+    SourceRelationshipStatus,
     VerdictReason,
     build_baseline,
+    check_current_file_relationship,
     collect_sonarr_inventory,
     compare_baseline,
     index_series_files,
@@ -924,3 +926,151 @@ def test_series_ordering_is_deterministic_and_rejects_stably(
         r for r in forward.rejected_files if r.reason is FileRejectReason.DUPLICATE_FILE_ID
     ]
     assert [str(r.path) for r in collisions] == sorted(str(r.path) for r in collisions)
+
+
+@pytest.mark.parametrize(
+    "expire_path", ["/api/v3/series", "/api/v3/episode", "/api/v3/episodefile"]
+)
+def test_inventory_io_deadline_stops_after_delayed_read(expire_path: str) -> None:
+    stub = standard_stub()
+    elapsed = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = stub.handler(request)
+        assert all(value <= 1.0 for value in request.extensions["timeout"].values())
+        if request.url.path == expire_path:
+            elapsed[0] = 2.0
+        return response
+
+    endpoint = sonarr_endpoint(handler)
+    try:
+        inventory = collect_sonarr_inventory(
+            endpoint,
+            allowed_roots=[ANIME_ROOT],
+            anime_only=True,
+            deadline=2.0,
+            monotonic=lambda: elapsed[0],
+        )
+    finally:
+        endpoint.client.close()
+    assert not inventory.verdict.complete
+    assert stub.requests[-1].url.path == expire_path
+    assert not inventory.files
+
+
+def test_inventory_expired_io_deadline_makes_no_requests() -> None:
+    stub = standard_stub()
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        inventory = collect_sonarr_inventory(
+            endpoint,
+            allowed_roots=[ANIME_ROOT],
+            anime_only=True,
+            deadline=0.0,
+            monotonic=lambda: 0.0,
+        )
+    finally:
+        endpoint.client.close()
+    assert not inventory.verdict.complete
+    assert not stub.requests
+
+
+def test_inventory_redirect_rechecks_io_deadline() -> None:
+    requests: list[httpx.Request] = []
+    elapsed = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        elapsed[0] = 2.0
+        return httpx.Response(302, headers={"location": "/sonarr/redirected"})
+
+    endpoint = sonarr_endpoint(handler)
+    try:
+        inventory = collect_sonarr_inventory(
+            endpoint,
+            allowed_roots=[ANIME_ROOT],
+            anime_only=True,
+            deadline=2.0,
+            monotonic=lambda: elapsed[0],
+        )
+    finally:
+        endpoint.client.close()
+    assert not inventory.verdict.complete
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("expire_path", ["/api/v3/series", "/api/v3/episode"])
+def test_source_guard_deadline_stops_after_delayed_read(expire_path: str) -> None:
+    stub = standard_stub()
+    elapsed = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = stub.handler(request)
+        if request.url.path == expire_path:
+            elapsed[0] = 2.0
+        return response
+
+    endpoint = sonarr_endpoint(handler)
+    try:
+        verdict = check_current_file_relationship(
+            endpoint,
+            series_id=SERIES_ANIME,
+            episode_file_id=FILE_PAIR,
+            path=f"{ANIME_ROOT}/Anime A/S01/E01-E02.mkv",
+            size=PAIR_FILE_SIZE,
+            episode_identities=(),
+            tvdb_series_id=stub.series[0]["tvdbId"],
+            allowed_roots=[ANIME_ROOT],
+            deadline=2.0,
+            monotonic=lambda: elapsed[0],
+        )
+    finally:
+        endpoint.client.close()
+    assert verdict.status is SourceRelationshipStatus.UNAVAILABLE
+    assert stub.requests[-1].url.path == expire_path
+
+
+def test_inventory_io_deadline_narrows_remaining_timeout() -> None:
+    timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json=[])
+
+    endpoint = sonarr_endpoint(handler)
+    try:
+        inventory = collect_sonarr_inventory(
+            endpoint,
+            allowed_roots=[ANIME_ROOT],
+            anime_only=True,
+            deadline=0.25,
+            monotonic=lambda: 0.0,
+        )
+    finally:
+        endpoint.client.close()
+    assert inventory.verdict.complete
+    assert timeouts
+    assert all(value == 0.25 for timeout in timeouts for value in timeout.values())
+
+
+def test_expired_root_read_is_incomplete_even_with_no_eligible_series() -> None:
+    elapsed = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/rootfolder":
+            elapsed[0] = 2.0
+        return httpx.Response(200, json=[])
+
+    endpoint = sonarr_endpoint(handler)
+    try:
+        inventory = collect_sonarr_inventory(
+            endpoint,
+            allowed_roots=[ANIME_ROOT],
+            anime_only=True,
+            deadline=2.0,
+            monotonic=lambda: elapsed[0],
+        )
+    finally:
+        endpoint.client.close()
+    assert not inventory.verdict.complete
+    assert VerdictReason.INCOMPLETE_SNAPSHOT in inventory.verdict.reasons

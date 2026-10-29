@@ -78,6 +78,7 @@ from .linking import (
     plan_fingerprint,
     preflight,
     preflight_file,
+    preflight_link_jobs_and_targets,
     preflight_reasons_are_retryable,
     primary_hard_preflight_reason,
     request_fingerprint,
@@ -1001,6 +1002,7 @@ def apply_campaign(
     lock_held: bool = False,
     daemon_drain: bool = False,
     budget_cycle_key: str | None = None,
+    budget_start_mono: float | None = None,
     fresh_campaign_quarantines: frozenset[int] = frozenset(),
 ) -> CampaignApplyReport:
     """One bounded batch of the approved campaign through the full guarded path.
@@ -1027,6 +1029,8 @@ def apply_campaign(
     budget key and reconsults the F10 drain authorization before **every** submission, so a
     mid-batch ``campaign revoke-drain`` stops the running batch. Manual ``campaign apply``
     allocates its own durable budget key and never requires the drain authorization.
+    ``budget_start_mono`` inherits an outer cycle start without granting a fresh wall-time
+    window; an omitted value gives a standalone invocation its own bounded window.
     """
     plan, digest = read_plan_file(plan_path)
     campaign = _require_campaign(store, plan.campaign_id)
@@ -1058,8 +1062,19 @@ def apply_campaign(
     try:
         # P3-2: the batch wall-time budget starts at batch start, BEFORE the DRY_RUN sweep, so
         # the whole cycle (sweep + apply) respects ``max_cycle_seconds`` (daemon ``_apply`` parity).
-        cycle_start_mono = deps.monotonic()
+        local_start_mono = deps.monotonic()
+        cycle_start_mono = (
+            local_start_mono
+            if budget_start_mono is None
+            else min(local_start_mono, budget_start_mono)
+        )
         _apply_guards(deps, settings, store, campaign, digest, now_iso, reasons)
+        if deps.monotonic() >= cycle_start_mono + deps.max_cycle_seconds:
+            raise CampaignDeferredError(
+                "batch_time_limit",
+                ("batch_time_limit:inherited_cycle",),
+                "campaign apply deferred: cycle wall-time exhausted; zero POSTs",
+            )
         preexisting_quarantines = frozenset(
             record.shoko_file_id
             for record in store.campaign_files(campaign.campaign_id)
@@ -1076,7 +1091,9 @@ def apply_campaign(
         )
         active = _apply_mapping(deps, sweep)
         counters = _CampaignCounters(sent_running=campaign.total_sent)
-        queue = _campaign_queue_snapshot(deps, active, now_iso)
+        queue = _campaign_queue_snapshot(
+            deps, active, now_iso, deadline=cycle_start_mono + deps.max_cycle_seconds
+        )
         batch_cycle_key = _campaign_budget_cycle_key(
             store,
             campaign.campaign_id,
@@ -1091,7 +1108,11 @@ def apply_campaign(
             campaign=campaign,
             sweep=sweep,
             active=active,
-            resolver=EpisodeIdResolver(deps.shoko, clock=deps.monotonic),
+            resolver=EpisodeIdResolver(
+                deps.shoko,
+                clock=deps.monotonic,
+                deadline=cycle_start_mono + deps.max_cycle_seconds,
+            ),
             queue=queue,
             now_iso=now_iso,
             cycle_key=batch_cycle_key,
@@ -1455,10 +1476,10 @@ def _campaign_quarantine_with_generation_guard(
 
 
 def _campaign_queue_snapshot(
-    deps: DaemonDeps, active: ActiveMappings, now_iso: str
+    deps: DaemonDeps, active: ActiveMappings, now_iso: str, *, deadline: float | None = None
 ) -> QueueSnapshot | None:
     """Read the queue, then ensure its network interval did not cross a mapping swap."""
-    queue = fetch_queue(deps.shoko)
+    queue = fetch_queue(deps.shoko, deadline=deadline, clock=deps.monotonic)
     _ensure_campaign_mapping_generation(deps, active, now_iso)
     return queue
 
@@ -2136,6 +2157,8 @@ def _commit_send(  # noqa: PLR0911
     campaign_id: str,
     send_iso: str,
     prepared: SendToken | BudgetRefusal,
+    *,
+    deadline: float | None = None,
 ) -> tuple[_SendTally, SendResult | None]:
     """Durably commit intent and one POST; verification happens after the mapping lease."""
     if isinstance(prepared, BudgetRefusal):
@@ -2164,7 +2187,7 @@ def _commit_send(  # noqa: PLR0911
         store.mark_sent(token, iso=send_iso)
         with store.protect_transport(token):
             transport_started = True
-            send = submit_link(deps.shoko, plan, clock=deps.monotonic)
+            send = submit_link(deps.shoko, plan, clock=deps.monotonic, deadline=deadline)
     except CampaignSendRefusedError as exc:
         store.void_prepared_send(
             plan.shoko_file_id,
@@ -2284,6 +2307,7 @@ def _send_one(  # noqa: PLR0911
         blocked_over=effective_blocked_over(deps),
         mapping_index=active.index,
         check_file=False,
+        check_targets=False,
     )
     blocked = _preflight_tally(verdict, store, plan, send_iso)
     if blocked is not None:
@@ -2291,7 +2315,20 @@ def _send_one(  # noqa: PLR0911
     source_tally = _campaign_source_check_tally(deps, store, plan, deadline=source_check_deadline)
     if source_tally is not None:
         return source_tally
-    file_verdict = preflight_file(deps.shoko, plan, settings, folders)
+    target_gate = preflight_link_jobs_and_targets(
+        deps.shoko, plan, deadline=source_check_deadline, clock=deps.monotonic
+    )
+    blocked = _preflight_tally(target_gate, store, plan, deps.now())
+    if blocked is not None:
+        return blocked
+    file_verdict = preflight_file(
+        deps.shoko,
+        plan,
+        settings,
+        folders,
+        deadline=source_check_deadline,
+        clock=deps.monotonic,
+    )
     send: SendResult | None = None
     tally: _SendTally
     try:
@@ -2340,7 +2377,9 @@ def _send_one(  # noqa: PLR0911
                     for target in plan.targets
                 ),
             )
-            tally, send = _commit_send(deps, store, plan, campaign_id, send_iso, prepared)
+            tally, send = _commit_send(
+                deps, store, plan, campaign_id, send_iso, prepared, deadline=source_check_deadline
+            )
     except ApplyLockUnavailableError:
         return _SendTally(
             0,
@@ -2354,7 +2393,14 @@ def _send_one(  # noqa: PLR0911
         return _SendTally(0, 0, 0, 1, ("writes_disabled",), stop_batch=True)
     if send is None:
         return tally
-    detail = verify_and_close(deps, plan, plan.shoko_file_id, cycle_key, send_iso)
+    detail = verify_and_close(
+        deps,
+        plan,
+        plan.shoko_file_id,
+        cycle_key,
+        send_iso,
+        deadline_mono=source_check_deadline,
+    )
     return _SendTally(1, int(detail.endswith(":verified")), 0, 0, (detail,))
 
 

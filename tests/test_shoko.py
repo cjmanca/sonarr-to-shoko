@@ -1989,3 +1989,43 @@ def test_location_diagnostics_bound_metadata_without_leaking_url_payloads(
         assert "password" not in excluded.detail
         assert "example.invalid" not in excluded.detail
         assert "URL omitted" in excluded.detail
+
+
+@pytest.mark.parametrize("expire_path", [FOLDER_PATH, FILE_PATH])
+def test_discovery_io_deadline_reaches_folder_and_page_reads(expire_path: str) -> None:
+    stub = ShokoStub()
+    stub.folders = [folder(1, "Anime", SHOKO_ROOT)]
+    elapsed = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = stub.handler(request)
+        assert all(value <= 1.0 for value in request.extensions["timeout"].values())
+        if request.url.path == expire_path:
+            elapsed[0] = 2.0
+        return response
+
+    endpoint = shoko_endpoint(handler)
+    try:
+        discovery = collect_shoko_discovery(
+            endpoint,
+            deadline=2.0,
+            monotonic=lambda: elapsed[0],
+        )
+    finally:
+        endpoint.client.close()
+    assert not discovery.verdict.complete
+    assert stub.paths()[-1] == expire_path
+    assert not discovery.files
+
+
+def test_discovery_expired_io_deadline_makes_no_requests() -> None:
+    stub = ShokoStub()
+    endpoint = shoko_endpoint(stub.handler)
+    try:
+        discovery = collect_shoko_discovery(endpoint, deadline=0.0, monotonic=lambda: 0.0)
+        folders = collect_import_folders(endpoint, deadline=0.0, monotonic=lambda: 0.0)
+    finally:
+        endpoint.client.close()
+    assert not discovery.verdict.complete
+    assert folders is None
+    assert not stub.requests

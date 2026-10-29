@@ -1084,6 +1084,22 @@ def test_huge_benign_queue_applies_within_budget_caps(
     assert report.deferred_planned == N_FIVE - BATCH_TWO
 
 
+def test_above_inventory_row_limit_defers_with_zero_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
+    world, clock = _queue_world(tmp_path, monkeypatch, (15_000, 0, 20_001))
+    store = eh.open_store(world)
+    try:
+        deps = eh.build_deps(world, store, clock, max_submissions=BATCH_TWO)
+        report = _run_apply(deps, clock, "c1")
+    finally:
+        store.close()
+    assert report.counts.submitted == 0
+    assert world.shoko.posts_count() == 0
+    assert any(reason.startswith("preflight_queue_unknown") for reason in report.reasons)
+
+
 # ----------------------------------------------- 14/15. async jobs and lost POSTs
 
 
@@ -1149,6 +1165,13 @@ def test_partial_materialization_after_terminal_review_keeps_slot_held(
         first = _run_apply(deps, clock, "c1")
         assert first.counts.submitted == 1
         posted = world.shoko.posts[0][1]
+        pending = store.get_file(21101)
+        assert pending is not None
+        assert pending.state is FileState.VERIFYING
+        # The inline I/O budget ends at the verification deadline. Classify the
+        # still-partial response through a fresh, bounded recovery read.
+        clock.advance(120)
+        _run_apply(deps, clock, "partial-recovery")
         record = store.get_file(21101)
         view = store.budget_view()
         assert record is not None

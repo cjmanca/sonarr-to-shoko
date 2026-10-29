@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -13,7 +14,7 @@ from typing import Any, Final
 import httpx
 
 from .errors import HttpPolicyError, PathError
-from .http import ApiEndpoint, resolve_and_send
+from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .paths import PathMapping, is_within_root, normalize_posix, validate_mappings
 from .shoko import VALID_DROP_TYPES, ImportFolder
 
@@ -232,21 +233,21 @@ def evaluate_service_safety(
     )
 
 
-def inspect_shoko_safety_settings(endpoint: ApiEndpoint) -> SafetyAssessment:
+def inspect_shoko_safety_settings(
+    endpoint: ApiEndpoint,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> SafetyAssessment:
     """Read only ``GET /Settings`` and discard its secret-bearing raw response immediately."""
     try:
-        response = resolve_and_send(endpoint, "GET", SETTINGS_PATH)
-    except (HttpPolicyError, httpx.HTTPError):
+        status_code, payload = get_bounded_json(
+            endpoint, SETTINGS_PATH, deadline=deadline, clock=clock
+        )
+    except (BoundedJsonError, HttpPolicyError, httpx.HTTPError):
         return _unavailable_assessment()
-    try:
-        if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-            return _unavailable_assessment()
-        try:
-            payload = response.json()
-        except ValueError:
-            return _unavailable_assessment()
-    finally:
-        response.close()
+    if not MIN_SUCCESS_STATUS <= status_code < MAX_SUCCESS_STATUS:
+        return _unavailable_assessment()
 
     # The secret-bearing response stays local to this call; only booleans escape.
     return assess_settings_payload(payload)

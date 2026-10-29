@@ -126,6 +126,27 @@ The container listens on port `8080` internally. Map a host port only when you
 want dashboard access, and keep that mapping on a trusted network. Authentication
 is required after first-use account creation.
 
+### Missing anime or episode metadata
+
+In dashboard **Settings**, **Let Shoko retrieve missing anime and episode metadata**
+is off by default. Enabling requires fresh setup confirmation accepting Shoko's
+normal same-anime maintenance, including possible database association changes and
+processing of the manual collection. Disabling requires fresh setup confirmation
+and prevents new requests; it does not cancel jobs Shoko already accepted.
+
+The Overview's **Missing episode metadata** panel shows the latest local
+observations with affected filenames, Sonarr/Shoko paths, and AniDB anime IDs.
+These are recent examples, not a total or percentage of pending work. **Accepted**
+means Shoko accepted a request; **metadata ready** means the service can check the
+complete file plan again. Only **Verified files** confirms completed file links.
+Uncertain deliveries receive read-only checks without automatically replaying the
+request. Observation time is not a promised completion or next-check time.
+
+If queue visibility is incomplete, check that the configured Shoko API key has
+administrator access to the queue inventory (`Queue/Items` in Shoko 5.3.3). New
+requests wait when the service cannot establish the queue state safely. Known
+queued/running/blocked work is awaited without submitting another request.
+
 ## Existing installations
 
 Keep the existing `/data` volume when upgrading. The application migrates SQLite

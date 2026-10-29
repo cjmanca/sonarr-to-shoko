@@ -27,6 +27,7 @@ from typing import Any, cast
 import hash_fixtures as hf
 import httpx
 import pytest
+import queue_fixtures as qf
 import state_v1_fixture as v1fx
 import yaml  # type: ignore[import-untyped]
 
@@ -168,12 +169,18 @@ class Stubs:
         if path == "/api/v3/Queue":
             return self._json(
                 request,
-                {
-                    "WaitingCount": 1,
-                    "BlockedCount": self.blocked_count,
-                    "TotalCount": 4,
-                    "ThreadCount": 1,
-                },
+                {**qf.summary(qf.unrelated(1, self.blocked_count, 4)), "ThreadCount": 1},
+            )
+        if path == "/api/v3/Queue/Items":
+            assert request.url.params["showAll"] == "true"
+            page_size = int(request.url.params["pageSize"])
+            page = int(request.url.params["page"])
+            assert page_size > 0
+            assert page > 0
+            rows = qf.unrelated(1, self.blocked_count, 4)
+            start = (page - 1) * page_size
+            return self._json(
+                request, {"Total": len(rows), "List": rows[start : start + page_size]}
             )
         if path.startswith("/api/v3/Series/AniDB/"):
             anime_id = int(path.split("/")[5])

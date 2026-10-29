@@ -12,7 +12,7 @@ import re
 import secrets
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
@@ -23,6 +23,8 @@ from threading import Timer
 from typing import Final
 from urllib.parse import parse_qs, urlsplit
 
+from .logging_setup import diagnostic_text
+from .metadata_status import MAX_EXAMPLES, MetadataStatusView
 from .onboarding import (
     OnboardingContext,
     OnboardingDecision,
@@ -80,6 +82,7 @@ class DashboardStatus:
     exclusion_counts: tuple[tuple[str, int], ...] = ()
     worker_activity: str = ""
     skipped_file_details: tuple[str, ...] = ()
+    metadata: MetadataStatusView = field(default_factory=MetadataStatusView)
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,8 @@ class DashboardSetupView:
     snapshot_digest: str = ""
     loading: bool = False
     progress_percent: int = 0
+    metadata_maintenance_policy: str | None = None
+    authorization_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,7 @@ class DashboardSettingsView:
     secret_env_vars: tuple[str, str]
     selected_roots: tuple[str, ...] = ()
     path_mappings: tuple[tuple[str, str], ...] = ()
+    allow_missing_metadata_refresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -739,6 +745,7 @@ class DashboardApplication:
             '<p class="hint">Waiting includes work being prepared or waiting for Shoko '
             "to confirm a link. Partial or uncertain link results need attention; "
             "conflicts and safety issues are included.</p></section></div>"
+            + DashboardApplication._metadata_section(status.metadata)
             + '<section class="panel" data-live="skipped-files"><h2>Files skipped</h2>'
             + (
                 "<p>Recent examples from the latest scan. Other eligible files can continue.</p>"
@@ -751,6 +758,72 @@ class DashboardApplication:
             "<summary>Advanced diagnostics</summary>"
             f"<ul>{diagnostics}</ul></details>",
             live=True,
+        )
+
+    @staticmethod
+    def _metadata_section(metadata: MetadataStatusView) -> str:
+        # The projection is already sanitized. Repeat at the display boundary for
+        # legacy/local providers, then escape HTML; these are text, never links.
+        def text(value: str) -> str:
+            return html.escape(diagnostic_text(value))
+
+        labels = {
+            "disabled": "Retrieval off",
+            "prepared": "Prepared locally",
+            "accepted": "Accepted; awaiting metadata",
+            "uncertain": "Delivery uncertain",
+            "waiting_queue": "Waiting for Shoko metadata work",
+            "waiting_file_queue": "Waiting for Shoko file work",
+            "queue_unknown": "Queue visibility incomplete",
+            "queue_blocked": "Waiting for queue checks",
+            "waiting": "Waiting for episode metadata",
+            "deferred": "Retrieval deferred",
+            "safety_hold": "Safety check required",
+            "needs_attention": "Needs attention",
+            "ready": "Metadata ready; file plan will be checked",
+        }
+        examples = []
+        for item in metadata.examples[:MAX_EXAMPLES]:
+            details = (
+                f"<div><dt>Sonarr path</dt><dd>{text(item.sonarr_path) or 'Unavailable'}</dd></div>"
+                f"<div><dt>Shoko path</dt><dd>{text(item.shoko_path) or 'Unavailable'}</dd></div>"
+                f"<div><dt>AniDB anime ID</dt><dd>{item.anime_id}</dd></div>"
+            )
+            if item.shoko_file_id is not None:
+                details += f"<div><dt>Shoko file ID</dt><dd>{item.shoko_file_id}</dd></div>"
+            if item.observed_iso:
+                details += f"<div><dt>Last observation</dt><dd>{text(item.observed_iso)}</dd></div>"
+            if item.next_read_only_check_iso:
+                details += (
+                    "<div><dt>Next read-only check</dt>"
+                    f"<dd>{text(item.next_read_only_check_iso)}</dd></div>"
+                )
+            examples.append(
+                f"<li><h3>{text(item.filename) or 'File context unavailable'}</h3>"
+                f"<p><strong>{labels.get(item.state, 'Needs attention')}</strong></p>"
+                f'<p>{text(item.message)}</p><dl class="facts">{details}</dl></li>'
+            )
+        return (
+            '<section class="panel" data-live="metadata"><h2>Missing episode metadata</h2>'
+            f"<p>{text(metadata.message)}</p>"
+            '<p>Manage retrieval in <a href="/settings">Settings</a>. Changing the option '
+            "requires setup confirmation. Turning it off cannot cancel accepted Shoko jobs.</p>"
+            "<h3>Latest metadata observations</h3>"
+            "<p>Recent examples, not a complete pending-work count. Metadata readiness does "
+            "not mean the file has been linked; verified links are counted above.</p>"
+            + (
+                f"<ul>{''.join(examples)}</ul>"
+                if examples
+                else "<p>No metadata observations yet.</p>"
+            )
+            + (
+                "<p>For incomplete queue visibility, check that the configured Shoko API key "
+                "can read the administrator queue inventory (Queue/Items in Shoko 5.3.3). "
+                "New requests wait while visibility is unknown.</p>"
+                if any(item.state == "queue_unknown" for item in metadata.examples[:MAX_EXAMPLES])
+                else ""
+            )
+            + "</section>"
         )
 
     @staticmethod
@@ -769,7 +842,16 @@ class DashboardApplication:
             '<form method="post" action="/settings">'
             f'<input type="hidden" name="csrf_token" value="{token}">'
             f'<input type="hidden" name="settings_digest" value="{settings.digest}">'
-            f'{fields}<details><summary>Show advanced</summary>'
+            f'{fields}'
+            '<label><input type="checkbox" name="allow_missing_metadata_refresh" value="1"'
+            f'{" checked" if settings.allow_missing_metadata_refresh else ""}>'
+            'Let Shoko retrieve missing anime and episode metadata</label>'
+            '<p>Off by default. Enabling requires fresh setup consent. Shoko may repair existing '
+            'database episode/file associations and run rename, move, processing, plugins or '
+            'hooks for the same anime, including your manual collection. Read-only mounts '
+            'protect media, not database associations. Turning this off does not cancel '
+            'jobs Shoko already accepted.</p>'
+            '<details><summary>Show advanced</summary>'
             '<p>Advanced service configuration (YAML). Safety and campaign fields apply to '
             'compatibility operations; normal automatic linking still requires scope consent. '
             'Hard safety limits cannot be increased here.</p>'

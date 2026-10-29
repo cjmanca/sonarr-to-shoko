@@ -29,6 +29,7 @@ from typing import Any, cast
 import hash_fixtures as hf
 import httpx
 import pytest
+import queue_fixtures as qf
 import yaml  # type: ignore[import-untyped]
 
 from shoko_linker import campaign as campaign_mod
@@ -82,6 +83,7 @@ from shoko_linker.linking import (
     SendOutcome,
     SendResult,
 )
+from shoko_linker.linking import preflight_file as original_file_preflight
 from shoko_linker.mapping_store import MappingStore, RefreshOutcome, load_active
 from shoko_linker.mapping_store import refresh as mapping_refresh
 from shoko_linker.policies import RunPolicy
@@ -93,6 +95,8 @@ from shoko_linker.state import (
     CAMPAIGN_QUARANTINE_PROGRESS_RECORDED_MARKER,
     CAMPAIGN_STATUS_APPROVED,
     CAMPAIGN_STATUS_REVOKED,
+    META_CAMPAIGN_DEFERRED_UNTIL,
+    META_CAMPAIGN_ZERO_PROGRESS,
     BaselineFile,
     BudgetRefusal,
     CampaignBinding,
@@ -168,6 +172,8 @@ class Stubs:
     source_xml: bytes | None = None
     verify_empty: set[int] = field(default_factory=set)
     blocked_count: int = 0
+    queue_items: list[dict[str, Any]] | None = None
+    queue_items_status: int = 200
     posts: list[dict[str, Any]] = field(default_factory=list)
     posted_files: list[int] = field(default_factory=list)
     linked: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
@@ -358,17 +364,19 @@ class Stubs:
                 json=[{"ID": 1, "Name": "Sonarr", "Path": SHOKO_ROOT, "DropFolderType": "None"}],
                 request=request,
             )
-        if path == "/api/v3/Queue":
-            return httpx.Response(
-                200,
-                json={
-                    "WaitingCount": 1,
-                    "BlockedCount": self.blocked_count,
-                    "TotalCount": 4,
-                    "ThreadCount": 1,
-                },
-                request=request,
+        if path in {"/api/v3/Queue", "/api/v3/Queue/Items"}:
+            items = (
+                self.queue_items
+                if self.queue_items is not None
+                else qf.unrelated(1, self.blocked_count, 4)
             )
+            payload = (
+                qf.summary(items)
+                if path.endswith("/Queue")
+                else {"Total": len(items), "List": items}
+            )
+            status = self.queue_items_status if path.endswith("/Items") else 200
+            return httpx.Response(status, json=payload, request=request)
         if path.startswith("/api/v3/Series/AniDB/"):
             if self.episode_list_timeout:
                 raise httpx.ReadTimeout("episode list timed out", request=request)
@@ -1176,7 +1184,7 @@ def test_manual_link_added_during_sonarr_source_check_blocks_campaign_post(
 
 
 def test_campaign_deadline_at_final_local_guard_leaves_no_send_or_budget_debt(
-    env: Env, capsys: pytest.CaptureFixture[str]
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The campaign's final auth check and Shoko file read share its monotonic send deadline."""
     _set_campaign(env, max_batch_size=1)
@@ -1201,6 +1209,12 @@ def test_campaign_deadline_at_final_local_guard_leaves_no_send_or_budget_debt(
         return True
 
     env.stubs.get_hook = slow_final_file_read
+
+    def bounded_file_preflight(*args: Any, **kwargs: Any) -> Any:
+        assert (kwargs["deadline"], kwargs["clock"]()) == (10.0, clock["now"])
+        return original_file_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_mod, "preflight_file", bounded_file_preflight)
     store = env.open_store()
     deps: DaemonDeps | None = None
     try:
@@ -3819,7 +3833,9 @@ def test_concurrent_prepared_campaign_contenders_are_voided_by_commit_consumer(
 
     post_calls: list[int] = []
 
-    def reject_one(_shoko: Any, link_plan: Any, *, clock: Callable[[], float]) -> SendResult:
+    def reject_one(
+        _shoko: Any, link_plan: Any, *, clock: Callable[[], float], deadline: float | None = None
+    ) -> SendResult:
         post_calls.append(link_plan.shoko_file_id)
         return SendResult(
             outcome=SendOutcome.REJECTED,
@@ -4712,6 +4728,48 @@ def test_daemon_drain_head_of_line_campaign_drops_out_and_the_next_drains(
         store.close()
 
 
+@pytest.mark.parametrize("reason", ["unexpected_stall", "cycle_time_budget_exhausted:unknown"])
+def test_daemon_unknown_zero_progress_reason_still_pauses(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    env.seed(specs(COUNT_TWO))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    with closing(env.open_store()) as store:
+        _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)
+        posts_before = len(env.stubs.posts)
+
+        def unexpected_local_outcome(*args: Any, **kwargs: Any) -> Any:
+            return env.now_iso, campaign_mod._SendTally(
+                0,
+                0,
+                0,
+                1,
+                (reason,),
+                stop_batch=True,
+            )
+
+        monkeypatch.setattr(
+            campaign_mod, "_post_preflight_send_staleness", unexpected_local_outcome
+        )
+        for key in ZERO_PROGRESS_CYCLE_KEYS:
+            cycle = _daemon_cycle(env, store, campaign_id, key)
+            assert cycle.campaign is not None
+            assert cycle.campaign.progress == cycle.campaign.submitted == 0
+            assert reason in cycle.campaign.reasons
+        campaign = store.get_campaign(campaign_id)
+        assert campaign is not None
+        assert campaign.status == "paused"
+        assert campaign.status_reason == "no_queueable_candidates"
+        assert store.get_meta(f"campaign_deferred_until:{campaign_id}") is None
+        assert len(env.stubs.posts) == posts_before
+
+
 def test_daemon_zero_progress_all_blocked_campaign_auto_pauses(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4993,7 +5051,7 @@ def test_f9_batch_loop_preflights_are_bounded_by_attempts(
 
 
 def test_f9_batch_loop_stops_at_the_wall_time_bound(
-    env: Env, capsys: pytest.CaptureFixture[str]
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """F9-1(c): a monotonic clock past ``max_cycle_seconds`` stops starting new submissions;
     the deferred remainder stays queueable (non-destructive) with zero further POSTs."""
@@ -5010,20 +5068,30 @@ def test_f9_batch_loop_stops_at_the_wall_time_bound(
     try:
         base = _campaign_deps(env, store, campaign_id)
         clock = {"value": 0.0}
+        late_reads: list[str] = []
 
-        def expire_batch_after_reconciliation(path: str) -> None:
-            if path == "/api/v3/File":
-                # Let the bounded reconciliation finish, then expire the shared batch budget
-                # before the campaign loop starts its first submission.
-                clock["value"] = 100.0
+        original_sweep = campaign_mod._apply_sweep
 
-        env.stubs.get_hook = expire_batch_after_reconciliation
+        def expire_batch_after_reconciliation(*args: Any, **kwargs: Any) -> daemon_mod.CycleReport:
+            # Finish the real bounded sweep first. Expiring inside its response body
+            # correctly defers incomplete reconciliation before this batch-loop gate.
+            sweep = original_sweep(*args, **kwargs)
+            clock["value"] = 100.0
+            return sweep
+
+        def record_late_read(path: str) -> None:
+            if clock["value"] >= 10.0:
+                late_reads.append(path)
+
+        monkeypatch.setattr(campaign_mod, "_apply_sweep", expire_batch_after_reconciliation)
+        env.stubs.get_hook = record_late_read
         deps = replace(base, monotonic=lambda: clock["value"], max_cycle_seconds=10.0)
         posts_before = len(env.stubs.posts)
         report = apply_campaign(deps, settings, store, env.tmp_path / "plan.json", T0)
         assert report.submitted == 0  # the clock is past the bound before the first submission
         assert any(reason.startswith("batch_time_limit:") for reason in report.reasons)
         assert len(env.stubs.posts) == posts_before  # zero POSTs after the bound
+        assert late_reads == []  # including the post-sweep aggregate queue check
         planned = [
             record
             for record in store.campaign_files(campaign_id)
@@ -8067,3 +8135,405 @@ def test_owner_quarantine_blocks_frozen_campaign_targets_after_restart_and_repai
         finally:
             store.close()
         assert not env.stubs.posts
+
+
+@pytest.mark.parametrize("job", ["file", "anime", "unknown"])
+def test_campaign_foreign_jobs_defer_without_send_intent(
+    env: Env, capsys: pytest.CaptureFixture[str], job: str
+) -> None:
+    candidate = specs(1)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    key = (
+        f"Import.ManualLinkJob_VideoLocalID:{candidate.shoko_id}_EpisodeID:999_Percentage:50"
+        if job == "file"
+        else f"AniDB.GetAniDBAnimeJob_AnimeID:{ANIME_ID}"
+    )
+    env.stubs.queue_items = [qf.item(key)] if job != "unknown" else []
+    env.stubs.queue_items_status = 403 if job == "unknown" else 200
+    result = apply(env, capsys)
+    assert result["payload"]["submitted"] == 0
+    assert result["payload"]["quarantined"] == 0
+    assert env.stubs.posts == []
+    with closing(env.open_store()) as store:
+        assert store.live_send_counts() == (0, 0)
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+
+
+def test_campaign_inline_verification_cannot_restart_elapsed_cycle_budget(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An accepted POST keeps its recovery hold when no cycle I/O time remains."""
+    _set_campaign(env, max_batch_size=1)
+    candidate = specs(1)[0]
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    clock = [0.0]
+    reads_after_post: list[str] = []
+
+    def after_post(_file_id: int) -> None:
+        clock[0] = 1.0
+
+    def record_late_read(path: str) -> None:
+        if clock[0] >= 1.0:
+            reads_after_post.append(path)
+
+    env.stubs.post_hook = after_post
+    env.stubs.get_hook = record_late_read
+    store = env.open_store()
+    deps: DaemonDeps | None = None
+    try:
+        deps = replace(
+            _campaign_deps(env, store, prepared["campaign_id"]),
+            monotonic=lambda: clock[0],
+            max_cycle_seconds=1.0,
+        )
+        assert deps is not None
+        report = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            env.now_iso,
+            batch_size=1,
+        )
+        assert report.submitted == 1
+        assert report.verified == 0
+        assert "verification:unknown" in report.reasons
+        assert reads_after_post == []
+        row = store.get_file(candidate.shoko_id)
+        assert row is not None
+        assert row.state is FileState.VERIFYING
+        inspection = store.active_send_details(candidate.shoko_id)
+        assert inspection is not None
+        assert not inspection.slot_released
+    finally:
+        store.close()
+        if deps is not None:
+            for endpoint in (deps.shoko, deps.sonarr, deps.mapping_source):
+                endpoint.client.close()
+
+
+@pytest.mark.parametrize("expire_chain", [True, False], ids=["deadline", "within-budget"])
+def test_campaign_pending_retry_keeps_original_cycle_deadline(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    expire_chain: bool,
+) -> None:
+    """A pending retry cannot start its second ID hop after the original cycle expires."""
+    candidate = specs(1)[0]
+    env.stubs.pending.add(candidate.shoko_id)
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    clock = [0.0]
+    retry_reads: list[str] = []
+    original_sweep = campaign_mod._apply_sweep
+    retry_started = False
+
+    def finish_sweep(*args: Any, **kwargs: Any) -> daemon_mod.CycleReport:
+        nonlocal retry_started
+        sweep = original_sweep(*args, **kwargs)
+        env.stubs.pending.clear()
+        clock[0] = 0.9
+        retry_started = True
+        return sweep
+
+    def finish_first_hop(path: str) -> None:
+        if retry_started:
+            retry_reads.append(path)
+            if path.startswith("/api/v3/Series/AniDB/") and expire_chain:
+                clock[0] = 1.1
+
+    monkeypatch.setattr(campaign_mod, "_apply_sweep", finish_sweep)
+    env.stubs.get_hook = finish_first_hop
+    store = env.open_store()
+    deps = replace(
+        _campaign_deps(env, store, prepared["campaign_id"]),
+        monotonic=lambda: clock[0],
+        max_cycle_seconds=1.0,
+    )
+    try:
+        report = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=1,
+        )
+        chain_reads = [path for path in retry_reads if "/AniDB/" in path]
+        if expire_chain:
+            assert chain_reads == [f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"]
+            assert retry_reads[-1] == chain_reads[0]
+            assert report.submitted == 0
+            assert report.quarantined == 0
+            assert any(reason.startswith("resolution_deferred:") for reason in report.reasons)
+            assert env.stubs.posts == []
+            assert store.live_send_counts() == (0, 0)
+            assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+        else:
+            assert f"/api/v3/Episode/AniDB/{ANIDB_EP}/Episode" in chain_reads
+            assert report.submitted == 1
+            assert report.verified == 1
+            assert env.stubs.posted_files == [candidate.shoko_id]
+    finally:
+        store.close()
+        for endpoint in (deps.shoko, deps.sonarr, deps.mapping_source):
+            endpoint.client.close()
+
+
+def test_campaign_sweep_resolution_chain_keeps_its_owned_deadline(
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bounded sweep cannot start a second ID hop after its resolution phase expires."""
+    candidate = specs(1)[0]
+    env.stubs.pending.add(candidate.shoko_id)
+    env.seed([candidate])
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    clock = [0.0]
+    chain_reads: list[str] = []
+    original_sweep = campaign_mod._apply_sweep
+
+    def finish_first_hop(path: str) -> None:
+        if "/AniDB/" in path:
+            chain_reads.append(path)
+            clock[0] = 0.6
+
+    def finish_sweep(*args: Any, **kwargs: Any) -> daemon_mod.CycleReport:
+        sweep = original_sweep(*args, **kwargs)
+        # Resolution owns half this cycle (0.5); the remaining half belongs to apply.
+        assert chain_reads == [f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"]
+        clock[0] = 1.1
+        return sweep
+
+    monkeypatch.setattr(campaign_mod, "_apply_sweep", finish_sweep)
+    env.stubs.get_hook = finish_first_hop
+    store = env.open_store()
+    deps = replace(
+        _campaign_deps(env, store, prepared["campaign_id"]),
+        monotonic=lambda: clock[0],
+        max_cycle_seconds=1.0,
+    )
+    try:
+        report = apply_campaign(
+            deps,
+            load_settings(env.config_path),
+            store,
+            env.tmp_path / "plan.json",
+            T0,
+            batch_size=1,
+        )
+        assert chain_reads == [f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"]
+        assert report.submitted == 0
+        assert env.stubs.posts == []
+        assert store.live_send_counts() == (0, 0)
+        assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
+    finally:
+        store.close()
+        for endpoint in (deps.shoko, deps.sonarr, deps.mapping_source):
+            endpoint.client.close()
+
+
+@pytest.mark.parametrize("expire_phase", ["before-drain", "sweep", "source", "within-budget"])
+def test_automatic_campaign_drain_inherits_outer_cycle_wall_budget(  # noqa: PLR0915
+    env: Env,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    expire_phase: str,
+) -> None:
+    """Arrival work and the real authorized campaign drain share one I/O deadline."""
+    _set_campaign(env, max_batch_size=1)
+    env.seed(specs(2))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    campaign_id = prepared["campaign_id"]
+    clock = [0.0]
+    drain_started = False
+    source_started = False
+    drain_reads: list[str] = []
+    late_requests: list[str] = []
+    original_apply = daemon_mod._run_apply
+    original_sweep = campaign_mod._apply_sweep
+
+    def finish_arrival_work(*args: Any, **kwargs: Any) -> Any:
+        nonlocal drain_started
+        result = original_apply(*args, **kwargs)
+        if drain_started:
+            return result
+        clock[0] = 10.0 if expire_phase == "before-drain" else 4.0
+        drain_started = True
+        return result
+
+    def finish_campaign_sweep(*args: Any, **kwargs: Any) -> daemon_mod.CycleReport:
+        nonlocal source_started
+        assert kwargs["cycle_start_mono"] == 0.0
+        result = original_sweep(*args, **kwargs)
+        source_started = True
+        if expire_phase == "source":
+            clock[0] = 9.0
+        return result
+
+    def observe(request: httpx.Request) -> None:
+        if not drain_started:
+            return
+        path = request.url.path
+        drain_reads.append(path)
+        if clock[0] >= 10.0:
+            late_requests.append(path)
+        if expire_phase == "sweep" or (expire_phase == "source" and source_started):
+            clock[0] = 10.0
+
+    with closing(env.open_store()) as store:
+        _canary(env, store, campaign_id)
+        _authorize_drain(env, store, campaign_id)
+        baseline_sends = store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0]
+        env.stubs.posts.clear()
+        env.stubs.posted_files.clear()
+        deps = replace(
+            _campaign_deps(env, store, campaign_id),
+            monotonic=lambda: clock[0],
+            max_cycle_seconds=10.0,
+        )
+        scoped = daemon_mod._campaign_scoped_deps(deps, campaign_id)
+        assert scoped.max_cycle_seconds == deps.max_cycle_seconds
+        assert scoped.monotonic is deps.monotonic
+        monkeypatch.setattr(daemon_mod, "_run_apply", finish_arrival_work)
+        monkeypatch.setattr(campaign_mod, "_apply_sweep", finish_campaign_sweep)
+        env.stubs.sonarr_hook = observe
+        env.stubs.get_hook = lambda path: observe(httpx.Request("GET", SHOKO_BASE + path))
+        try:
+            cycle = run_cycle(
+                deps,
+                now_iso=T0,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.BACKLOG,
+                cycle_key="inherited-wall-budget",
+                budget_start_mono=0.0,
+            )
+            assert cycle.campaign_drain_selected
+            assert late_requests == []
+            if expire_phase == "within-budget":
+                assert cycle.campaign is not None
+                assert cycle.campaign.submitted == 1
+                assert len(env.stubs.posts) == 1
+            else:
+                assert env.stubs.posts == []
+                assert store.live_send_counts() == (0, 0)
+                assert (
+                    store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0]
+                    == baseline_sends
+                )
+                current = store.get_campaign(campaign_id)
+                assert current is not None
+                assert current.status == "approved"
+                retry = store.get_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}")
+                assert retry is not None
+                assert datetime.fromisoformat(retry) > datetime.fromisoformat(T0)
+                assert store.get_meta(f"{META_CAMPAIGN_ZERO_PROGRESS}:{campaign_id}") == "0"
+                if expire_phase == "before-drain":
+                    assert drain_reads == []
+                else:
+                    assert len(drain_reads) >= 1
+        finally:
+            for endpoint in (deps.shoko, deps.sonarr, deps.mapping_source):
+                endpoint.client.close()
+
+    if expire_phase != "within-budget":
+        # The persisted cooldown survives restart; after it passes the same remaining file
+        # safely drains using a new cycle's own full budget, without replaying the canary.
+        env.stubs.sonarr_hook = None
+        env.stubs.get_hook = None
+        monkeypatch.setattr(daemon_mod, "_run_apply", original_apply)
+        monkeypatch.setattr(campaign_mod, "_apply_sweep", original_sweep)
+        env.now_iso = _iso_plus(T0, 3600.0)
+        with closing(env.open_store()) as reopened:
+            resumed = _daemon_cycle(env, reopened, campaign_id, "after-wall-budget-restart")
+            assert resumed.campaign is not None
+            assert resumed.campaign.submitted == 1
+            assert len(env.stubs.posts) == 1
+            assert _campaign_sent(reopened, campaign_id) == 2
+
+
+def test_standalone_campaign_apply_owns_full_budget_at_later_clock(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.seed(specs(1))
+    prepared = prepare(env, capsys)
+    approve(env, capsys, prepared["approval_digest"])
+    with closing(env.open_store()) as store:
+        deps = replace(
+            _campaign_deps(env, store, prepared["campaign_id"]),
+            monotonic=lambda: 100.0,
+            max_cycle_seconds=10.0,
+        )
+        try:
+            report = apply_campaign(
+                deps,
+                load_settings(env.config_path),
+                store,
+                env.tmp_path / "plan.json",
+                T0,
+            )
+            assert report.submitted == 1
+            assert report.verified == 1
+        finally:
+            for endpoint in (deps.shoko, deps.sonarr, deps.mapping_source):
+                endpoint.client.close()
+
+
+def test_new_arrival_submission_cannot_grant_campaign_a_fresh_wall_window(
+    dual_env: DualEnv, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = dual_env
+    campaign_id = _dual_campaign(env, capsys)
+    env.write_daemon_lease()
+    clock = [0.0]
+    with closing(env.open_store()) as store:
+        _dual_canary(env, store, capsys)
+        authorize_campaign_drain(store, campaign_id, T0, note=AUTH_NOTE)
+        env.stubs.posted_files.clear()
+        late_reads: list[str] = []
+
+        def consume_cycle(_file_id: int) -> None:
+            clock[0] = 10.0
+
+        def observe(path: str) -> None:
+            if clock[0] >= 10.0:
+                late_reads.append(path)
+
+        env.stubs.post_hook = consume_cycle
+        env.stubs.get_hook = observe
+        deps = replace(env.daemon_deps(store), monotonic=lambda: clock[0], max_cycle_seconds=10.0)
+        try:
+            report = run_cycle(
+                deps,
+                now_iso=T0,
+                mode=CycleMode.APPLY,
+                policy=RunPolicy.NEW_ARRIVAL,
+                cycle_key="real-arrival-budget",
+                budget_start_mono=0.0,
+            )
+            assert report.new_arrival_submitted == 1
+            assert report.campaign_drain_selected
+            assert report.campaign_submitted == 0
+            assert len(env.stubs.posted_files) == 1
+            assert env.stubs.posted_files[0] in {502, 503, 504}
+            assert late_reads == []
+            assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 2
+            assert store.live_send_counts() == (1, 1)
+            current = store.get_campaign(campaign_id)
+            assert current is not None
+            assert current.status == "approved"
+            assert current.total_sent == 1
+            assert store.get_meta(f"{META_CAMPAIGN_DEFERRED_UNTIL}:{campaign_id}") is not None
+        finally:
+            for endpoint in (deps.shoko, deps.sonarr, deps.mapping_source):
+                endpoint.client.close()

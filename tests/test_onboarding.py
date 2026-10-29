@@ -24,6 +24,7 @@ from shoko_linker.state import (
     META_ONBOARDING_RECONFIRMATION_REQUIRED,
     SCHEMA_VERSION,
     StateError,
+    StateStore,
     WriteDisabledError,
     open_state,
 )
@@ -125,6 +126,8 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
         (5, "migrated from 4"),
         (6, "migrated from 5"),
         (7, "migrated from 6"),
+        (8, "migrated from 7"),
+        (9, "migrated from 8"),
     ]
     conn = sqlite3.connect(path)
     try:
@@ -1259,3 +1262,94 @@ def test_evaluate_mismatch_holds_only_the_consent_it_observed(
                 OnboardingStatus.NEEDS_CONFIRMATION
             )
             assert reopened.get_service_pause() == (True, reason)
+
+
+@pytest.mark.parametrize("channel", ["environment", "folders", "evaluation"])
+def test_observation_generation_fences_aba_and_stale_safe_reads(
+    tmp_path: Path, channel: str
+) -> None:
+    path = tmp_path / "observations.sqlite3"
+    with open_state(path) as store, open_state(path) as other:
+        manager = OnboardingManager(store)
+        record = manager.confirm_setup(
+            make_binding(),
+            safe_assessment(),
+            confirmed_facts=confirmed_facts(safe_assessment()),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        encoded = record.to_json()
+        initial = store.get_service_authorization_revision()
+
+        def observe(handle: StateStore, revision: str | None, hazard: bool) -> bool:
+            return handle.observe_onboarding_facts(
+                encoded,
+                expected_authorization_revision=revision,
+                channel=channel,
+                fingerprint=("a" if hazard else "b") * 64,
+                reason="unsafe_shoko_settings" if hazard else None,
+                iso=T0,
+            )
+
+        assert observe(other, initial, True)
+        first = store.get_service_authorization_revision()
+        assert first != initial
+        assert observe(other, first, True)
+        assert store.get_service_authorization_revision() == first
+        # A safe request started before this hazard cannot erase its identity.
+        assert not observe(store, initial, False)
+        assert observe(other, first, True)
+        assert store.get_service_authorization_revision() == first
+        assert observe(store, first, False)
+        assert observe(other, first, True)
+        second = store.get_service_authorization_revision()
+        assert second not in {initial, first}
+        assert not observe(store, first, False)
+        assert manager.reconfirmation_required()
+        manager.confirm_setup(
+            make_binding(),
+            safe_assessment(),
+            confirmed_facts=record.confirmed_facts,
+            automatic_link_consent=True,
+            iso=T_PLUS_30_DAYS,
+        )
+        assert not observe(other, second, True)
+        assert not manager.reconfirmation_required()
+
+
+def test_observed_hard_hold_revision_and_fact_identity_roll_back_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "rollback.sqlite3"
+    with open_state(path) as store:
+        manager = OnboardingManager(store)
+        record = manager.confirm_setup(
+            make_binding(),
+            safe_assessment(),
+            confirmed_facts=confirmed_facts(safe_assessment()),
+            automatic_link_consent=True,
+            iso=T0,
+        )
+        revision = store.get_service_authorization_revision()
+        original = store._set_meta_tx
+
+        def fail(key: str, value: str) -> None:
+            if key == META_ONBOARDING_RECONFIRMATION_REQUIRED:
+                raise StateError("injected review failure")
+            original(key, value)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_set_meta_tx", fail)
+            with pytest.raises(StateError, match="injected"):
+                store.observe_onboarding_facts(
+                    record.to_json(),
+                    expected_authorization_revision=revision,
+                    channel="environment",
+                    fingerprint="a" * 64,
+                    reason="unsafe_shoko_settings",
+                    iso=T0,
+                )
+        assert store.get_service_authorization_revision() == revision
+        assert store.get_meta("onboarding_observation_v1:environment") is None
+        assert not manager.reconfirmation_required()
+        assert store.get_service_pause() == (False, "")

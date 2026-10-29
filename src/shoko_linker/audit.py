@@ -32,7 +32,7 @@ import httpx
 
 from .config import Settings
 from .errors import HttpPolicyError, PathError
-from .http import ApiEndpoint, resolve_and_send
+from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .linking import EpisodeResolutionStatus, ShokoFileXRefs, _match_anidb_episode, parse_file_xrefs
 from .mapping_store import ActiveMappings
 from .mappings import ResolutionStatus
@@ -532,18 +532,11 @@ def _get_payload(
 ) -> Any | None:
     """One budgeted GET returning its parsed JSON payload; ``None`` on any failure."""
     try:
-        response = resolve_and_send(endpoint, "GET", path, params=params)
-    except (HttpPolicyError, httpx.HTTPError):
+        status, payload = get_bounded_json(endpoint, path, params)
+    except (BoundedJsonError, HttpPolicyError, httpx.HTTPError):
         return None
-    try:
-        if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-            return None
-        try:
-            payload = response.json()
-        except ValueError:
-            return None
-    finally:
-        response.close()
+    if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
+        return None
     return payload
 
 

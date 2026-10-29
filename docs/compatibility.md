@@ -528,3 +528,15 @@ episodeoffset="16"`)**, 17303 (Final Part 3, `episodeoffset="28"`).
   renamer flags, `AniDb.MyList_AddFiles`), mount read-only-ness, plugin inventory,
   live AniDB episode titles (e.g., "Traitor" title check), queue behavior.
 - Shoko `master`-branch link semantics; Shoko v6 API.
+
+### Optional missing-metadata maintenance (Shoko 5.3.3)
+
+The normal-service option defaults off and requires separate scope-bound consent; see [requirements](../PROJECT.md#shoko-linking-and-verification). The source-verified request is `POST /api/v3/Series/AniDB/{id}/Refresh` with `force=false`, `downloadRelations=false`, `createSeriesEntry=true`, `immediate=false`, `cacheOnly=false`, and `skipTmdbUpdate=true`. JSON `false` means queued, not complete or rejected. This is normal Shoko maintenance, not a pure metadata/no-hook operation: same-anime associations and processing may change. Different job flags can produce different queue keys for the same anime. Queue inspection requires administrator visibility; unknown visibility refuses new requests. Queue snapshots plus local durable guards do not promise globally exactly-once scheduling across Shoko clients. No live write is claimed.
+
+New file-link submissions require fresh, complete Shoko job visibility to avoid duplicating same-file ManualLink jobs or using episode IDs while a target anime refresh is pending. In Shoko 5.3.3, `GET /api/v3/Queue/Items` requires an administrator API key. A forbidden, incomplete, or unavailable inventory safely defers new links in both normal and advanced modes; verification of already submitted links remains available. Unrelated jobs do not block linking. This read-and-submit guard cannot prevent another client from scheduling a job after the observation.
+
+Each fresh inventory is bounded to 20,000 jobs, 20 pages of at most 1,000 jobs,
+and 8 MB of combined response bodies (including both running-job summaries),
+within the caller's remaining deadline and configured HTTP timeouts. These bounds
+cover the tested 20,000-job unrelated backlog; larger or more verbose responses
+defer new submissions rather than treating an incomplete inventory as empty.

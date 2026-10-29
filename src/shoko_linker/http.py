@@ -21,7 +21,10 @@ Policy (deliberate, not incidental):
 
 from __future__ import annotations
 
+import json as json_module
 import logging
+import math
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Final
 
@@ -41,6 +44,11 @@ AUTH_HEADER_NAMES: Final[frozenset[str]] = frozenset(
 REDIRECT_STATUSES: Final[frozenset[int]] = frozenset({301, 302, 303, 307, 308})
 _SEE_OTHER: Final[int] = 303
 MAX_REDIRECTS: Final[int] = 5
+_MIN_HTTP_STATUS: Final[int] = 100
+_MAX_HTTP_STATUS: Final[int] = 599
+# About 18 KiB per episode for the supported 7,000-episode library; most
+# inventories are per-series or paged and substantially smaller.
+MAX_INVENTORY_JSON_BYTES: Final[int] = 128 * 1024 * 1024
 _IDEMPOTENT_METHODS: Final[frozenset[str]] = frozenset(
     {"GET", "HEAD", "OPTIONS", "TRACE", "DELETE", "PUT"}
 )
@@ -153,6 +161,11 @@ def resolve_and_send(
     json: Any | None = None,
     max_redirects: int = MAX_REDIRECTS,
     stream: bool = False,
+    timeout: httpx.Timeout | None = None,
+    headers: Mapping[str, str] | None = None,
+    same_origin_only: bool = False,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> httpx.Response:
     """Send one request, following same-origin redirects manually.
 
@@ -165,9 +178,17 @@ def resolve_and_send(
             non-idempotent method, or when a redirect carries no usable ``Location``.
 
     When ``stream=True``, the returned body is unconsumed; the caller must close the response.
+    ``timeout`` optionally narrows the client's timeout for a bounded read operation.
+    An absolute ``deadline`` checks time before each redirect hop and further narrows
+    that hop's timeouts. It cannot interrupt in-flight I/O beyond those timeouts.
+    Extra ``headers`` cannot replace endpoint auth. ``same_origin_only`` refuses
+    foreign redirect targets before issuing any request to them.
     """
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("request deadline must be finite")
     verb = method.upper()
-    request_headers = dict(endpoint.headers_factory())
+    request_headers = dict(headers or {})
+    request_headers.update(endpoint.headers_factory())
     origin = _resolve(endpoint.client, url)
     if not same_origin(endpoint.client.base_url, origin):
         raise HttpPolicyError(
@@ -176,6 +197,17 @@ def resolve_and_send(
         )
     target = origin
     for hop in range(max_redirects + 1):
+        hop_timeout = timeout if timeout is not None else endpoint.client.timeout
+        if deadline is not None:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise httpx.TimeoutException("request deadline exceeded")
+            hop_timeout = httpx.Timeout(
+                **{
+                    name: remaining if value is None else min(value, remaining)
+                    for name, value in hop_timeout.as_dict().items()
+                }
+            )
         if not same_origin(origin, target):
             # The key belongs to the origin that issued it; cross-origin hops are anonymous.
             request_headers = strip_auth_headers(request_headers)
@@ -186,6 +218,7 @@ def resolve_and_send(
                 params=params if hop == 0 else None,
                 json=json,
                 headers=request_headers,
+                timeout=hop_timeout,
             ),
             stream=stream,
         )
@@ -211,10 +244,129 @@ def resolve_and_send(
                 "(no non-idempotent replays)"
             )
         response.close()
+        if same_origin_only and not same_origin(origin, next_url):
+            raise HttpPolicyError("refusing cross-origin API redirect")
         target = next_url
     raise HttpPolicyError(
         f"redirect limit of {max_redirects} hops exceeded for {url!r} (last target {str(target)!r})"
     )
+
+
+class BoundedJsonError(ValueError):
+    """A response cannot safely be treated as a complete JSON inventory."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = (
+            status_code
+            if type(status_code) is int and _MIN_HTTP_STATUS <= status_code <= _MAX_HTTP_STATUS
+            else None
+        )
+
+
+def get_bounded_json(
+    endpoint: ApiEndpoint,
+    path: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    max_bytes: int = MAX_INVENTORY_JSON_BYTES,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[int, Any]:
+    """GET identity JSON without buffering/decompressing an unbounded response.
+
+    Non-success statuses return no payload without consuming their bodies. Errors
+    contain no response data. The optional absolute deadline bounds body reads
+    between chunks and narrows each configured timeout; a blocking read still
+    depends on that HTTP timeout. Callers own any wider workflow deadline.
+    """
+    if max_bytes <= 0 or (deadline is not None and not math.isfinite(deadline)):
+        raise ValueError("invalid bounded JSON limits")
+
+    def remaining() -> float | None:
+        if deadline is None:
+            return None
+        value = deadline - clock()
+        if value <= 0:
+            raise BoundedJsonError("JSON response deadline exceeded")
+        return value
+
+    budget = remaining()
+    timeout = None
+    if budget is not None:
+        timeout = httpx.Timeout(
+            **{
+                name: budget if value is None else min(value, budget)
+                for name, value in endpoint.client.timeout.as_dict().items()
+            }
+        )
+    response = resolve_and_send(
+        endpoint,
+        "GET",
+        path,
+        params=params,
+        stream=True,
+        timeout=timeout,
+        headers={"Accept-Encoding": "identity"},
+        same_origin_only=True,
+        deadline=deadline,
+        clock=clock,
+    )
+    try:
+        if not response.is_success:
+            remaining()
+            return response.status_code, None
+        return response.status_code, read_bounded_json(
+            response, max_bytes=max_bytes, deadline=deadline, clock=clock
+        )
+    finally:
+        response.close()
+
+
+def read_bounded_json(
+    response: httpx.Response,
+    *,
+    max_bytes: int,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> Any:
+    """Read identity JSON from an already streamed response; caller owns closure.
+
+    Mutation callers may use this only for diagnostics that are actually needed.
+    This never sends a request, retries, or uses a decompression iterator.
+    """
+    if max_bytes <= 0 or (deadline is not None and not math.isfinite(deadline)):
+        raise ValueError("invalid bounded JSON limits")
+
+    def check_deadline() -> None:
+        if deadline is not None and clock() >= deadline:
+            raise BoundedJsonError(
+                "JSON response deadline exceeded", status_code=response.status_code
+            )
+
+    check_deadline()
+    if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+        raise BoundedJsonError(
+            "unsupported JSON response encoding", status_code=response.status_code
+        )
+    body = bytearray()
+    # Preloaded mock responses have already consumed their stream. Real
+    # streamed responses use iter_raw, never httpx's decompression iterator.
+    chunks = (response.content,) if response.is_stream_consumed else response.iter_raw()
+    for chunk in chunks:
+        check_deadline()
+        if len(body) + len(chunk) > max_bytes:
+            raise BoundedJsonError(
+                "JSON response exceeds size limit", status_code=response.status_code
+            )
+        body.extend(chunk)
+    check_deadline()
+    try:
+        payload = json_module.loads(body)
+    except (ValueError, RecursionError):
+        raise BoundedJsonError("invalid JSON response", status_code=response.status_code) from None
+    check_deadline()
+    return payload
 
 
 def _resolve(client: httpx.Client, url: str) -> httpx.URL:

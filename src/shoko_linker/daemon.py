@@ -87,29 +87,34 @@ from . import mappings as _mappings
 from .attestation import SCOPE_DAEMON, AttestationVerdict
 from .backoff import capped_backoff
 from .config import Settings, apply_gate
-from .errors import HttpPolicyError
-from .http import ApiEndpoint, resolve_and_send
+from .errors import ConfigError, HttpPolicyError
+from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .linking import (
     EpisodeIdResolver,
     EpisodeResolutionStatus,
     EpisodeTargetResolution,
     LinkPlan,
     LinkTarget,
+    MetadataDemand,
     PendingTarget,
     PlanSkip,
     PlanStatus,
     PreflightReason,
     PreflightVerdict,
     QueueSnapshot,
+    ResolvedEpisode,
     SendOutcome,
     SendResult,
     ShokoFileXRefs,
     VerificationVerdict,
     fetch_queue,
+    freeze_metadata_demand,
     freeze_plan,
+    metadata_demand_fingerprint,
     parse_file_xrefs,
     preflight,
     preflight_file,
+    preflight_link_jobs_and_targets,
     preflight_reasons_are_retryable,
     primary_hard_preflight_reason,
     request_fingerprint,
@@ -132,9 +137,26 @@ from .mapping_store import (
 from .mapping_store import (
     status as mapping_status,
 )
-from .mappings import EpisodeType, MappingIndex, ResolutionStatus, effective_source_targets
+from .mappings import (
+    EpisodeType,
+    MappingIndex,
+    MappingTarget,
+    ResolutionStatus,
+    effective_source_targets,
+)
 from .mappings import resolve as resolve_mapping
+from .metadata_operations import metadata_source_key, recover_metadata_operations
+from .metadata_refresh import MetadataRefreshOutcome, submit_metadata_refresh
+from .metadata_status import observe_metadata_status, observe_resolved_metadata_plans
+from .onboarding import (
+    METADATA_MAINTENANCE_CONFIRMATION,
+    METADATA_MAINTENANCE_POLICY,
+    OnboardingManager,
+    OnboardingRecord,
+    current_metadata_maintenance_policy,
+)
 from .policies import RunPolicy
+from .queue_inventory import Presence, QueueJobKind, fetch_queue_inventory
 from .rate_control import (
     MAX_SERVICE_CYCLE_SUBMISSIONS,
     RateSignals,
@@ -156,6 +178,7 @@ from .shoko import (
     match_shoko_files,
 )
 from .sonarr import (
+    SonarrEpisode,
     SonarrFile,
     SonarrInventory,
     SourceRelationshipStatus,
@@ -191,6 +214,8 @@ from .state import (
     FileSeed,
     FileState,
     LockHeldError,
+    MetadataOperation,
+    MetadataOperationState,
     SendToken,
     StateError,
     StateStore,
@@ -310,6 +335,10 @@ class DaemonDeps:
     #: advanced CLI's apply gate or operator attestation.
     service_mode: bool = False
     service_authorized: Callable[[], bool] = _service_authorization_closed
+    #: Production remote authorization is bound once to the actual cycle I/O deadline.
+    #: The no-argument callback remains useful for offline/local callers; production
+    #: supplies this callback instead, so repeated checks never get a fresh allowance.
+    service_authorized_for_deadline: Callable[[float], bool] | None = None
     #: Local persistence/pause re-check after the last Shoko network guard. Production service
     #: wiring captures the fresh remote authorization context immediately before that guard.
     #: Required for service-mode writes: a missing callback fails closed and never falls back to
@@ -404,6 +433,9 @@ class CycleReport:
     total_link_requests_attempted: int = 0
     new_arrival_writes_suppressed: bool = True
     campaign_writes_suppressed: bool = True
+    metadata_requests_attempted: int = 0
+    metadata_deferred: int = 0
+    metadata_observations: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -995,6 +1027,15 @@ class _ReconcileResult:
     exclusion_counts: Mapping[str, int]
     scope_excluded_count: int
     resolution_deferred_file_ids: frozenset[int]
+    metadata_demands: Mapping[int, MetadataDemand] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+
+@dataclass(frozen=True)
+class _MetadataWait:
+    demand: MetadataDemand
+    plan: LinkPlan | None
 
 
 class _ResolutionDeferral(Enum):
@@ -1184,6 +1225,8 @@ def _episode_resolutions(
     match: Any,
     tvdb_series: int,
     active: ActiveMappings,
+    *,
+    recover_missing_anime: bool = False,
 ) -> list[EpisodeTargetResolution] | str | _ResolutionDeferral:
     """Map every episode, then resolve each AniDB target to a Shoko internal ID.
 
@@ -1191,6 +1234,7 @@ def _episode_resolutions(
     or a typed retryable deferral for a transport failure (never a partial plan).
     """
     resolutions: list[EpisodeTargetResolution] = []
+    mapped: list[tuple[SonarrEpisode, MappingTarget]] = []
     for episode in match.sonarr_file.episodes:
         answer = resolve_mapping(
             active.index,
@@ -1218,28 +1262,53 @@ def _episode_resolutions(
             )
             return prefix + provenance
         for target in answer.targets:
-            triple = (target.anidb_id, target.episode_type.value, target.anidb_episode_number)
+            if (
+                type(target.anidb_id) is not int
+                or target.anidb_id <= 0
+                or type(target.anidb_episode_number) is not int
+                or target.anidb_episode_number <= 0
+                or not isinstance(target.episode_type, EpisodeType)
+            ):
+                return "target_provenance_invalid:invalid mapped AniDB identity"
+            mapped.append((episode, target))
+    # Every source episode must map before any target metadata lookup. An early
+    # missing anime must not create work for an ultimately ambiguous whole file.
+    observed: dict[tuple[int, str, int], ResolvedEpisode] = {}
+    for episode, target in mapped:
+        triple = (target.anidb_id, target.episode_type.value, target.anidb_episode_number)
+        resolved = observed.get(triple)
+        if resolved is None:
             resolved = resolver.resolve(*triple)
-            pending = resolved.status is EpisodeResolutionStatus.PENDING_METADATA
-            if resolved.status is EpisodeResolutionStatus.TRANSPORT_FAILURE:
-                return _ResolutionDeferral.TRANSPORT_FAILURE
-            if resolved.status is not EpisodeResolutionStatus.RESOLVED and not pending:
-                return f"target_{resolved.status.value.lower()}:{resolved.detail}"
-            resolutions.append(
-                EpisodeTargetResolution(
-                    episode=episode,
-                    tvdb_series=tvdb_series,
-                    status=ResolutionStatus.RESOLVED,
-                    anidb_anime_id=target.anidb_id,
-                    anidb_episode_number=target.anidb_episode_number,
-                    episode_type=target.episode_type.value,
-                    source_rule=target.source_rule.value,
-                    anidb_episode_id=resolved.anidb_episode_id,
-                    shoko_episode_id=resolved.shoko_episode_id,
-                    pending_metadata=pending,
-                    detail=resolved.detail,
-                )
+            observed[triple] = resolved
+        missing = resolved.status in (
+            EpisodeResolutionStatus.PENDING_METADATA,
+            EpisodeResolutionStatus.ANIME_NOT_CACHED,
+        )
+        pending = (
+            missing
+            if recover_missing_anime
+            else resolved.status is EpisodeResolutionStatus.PENDING_METADATA
+        )
+        if resolved.status is EpisodeResolutionStatus.TRANSPORT_FAILURE:
+            return _ResolutionDeferral.TRANSPORT_FAILURE
+        if resolved.status is not EpisodeResolutionStatus.RESOLVED and not pending:
+            return f"target_{resolved.status.value.lower()}:{resolved.detail}"
+        resolutions.append(
+            EpisodeTargetResolution(
+                episode=episode,
+                tvdb_series=tvdb_series,
+                status=ResolutionStatus.RESOLVED,
+                anidb_anime_id=target.anidb_id,
+                anidb_episode_number=target.anidb_episode_number,
+                episode_type=target.episode_type.value,
+                source_rule=target.source_rule.value,
+                anidb_episode_id=resolved.anidb_episode_id,
+                shoko_episode_id=resolved.shoko_episode_id,
+                pending_metadata=pending,
+                detail=resolved.detail,
+                metadata_status=resolved.status if missing else None,
             )
+        )
     return resolutions
 
 
@@ -1288,10 +1357,44 @@ def _compact_mapping_candidate_provenance(candidates: Sequence[Any], *, max_char
     return f"[omitted={total}]"[:max_chars]
 
 
+def _recoverable_service_ambiguity(
+    record: FileRecord, *, affected_sonarr_series: frozenset[int] | None = None
+) -> bool:
+    """Retry only known waits after a fresh complete source match, never review holds.
+
+    Source exclusions describe a previous failed match, not immutable source
+    drift. Current matching must succeed before either caller can reopen them.
+    """
+    if (
+        record.state is not FileState.AMBIGUOUS
+        or record.campaign_id is not None
+        or record.cohort is Cohort.CAMPAIGN
+    ):
+        return False
+    if record.state_detail.startswith("target_unmapped:"):
+        # Full/legacy scans retry absent mappings. Incremental activations retry
+        # only affected series; metadata and source readiness are independent.
+        return affected_sonarr_series is None or record.sonarr_series_id in affected_sonarr_series
+    if record.state_detail.startswith("target_anime_not_cached:"):
+        return True
+    category, _, rest = record.state_detail.partition(":")
+    reason, separator, _ = rest.partition(":")
+    # Every emitted exclusion describes a condition that the current complete
+    # matcher must independently disprove. This is not permission to retry while
+    # that exclusion still applies, or to erase an unknown/operator review hold.
+    return (
+        category == "source_exclusion"
+        and bool(separator)
+        and reason in {reason.value for reason in ExclusionReason}
+    )
+
+
 def _preserve_unaffected_service_unresolved(
     deps: DaemonDeps,
     matches: Sequence[Any],
     affected_sonarr_series: frozenset[int] | None,
+    *,
+    recover_metadata_waits: bool = False,
 ) -> frozenset[int]:
     if not deps.service_mode:
         return frozenset()
@@ -1304,9 +1407,20 @@ def _preserve_unaffected_service_unresolved(
             deps.store.mapping_target_quarantined(match.shoko_file_id)
             or record.state_detail.startswith("service_mapping_target_changed")
         ) or (
-            affected_sonarr_series is not None
-            and record.state in (FileState.AMBIGUOUS, FileState.CONFLICT)
-            and record.sonarr_series_id not in affected_sonarr_series
+            record.state in (FileState.AMBIGUOUS, FileState.CONFLICT)
+            and not (
+                recover_metadata_waits
+                and _recoverable_service_ambiguity(
+                    record, affected_sonarr_series=affected_sonarr_series
+                )
+            )
+            and (
+                recover_metadata_waits
+                or (
+                    affected_sonarr_series is not None
+                    and record.sonarr_series_id not in affected_sonarr_series
+                )
+            )
         ):
             preserved.add(match.shoko_file_id)
     return frozenset(preserved)
@@ -1599,13 +1713,39 @@ def _resolve_match_plan(
     active: ActiveMappings,
     discovery: ShokoDiscovery,
     policy: RunPolicy,
-) -> LinkPlan | PlanSkip | _ResolutionDeferral:
-    resolutions = _episode_resolutions(resolver, match, tvdb, active)
+    *,
+    scope_fingerprint: str | None = None,
+) -> LinkPlan | _MetadataWait | PlanSkip | _ResolutionDeferral:
+    resolutions = _episode_resolutions(
+        resolver, match, tvdb, active, recover_missing_anime=scope_fingerprint is not None
+    )
     if resolutions is _ResolutionDeferral.TRANSPORT_FAILURE:
         return resolutions
     if isinstance(resolutions, str):
         return PlanSkip(resolutions, resolutions)
-    return freeze_plan(
+    demand: MetadataDemand | None = None
+    if scope_fingerprint is not None and any(
+        item.metadata_status is not None for item in resolutions
+    ):
+        frozen_demand = freeze_metadata_demand(
+            match,
+            resolutions,
+            scope_fingerprint=scope_fingerprint,
+            policy=policy,
+            targets_digest=active.targets_digest,
+            structure_digest=active.structure_digest,
+            shoko_paths=_resolve_shoko_paths(discovery, match.shoko_file_id),
+            mapping_revision=str(active.revision),
+            overrides_active=active.overrides_applied,
+        )
+        if isinstance(frozen_demand, PlanSkip):
+            return frozen_demand
+        demand = frozen_demand
+        if any(
+            item.metadata_status is EpisodeResolutionStatus.ANIME_NOT_CACHED for item in resolutions
+        ):
+            return _MetadataWait(demand, None)
+    plan = freeze_plan(
         match,
         resolutions,
         policy=policy,
@@ -1614,6 +1754,48 @@ def _resolve_match_plan(
         shoko_paths=_resolve_shoko_paths(discovery, match.shoko_file_id),
         mapping_revision=str(active.revision),
         overrides_active=active.overrides_applied,
+    )
+    if isinstance(plan, PlanSkip):
+        return plan
+    return _MetadataWait(demand, plan) if demand is not None else plan
+
+
+def _metadata_scope_fingerprint(settings: Settings, policy: RunPolicy) -> str:
+    """Current selected scope only; no API keys, timing or metadata observations."""
+    scope = (
+        policy.value,
+        settings.sonarr.url,
+        settings.shoko.url,
+        sorted(settings.sonarr.allowed_roots),
+        sorted(settings.shoko.allowed_roots),
+        sorted((mapping.sonarr, mapping.shoko) for mapping in settings.path_mappings),
+        settings.anime_only,
+    )
+    return hashlib.sha256(json.dumps(scope, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _metadata_candidate_allowed(deps: DaemonDeps, match: Any) -> bool:
+    record = deps.store.get_file(match.shoko_file_id)
+    if record is None:
+        return True
+    source = match.sonarr_file
+    return (
+        record.campaign_id is None
+        and record.cohort is not Cohort.CAMPAIGN
+        and not deps.store.mapping_target_quarantined(match.shoko_file_id)
+        and (
+            _recoverable_service_ambiguity(record)
+            or record.state
+            in {
+                FileState.DISCOVERED,
+                FileState.MATCHED,
+                FileState.MAPPED,
+                FileState.PLANNED,
+                FileState.WAITING,
+            }
+        )
+        and (record.sonarr_series_id, record.sonarr_file_id, record.sonarr_path, record.sonarr_size)
+        == (source.series_id, source.episode_file_id, source.path, source.size)
     )
 
 
@@ -1912,6 +2094,7 @@ def _collect_bounded_sonarr_inventory(deps: DaemonDeps, cycle_start_mono: float)
         series_cursor=cursor,
         swept_series_ids=frozenset(swept & children.keys()),
         series_deadline=_inventory_deadline(deps, cycle_start_mono),
+        deadline=_inventory_deadline(deps, cycle_start_mono),
         monotonic=deps.monotonic,
     )
     if inventory.series_manifest_hash is None:
@@ -2016,7 +2199,19 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
         discovery, inventory.files, inventory.verdict.complete, deps.settings
     )
     preserve_unresolved = _preserve_unaffected_service_unresolved(
-        deps, match_result.matches, affected_sonarr_series
+        deps,
+        match_result.matches,
+        affected_sonarr_series,
+        recover_metadata_waits=policy is RunPolicy.SERVICE,
+    )
+    metadata_eligible = (
+        frozenset(
+            match.shoko_file_id
+            for match in match_result.matches
+            if _metadata_candidate_allowed(deps, match)
+        )
+        if deps.service_mode and policy is RunPolicy.SERVICE
+        else frozenset()
     )
     cohorts, inserted, identity_drifts = _record_and_match(
         deps,
@@ -2024,15 +2219,15 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
         now_iso,
         preserve_unresolved=preserve_unresolved,
     )
-    resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic)
+    resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic, deadline=resolution_deadline)
     plans: dict[int, LinkPlan] = {}
+    metadata_demands: dict[int, MetadataDemand] = {}
     skip_reasons, exclusion_counts, scope_excluded_count = _record_exclusions(
         deps, match_result, discovery, now_iso
     )
     fresh_campaign_quarantines: set[int] = set()
     deferred_campaign_identity_details: dict[int, tuple[str, str]] = {}
     mapped_ids: list[int] = []
-    pending = 0
     resolution_deferred_ids: set[int] = set()
     target_conflicts, verified_drift_positions = _source_target_conflicts(
         deps, match_result.matches, series_tvdb, active, affected_sonarr_series
@@ -2088,7 +2283,19 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
         if not resolution_due:
             resolution_deferred_ids.add(file_id)
             continue
-        frozen = _resolve_match_plan(resolver, match, tvdb_series, active, discovery, policy)
+        frozen = _resolve_match_plan(
+            resolver,
+            match,
+            tvdb_series,
+            active,
+            discovery,
+            policy,
+            scope_fingerprint=(
+                _metadata_scope_fingerprint(deps.settings, policy)
+                if file_id in metadata_eligible
+                else None
+            ),
+        )
         if frozen is _ResolutionDeferral.TRANSPORT_FAILURE:
             resolution_deferred_ids.add(file_id)
             skip_reasons[file_id] = "resolution_deferred:transport_failure"
@@ -2097,15 +2304,28 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
             skip_reasons[file_id] = frozen.reason
             _advance(deps, file_id, FileState.AMBIGUOUS, frozen.reason, now_iso)
             continue
+        if isinstance(frozen, _MetadataWait):
+            metadata_demands[file_id] = frozen.demand
+            _advance(deps, file_id, FileState.WAITING, "pending_metadata", now_iso)
+            if frozen.plan is not None:
+                plans[file_id] = frozen.plan
+            continue
         mapped_ids.append(file_id)
         if frozen.status is PlanStatus.PENDING_TARGETS:
-            pending += 1
             plans[file_id] = frozen
             continue
         plans[file_id] = frozen
     # P3b: the walk steps run bulk (one transaction each, per-edge validation
     # identical to per-file advance — illegal edges skipped).
     _filter_resolved_target_drift(deps, plans, skip_reasons, now_iso)
+    metadata_demands = {
+        file_id: demand
+        for file_id, demand in metadata_demands.items()
+        if file_id not in skip_reasons
+    }
+    pending = sum(plan.status is PlanStatus.PENDING_TARGETS for plan in plans.values()) + sum(
+        file_id not in plans for file_id in metadata_demands
+    )
     planned_ids = [file_id for file_id, plan in plans.items() if plan.status is PlanStatus.LINKABLE]
     deps.store.advance_bulk(mapped_ids, FileState.MAPPED, "mapped", iso=now_iso)
     deps.store.advance_bulk(planned_ids, FileState.PLANNED, "planned", iso=now_iso)
@@ -2125,6 +2345,7 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
         exclusion_counts=exclusion_counts,
         scope_excluded_count=scope_excluded_count,
         resolution_deferred_file_ids=frozenset(resolution_deferred_ids),
+        metadata_demands=MappingProxyType(metadata_demands),
     )
 
 
@@ -2237,6 +2458,8 @@ def _xref_fetcher(
     *,
     expected_ed2k: str | None = None,
     expected_size: int | None = None,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Callable[[], ShokoFileXRefs | None]:
     """Build the verification poll: ``GET File/{id}?include=XRefs`` (read-only).
 
@@ -2246,20 +2469,17 @@ def _xref_fetcher(
 
     def fetch() -> ShokoFileXRefs | None:
         try:
-            response = resolve_and_send(
-                endpoint, "GET", f"api/v3/File/{file_id}", params={"include": XREF_INCLUDE_FLAGS}
+            status, payload = get_bounded_json(
+                endpoint,
+                f"api/v3/File/{file_id}",
+                {"include": XREF_INCLUDE_FLAGS},
+                deadline=deadline,
+                clock=clock,
             )
-        except (HttpPolicyError, httpx.HTTPError):
+        except (BoundedJsonError, HttpPolicyError, httpx.HTTPError):
             return None
-        try:
-            if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
-                return None
-            try:
-                payload = response.json()
-            except ValueError:
-                return None
-        finally:
-            response.close()
+        if not MIN_SUCCESS_STATUS <= status < MAX_SUCCESS_STATUS:
+            return None
         if expected_ed2k is not None:
             expected = canonical_ed2k(expected_ed2k)
             entry = payload if isinstance(payload, Mapping) else None
@@ -2332,20 +2552,41 @@ def _preflight_failure_outcome(
 
 
 def _verify_and_close(
-    deps: DaemonDeps, plan: LinkPlan, file_id: int, cycle_key: str, now_iso: str
+    deps: DaemonDeps,
+    plan: LinkPlan,
+    file_id: int,
+    cycle_key: str,
+    now_iso: str,
+    *,
+    deadline_mono: float | None = None,
 ) -> str:
     """Poll the XRef set to the exact planned set and close the loop (slot released on VERIFIED)."""
     deadline = deps.monotonic() + deps.verification_timeout_seconds
+    # Keep the persisted/outcome timeout separate from the cycle I/O cutoff.
+    # Standalone callers without a workflow budget retain the legacy poll contract.
+    io_deadline = min(deadline, deadline_mono) if deadline_mono is not None else None
     expected_ed2k = canonical_ed2k(plan.shoko_ed2k)
     same_file_observation = False
 
     def fetch_xrefs() -> ShokoFileXRefs | None:
         nonlocal same_file_observation
         observed = _xref_fetcher(
-            deps.shoko, file_id, expected_ed2k=expected_ed2k, expected_size=plan.shoko_size
+            deps.shoko,
+            file_id,
+            expected_ed2k=expected_ed2k,
+            expected_size=plan.shoko_size,
+            deadline=io_deadline,
+            clock=deps.monotonic,
         )()
         same_file_observation = observed is not None and observed.file_id == file_id
         return observed
+
+    def advance(seconds: float) -> None:
+        deps.advance(
+            seconds
+            if io_deadline is None
+            else min(seconds, max(0.0, io_deadline - deps.monotonic()))
+        )
 
     verification = (
         VerificationVerdict.UNKNOWN
@@ -2356,7 +2597,7 @@ def _verify_and_close(
             clock=deps.monotonic,
             deadline=deadline,
             poll_interval=deps.poll_interval_seconds,
-            advance=deps.advance,
+            advance=advance,
             max_polls=deps.max_verify_polls,
         )
     )
@@ -2372,10 +2613,16 @@ def _verify_and_close(
 
 
 def verify_and_close(
-    deps: DaemonDeps, plan: LinkPlan, file_id: int, cycle_key: str, now_iso: str
+    deps: DaemonDeps,
+    plan: LinkPlan,
+    file_id: int,
+    cycle_key: str,
+    now_iso: str,
+    *,
+    deadline_mono: float | None = None,
 ) -> str:
     """Public inline verification wrapper (campaign apply reuses the daemon's poll loop)."""
-    return _verify_and_close(deps, plan, file_id, cycle_key, now_iso)
+    return _verify_and_close(deps, plan, file_id, cycle_key, now_iso, deadline_mono=deadline_mono)
 
 
 def xref_fetcher(endpoint: ApiEndpoint, file_id: int) -> Callable[[], ShokoFileXRefs | None]:
@@ -2383,7 +2630,9 @@ def xref_fetcher(endpoint: ApiEndpoint, file_id: int) -> Callable[[], ShokoFileX
     return _xref_fetcher(endpoint, file_id)
 
 
-def inspect_send_state(deps: DaemonDeps, file_id: int) -> ShokoFileXRefs | None:
+def inspect_send_state(
+    deps: DaemonDeps, file_id: int, *, deadline_mono: float | None = None
+) -> ShokoFileXRefs | None:
     """Read-only recovery inspection: ``GET File/{id}?include=XRefs`` (P1-3).
 
     Never a POST, never a DELETE — the hold branches verify, they do not repair.
@@ -2395,7 +2644,12 @@ def inspect_send_state(deps: DaemonDeps, file_id: int) -> ShokoFileXRefs | None:
     if expected_ed2k is None:
         return None
     return _xref_fetcher(
-        deps.shoko, file_id, expected_ed2k=expected_ed2k, expected_size=record.sonarr_size
+        deps.shoko,
+        file_id,
+        expected_ed2k=expected_ed2k,
+        expected_size=record.sonarr_size,
+        deadline=deadline_mono,
+        clock=deps.monotonic,
     )()
 
 
@@ -2453,7 +2707,9 @@ class _RecoveryRowOutcome:
     reason: str
 
 
-def _recovery_poll_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRowOutcome:
+def _recovery_poll_row(
+    deps: DaemonDeps, row: Any, now_iso: str, *, deadline_mono: float | None = None
+) -> _RecoveryRowOutcome:
     """(a) one ``verifying``/``partial`` row: re-poll XRefs against the persisted plan targets."""
     file_id = row.shoko_file_id
     inspection = deps.store.active_send_details(file_id)
@@ -2466,7 +2722,9 @@ def _recovery_poll_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRow
     deadline = _parse_iso(inspection.attempted_iso) + timedelta(
         seconds=deps.verification_timeout_seconds
     )
-    observed = inspect_send_state(deps, file_id)
+    if deadline_mono is not None and deps.monotonic() >= deadline_mono:
+        return _RecoveryRowOutcome(f"recovery_deadline:{file_id}")
+    observed = inspect_send_state(deps, file_id, deadline_mono=deadline_mono)
     if observed is None or observed.file_id != file_id:
         with contextlib.suppress(TransitionError):
             if observed is None:
@@ -2479,7 +2737,9 @@ def _recovery_poll_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRow
     return _RecoveryRowOutcome(f"recovery_poll:{file_id}:{verdict.value}")
 
 
-def _recovery_hold_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRowOutcome:
+def _recovery_hold_row(
+    deps: DaemonDeps, row: Any, now_iso: str, *, deadline_mono: float | None = None
+) -> _RecoveryRowOutcome:
     """(b) one ``request_may_have_been_sent``/``indeterminate_write``: inspect — verify/hold,
     never resubmit."""
     file_id = row.shoko_file_id
@@ -2495,7 +2755,9 @@ def _recovery_hold_row(deps: DaemonDeps, row: Any, now_iso: str) -> _RecoveryRow
     deadline = _parse_iso(inspection.attempted_iso) + timedelta(
         seconds=deps.verification_timeout_seconds
     )
-    observed = inspect_send_state(deps, file_id)
+    if deadline_mono is not None and deps.monotonic() >= deadline_mono:
+        return _RecoveryRowOutcome(f"recovery_deadline:{file_id}")
+    observed = inspect_send_state(deps, file_id, deadline_mono=deadline_mono)
     if observed is None or observed.file_id != file_id:
         return _RecoveryRowOutcome(f"recovery_hold_unknown:{file_id}")
     verdict = _stored_triples_verdict(
@@ -2539,9 +2801,9 @@ def _recovery_replan_rows(
     return outcomes
 
 
-def _recovery_phase(
-    deps: DaemonDeps, now_iso: str, cycle_start_mono: float, *, full: bool = True
-) -> tuple[str, ...]:
+def _file_recovery_phase(
+    deps: DaemonDeps, now_iso: str, cycle_start_mono: float, *, max_rows: int
+) -> tuple[tuple[str, ...], int]:
     """Consume persisted recovery rows BEFORE processing new candidates (P1-3/P2-2).
 
     (a) continue_polling re-polls with the persisted target triples; (b) hold rows are
@@ -2551,59 +2813,94 @@ def _recovery_phase(
     (d) replannable rows are voided (slot released, audit row ``voided``) and re-prepared
     in-cycle by reconcile + apply. Never issues a POST in any recovery branch.
 
-    P2-A: the GET-heavy branches (poll + hold) are bounded by ``max_recovery_rows_per_cycle``
+    All branches, including prepared cleanup, share ``max_recovery_rows_per_cycle``
     and the cycle's monotonic budget (``max_cycle_seconds``), oldest-first by the immutable
     ``attempted_iso`` deadline anchor; the remainder is deferred (reported as
     ``recovery_deferred:<n>``). A huge verifying backlog drains across cycles and terminates
-    instead of pinning the cycle wall-time and issuing one GET per row.
+    instead of decoding terminal history or issuing one GET per persisted row.
     """
-    plan = deps.store.recover_after_restart()
-    outcomes: list[_RecoveryRowOutcome] = []
-    queue: list[tuple[Any, str]] = [(row, "poll") for row in plan.continue_polling]
-    queue.extend((row, "hold") for row in plan.hold_for_verification)
-    queue.sort(key=lambda entry: (_recovery_sort_key(deps, entry[0]), entry[0].shoko_file_id))
     raw_cursor = deps.store.get_meta(META_RECOVERY_CURSOR)
     try:
         cursor = max(0, int(raw_cursor or "0"))
     except ValueError:
         cursor = 0
-    start = next(
-        (index + 1 for index, (row, _kind) in enumerate(queue) if row.shoko_file_id == cursor),
-        0,
+    deadline = cycle_start_mono + deps.max_cycle_seconds
+    batch = deps.store.file_recovery_batch(
+        after_id=cursor, limit=max_rows if deps.monotonic() < deadline else 0
     )
-    if start:
-        queue = queue[start:] + queue[:start]
+    outcomes: list[_RecoveryRowOutcome] = []
+    processed_count = 0
+    for file_id in batch.ids:
+        if deps.monotonic() >= deadline:
+            break
+        try:
+            row = deps.store.get_file(file_id)
+            if row is None:
+                outcome = _RecoveryRowOutcome(f"recovery_missing:{file_id}")
+            elif row.state is FileState.PREPARED_NOT_SENT:
+                outcome = _recovery_replan_rows(deps, (row,), now_iso)[0]
+            elif row.state in (FileState.REQUEST_MAY_HAVE_BEEN_SENT, FileState.INDETERMINATE_WRITE):
+                outcome = _recovery_hold_row(deps, row, now_iso, deadline_mono=deadline)
+            elif row.state in (FileState.VERIFYING, FileState.PARTIAL, FileState.CONFLICT):
+                outcome = _recovery_poll_row(deps, row, now_iso, deadline_mono=deadline)
+            else:
+                outcome = _RecoveryRowOutcome(f"recovery_skipped:{file_id}")
+        except (StateError, ValueError):
+            outcome = _RecoveryRowOutcome(f"recovery_invalid:{file_id}")
+        outcomes.append(outcome)
+        processed_count += 1
+        deps.store.set_meta(META_RECOVERY_CURSOR, str(file_id))
+    deferred = batch.total - processed_count
+    if deferred:
+        outcomes.append(_RecoveryRowOutcome(f"recovery_deferred:{deferred}"))
+    re_evaluate = deps.store.recovery_re_evaluate_count()
+    if re_evaluate:
+        outcomes.append(_RecoveryRowOutcome(f"recovery_re_evaluate:{re_evaluate}"))
+    return tuple(item.reason for item in outcomes), processed_count
+
+
+def _recovery_phase(
+    deps: DaemonDeps, now_iso: str, cycle_start_mono: float, *, full: bool = True
+) -> tuple[str, ...]:
+    """Share one bounded read-only recovery allowance; alternate first service lane.
+
+    Alternation also makes progress with a one-row light-cycle allowance when both
+    operation kinds have long-running jobs. Each lane keeps its own durable cursor.
+    """
     cap = (
         deps.max_recovery_rows_per_cycle if full else max(1, deps.max_recovery_rows_per_cycle // 2)
     )
-    deferred = 0
-    for processed, (row, kind) in enumerate(queue):
-        if processed >= cap or deps.monotonic() - cycle_start_mono >= deps.max_cycle_seconds:
-            deferred = len(queue) - processed
-            break
-        if kind == "poll":
-            outcomes.append(_recovery_poll_row(deps, row, now_iso))
+    if not deps.service_mode:
+        return _file_recovery_phase(deps, now_iso, cycle_start_mono, max_rows=cap)[0]
+    reasons: list[str] = []
+    metadata_first = deps.store.get_meta("service_recovery_metadata_first:v1") == "1"
+    remaining = cap
+    for metadata in (metadata_first, not metadata_first):
+        if metadata:
+            report = recover_metadata_operations(
+                deps.shoko,
+                deps.store,
+                source_key=metadata_source_key(deps.shoko),
+                now_iso=now_iso,
+                deadline=cycle_start_mono + deps.max_cycle_seconds,
+                max_rows=remaining,
+                clock=deps.monotonic,
+            )
+            remaining -= report.processed_count
+            reasons.extend(
+                f"metadata_recovery:{item.anime_id}:{item.status.value}"
+                for item in report.observations
+            )
+            if report.deferred_count:
+                reasons.append(f"metadata_recovery_deferred:{report.deferred_count}")
         else:
-            outcomes.append(_recovery_hold_row(deps, row, now_iso))
-        deps.store.set_meta(META_RECOVERY_CURSOR, str(row.shoko_file_id))
-    if deferred:
-        outcomes.append(_RecoveryRowOutcome(f"recovery_deferred:{deferred}"))
-    # (d) replan rows are DB-only (no GETs) and bounded by the prepared-not-sent count.
-    outcomes.extend(_recovery_replan_rows(deps, plan.replannable, now_iso))
-    if plan.re_evaluate:
-        # Summarized: the reconcile pass in this same cycle re-walks these
-        # rows (persisted waiting/ambiguous consumption) — a 7k-row list per cycle is noise.
-        outcomes.append(_RecoveryRowOutcome(f"recovery_re_evaluate:{len(plan.re_evaluate)}"))
-    return tuple(item.reason for item in outcomes)
-
-
-def _recovery_sort_key(deps: DaemonDeps, row: Any) -> str:
-    """Oldest-first ordering key: the immutable ``attempted_iso`` deadline anchor (P1-B)."""
-    inspection = deps.store.active_send_details(row.shoko_file_id)
-    if inspection is not None:
-        return inspection.attempted_iso
-    record = deps.store.get_file(row.shoko_file_id)
-    return record.updated_iso if record is not None else ""
+            file_reasons, processed = _file_recovery_phase(
+                deps, now_iso, cycle_start_mono, max_rows=remaining
+            )
+            reasons.extend(file_reasons)
+            remaining -= processed
+    deps.store.set_meta("service_recovery_metadata_first:v1", "0" if metadata_first else "1")
+    return tuple(reasons)
 
 
 def _candidate_freshness_guard(
@@ -2660,7 +2957,14 @@ def _post_preflight_freshness_guard(
 
 
 def _close_send(
-    deps: DaemonDeps, plan: LinkPlan, file_id: int, cycle_key: str, send_iso: str, send: Any
+    deps: DaemonDeps,
+    plan: LinkPlan,
+    file_id: int,
+    cycle_key: str,
+    send_iso: str,
+    send: Any,
+    *,
+    deadline_mono: float | None = None,
 ) -> _ApplyOutcome:
     """Close the durable send row's outcome: inline verify on acceptance, no resubmit ever."""
     if send.outcome is SendOutcome.AMBIGUOUS_SEND:
@@ -2669,7 +2973,9 @@ def _close_send(
         )
     if send.outcome is not SendOutcome.ACCEPTED_UNVERIFIED:
         return _ApplyOutcome(1, 0, (), ())
-    verification = _verify_and_close(deps, plan, file_id, cycle_key, send_iso)
+    verification = _verify_and_close(
+        deps, plan, file_id, cycle_key, send_iso, deadline_mono=deadline_mono
+    )
     return _ApplyOutcome(
         1,
         0,
@@ -2680,11 +2986,14 @@ def _close_send(
 
 
 def check_plan_sonarr_source(
-    deps: DaemonDeps, plan: LinkPlan, *, deadline: float | None
+    deps: DaemonDeps, plan: LinkPlan | MetadataDemand, *, deadline: float | None
 ) -> SourceRelationshipVerdict:
     """Compare a frozen plan with current Sonarr series, file, and episode rows."""
-    tvdb_series_ids = {item.tvdb_series for item in plan.targets}
-    tvdb_series_ids.update(item.tvdb_series for item in plan.pending_targets)
+    if isinstance(plan, MetadataDemand):
+        tvdb_series_ids = {item.tvdb_series for item in plan.mapped_targets}
+    else:
+        tvdb_series_ids = {item.tvdb_series for item in plan.targets}
+        tvdb_series_ids.update(item.tvdb_series for item in plan.pending_targets)
     if len(tvdb_series_ids) != 1:
         return SourceRelationshipVerdict(
             SourceRelationshipStatus.UNAVAILABLE,
@@ -2711,6 +3020,420 @@ def check_plan_sonarr_source(
         deadline=deadline,
         monotonic=deps.monotonic,
     )
+
+
+@dataclass(frozen=True)
+class MetadataExecutionOutcome:
+    """One bounded metadata decision, with no file/canary completion credit.
+
+    attempted is the durable admission count, including uncertain delivery; callers
+    must share its request allowance with file submissions. Replan only on a new
+    reconciliation pass; this primitive never patches a frozen demand or link plan.
+    """
+
+    reason: str
+    attempted: int = 0
+
+
+def _metadata_mapping_current(demand: MetadataDemand, active: ActiveMappings) -> bool:
+    if (
+        not demand.mapped_targets
+        or demand.episodes != tuple(dict.fromkeys(t.source for t in demand.mapped_targets))
+        or not demand.needs
+        or not demand.missing_targets <= demand.required_targets
+        or any(need.target not in demand.mapped_targets for need in demand.needs)
+        or demand.fingerprint != metadata_demand_fingerprint(demand)
+        or (
+            demand.targets_digest,
+            demand.structure_digest,
+            demand.mapping_revision,
+            demand.overrides_active,
+        )
+        != (
+            active.targets_digest,
+            active.structure_digest,
+            str(active.revision),
+            active.overrides_applied,
+        )
+    ):
+        return False
+    grouped: dict[tuple[int, int, int, int | None], set[tuple[int, int, str, str]]] = {}
+    for target in demand.mapped_targets:
+        source = target.source
+        key = (
+            target.tvdb_series,
+            source.season_number,
+            source.episode_number,
+            source.absolute_episode_number,
+        )
+        grouped.setdefault(key, set()).add(
+            (
+                target.anidb_anime_id,
+                target.anidb_episode_number,
+                target.episode_type.value,
+                target.source_rule,
+            )
+        )
+    for key, expected in grouped.items():
+        current = resolve_mapping(active.index, *key)
+        if (
+            current.status is not ResolutionStatus.RESOLVED
+            or {
+                (t.anidb_id, t.anidb_episode_number, t.episode_type.value, t.source_rule.value)
+                for t in current.targets
+            }
+            != expected
+        ):
+            return False
+    return True
+
+
+def _metadata_file_current(deps: DaemonDeps, demand: MetadataDemand) -> bool:
+    record = deps.store.get_file(demand.shoko_file_id)
+    return (
+        record is not None
+        and record.campaign_id is None
+        and record.cohort is not Cohort.CAMPAIGN
+        and record.state
+        in {FileState.MATCHED, FileState.MAPPED, FileState.PLANNED, FileState.WAITING}
+        and not deps.store.mapping_target_quarantined(demand.shoko_file_id)
+        and record.identity is not None
+        and canonical_ed2k(record.identity.ed2k) == demand.shoko_ed2k
+        and (record.sonarr_series_id, record.sonarr_file_id, record.sonarr_path, record.sonarr_size)
+        == (
+            demand.sonarr_series_id,
+            demand.sonarr_episode_file_id,
+            demand.sonarr_path,
+            demand.sonarr_size,
+        )
+        and demand.shoko_size == demand.sonarr_size
+        and not _grace_period_active(deps, record, deps.now())
+    )
+
+
+def _metadata_consent_current(deps: DaemonDeps, expected: str, revision: str | None) -> bool:
+    if (
+        deps.store.get_onboarding_json() != expected
+        or deps.store.get_service_authorization_revision() != revision
+        or current_metadata_maintenance_policy(deps.store) != METADATA_MAINTENANCE_POLICY
+        or OnboardingManager(deps.store).reconfirmation_required()
+        or deps.store.get_service_pause()[0]
+    ):
+        return False
+    record = OnboardingRecord.from_json(expected)
+    binding = record.binding
+    return (
+        binding.metadata_maintenance_policy == METADATA_MAINTENANCE_POLICY
+        and METADATA_MAINTENANCE_CONFIRMATION in record.confirmed_facts
+        and binding.sonarr_url == deps.settings.sonarr.url
+        and binding.shoko_url == deps.settings.shoko.url
+        and str(deps.shoko.base_url).rstrip("/") == binding.shoko_url.rstrip("/")
+        and str(deps.sonarr.base_url).rstrip("/") == binding.sonarr_url.rstrip("/")
+        and binding.roots == tuple(sorted(set(deps.settings.sonarr.allowed_roots)))
+        and set(binding.path_mappings) == set(deps.settings.path_mappings)
+    )
+
+
+def _metadata_local_guard(
+    deps: DaemonDeps,
+    demand: MetadataDemand,
+    active: ActiveMappings,
+    expected: str,
+    revision: str | None,
+    deadline: float,
+    *,
+    generation_lock_held: bool = False,
+) -> bool:
+    return (
+        deps.service_mode
+        and demand.policy == RunPolicy.SERVICE.value
+        and math.isfinite(deadline)
+        and deps.monotonic() < deadline
+        and not deps.shutdown_requested()
+        and not deps.store.writes_disabled
+        and deps.store.owns_apply_ownership(deps.pid, deps.now())
+        and demand.scope_fingerprint
+        == _metadata_scope_fingerprint(deps.settings, RunPolicy.SERVICE)
+        and _metadata_consent_current(deps, expected, revision)
+        and _metadata_file_current(deps, demand)
+        and deps.store.can_auto_apply(
+            demand.shoko_file_id,
+            now=deps.now(),
+            attestation_valid=None,
+            gate_open=None,
+            service_mode=True,
+            service_authorized=True,
+            service_backlog=True,
+            budgets_ok=True,
+            mapping_stable=True,
+            source_stable=True,
+        ).eligible
+        and _post_preflight_freshness_guard(
+            deps,
+            active,
+            deps.now(),
+            cycle_deadline=deadline,
+            generation_lock_held=generation_lock_held,
+        )
+        is None
+    )
+
+
+def _fresh_metadata_missing(
+    deps: DaemonDeps,
+    demand: MetadataDemand,
+    deadline: float,
+) -> frozenset[tuple[int, EpisodeType, int]] | None:
+    resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic, deadline=deadline)
+    missing: set[tuple[int, EpisodeType, int]] = set()
+    known = {need.target.identity: need.known_anidb_episode_id for need in demand.needs}
+    for anime, kind, number in sorted(
+        demand.required_targets, key=lambda t: (t[0], t[1].value, t[2])
+    ):
+        result = resolver.resolve(anime, kind.value, number)
+        previous_id = known.get((anime, kind, number))
+        if previous_id is not None and result.anidb_episode_id != previous_id:
+            return None
+        if result.status in {
+            EpisodeResolutionStatus.ANIME_NOT_CACHED,
+            EpisodeResolutionStatus.PENDING_METADATA,
+        }:
+            missing.add((anime, kind, number))
+        elif result.status is not EpisodeResolutionStatus.RESOLVED:
+            return None
+    return frozenset(missing) if deps.monotonic() < deadline else None
+
+
+def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered send boundary
+    deps: DaemonDeps,
+    demand: MetadataDemand,
+    anime_id: int,
+    active: ActiveMappings,
+    folders: Mapping[int, ImportFolder],
+    flags: _EligibilityFlags,
+    cycle_key: str,
+    *,
+    deadline: float,
+) -> MetadataExecutionOutcome:
+    """Authorize and execute at most one normal-service metadata request.
+
+    Caller owns the cycle's apply lock and shared submission allowance. Existing
+    own operations are inspect-only; read-only recovery is independent of the current
+    option and authorization.
+    """
+    deps = _bind_service_authorization(deps, deadline)
+    operation: MetadataOperation | None = None
+    attempted = 0
+    try:
+        expected = deps.store.get_onboarding_json()  # capture BEFORE remote authorization
+        revision = deps.store.get_service_authorization_revision()
+        # Rebuild against the current override configuration, not a caller-supplied
+        # index whose frozen digest labels could still name a different index.
+        verified = load_active(deps.mapping_store, _load_overrides(deps))
+        if verified is None or (
+            active.revision,
+            active.content_sha256,
+            active.targets_digest,
+            active.structure_digest,
+            active.source_epoch,
+            active.overrides_applied,
+        ) != (
+            verified.revision,
+            verified.content_sha256,
+            verified.targets_digest,
+            verified.structure_digest,
+            verified.source_epoch,
+            verified.overrides_applied,
+        ):
+            return MetadataExecutionOutcome("metadata_generation_or_overrides_changed")
+        active = verified
+        if (
+            expected is None
+            or not _metadata_local_guard(deps, demand, active, expected, revision, deadline)
+            or not _metadata_mapping_current(demand, active)
+        ):
+            return MetadataExecutionOutcome("metadata_authorization_or_demand_changed")
+        required = tuple(t for t in demand.required_targets if t[0] == anime_id)
+        if not required or not any(t[0] == anime_id for t in demand.missing_targets):
+            return MetadataExecutionOutcome("metadata_anime_not_required")
+        source_key = metadata_source_key(deps.shoko)
+        prior = deps.store.get_metadata_operation(source_key, anime_id)
+        if prior is not None and (
+            (
+                prior.reservation_owned
+                and prior.state
+                not in {MetadataOperationState.READY, MetadataOperationState.DEFINITELY_REJECTED}
+            )
+            or prior.state
+            in {
+                MetadataOperationState.PREPARED,
+                MetadataOperationState.POSSIBLY_DELIVERED,
+                MetadataOperationState.NEEDS_ATTENTION,
+            }
+        ):
+            return MetadataExecutionOutcome("metadata_operation_retained")
+        eligible = deps.store.can_auto_apply(
+            demand.shoko_file_id,
+            now=deps.now(),
+            attestation_valid=None,
+            gate_open=None,
+            service_mode=True,
+            service_authorized=True,
+            service_backlog=True,
+            budgets_ok=flags.budgets_ok and _service_candidate_budget_headroom(deps, deps.now(), 1),
+            mapping_stable=flags.mapping_stable,
+            source_stable=flags.source_stable,
+        )
+        if not eligible.eligible or not deps.service_authorized():
+            return MetadataExecutionOutcome("metadata_service_not_eligible")
+        source = check_plan_sonarr_source(deps, demand, deadline=deadline)
+        if source.status is not SourceRelationshipStatus.CURRENT:
+            return MetadataExecutionOutcome("metadata_sonarr_source_changed_or_unavailable")
+        # A second remote authorization observes current physical/folder/settings facts
+        # after source reads; no remote authorization follows the protected file read.
+        if not deps.service_authorized():
+            return MetadataExecutionOutcome("metadata_authorization_changed")
+        queue = fetch_queue(deps.shoko, deadline=deadline, clock=deps.monotonic)
+        if queue is None or queue.blocked_count > effective_blocked_over(deps):
+            return MetadataExecutionOutcome("metadata_queue_unavailable_or_blocked")
+        inventory = fetch_queue_inventory(deps.shoko, deadline=deadline, clock=deps.monotonic)
+        presence = inventory.lookup(QueueJobKind.ANIME_METADATA, anime_id).presence
+        if presence is Presence.PRESENT:
+            deps.store.observe_external_metadata_operation(
+                source_key,
+                anime_id,
+                demand_fingerprint=demand.fingerprint,
+                request_fingerprint=_metadata_request_fingerprint(source_key, anime_id),
+                request_version=1,
+                iso=deps.now(),
+                required_targets=required,
+                missing_targets=tuple(t for t in demand.missing_targets if t[0] == anime_id),
+            )
+            return MetadataExecutionOutcome("metadata_waiting_external_queue")
+        file_job = inventory.lookup(QueueJobKind.MANUAL_LINK, demand.shoko_file_id).presence
+        if presence is Presence.UNKNOWN or file_job is Presence.UNKNOWN:
+            return MetadataExecutionOutcome("metadata_queue_not_clear")
+        if file_job is Presence.PRESENT:
+            return MetadataExecutionOutcome("metadata_waiting_external_file_queue")
+        missing = _fresh_metadata_missing(deps, demand, deadline)
+        if missing is None:
+            return MetadataExecutionOutcome("metadata_targets_unavailable")
+        selected_missing = tuple(t for t in missing if t[0] == anime_id)
+        if not selected_missing:
+            return MetadataExecutionOutcome("metadata_replan")
+        # Final network guard; never invent a LinkPlan or internal episode IDs.
+        file_gate = preflight_file(
+            deps.shoko, demand, deps.settings, folders, deadline=deadline, clock=deps.monotonic
+        )
+        if not file_gate.ok:
+            return MetadataExecutionOutcome("metadata_file_preflight_refused")
+        with deps.mapping_store.generation_lock() as acquired:
+            if not acquired or not _metadata_local_guard(
+                deps, demand, active, expected, revision, deadline, generation_lock_held=True
+            ):
+                return MetadataExecutionOutcome("metadata_authorization_or_generation_changed")
+            prepared = deps.store.prepare_metadata_operation(
+                source_key,
+                anime_id,
+                demand_fingerprint=demand.fingerprint,
+                request_fingerprint=_metadata_request_fingerprint(source_key, anime_id),
+                request_version=1,
+                cycle_key=cycle_key,
+                iso=deps.now(),
+                expected_document_json=expected,
+                required_targets=required,
+                missing_targets=selected_missing,
+                retry_unsent_claim=(
+                    prior.claim
+                    if prior is not None
+                    and prior.state is MetadataOperationState.DEFINITELY_REJECTED
+                    else None
+                ),
+                adopt_external_claim=(
+                    prior.claim
+                    if prior is not None
+                    and not prior.reservation_owned
+                    and prior.attempted_iso is None
+                    else None
+                ),
+                after_ready_claim=(
+                    prior.claim
+                    if prior is not None and prior.state is MetadataOperationState.READY
+                    else None
+                ),
+            )
+            if isinstance(prepared, BudgetRefusal):
+                return MetadataExecutionOutcome(
+                    prepared.reason
+                    if prepared.reason.startswith("metadata_")
+                    else "metadata_" + prepared.reason
+                )
+            operation = prepared
+            # Bind display context to the new generation before any possible HTTP,
+            # including READY re-arms whose old claim belongs to another file.
+            with contextlib.suppress(StateError):
+                observe_metadata_status(
+                    deps.store,
+                    source_key,
+                    anime_id,
+                    "metadata_prepared",
+                    deps.now(),
+                    demand=demand,
+                    operation_snapshot=operation,
+                )
+            if not _metadata_local_guard(
+                deps, demand, active, expected, revision, deadline, generation_lock_held=True
+            ):
+                deps.store.cancel_prepared_metadata_operation(operation, iso=deps.now())
+                return MetadataExecutionOutcome("metadata_authorization_changed")
+            now_iso = deps.now()
+            operation = deps.store.mark_metadata_possibly_delivered(
+                operation,
+                iso=now_iso,
+                verification_deadline_iso=(
+                    _parse_iso(now_iso) + timedelta(seconds=deps.verification_timeout_seconds)
+                ).isoformat(),
+                expected_document_json=expected,
+            )
+            if not _metadata_local_guard(
+                deps, demand, active, expected, revision, deadline, generation_lock_held=True
+            ):
+                # Definitely no HTTP; release only if persistence is still writable.
+                deps.store.record_metadata_operation(
+                    operation, MetadataOperationState.DEFINITELY_REJECTED, iso=deps.now()
+                )
+                return MetadataExecutionOutcome("metadata_authorization_changed")
+            deps.store.admit_metadata_transport(operation, expected_document_json=expected)
+            if not _metadata_local_guard(
+                deps, demand, active, expected, revision, deadline, generation_lock_held=True
+            ):
+                deps.store.record_metadata_operation(
+                    operation, MetadataOperationState.DEFINITELY_REJECTED, iso=deps.now()
+                )
+                return MetadataExecutionOutcome("metadata_authorization_changed")
+            attempted = 1
+            result = submit_metadata_refresh(
+                deps.shoko, anime_id, deadline=deadline, clock=deps.monotonic
+            )
+            if result.outcome is MetadataRefreshOutcome.NOT_SENT:
+                deps.store.record_metadata_operation(
+                    operation, MetadataOperationState.DEFINITELY_REJECTED, iso=deps.now()
+                )
+                return MetadataExecutionOutcome("metadata_not_sent", attempted)
+            if result.outcome is MetadataRefreshOutcome.ACCEPTED_QUEUED:
+                deps.store.record_metadata_operation(
+                    operation, MetadataOperationState.ACCEPTED_WAITING, iso=deps.now()
+                )
+                return MetadataExecutionOutcome("metadata_accepted_waiting", attempted)
+            return MetadataExecutionOutcome("metadata_delivery_unknown", attempted)
+    except (StateError, ConfigError, ValueError, ApplyLockUnavailableError, httpx.HTTPError):
+        # Never release a possibly delivered claim or replay after persistence failure.
+        return MetadataExecutionOutcome("metadata_state_or_guard_unavailable", attempted)
+
+
+def _metadata_request_fingerprint(source_key: str, anime_id: int) -> str:
+    # The version identifies the reviewed six-flag request contract, not mutable demand.
+    return hashlib.sha256(f"metadata_refresh:v1:{source_key}:{anime_id}".encode()).hexdigest()
 
 
 def _refresh_service_canary(deps: DaemonDeps, now_iso: str) -> tuple[int, str] | None:
@@ -2760,8 +3483,12 @@ def _finish_service_candidate(
     cycle_key: str,
     send_iso: str,
     send: Any,
+    *,
+    deadline_mono: float | None = None,
 ) -> _ApplyOutcome:
-    outcome = _close_send(deps, plan, file_id, cycle_key, send_iso, send)
+    outcome = _close_send(
+        deps, plan, file_id, cycle_key, send_iso, send, deadline_mono=deadline_mono
+    )
     canary = _refresh_service_canary(deps, send_iso)
     if canary is not None and canary[1] == "failed":
         return replace(outcome, reasons=(*outcome.reasons, "service_canary_failed"))
@@ -2811,6 +3538,8 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
 ) -> _ApplyOutcome:
     """One file's guarded send: fresh safety inputs → eligibility → preflight → prepare →
     mark_sent → submit → verify (F11: every submission timestamp comes from the fresh clock)."""
+    if source_check_deadline is not None:
+        deps = _bind_service_authorization(deps, source_check_deadline)
     # Advanced mode re-evaluates its lease and apply gate per candidate; normal service mode
     # re-evaluates current onboarding consent. A blocked candidate defers (stays planned), never
     # quarantined.
@@ -2853,6 +3582,7 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
         blocked_over=effective_blocked_over(deps),
         mapping_index=active.index,
         check_file=False,
+        check_targets=False,
     )
     if not gate.ok:
         return _preflight_failure_outcome(deps, file_id, gate, send_iso)
@@ -2882,7 +3612,19 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
     # catches a pause/consent change that lands during this final Shoko request.
     if deps.service_mode and not deps.service_authorized():
         return _ApplyOutcome(0, 1, ("service_authorization_changed",), ())
-    file_gate = preflight_file(deps.shoko, plan, deps.settings, folders)
+    target_gate = preflight_link_jobs_and_targets(
+        deps.shoko, plan, deadline=source_check_deadline, clock=deps.monotonic
+    )
+    if not target_gate.ok:
+        return _preflight_failure_outcome(deps, file_id, target_gate, deps.now())
+    file_gate = preflight_file(
+        deps.shoko,
+        plan,
+        deps.settings,
+        folders,
+        deadline=source_check_deadline,
+        clock=deps.monotonic,
+    )
     if deps.store.writes_disabled:
         return _ApplyOutcome(0, 1, ("writes_disabled",), ())
     # The final hold/generation check, durable send intent, and one Shoko mutation share the
@@ -2934,7 +3676,9 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
             deps.store.mark_sent(token, iso=send_iso)
             with deps.store.protect_transport(token):
                 transport_started = True
-                send = submit_link(deps.shoko, plan, clock=deps.monotonic)
+                send = submit_link(
+                    deps.shoko, plan, clock=deps.monotonic, deadline=source_check_deadline
+                )
             deps.store.record_send_outcome(
                 token, send.outcome, iso=send_iso, http_status=send.http_status, detail=send.detail
             )
@@ -2957,7 +3701,9 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
             ("writes_disabled",),
             (),
         )
-    return _finish_service_candidate(deps, plan, file_id, cycle_key, send_iso, send)
+    return _finish_service_candidate(
+        deps, plan, file_id, cycle_key, send_iso, send, deadline_mono=source_check_deadline
+    )
 
 
 def mapping_generation_identity(
@@ -3225,7 +3971,11 @@ def _zero_progress_is_recoverable(
     )
     if hard:
         return False
-    if any(reason.startswith(_RECOVERABLE_ZERO_PROGRESS_PREFIXES) for reason in reasons):
+    # The final local guard emits an exact cycle-cap reason, distinct from the
+    # campaign authorization deadline (a hard stop). Do not accept suffixed variants.
+    if "cycle_time_budget_exhausted" in reasons or any(
+        reason.startswith(_RECOVERABLE_ZERO_PROGRESS_PREFIXES) for reason in reasons
+    ):
         return True
     return any(
         record.state in _PENDING_VERIFICATION_STATES
@@ -3341,12 +4091,15 @@ def _drain_campaign(
     *,
     cycle_key: str,
     fresh_campaign_quarantines: frozenset[int],
+    budget_start_mono: float | None = None,
 ) -> _CampaignDrainOutcome:
     """Drain **one** bounded batch of the oldest approved campaign (F7), under this cycle's lock.
 
     Runs entirely through :func:`shoko_linker.campaign.apply_campaign` with
     ``lock_held=True`` and this cycle's existing ``cycle_key`` (the daemon cycle already owns
     the OS apply lock), so arrival and campaign reservations share one durable per-cycle ceiling.
+    ``budget_start_mono`` carries the original outer cycle start through the nested sweep
+    and all subsequent I/O; campaign-scoped dependencies preserve the outer wall-time ceiling.
     The full guard chain applies unchanged: plan digest, status/deadline/max-submissions,
     write gate,
     campaign-scope attestation (an expiring lease pauses writes and stops the batch, zero
@@ -3400,6 +4153,7 @@ def _drain_campaign(
             lock_held=True,
             daemon_drain=True,
             budget_cycle_key=cycle_key,
+            budget_start_mono=budget_start_mono,
             fresh_campaign_quarantines=fresh_campaign_quarantines,
         )
     except CampaignPlanInvalidError as exc:
@@ -3415,6 +4169,13 @@ def _drain_campaign(
         reasons.append(f"campaign_deferred:{campaign.campaign_id}:{exc.reason_code}")
         reasons.extend(exc.reason_codes)
         log.warning("campaign %s drain deferred: %s", campaign.campaign_id, exc)
+        if (
+            exc.reason_code in {"batch_time_limit", "reconciliation_incomplete"}
+            and budget_start_mono is not None
+            and deps.monotonic() >= budget_start_mono + deps.max_cycle_seconds
+        ):
+            retry = _rolling_cooldown_retry_iso(deps, now_iso, ())
+            _defer_campaign_drain(deps, campaign.campaign_id, retry, reasons, "batch_cooldown")
         return _CampaignDrainOutcome(selected=True)
     except CampaignError as exc:
         reasons.append(f"campaign_deferred:{campaign.campaign_id}")
@@ -3659,6 +4420,8 @@ def run_cycle(
     original_budget_limits = deps.store.budget_limits
     try:
         _apply_service_budget_limits(deps)
+        cycle_start_mono = deps.monotonic() if budget_start_mono is None else budget_start_mono
+        deps = _bind_service_authorization(deps, cycle_start_mono + deps.max_cycle_seconds)
         return _run_cycle_body(
             deps,
             now_iso=now_iso,
@@ -3668,7 +4431,7 @@ def run_cycle(
             full=full,
             campaign_quarantine_limit=campaign_quarantine_limit,
             bounded_read_only=bounded_read_only,
-            budget_start_mono=budget_start_mono,
+            budget_start_mono=cycle_start_mono,
             resolution_priority_file_ids=resolution_priority_file_ids,
         )
     finally:
@@ -3687,6 +4450,24 @@ def run_cycle(
                 holder = exc.holder.owner_pid if exc.holder is not None else "unknown"
                 with contextlib.suppress(WriteDisabledError):
                     deps.store.set_meta("last_lock_release_denied", str(holder))
+
+
+def _bind_service_authorization(deps: DaemonDeps, deadline: float) -> DaemonDeps:
+    """Bind production remote checks to one cycle budget, including rate feedback."""
+    if not deps.service_mode or deps.service_authorized_for_deadline is None:
+        return deps
+    authorize = deps.service_authorized_for_deadline
+    clock = deps.monotonic
+
+    def bounded_authorization(current_deadline: float) -> bool:
+        limit = min(deadline, current_deadline)
+        return clock() < limit and authorize(limit) and clock() < limit
+
+    return replace(
+        deps,
+        service_authorized=lambda: bounded_authorization(deadline),
+        service_authorized_for_deadline=bounded_authorization,
+    )
 
 
 def _run_cycle_body(
@@ -3841,7 +4622,7 @@ def _run_cycle_body(
         and not phase.churn_paused
         and not service_mapping_refresh_failed
     )
-    submitted, deferred = _run_apply(
+    submitted, deferred, metadata = _run_apply(
         deps,
         reconcile.plans,
         flags,
@@ -3856,6 +4637,7 @@ def _run_cycle_body(
         policy,
         mode,
         full=full,
+        metadata_demands=reconcile.metadata_demands,
     )
 
     # F7: drain ONE bounded batch of the oldest approved backlog campaign through the full
@@ -3881,6 +4663,7 @@ def _run_cycle_body(
             reasons,
             cycle_key=cycle_key,
             fresh_campaign_quarantines=reconcile.fresh_campaign_quarantines,
+            budget_start_mono=cycle_start_mono,
         )
 
     counts = _final_counts(
@@ -3939,6 +4722,9 @@ def _run_cycle_body(
         exclusion_counts=reconcile.exclusion_counts,
         scope_excluded_count=reconcile.scope_excluded_count,
         resolution_deferred_file_ids=reconcile.resolution_deferred_file_ids,
+        metadata_requests_attempted=metadata.attempted,
+        metadata_deferred=metadata.deferred,
+        metadata_observations=metadata.observations,
     )
 
 
@@ -3997,6 +4783,66 @@ def _load_service_rate_state(deps: DaemonDeps, now_iso: str) -> RateState:
         return state
 
 
+class _MetadataRateHealth(Enum):
+    NORMAL_WAIT = "normal_wait"
+    API_FAILURE = "api_failure"
+    SAFETY_HOLD = "safety_hold"
+
+
+def _metadata_rate_health(reason: str) -> _MetadataRateHealth | None:
+    """Classify exact metadata outcomes without granting file-success credit.
+
+    Ordinary waits/yields are not failures. Unknown future outcomes refuse a
+    healthy-cycle ramp, so new metadata branches cannot silently escape feedback.
+    """
+    if reason.startswith("metadata_recovery:"):
+        status = reason.rsplit(":", 1)[-1]
+        health_by_status = dict.fromkeys(
+            ("unsent_released", "ready", "waiting_metadata", "waiting_queue", "deadline"),
+            _MetadataRateHealth.NORMAL_WAIT,
+        )
+        health_by_status.update(
+            dict.fromkeys(
+                ("queue_unknown", "state_unavailable"),
+                _MetadataRateHealth.API_FAILURE,
+            )
+        )
+        return health_by_status.get(status, _MetadataRateHealth.SAFETY_HOLD)
+    if reason.startswith("metadata_recovery_deferred:"):
+        return _MetadataRateHealth.NORMAL_WAIT
+    if not reason.startswith("metadata_"):
+        return None
+    if reason in {
+        "metadata_disabled",
+        "metadata_anime_not_required",
+        "metadata_operation_retained",
+        "metadata_operation_exists",
+        "metadata_service_not_eligible",  # includes ordinary durable budget headroom waits
+        "metadata_waiting_external_queue",
+        "metadata_waiting_external_file_queue",
+        "metadata_replan",
+        "metadata_not_sent",  # transport proves the deadline expired before any HTTP
+        "metadata_accepted_waiting",
+        "metadata_pending_files_exhausted",
+        "metadata_pending_episode_jobs_exhausted",
+        "metadata_cycle_new_exhausted",
+        "metadata_rolling_new_exhausted",
+    }:
+        return _MetadataRateHealth.NORMAL_WAIT
+    if reason in {
+        "metadata_queue_unavailable_or_blocked",
+        "metadata_queue_not_clear",
+        "metadata_targets_unavailable",
+        "metadata_sonarr_source_changed_or_unavailable",
+        "metadata_delivery_unknown",
+        "metadata_state_or_guard_unavailable",
+    }:
+        return _MetadataRateHealth.API_FAILURE
+    # Includes changed authorization/generation/demand, protected-file refusal,
+    # overdue verification and invalid coverage, rather than guessing safety.
+    return _MetadataRateHealth.SAFETY_HOLD
+
+
 def _update_service_rate_state(
     deps: DaemonDeps,
     state: RateState,
@@ -4007,13 +4853,17 @@ def _update_service_rate_state(
     verified: int,
     reasons: Sequence[str],
     drift: Sequence[str],
+    deadline: float | None = None,
 ) -> RateState:
+    if deadline is not None:
+        deps = _bind_service_authorization(deps, deadline)
     if not deps.service_mode:
         return state
     configured = deps.store.budget_limits
     limits = None if configured is None else service_budget_limits(configured)
     budget_view = deps.store.budget_view()
     all_reasons = tuple(reasons) + tuple(drift)
+    metadata_health = {_metadata_rate_health(reason) for reason in all_reasons}
     mapping_markers = (
         "mapping_unstable",
         "mapping_churn",
@@ -4061,15 +4911,17 @@ def _update_service_rate_state(
         max_pending_episode_jobs=(0 if limits is None else limits.max_pending_episode_jobs),
         submitted=submitted,
         verified=verified,
-        api_healthy=not any(
-            marker in reason for reason in all_reasons for marker in failure_markers
+        api_healthy=(
+            _MetadataRateHealth.API_FAILURE not in metadata_health
+            and not any(marker in reason for reason in all_reasons for marker in failure_markers)
         ),
         mapping_stable=not any(
             marker in reason for reason in all_reasons for marker in mapping_markers
         ),
         authorization_valid=deps.service_authorized(),
-        anomaly_free=not any(
-            marker in reason for reason in all_reasons for marker in anomaly_markers
+        anomaly_free=(
+            _MetadataRateHealth.SAFETY_HOLD not in metadata_health
+            and not any(marker in reason for reason in all_reasons for marker in anomaly_markers)
         ),
         canary_verified=canary is not None and canary[1] == "verified",
     )
@@ -4114,6 +4966,87 @@ def _apply_cycle_limit(deps: DaemonDeps, *, full: bool) -> int:
     return deps.max_submissions if full else max(1, deps.max_submissions // 2)
 
 
+@dataclass(frozen=True)
+class _MetadataScheduleReport:
+    attempted: int = 0
+    deferred: int = 0
+    observations: tuple[tuple[int, str], ...] = ()
+
+
+def _schedule_metadata_demands(
+    deps: DaemonDeps,
+    demands: Mapping[int, MetadataDemand],
+    flags: _EligibilityFlags,
+    active: ActiveMappings,
+    folders: Mapping[int, ImportFolder],
+    cycle_key: str,
+    *,
+    remaining_submissions: int,
+    deadline: float,
+) -> _MetadataScheduleReport:
+    """After ready links, consider bounded distinct anime using one complete file each."""
+    if not deps.service_mode or not demands:
+        return _MetadataScheduleReport()
+    # Pick a reproducible supporting file, without manufacturing a partial demand.
+    groups: dict[int, MetadataDemand] = {}
+    for file_id in sorted(demands):
+        demand = demands[file_id]
+        if not _metadata_file_current(deps, demand):
+            continue
+        for anime, _kind, _number in sorted(
+            demand.missing_targets, key=lambda target: (target[0], target[1].value, target[2])
+        ):
+            groups.setdefault(anime, demand)
+    if not groups:
+        return _MetadataScheduleReport()
+    source_key = metadata_source_key(deps.shoko)
+    for anime, demand in list(groups.items())[:20]:
+        with contextlib.suppress(StateError):
+            observe_metadata_status(
+                deps.store, source_key, anime, "metadata_waiting", deps.now(), demand=demand
+            )
+    if current_metadata_maintenance_policy(deps.store) != METADATA_MAINTENANCE_POLICY:
+        return _MetadataScheduleReport(
+            deferred=len(groups), observations=((0, "metadata_disabled"),)
+        )
+    canary_hold = _service_canary_hold_reason(deps)
+    if canary_hold is not None:
+        return _MetadataScheduleReport(deferred=len(groups), observations=((0, canary_hold),))
+    if deps.store.get_service_canary() is None:
+        remaining_submissions = min(remaining_submissions, 1)
+    cursor_key = "service_metadata_schedule_cursor:v1"
+    try:
+        cursor = int(deps.store.get_meta(cursor_key) or "0")
+    except ValueError:
+        cursor = 0
+    ordered = sorted(groups)
+    ordered = [anime for anime in ordered if anime > cursor] + [
+        anime for anime in ordered if anime <= cursor
+    ]
+    attempted = 0
+    observations: list[tuple[int, str]] = []
+    # A blocked first group cannot monopolize each cycle's bounded planning work.
+    for anime in ordered[:MAX_SERVICE_CYCLE_SUBMISSIONS]:
+        if (
+            attempted >= remaining_submissions
+            or deps.monotonic() >= deadline
+            or deps.shutdown_requested()
+            or deps.store.writes_disabled
+        ):
+            break
+        outcome = process_metadata_demand(
+            deps, groups[anime], anime, active, folders, flags, cycle_key, deadline=deadline
+        )
+        attempted += outcome.attempted
+        observations.append((anime, outcome.reason))
+        with contextlib.suppress(StateError):
+            observe_metadata_status(
+                deps.store, source_key, anime, outcome.reason, deps.now(), demand=groups[anime]
+            )
+        deps.store.set_meta(cursor_key, str(anime))
+    return _MetadataScheduleReport(attempted, len(groups) - attempted, tuple(observations))
+
+
 def _run_apply(
     deps: DaemonDeps,
     plans: Mapping[int, LinkPlan],
@@ -4129,13 +5062,16 @@ def _run_apply(
     policy: RunPolicy,
     mode: CycleMode,
     full: bool = True,
-) -> tuple[int, int]:
+    metadata_demands: Mapping[int, MetadataDemand] | None = None,
+) -> tuple[int, int, _MetadataScheduleReport]:
     """Drive the apply loop and fold its reasons/drift into the cycle's lists."""
     if not apply_running:
         if deps.service_mode and mode is CycleMode.APPLY:
             _observe_service_rate_hold(deps, now_iso, reasons, drift)
-        return (0, 0)
-    queue = fetch_queue(deps.shoko)
+        return (0, 0, _MetadataScheduleReport())
+    queue = fetch_queue(
+        deps.shoko, deadline=cycle_start_mono + deps.max_cycle_seconds, clock=deps.monotonic
+    )
     configured_limit = _apply_cycle_limit(deps, full=full)
     rate_state = _load_service_rate_state(deps, now_iso) if deps.service_mode else None
     max_submissions = (
@@ -4158,6 +5094,22 @@ def _run_apply(
     )
     reasons.extend(apply_reasons)
     drift.extend(apply_drift)
+    if deps.service_mode:
+        with contextlib.suppress(StateError):
+            observe_resolved_metadata_plans(
+                deps.store, metadata_source_key(deps.shoko), plans, deps.now()
+            )
+    metadata = _schedule_metadata_demands(
+        deps,
+        metadata_demands or {},
+        flags,
+        active,
+        folders,
+        cycle_key,
+        remaining_submissions=max(0, max_submissions - submitted),
+        deadline=cycle_start_mono + deps.max_cycle_seconds,
+    )
+    reasons.extend(reason for _anime, reason in metadata.observations)
     current_queue_reasons = queue_reasons(queue)
     reasons.extend(current_queue_reasons)
     if rate_state is not None:
@@ -4174,10 +5126,11 @@ def _run_apply(
                     verified=verified,
                     reasons=reasons,
                     drift=drift,
+                    deadline=cycle_start_mono + deps.max_cycle_seconds,
                 )
         except WriteDisabledError:
             reasons.append("writes_disabled")
-    return (submitted, deferred)
+    return (submitted, deferred, metadata)
 
 
 def queue_reasons(queue: QueueSnapshot | None) -> tuple[str, ...]:

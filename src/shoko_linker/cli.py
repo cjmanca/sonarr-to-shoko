@@ -99,6 +99,7 @@ from .config import (
     apply_gate,
     apply_gate_status,
     load_settings,
+    parse_runtime_options,
 )
 from .daemon import (
     AttestationScopeHooks,
@@ -128,6 +129,8 @@ from .mapping_store import (
 from .mapping_store import (
     status as mapping_status,
 )
+from .metadata_operations import metadata_source_key, recover_metadata_operations
+from .metadata_status import MetadataStatusView, metadata_status_view
 from .onboarding import OnboardingContext, OnboardingManager, OnboardingStatus, ScopeBinding
 from .policies import PolicyRequest, RunPolicy, parse_policy
 from .reporting import (
@@ -919,6 +922,7 @@ class _NormalServiceRuntime:
             "mapping_cache": "Available after scope and safety setup is confirmed above.",
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
+        self._tick_cycle_started = False
 
     def _update_latest(self, **changes: Any) -> None:
         with self._latest_lock:
@@ -983,7 +987,34 @@ class _NormalServiceRuntime:
                 "Waiting for the initial link to be verified before processing more files. "
                 "The service will check again automatically."
             )
-        return authorized, next_action
+        return _NormalServiceRuntime._queue_wait_status(report, authorized, next_action)
+
+    @staticmethod
+    def _queue_wait_status(
+        report: CycleReport | None, active: bool, next_action: str
+    ) -> tuple[bool, str]:
+        """Explain queue refusals even when fully mapped files need no metadata."""
+        if not active or report is None:
+            return active, next_action
+        # Interpret structured refusal codes only, never upstream messages.
+        partial = bool(report.counts.submitted or report.counts.verified)
+        if "preflight_queue_unknown" in report.reasons:
+            return False, (
+                "Some files are waiting because " if partial else "Linking is waiting because "
+            ) + (
+                "Shoko's job queue could not be checked completely. "
+                "Check Shoko connectivity and the configured Shoko account or API key's "
+                "administrator permissions to view its job queue. Incomplete or oversized "
+                "queue results can also prevent this check. The service will retry read-only "
+                "checks automatically; new links wait until related jobs can be ruled out."
+            )
+        if "preflight_queue_blocked" in report.reasons:
+            return False, (
+                "Some files are waiting for related Shoko jobs to finish. "
+                if partial
+                else "Waiting for related Shoko jobs to finish before submitting new links. "
+            ) + "The service will check again automatically."
+        return active, next_action
 
     @staticmethod
     def _mapping_guidance(status: MappingStatus, now: datetime) -> str:
@@ -1057,6 +1088,18 @@ class _NormalServiceRuntime:
                 ),
             )
             counts = store.service_file_counts()
+            preferences = load_service_settings(store, self.settings)
+            metadata = (
+                metadata_status_view(
+                    store,
+                    metadata_source_key(self.shoko),
+                    enabled=preferences["allow_missing_metadata_refresh"],
+                )
+                if preferences["shoko_url"] == self.settings.shoko_url
+                else MetadataStatusView(
+                    message="Restart the container to check the saved Shoko server."
+                )
+            )
             exclusions = discovery_exclusion_payload(store)
             exclusion_counts = tuple(sorted(exclusions["counts"].items()))
             exclusion_diagnostics = tuple(
@@ -1089,6 +1132,7 @@ class _NormalServiceRuntime:
                     for item in exclusions["examples"]
                 ),
                 worker_activity=cast(str, latest["worker_activity"]),
+                metadata=metadata,
             )
         finally:
             store.close()
@@ -1098,14 +1142,65 @@ class _NormalServiceRuntime:
         self._update_latest(authorized=False, worker_activity=message, next_action=message)
 
     def worker_tick(self) -> None:
+        started = time.monotonic()
+        self._tick_cycle_started = False
+        recovery_limits: tuple[float, int] | None = None
         try:
+            # Snapshot limits before connection/setup I/O. A blocked check must not
+            # grant recovery a fresh wall-time allowance when it eventually returns.
+            with contextlib.closing(StateStore(Path(self.settings.database_path))) as store:
+                document = load_service_settings(store, self.settings)
+                sync, _, _, _ = parse_runtime_options(
+                    {name: document[name] for name in ("sync", "mappings", "safety", "campaign")}
+                )
+                recovery_limits = (
+                    started + sync.max_cycle_seconds,
+                    sync.max_recovery_rows_per_cycle,
+                )
             self._worker_tick()
         except Exception:
             # Include failures before opening the state store (connection/configuration I/O).
             self._cycle_deferred()
             self.logger.error("Normal service check failed; it will be retried.")
         finally:
+            if not self._tick_cycle_started and recovery_limits is not None:
+                self._recover_blocked_metadata(*recovery_limits)
             self._update_latest(worker_activity="")
+
+    def _recover_blocked_metadata(self, deadline: float, max_rows: int) -> None:
+        """Inspect accepted work even when setup or pause prevents a daemon cycle.
+
+        This path never reconciles files, reserves capacity or sends remote writes.
+        Authorized cycles own their existing shared file/metadata recovery budget.
+        """
+        if time.monotonic() >= deadline or max_rows == 0 or self.state.should_stop():
+            return
+        try:
+            with contextlib.closing(StateStore(Path(self.settings.database_path))) as store:
+                document = load_service_settings(store, self.settings)
+                # Runtime endpoints are replaced only on restart. Never inspect the
+                # old server after a saved Shoko URL change, or follow historical URLs.
+                if document["shoko_url"] != self.settings.shoko_url:
+                    return
+                report = recover_metadata_operations(
+                    self.shoko,
+                    store,
+                    source_key=metadata_source_key(self.shoko),
+                    now_iso=current_iso(),
+                    deadline=deadline,
+                    max_rows=max_rows,
+                )
+                if report.observations:
+                    self._update_latest(
+                        diagnostics=tuple(
+                            f"metadata_recovery:{item.anime_id}:{item.status.value}"
+                            for item in report.observations[:20]
+                        )
+                    )
+        except Exception:
+            # Preserve the actual setup/pause guidance and never expose endpoint
+            # exceptions, response bodies or credentials through recovery status.
+            self.logger.warning("Queued metadata inspection was deferred; it will retry.")
 
     def _worker_tick(self) -> None:
         self._checking_activity("Checking Sonarr and Shoko connections.")
@@ -1164,9 +1259,17 @@ class _NormalServiceRuntime:
         context = self._service_authorization_context(store)
         return self._service_context_authorized(manager, context, expected_binding_digest)
 
-    def _service_authorization_context(self, store: StateStore) -> OnboardingContext | None:
+    def _service_authorization_context(
+        self,
+        store: StateStore,
+        *,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> OnboardingContext | None:
         """Refresh remote facts before onboarding compares them with persisted consent."""
-        return self.setup.current_context(store)
+        if deadline is None:
+            return self.setup.current_context(store)
+        return self.setup.current_context(store, deadline=deadline, clock=clock)
 
     @staticmethod
     def _service_context_authorized(
@@ -1206,8 +1309,10 @@ class _NormalServiceRuntime:
 
         authorization_context: list[OnboardingContext | None] = [None]
 
-        def service_authorized() -> bool:
-            context = self._service_authorization_context(store)
+        def service_authorized(deadline: float) -> bool:
+            context = self._service_authorization_context(
+                store, deadline=deadline, clock=deps.monotonic
+            )
             authorization_context[0] = context
             return self._service_context_authorized(manager, context, expected_binding_digest)
 
@@ -1232,10 +1337,11 @@ class _NormalServiceRuntime:
         deps = replace(
             deps,
             service_mode=True,
-            service_authorized=service_authorized,
+            service_authorized_for_deadline=service_authorized,
             service_authorized_local=service_authorized_local,
         )
         try:
+            self._tick_cycle_started = True
             self._run_daemon_cycle(deps, store, effective)
         finally:
             for endpoint in endpoints:

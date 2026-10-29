@@ -17,8 +17,9 @@ from .config import DatabaseSettings, Settings, parse_settings
 from .errors import ConfigError, HttpPolicyError
 from .http import (
     ApiEndpoint,
+    BoundedJsonError,
+    get_bounded_json,
     make_client,
-    resolve_and_send,
     shoko_headers,
     sonarr_headers,
 )
@@ -115,19 +116,26 @@ def _probe_endpoint(
     expected_shape: Literal["object", "array"],
 ) -> tuple[bool, str | None]:
     try:
-        response = resolve_and_send(endpoint, "GET", path)
+        status_code, payload = get_bounded_json(endpoint, path)
+    except BoundedJsonError as exc:
+        malformed_response = (
+            exc.status_code is not None
+            and MIN_SUCCESS_STATUS <= exc.status_code < MAX_SUCCESS_STATUS
+        )
+        message = (
+            f"{service_name} returned an unsupported response. Check its API version."
+            if malformed_response
+            else f"Cannot connect to {service_name}. Check its address and API key."
+        )
+        return False, message
     except (httpx.HTTPError, HttpPolicyError):
         return False, f"Cannot connect to {service_name}. Check its address and API key."
 
-    if response.status_code in AUTH_FAILURE_STATUSES:
+    if status_code in AUTH_FAILURE_STATUSES:
         return False, f"Cannot authenticate with {service_name}. Check its address and API key."
-    if not MIN_SUCCESS_STATUS <= response.status_code < MAX_SUCCESS_STATUS:
+    if not MIN_SUCCESS_STATUS <= status_code < MAX_SUCCESS_STATUS:
         return False, f"Cannot connect to {service_name}. Check its address and API key."
 
-    try:
-        payload = response.json()
-    except (ValueError, UnicodeDecodeError):
-        return False, f"{service_name} returned an unsupported response. Check its API version."
     expected_type = dict if expected_shape == "object" else list
     if not isinstance(payload, expected_type):
         return False, f"{service_name} returned an unsupported response. Check its API version."
