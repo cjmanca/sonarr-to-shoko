@@ -1,3 +1,147 @@
+# Final source-recovery cross-change validation — 2026-10-30T05:02:05.046930+00:00
+
+Current baseline: `5d25975db15ce3e67a78391f4400db3e92e980bc` on `main`; reviewed delta remains uncommitted. This validator made no source/test/build changes and did not perform live recovery, commit, push, publishing, deployment, or Sonarr/Shoko writes.
+
+Actual complete frozen Python 3.12 quality gate passed: `uv sync --frozen --python 3.12`, `uv lock --check`, `uv pip check`, `uv run --frozen ruff check .`, `uv run --frozen ruff format --check .`, `uv run --frozen mypy`, complete `uv run --frozen pytest -q --junitxml=...`, and `git diff --check`. Host Python 3.12.11; uv 0.9.18; ruff 0.8.6; mypy 1.13.0; pytest 8.4.2; Node v24.12.0; Docker 29.7.2. Ruff format: 127 files; mypy: 122 source files. Complete host suite: 3557 passed, 1 skipped (Windows lacks POSIX mode bits).
+
+Fresh `uv build` wheel/sdist passed. Isolated installed wheel: 705 passed, 1 Windows POSIX skip; all selected Node regressions ran. Fresh `docker build --no-cache` plus network-disabled installed-runtime tests: 692 passed, zero skips, 14 Node-dependent cases explicitly deselected and covered by installed-wheel/host execution. Docker Python 3.12.15, installed package hashes/imports, CLI help, offline config validation, default-deny exit 3, non-root test runtime, and configured root-bootstrap identity/persistent-state smoke passed. No new runtime dependency or Node installation was used for container tests.
+
+All 42 packaged files (41 Python modules, including `source_review.py` and `source_review_collector.py`) match frozen source bytes across wheel, sdist, isolated wheel installation, and Docker installation. Frozen 156-file input manifest unchanged after all checks (DEBUG_SESSION checkpoint and orchestration-only PLAN/STATUS/ORCHESTRATION excluded): SHA256 `b073445024351ff0a76a602fdbcdd6bd0ccd3d6b51e63d51dff9c579536a911e`. Wheel SHA256 `c821669b556325b90535285287cd1e06632e1cc0114e6929a0c94c0d3ccddc09`; sdist SHA256 `ad8c0f9830c7892010bdec71c9644a2583f378e9ce602950f288e09aeb811b60`. Image `sha256:f616aa081f312d2d7f159a84f0b8415797bf7007635a598c3003f4ab9dc0fda9` (`shoko-sonarr-linker:source-recovery-final-224218`). Exact commands, outputs, JUnit files, versions, hashes, selections, and before/after manifests: `C:\Users\METHEJ~1\AppData\Local\Temp\sonarr-source-recovery-final-rerun-20261029-224218`.
+
+Dirty paths at validation:
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service.py
+ M src/shoko_linker/state.py
+ M tests/test_daemon.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_routes.py
+ M tests/test_service_queue_guidance.py
+ M tests/test_service_runtime.py
+?? src/shoko_linker/source_review.py
+?? src/shoko_linker/source_review_collector.py
+?? tests/test_dashboard_file_reasons.py
+?? tests/test_dashboard_source_review.py
+?? tests/test_preflight_deferral_observation.py
+?? tests/test_source_continuity_evidence.py
+?? tests/test_source_rebaseline.py
+?? tests/test_source_review.py
+?? tests/test_source_review_collector.py
+?? tests/test_source_review_scheduling.py
+```
+
+Remaining external/unverified: live deployed API behavior, production source recovery/write actions, remote CI/GHCR/deployment, and the preexisting dark-theme literal-white-header appearance. No new blocker found. Root owns final acceptance and the next authorized local commit/normal push.
+
+---
+
+## Guidance fixture independent review and renewed final delta sweep - 2026-10-30T04:41:30.769205+00:00
+
+CLEAN NO CODE CHANGES. Independent read-only review of the sole post-sweep implementation delta, tests/test_service_queue_guidance.py (9 additions, 2 deletions), against cli.py _operational_status and the existing runtime/dashboard interfaces. The source_continuity case asserts the full current Overview recovery guidance; the separate writes_disabled case retains generic safety-check guidance. Both retain not-active and no-job-queue assertions. Independent continuity and write-stop gates remain covered, with no weakened safety assertions or new framework. Three passes checked requirements/behavior, hold isolation/failure priority, and actual diff/targeted results. No actionable findings; ignore list EMPTY.
+
+Previous full gate was NOT PASS: root reported 3555 passed, 1 failed (the stale source-continuity guidance expectation), 1 Windows POSIX-permissions skip; all static checks passed. This focused test repair and review do not constitute a full-gate rerun.
+
+Renewed all-twelve-lane cross-change delta matrix (earlier sequential final review evidence reused for unchanged code, not a new deep audit): L1 config/paths CLEAN unchanged; L2 transport CLEAN unchanged; L3 mappings CLEAN unchanged; L4 linking CLEAN unchanged; L5 SQLite/schema CLEAN unchanged; L6 scope/consent CLEAN unchanged; L7 service CLEAN renewed (independent durable hold projection, queue priority); L8 daemon/campaign CLEAN unchanged; L9 dashboard/settings CLEAN renewed (Overview source-review destination and specific continuity banner remain consistent); L10 CLI/report/secrets CLEAN renewed (current continuity and generic write-stop branches independently asserted); L11 package/container CLEAN unchanged; L12 CI publishing CLEAN unchanged. The only new implementation delta is a test fixture; it changes no production, authentication, mapping, persistence, write, delivery, or publishing behavior. HEAD remains 5d25975db15ce3e67a78391f4400db3e92e980bc. Prior uncommitted work preserved.
+
+Actual reviewer checks, all exit 0:
+- `uv run --frozen --python 3.12 python -m pytest -q tests/test_service_queue_guidance.py tests/test_service_runtime.py::test_durable_safety_hold_overrides_cached_active_status` - 16 passed (offline/mocked).
+- `uv run --frozen --python 3.12 ruff check tests/test_service_queue_guidance.py` - all checks passed.
+- `uv run --frozen --python 3.12 ruff format --check tests/test_service_queue_guidance.py` - 1 file already formatted.
+- `uv run --frozen --python 3.12 mypy tests/test_service_queue_guidance.py` - success, no issues in 1 source file.
+- `git diff --check -- tests/test_service_queue_guidance.py` - clean.
+
+Next: orchestrator reruns final full gate, installed-wheel and Docker checks; only after PASS, proceed with the already authorized normal commit/push. No full validation, build, live Sonarr/Shoko calls, media operations, code edits, commits, pushes, or publication performed by this reviewer. PLAN/STATUS untouched. This authorized UTF-8 bookkeeping prefix uses same-directory atomic replacement and preserves every previous DEBUG_SESSION.md byte exactly as suffix (verified).
+
+---
+
+## Final sequential cross-change review checkpoint - 2026-10-30T04:25:38.365000+00:00
+
+All twelve lanes final CLEAN, based on the sequential reviewer results: L1/L3/L4/L5 CLEAN (root-provided earlier sweep: 155 + 53 targeted tests); L2/L6/L7/L8 CLEAN (root-provided earlier sweep: 65 + 11 targeted tests); this independent final delta sweep L9 dashboard/settings, L10 CLI/report/secrets, L11 package/container, L12 CI publishing interfaces CLEAN NO CHANGES. Ignore list EMPTY. No new actionable findings; no code edits. Three passes covered requirements/code, edge/failure/restart interfaces, and diff/tests. Previously unchanged delivery baseline evidence was reused; no full re-audit or build.
+
+Reviewed tree HEAD: 5d25975db15ce3e67a78391f4400db3e92e980bc. Dirty paths at review completion (preserved):
+```
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service.py
+ M src/shoko_linker/state.py
+ M tests/test_daemon.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_routes.py
+ M tests/test_service_runtime.py
+?? src/shoko_linker/source_review.py
+?? src/shoko_linker/source_review_collector.py
+?? tests/test_dashboard_file_reasons.py
+?? tests/test_dashboard_source_review.py
+?? tests/test_preflight_deferral_observation.py
+?? tests/test_source_continuity_evidence.py
+?? tests/test_source_rebaseline.py
+?? tests/test_source_review.py
+?? tests/test_source_review_collector.py
+?? tests/test_source_review_scheduling.py
+```
+
+Actual checks run by this reviewer (all exit 0):
+- `uv run --frozen --python 3.12 python -m pytest -q tests/test_dashboard_source_review.py tests/test_dashboard_file_reasons.py tests/test_dashboard_routes.py tests/test_dashboard_live_updates.py tests/test_dashboard_poll_targets.py tests/test_cli.py tests/test_container_entrypoint.py tests/test_cli_m7.py::test_offline_report_redacts_legacy_runtime_keys_with_fresh_registry tests/test_cli_m7.py::test_report_boundary_redacts_new_nested_diagnostics_without_changing_structure tests/test_workflows.py::test_publish_permissions_are_least_privilege tests/test_workflows.py::test_ci_workflow_has_no_publish_permission tests/test_workflows.py::test_publish_gates_exclude_pull_requests tests/test_workflows.py::test_shared_check_list_parity tests/test_workflows.py::test_successful_test_job_records_the_exact_checked_revision_after_checks tests/test_workflows.py::test_publish_reuses_checks_only_for_the_same_runs_identical_revision tests/test_workflows.py::test_publish_sha_is_reverified_under_lock_before_docker_steps` - passed, offline/mocked routes/controller, Node poller, CLI/redaction, identity and workflow tests.
+- `uv run --frozen --python 3.12 python -c ...` - asserted Hatch wheel package `src/shoko_linker`, source presence and imported source_review/source_review_collector/dashboard/cli/container_entrypoint successfully; no build performed.
+- `git diff --check -- src/shoko_linker/cli.py src/shoko_linker/dashboard.py tests/test_dashboard_routes.py tests/test_dashboard_live_updates.py` - passed (line-ending notices only).
+
+Earlier browser evidence supplied by root, not repeated here: local app with synthetic collector CLEAN at desktop and widths 320/375/760; changed-token acknowledgment reset, same-token focus/acknowledgment/disclosures preserved, expired form removed, acceptance cleared ONLY continuity while retaining user and global-budget pauses, local audit and redaction. Literal white/light header under dark theme remains UNVERIFIED, with no demonstrated layout defect. No live Sonarr/Shoko API validation, remote writes, media operations, full quality gate, Docker build, publication, commits or pushes performed by this reviewer.
+
+Next: dedicated full validation, then orchestrator acceptance and authorized local commit/normal push only if that gate passes. PLAN/STATUS untouched. This UTF-8 prefix was written using a same-directory temporary file and atomic replace; all prior DEBUG_SESSION.md bytes are preserved exactly as the suffix.
+
+---
+
+## Sequential file-diagnostic investigation checkpoint (2026-10-29)
+- Read-only bounded hunter; Ignore list EMPTY. Branch main, HEAD 5d25975db15ce3e67a78391f4400db3e92e980bc. No implementation, commit, push, live writes, media operations, or full validation.
+- Prior orchestrator evidence (reported, not rerun here): actual live global cause discovery_total_drop/requires_rebaseline; continuity evidence/state hold/atomic confirmation/controller/production adapter/recovery UI and second-pass continuations independently clean; header inside existing white header clean. Last 35 scheduling/service/dashboard recovery tests passed; earlier 103 scheduling/controller/service/runtime, header 44, adapter 34, controller 40 passed. No invented individual cause for 14 exclusions; Standard/Daily already supported; cache hypothesis not reproduced.
+- P2 confirmed: dashboard.py _table_section omits sanitized ServiceFileExample.detail and repeats generic item.message. Synthetic unique detail absent from rendered HTML; generic message appears 3 times.
+- P2 independently demonstrated offline: existing HTTP503 second-target-read fixture in daemon and service returns precise target_unavailable deferred reason and zero submissions but stored/projected detail remains 'planned'. Next healthy cycle safely verifies. This is not evidence that current 32 waiting files each failed that check; global hold remains separate.
+- Four targeted cases passed: pinned uv run --frozen pytest -q tests/test_daemon.py::test_unavailable_second_target_read_defers_daemon_and_service_without_send_intent tests/test_dashboard_routes.py::test_table_filename_library_relative_path_and_hover_text_are_escaped_and_redacted tests/test_tracked_file_status.py::test_examples_show_stored_paths_and_sanitize_before_deriving_filename. Initial direct fixture probe lacked autouse dummy environment; corrected probe supplied offline fixture keys and passed. No live service validation.
+- Recommended bounded next work: expose existing safe recorded details with historical label and plain main reason; separately persist only actually attempted retryable per-file preflight deferrals, bound to unchanged planned source/targets, with observation timestamp, sanitization before clipping, and no changes to admission/order/budgets/retry clocks. Never stamp unvisited rows with global holds. Implementer/reviewer must be distinct and sequential. Then local fixture browser acceptance, final lane-delta/full gate, and only orchestrator-authorized commit/normal push.
+- Dirty paths at checkpoint:
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service.py
+ M src/shoko_linker/state.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_routes.py
+ M tests/test_service_runtime.py
+?? src/shoko_linker/source_review.py
+?? src/shoko_linker/source_review_collector.py
+?? tests/test_dashboard_source_review.py
+?? tests/test_source_continuity_evidence.py
+?? tests/test_source_rebaseline.py
+?? tests/test_source_review.py
+?? tests/test_source_review_collector.py
+?? tests/test_source_review_scheduling.py
+
+## 2026-10-29 — Stage 1A P2 timestamp fix ready for re-review
+
+- Independent review found explicit record_source_observation accepted parseable overlength timestamps, making latest/next-hold evidence unreadable. Both source-observation entrypoints now share bounded timestamp validation before transactions; no canonical rewriting or safety-policy change.
+- Added rejection regressions for a 106-character fractional timestamp, UTC conversion overflow, and malformed input through both entrypoints. All metadata and total SQLite changes stay unchanged; valid explicit clearing and a subsequent new hold remain readable.
+- Actual targeted result: 47 passed, 149 deselected using the Stage 1A continuity/pending-departure selection. Scoped Ruff lint/format, mypy, and diff checks passed. No full gate, commits, live API/media actions, or production recovery. Different-agent re-review pending. Ignore list: EMPTY. Exact next task: independent re-review of the bounded Stage 1A timestamp fix.
+
+## 2026-10-29 — Stage 1A continuity evidence handoff (independent review pending)
+
+- Newly observed normal-service source continuity hold is P1: user sees zero history/zero verified while all work is held; live advanced discovery reported `discovery_total_drop` plus `requires_rebaseline`. Losing the original 57-to-56 evidence as anchors advance is P2. No production recovery or remote/media actions were performed in this stage.
+- Stage 1A implements bounded durable first-cause evidence, separate latest-complete observation/content identity, stable semantic revisions, and a read-only immutable typed review view in `state.py`; focused offline tests are in `tests/test_source_continuity_evidence.py`. `PROJECT.md` records the requirement and identifies normal recovery as planned. Hold detection, landed-link accounting (including PARTIAL), pending departures, explicit clearing, and independent safety controls remain intact. Original legacy count/time remain unknown.
+- Actual Stage 1A checks: `.venv/Scripts/python.exe -m pytest tests/test_source_continuity_evidence.py tests/test_state.py -k 'continuity or pending_departure or pending_send_does_not_mask'` => 41 passed, 149 deselected; scoped `ruff check`, `ruff format --check`, and `mypy` on state.py/new tests passed; `git diff --check` passed. No new full validation gate was run. Different-agent independent review is pending.
+- Existing three-file dashboard header implementation (`dashboard.py`, `test_dashboard_routes.py`, `test_dashboard_live_updates.py`) was preserved outside this stage; its prior 41 passing focused tests still await independent review.
+- Previous published baseline is `5d25975`, with the previously recorded full gate of 3341 passed / 1 skipped. That is baseline evidence, not a gate for this uncommitted tree.
+- Planned sequence: Stage 1B bound atomic recovery prepare/confirm; worker fresh safety assessment; explicit dashboard review/confirmation; specific file diagnostics. These are not implemented or authorized as production recovery by Stage 1A.
+- Ignore list: EMPTY. Exact next task: independent read-only review of Stage 1A evidence implementation against its assigned brief, including atomicity, bounded corrupt reads, legacy honesty, stable content binding, and unchanged hold/accounting behavior.
+
 ## 2026-10-29 — Final full validation PASS (reviewed dashboard tree)
 
 - Full frozen Python 3.12 gate: 3341 passed, 1 skipped, 0 failed; JUnit 583.572s. The Windows skip is the POSIX owner-only database permissions test. This supersedes the earlier failing validation; the explicit schema-10 migration-history expectation was independently reviewed before this run.

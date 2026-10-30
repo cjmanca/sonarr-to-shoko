@@ -483,6 +483,26 @@ class OnboardingManager:
             check_authorization_revision=True,
         )
 
+    def evaluate_source_review_context(
+        self, context: OnboardingContext, *, iso: str
+    ) -> OnboardingDecision:
+        """Read saved consent for a read-only review, preserving every pause and hold.
+
+        This decision is not automatic-write authorization and must never be used by
+        the normal apply path. Unlike Resume it changes no durable authorization.
+        """
+        _validate_iso(iso)
+        return self._evaluate(
+            context.binding,
+            context.assessment,
+            iso=iso,
+            respect_user_pause=False,
+            expected_consent=context.consent_json,
+            expected_authorization_revision=context.authorization_revision,
+            check_authorization_revision=True,
+            persist_observations=False,
+        )
+
     def resume_context(self, context: OnboardingContext, *, iso: str) -> OnboardingDecision:
         return self.resume(
             context.binding,
@@ -585,6 +605,7 @@ class OnboardingManager:
         *,
         iso: str,
         respect_user_pause: bool,
+        persist_observations: bool = True,
         expected_consent: str | None = None,
         expected_authorization_revision: str | None = None,
         check_authorization_revision: bool = False,
@@ -604,7 +625,7 @@ class OnboardingManager:
         message = "Setup is confirmed and current safety checks pass."
         binding_digest: str | None = None
         if assessment.status is SafetyStatus.UNSAFE:
-            held = (
+            held = not persist_observations or (
                 self.store.pause_onboarding_if_current(None, "unsafe_shoko_settings", iso)
                 if encoded is None
                 else self._observe_evaluation(
@@ -639,7 +660,7 @@ class OnboardingManager:
                 or not current_facts_match
             ):
                 assert encoded is not None
-                held = self._observe_evaluation(
+                held = not persist_observations or self._observe_evaluation(
                     encoded, revision, binding, assessment, "setup_changed", iso
                 )
                 status = OnboardingStatus.NEEDS_CONFIRMATION
@@ -648,7 +669,9 @@ class OnboardingManager:
                     if held
                     else "Setup changed during safety checks. Refresh setup before resuming."
                 )
-            elif not self._observe_evaluation(encoded, revision, binding, assessment, None, iso):
+            elif persist_observations and not self._observe_evaluation(
+                encoded, revision, binding, assessment, None, iso
+            ):
                 status = OnboardingStatus.NEEDS_CONFIRMATION
                 message = "Setup changed during safety checks. Refresh setup before resuming."
             elif self.reconfirmation_required():

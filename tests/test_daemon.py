@@ -744,6 +744,20 @@ def open_tmp_store(tmp_path: Path) -> StateStore:
     return store
 
 
+def _assert_persisted_preflight_deferral(store: StateStore, file_id: int) -> None:
+    record = store.get_file(file_id)
+    assert record is not None
+    assert record.state_detail.startswith("preflight_deferred:target_unavailable:")
+    assert "HTTP 503" in record.state_detail
+    assert T0 in record.state_detail
+    assert "last attempted preflight" in record.state_detail
+    assert "retry" in record.state_detail.lower()
+    assert "synthetic-api-key-must-not-leak" not in record.state_detail
+    projected = store.service_file_page("waiting").rows
+    assert projected[0].detail == record.state_detail
+    assert projected[0].reason == "pre_send"
+
+
 @pytest.mark.parametrize("service_mode", [False, True])
 def test_unavailable_second_target_read_defers_daemon_and_service_without_send_intent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mode: bool
@@ -796,12 +810,17 @@ def test_unavailable_second_target_read_defers_daemon_and_service_without_send_i
         record = store.get_file(file.shoko_id)
         assert record is not None
         assert record.state is FileState.PLANNED
+        _assert_persisted_preflight_deferral(store, file.shoko_id)
         assert store.connection.execute("SELECT COUNT(*) FROM sends").fetchone()[0] == 0
         budget = store.budget_view()
         assert budget.pending_file_requests == 0
         assert budget.pending_episode_jobs == 0
         assert budget.rolling_new_submissions == 0
 
+        store.close()
+        store = StateStore(tmp_path / "state.sqlite3", budget_limits=WIDE_LIMITS)
+        deps = replace(deps, store=store)
+        assert store.get_file(file.shoko_id) == record
         shoko.target_read_failures.clear()
         second = run_cycle(
             deps,
@@ -816,6 +835,7 @@ def test_unavailable_second_target_read_defers_daemon_and_service_without_send_i
         record = store.get_file(file.shoko_id)
         assert record is not None
         assert record.state is FileState.VERIFIED
+        assert "preflight_deferred" not in record.state_detail
     finally:
         for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):
             endpoint.client.close()

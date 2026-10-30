@@ -115,7 +115,12 @@ def test_ready_only_queue_wait_reaches_authenticated_live_controls(
     [
         ("setup", "Complete setup first."),
         ("pause", "Resume when you are ready"),
-        ("safety", "stopped by a safety check"),
+        (
+            "source_continuity",
+            "Source collection changed. Review source change on Overview "
+            "before linking can continue.",
+        ),
+        ("writes_disabled", "stopped by a safety check"),
         ("failed", "service check needs attention"),
         ("mapping", "Verified mappings are unavailable."),
         ("canary", "Waiting for the initial link"),
@@ -128,8 +133,10 @@ def test_queue_wait_does_not_shadow_higher_priority_gates(
     with open_state(tmp_path / "state.sqlite3") as store:
         if condition == "pause":
             OnboardingManager(store).pause(iso=td.T0)
-        elif condition == "safety":
+        elif condition == "source_continuity":
             store.set_meta("requires_rebaseline", "1")
+        elif condition == "writes_disabled":
+            store.disable_writes("test safety hold")
         elif condition == "failed":
             report = replace(report, failed=True)
         elif condition == "mapping":

@@ -19,11 +19,25 @@ const vm = require('node:vm');
 const timers = [];
 const requested = [];
 let replacements = 0;
+let focusCalls = 0;
 let current, incoming;
 function detail(key, open = false) { return {dataset: {disclosure: key}, open}; }
 function section(key, content, children = []) {
+  const controls = key === 'metrics' ? ['verified', 'waiting', 'review', 'toggle'].map(key => ({
+    dataset: {headerFocus: key},
+    focus(options) {
+      assert.equal(options.preventScroll, true);
+      focusCalls++; document.activeElement = this;
+    }
+  })) : [];
   return {
     dataset: {live: key}, tagName: 'SECTION', content, children,
+    controls,
+    contains(active) { return controls.includes(active); },
+    querySelector(selector) {
+      const key = selector.match(/^\[data-header-focus="(.+)"\]$/)[1];
+      return controls.find(control => control.dataset.headerFocus === key) || null;
+    },
     querySelectorAll(selector) {
       assert.equal(selector, 'details[data-disclosure]'); return this.children;
     },
@@ -43,6 +57,7 @@ const setup = {
 const form = {selected: 'user editing settings'};
 const notice = {hidden: true, textContent: ''};
 const document = {
+  activeElement: null,
       addEventListener() {},
   getElementById() { return notice; },
   querySelector(selector) { assert.equal(selector, '[data-refresh-url]'); return null; },
@@ -103,6 +118,36 @@ vm.runInNewContext(PRODUCTION_SCRIPT, {document, window, DOMParser, fetch, Abort
   assert.equal(setup.userChoice, 'keep my selected library');
   assert.equal(form.selected, 'user editing settings');
   assert.deepEqual(requested, ['/issues?view=exclusions&page=2', '/issues?view=exclusions&page=2']);
+  // Counters and the persisted Pause/Resume toggle survive changing metrics markup.
+  for (const [key, content] of [
+    ['verified', '37'], ['waiting', '38'], ['review', '39'],
+    ['toggle', 'paused: Resume'], ['toggle', 'running: Pause']
+  ]) {
+    const previous = current.get('metrics').controls.find(c => c.dataset.headerFocus === key);
+    document.activeElement = previous;
+    const fresh = section('metrics', content);
+    incoming = new Map([['metrics', fresh]]);
+    const before = focusCalls;
+    await timers.shift()();
+    assert.equal(current.get('metrics'), fresh);
+    assert.equal(document.activeElement, fresh.controls.find(c => c.dataset.headerFocus === key));
+    assert.notEqual(document.activeElement, previous);
+    assert.equal(focusCalls, before + 1);
+    // Equivalent markup keeps the existing focused node without another focus call.
+    incoming = new Map([['metrics', section('metrics', content)]]);
+    const active = document.activeElement;
+    await timers.shift()();
+    assert.equal(document.activeElement, active);
+    assert.equal(focusCalls, before + 1);
+  }
+  // Focus outside the metrics is untouched even if it uses the same key.
+  const outside = {dataset: {headerFocus: 'toggle'}};
+  document.activeElement = outside;
+  const before = focusCalls;
+  incoming = new Map([['metrics', section('metrics', 'another count')]]);
+  await timers.shift()();
+  assert.equal(document.activeElement, outside);
+  assert.equal(focusCalls, before);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
     script = script.replace("PRODUCTION_SCRIPT", json.dumps(_DASHBOARD_JS))

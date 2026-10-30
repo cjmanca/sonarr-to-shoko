@@ -190,6 +190,8 @@ from .service_settings import (
     load_service_settings,
 )
 from .service_setup import ServiceSetupController
+from .source_review import SourceReviewController
+from .source_review_collector import FreshSourceReviewCollector
 from .state import (
     ATTESTATION_PAUSE_REASON,
     META_LAST_CYCLE_END_ISO,
@@ -913,6 +915,8 @@ class _NormalServiceRuntime:
         sonarr: ApiEndpoint,
         shoko: ApiEndpoint,
         state: StopState,
+        *,
+        wake: Callable[[], None] = lambda: None,
     ) -> None:
         self.settings = settings
         self.sonarr = sonarr
@@ -930,6 +934,14 @@ class _NormalServiceRuntime:
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
         self._tick_cycle_started = False
+        self.source_review = SourceReviewController(
+            Path(settings.database_path),
+            FreshSourceReviewCollector(
+                settings, sonarr, shoko, self.setup, shutdown_requested=state.should_stop
+            ),
+            wake=wake,
+            shutdown_requested=state.should_stop,
+        )
 
     def _update_latest(self, **changes: Any) -> None:
         with self._latest_lock:
@@ -967,11 +979,16 @@ class _NormalServiceRuntime:
                 else:
                     next_action = "Review the current scope, safety setup and connections."
             return False, next_action
-        if store.writes_disabled or store.get_meta("requires_rebaseline") == "1":
-            return False, (
-                "Automatic linking is stopped by a safety check. "
+        continuity_held = store.get_meta("requires_rebaseline") == "1"
+        if store.writes_disabled or continuity_held:
+            guidance = (
+                "Source collection changed. Review source change on Overview "
+                "before linking can continue."
+                if continuity_held
+                else "Automatic linking is stopped by a safety check. "
                 "Review advanced diagnostics before retrying."
             )
+            return False, guidance
         canary = store.get_service_canary()
         if canary is not None and canary[1] == "failed":
             return False, (
@@ -1193,10 +1210,11 @@ class _NormalServiceRuntime:
         finally:
             store.close()
 
-    def worker_tick(self) -> None:
+    def worker_tick(self) -> float | None:
         started = time.monotonic()
         self._tick_cycle_started = False
         recovery_limits: tuple[float, int] | None = None
+        review_operation = False
         try:
             # Snapshot limits before connection/setup I/O. A blocked check must not
             # grant recovery a fresh wall-time allowance when it eventually returns.
@@ -1209,15 +1227,23 @@ class _NormalServiceRuntime:
                     started + sync.max_cycle_seconds,
                     sync.max_recovery_rows_per_cycle,
                 )
+            review_operation = self.source_review.worker_tick(recovery_limits[0])
+            if review_operation:
+                return self.source_review.continuation_delay()
             self._worker_tick()
         except Exception:
             # Include failures before opening the state store (connection/configuration I/O).
             self._cycle_deferred()
             self.logger.error("Normal service check failed; it will be retried.")
         finally:
-            if not self._tick_cycle_started and recovery_limits is not None:
+            if (
+                not review_operation
+                and not self._tick_cycle_started
+                and recovery_limits is not None
+            ):
                 self._recover_blocked_metadata(*recovery_limits)
             self._update_latest(worker_activity="")
+        return None
 
     def _recover_blocked_metadata(self, deadline: float, max_rows: int) -> None:
         """Inspect accepted work even when setup or pause prevents a daemon cycle.
@@ -1508,7 +1534,8 @@ def _run_service(_args: argparse.Namespace) -> int:
         shoko.client.close()
         raise ConfigError("DASHBOARD_PORT must be an integer between 1 and 65535") from None
 
-    runtime = _NormalServiceRuntime(settings, sonarr, shoko, state)
+    worker_wake = threading.Event()
+    runtime = _NormalServiceRuntime(settings, sonarr, shoko, state, wake=worker_wake.set)
     server = None
     dashboard_endpoints: tuple[ApiEndpoint, ApiEndpoint] | None = None
     try:
@@ -1527,7 +1554,6 @@ def _run_service(_args: argparse.Namespace) -> int:
             finally:
                 dashboard_store.close()
 
-        worker_wake = threading.Event()
         preferences = ServiceSettingsController(settings, worker_wake.set)
         application = DashboardApplication(
             settings.database_path,
@@ -1538,6 +1564,9 @@ def _run_service(_args: argparse.Namespace) -> int:
             setup_action=dashboard_setup.action,
             settings_provider=preferences.view,
             settings_action=preferences.save,
+            source_review_provider=runtime.source_review.view,
+            source_review_assess=runtime.source_review.request_assessment,
+            source_review_confirm=runtime.source_review.request_confirmation,
             control_changed=worker_wake.set,
         )
         server = create_dashboard_server(DASHBOARD_BIND_HOST, dashboard_port, application)

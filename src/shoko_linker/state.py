@@ -155,7 +155,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -235,6 +235,24 @@ META_SOURCE_ROOTS_FINGERPRINT: Final[str] = "source_roots_fingerprint"
 META_SOURCE_LAST_DISCOVERY_TOTAL: Final[str] = "source_last_discovery_total"
 META_SOURCE_ANCHOR_BASIS: Final[str] = "source_anchor_verified_basis"
 META_REQUIRES_REBASELINE: Final[str] = "requires_rebaseline"
+META_SOURCE_CONTINUITY_HOLD: Final[str] = "source_continuity_hold_v1"
+META_SOURCE_CONTINUITY_LATEST: Final[str] = "source_continuity_latest_complete_v1"
+META_SOURCE_CONTINUITY_CHECK_COMPLETE: Final[str] = "source_continuity_check_complete"
+META_SOURCE_REBASELINE_PREPARED: Final[str] = "source_rebaseline_prepared_v1"
+META_SOURCE_REBASELINE_AUDIT: Final[str] = "source_rebaseline_last_audit_v1"
+MAX_SOURCE_REBASELINE_SECONDS: Final[int] = 900
+MAX_CONTINUITY_DOCUMENT_CHARS: Final[int] = 16_384
+_CONTINUITY_ISO_MAX_CHARS: Final[int] = 64
+_CONTINUITY_NONCE_CHARS: Final[int] = 32
+_CONTINUITY_COUNTER_MAX: Final[int] = 2**63 - 1
+_CONTINUITY_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "instance_identity_changed",
+        "roots_changed",
+        "discovery_total_drop",
+        "snapshot_marker_missing",
+    }
+)
 META_APPLY_LOCK_STEALS: Final[str] = "apply_lock_steals"
 META_LAST_REFUSAL: Final[str] = "last_refusal"
 META_SLOT_RELEASE_NOOPS: Final[str] = "slot_release_noops"
@@ -1283,6 +1301,122 @@ class SourceObservation:
 
 
 @dataclass(frozen=True)
+class SourceContinuityObservation:
+    """Exact input proofs, never raw configured URLs or credential-bearing strings."""
+
+    instance_identity_sha256: str
+    roots_fingerprint_sha256: str
+    snapshot_summary_sha256: str
+    discovery_total: int | None
+
+
+@dataclass(frozen=True)
+class SourceContinuityHold:
+    """First cause of one active hold. Legacy holds have unknown original evidence."""
+
+    version: int
+    hold_id: str
+    detected_iso: str | None
+    reasons: tuple[str, ...]
+    prior: SourceContinuityObservation | None
+    current: SourceContinuityObservation | None
+    previous_anchor_iso: str | None
+    anchor_landed_count: int | None
+    current_landed_count: int | None
+    expected_drop: int | None
+    tolerance: int | None
+
+
+@dataclass(frozen=True)
+class SourceContinuityCompleteObservation:
+    version: int
+    revision: str
+    content_sha256: str
+    observed_iso: str
+    observation: SourceContinuityObservation
+    landed_count: int
+
+
+@dataclass(frozen=True)
+class SourceContinuityReview:
+    """Read-only local evidence; it grants no recovery or write authorization."""
+
+    requires_rebaseline: bool
+    hold: SourceContinuityHold | None
+    latest_complete: SourceContinuityCompleteObservation | None
+    latest_check_complete: bool
+    evidence_status: Literal["available", "legacy_unknown", "invalid", "none"]
+
+
+@dataclass(frozen=True)
+class SourceRebaselineAssessment:
+    """Trusted controller output, never constructed from a confirmation form.
+
+    content_sha256 covers the FULL normalized source inventories, paths and relationships,
+    not inventory_snapshot_hash. The controller must independently recollect complete
+    evidence on confirmation and recheck external facts; SQLite cannot compare a mapping
+    file or remote settings atomically. Times bound that complete collection interval.
+    """
+
+    observation: SourceObservation
+    content_sha256: str
+    started_iso: str
+    completed_iso: str
+
+
+@dataclass(frozen=True)
+class SourceRebaselineBindings:
+    """Fresh trusted external identity and exact local authorization snapshot digests.
+
+    effective_identity_sha256 covers endpoints, selected scope, path translations and
+    effective settings. mapping_identity_sha256 covers current mapping content. Neither
+    may be taken from client-echoed hidden form fields as evidence of current facts.
+    local_state_sha256 comes from get_source_rebaseline_local_binding().
+    """
+
+    effective_identity_sha256: str
+    mapping_identity_sha256: str
+    local_state_sha256: str
+
+
+@dataclass(frozen=True)
+class SourceRebaselinePrepared:
+    version: int
+    token: str
+    hold_id: str
+    created_iso: str
+    expires_iso: str
+    assessment_sha256: str
+    assessment_started_iso: str
+    assessment_completed_iso: str
+    latest_revision: str
+    latest_content_sha256: str
+    observation: SourceContinuityObservation
+    landed_count: int
+    bindings: SourceRebaselineBindings
+    owner_sha256: str
+
+
+@dataclass(frozen=True)
+class SourceRebaselineAudit:
+    """Last successful LOCAL baseline change, never a Shoko request/history event."""
+
+    version: int
+    prepared: SourceRebaselinePrepared
+    before: SourceContinuityHold
+    assessment_started_iso: str
+    assessment_completed_iso: str
+    accepted_iso: str
+
+
+@dataclass(frozen=True)
+class SourceRebaselineReview:
+    prepared: SourceRebaselinePrepared | None
+    last_audit: SourceRebaselineAudit | None
+    valid: bool
+
+
+@dataclass(frozen=True)
 class LockHolder:
     """The apply-lock holder as recorded in meta."""
 
@@ -2203,6 +2337,220 @@ def _require_iso(value: str, name: str) -> None:
         _parse_iso(value)
     except ValueError as exc:
         raise StateError(f"{name}: not a valid ISO-8601 timestamp: {exc}") from exc
+
+
+def _continuity_counter(value: Any, *, optional: bool = False) -> int | None:
+    if value is None and optional:
+        return None
+    if type(value) is not int or not 0 <= value <= _CONTINUITY_COUNTER_MAX:
+        raise ValueError("invalid continuity counter")
+    return value
+
+
+def _continuity_iso(value: Any, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or len(value) > _CONTINUITY_ISO_MAX_CHARS:
+        raise ValueError("invalid continuity timestamp")
+    _parse_iso(value)  # Includes timezone conversion overflow checks.
+    return value
+
+
+def _require_bounded_iso(value: str, *, name: str, context: str) -> None:
+    """Validate bounded timestamp evidence before any persistence transaction."""
+    try:
+        _continuity_iso(value)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise StateError(f"{name}: not a valid bounded {context} timestamp") from exc
+
+
+def _continuity_nonce(value: Any) -> str:
+    if not isinstance(value, str) or len(value) != _CONTINUITY_NONCE_CHARS:
+        raise ValueError("invalid continuity identity")
+    if any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("invalid continuity identity")
+    return value
+
+
+def _continuity_observation(observation: SourceObservation) -> SourceContinuityObservation:
+    def proof(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    return SourceContinuityObservation(
+        proof(observation.instance_identity),
+        proof(observation.roots_fingerprint),
+        proof(observation.snapshot_summary_id),
+        _continuity_counter(observation.discovery_total, optional=True),
+    )
+
+
+def _decode_continuity_observation(value: Any) -> SourceContinuityObservation:
+    if not isinstance(value, dict):
+        raise ValueError("invalid continuity observation")
+    proofs = [
+        value[key]
+        for key in (
+            "instance_identity_sha256",
+            "roots_fingerprint_sha256",
+            "snapshot_summary_sha256",
+        )
+    ]
+    for proof in proofs:
+        _require_hex64(proof, "continuity proof")
+    return SourceContinuityObservation(
+        proofs[0],
+        proofs[1],
+        proofs[2],
+        _continuity_counter(value["discovery_total"], optional=True),
+    )
+
+
+def _continuity_document(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str) or len(value) > MAX_CONTINUITY_DOCUMENT_CHARS:
+        raise ValueError("invalid continuity document size")
+    document = json.loads(value)
+    if not isinstance(document, dict) or type(document.get("version")) is not int:
+        raise ValueError("invalid continuity document")
+    if document["version"] != 1:
+        raise ValueError("unsupported continuity version")
+    return document
+
+
+def _decode_continuity_hold(raw: str) -> SourceContinuityHold:
+    value = _continuity_document(raw)
+    hold_id = _continuity_nonce(value["hold_id"])
+    if value["detected_iso"] is None:
+        unknown = SourceContinuityHold(
+            1, hold_id, None, (), None, None, None, None, None, None, None
+        )
+        if value != asdict(unknown) | {"reasons": []}:
+            raise ValueError("invalid legacy continuity evidence")
+        return unknown
+    reasons = value["reasons"]
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or len(reasons) > len(_CONTINUITY_REASONS)
+        or any(
+            not isinstance(reason, str) or reason not in _CONTINUITY_REASONS for reason in reasons
+        )
+        or len(set(reasons)) != len(reasons)
+    ):
+        raise ValueError("invalid continuity reasons")
+    return SourceContinuityHold(
+        1,
+        hold_id,
+        _continuity_iso(value["detected_iso"]),
+        tuple(reasons),
+        _decode_continuity_observation(value["prior"]),
+        _decode_continuity_observation(value["current"]),
+        _continuity_iso(value["previous_anchor_iso"], optional=True),
+        _continuity_counter(value["anchor_landed_count"]),
+        _continuity_counter(value["current_landed_count"]),
+        _continuity_counter(value["expected_drop"]),
+        _continuity_counter(value["tolerance"]),
+    )
+
+
+def _decode_continuity_latest(raw: str) -> SourceContinuityCompleteObservation:
+    value = _continuity_document(raw)
+    _require_hex64(value["content_sha256"], "continuity content proof")
+    observed_iso = _continuity_iso(value["observed_iso"])
+    assert observed_iso is not None
+    observation = _decode_continuity_observation(value["observation"])
+    landed_count = _continuity_counter(value["landed_count"])
+    assert landed_count is not None
+    encoded = _continuity_content(observation, landed_count)
+    if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != value["content_sha256"]:
+        raise ValueError("invalid continuity content proof")
+    return SourceContinuityCompleteObservation(
+        1,
+        _continuity_nonce(value["revision"]),
+        value["content_sha256"],
+        observed_iso,
+        observation,
+        landed_count,
+    )
+
+
+def _continuity_content(observation: SourceContinuityObservation, landed_count: int) -> str:
+    return json.dumps(
+        {"observation": asdict(observation), "landed_count": landed_count},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _rebaseline_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _rebaseline_digest(value: Any) -> str:
+    return hashlib.sha256(_rebaseline_json(value).encode("utf-8")).hexdigest()
+
+
+def _decode_rebaseline_prepared(value: dict[str, Any]) -> SourceRebaselinePrepared:
+    _continuity_document(_rebaseline_json(value))
+    for key in ("token", "hold_id", "latest_revision"):
+        _continuity_nonce(value[key])
+    for key in ("assessment_sha256", "latest_content_sha256", "owner_sha256"):
+        _require_hex64(value[key], "rebaseline proof")
+    for key in ("created_iso", "expires_iso", "assessment_started_iso", "assessment_completed_iso"):
+        _continuity_iso(value[key])
+    bindings = SourceRebaselineBindings(**value["bindings"])
+    for proof in asdict(bindings).values():
+        _require_hex64(proof, "rebaseline binding")
+    result = SourceRebaselinePrepared(
+        **(
+            value
+            | {
+                "observation": _decode_continuity_observation(value["observation"]),
+                "landed_count": _continuity_counter(value["landed_count"]),
+                "bindings": bindings,
+            }
+        )
+    )
+    if (
+        _parse_iso(result.created_iso) >= _parse_iso(result.expires_iso)
+        or (_parse_iso(result.expires_iso) - _parse_iso(result.created_iso)).total_seconds()
+        > MAX_SOURCE_REBASELINE_SECONDS
+        or _rebaseline_json(value) != _rebaseline_json(asdict(result))
+        or not _parse_iso(result.assessment_started_iso)
+        <= _parse_iso(result.assessment_completed_iso)
+        <= _parse_iso(result.created_iso)
+        or _rebaseline_digest(
+            {"observation": asdict(result.observation), "landed_count": result.landed_count}
+        )
+        != result.latest_content_sha256
+    ):
+        raise ValueError("invalid rebaseline preparation")
+    return result
+
+
+def _decode_rebaseline_audit(value: dict[str, Any]) -> SourceRebaselineAudit:
+    _continuity_document(_rebaseline_json(value))
+    for key in ("assessment_started_iso", "assessment_completed_iso", "accepted_iso"):
+        _continuity_iso(value[key])
+    result = SourceRebaselineAudit(
+        **(
+            value
+            | {
+                "prepared": _decode_rebaseline_prepared(value["prepared"]),
+                "before": _decode_continuity_hold(_rebaseline_json(value["before"])),
+            }
+        )
+    )
+    if (
+        result.before.hold_id != result.prepared.hold_id
+        or _rebaseline_json(value) != _rebaseline_json(asdict(result))
+        or not _parse_iso(result.prepared.created_iso)
+        < _parse_iso(result.assessment_started_iso)
+        <= _parse_iso(result.assessment_completed_iso)
+        <= _parse_iso(result.accepted_iso)
+        < _parse_iso(result.prepared.expires_iso)
+    ):
+        raise ValueError("invalid rebaseline audit")
+    return result
 
 
 def _canonical_metadata_targets(
@@ -4256,6 +4604,48 @@ class StateStore:
         """Indexed by ``idx_files_cohort``; deterministic order by id."""
         rows = self._conn.execute(_SQL_FILES_BY_COHORT, (cohort.value,)).fetchall()
         return tuple(_row_to_file_record(row) for row in rows)
+
+    @_mutation
+    def record_preflight_deferral(
+        self,
+        expected: FileRecord,
+        *,
+        expected_targets: Mapping[str, tuple[int | None, int | None]],
+        code: str,
+        message: str,
+        observed_iso: str,
+    ) -> bool:
+        """Record the last attempted preflight, without changing eligibility or clocks.
+
+        This is historical diagnostic evidence, not a transition or a queue observation.
+        A stale candidate, changed frozen target, or non-planned row is a no-op.
+        """
+        _require_bounded_iso(observed_iso, name="observed_iso", context="observation")
+        code = diagnostic_text(code, limit=128)
+        detail = diagnostic_text(
+            f"preflight_deferred:{code}: observed {observed_iso} (last attempted preflight): "
+            f"{message}",
+            limit=MAX_DETAIL_CHARS,
+        )
+        targets = json.dumps(
+            {source: list(ids) for source, ids in expected_targets.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._transaction():
+            if (
+                expected.state is not FileState.PLANNED
+                or self.get_file(expected.shoko_file_id) != expected
+                or not expected_targets
+                or self.get_meta(f"file_mapping_targets:v1:{expected.shoko_file_id}") != targets
+                or self.mapping_target_quarantined(expected.shoko_file_id)
+            ):
+                return False
+            self._conn.execute(
+                "UPDATE files SET state_detail = ? WHERE shoko_file_id = ?",
+                (detail, expected.shoko_file_id),
+            )
+        return True
 
     @_mutation
     def advance(self, shoko_file_id: int, new_state: FileState, detail: str, *, iso: str) -> None:
@@ -6334,6 +6724,352 @@ class StateStore:
 
     # ---------------------------------------------------------- source identity
 
+    def get_source_rebaseline_review(self) -> SourceRebaselineReview:
+        """Bounded immutable local display data. Never repair corruption or create IDs."""
+        try:
+            # One SQL statement keeps the two display documents in one read snapshot.
+            rows = self._conn.execute(
+                "SELECT key, CASE WHEN typeof(value) = 'text'"
+                " AND length(CAST(value AS BLOB)) <= ? AND instr(value, char(0)) = 0"
+                " THEN value ELSE NULL END FROM meta WHERE key IN (?, ?)",
+                (
+                    MAX_CONTINUITY_DOCUMENT_CHARS,
+                    META_SOURCE_REBASELINE_PREPARED,
+                    META_SOURCE_REBASELINE_AUDIT,
+                ),
+            ).fetchall()
+            values = dict(rows)
+            decoded: dict[str, dict[str, Any]] = {}
+            for key, raw in values.items():
+                doc = _continuity_document(raw)
+                if raw != _rebaseline_json(doc):
+                    raise ValueError("noncanonical rebaseline document")
+                decoded[key] = doc
+            prepared = decoded.get(META_SOURCE_REBASELINE_PREPARED)
+            audit = decoded.get(META_SOURCE_REBASELINE_AUDIT)
+            return SourceRebaselineReview(
+                None if prepared is None else _decode_rebaseline_prepared(prepared),
+                None if audit is None else _decode_rebaseline_audit(audit),
+                True,
+            )
+        except (ValueError, TypeError, KeyError, StateError, OverflowError, RecursionError):
+            return SourceRebaselineReview(None, None, False)
+
+    def get_source_rebaseline_local_binding(self) -> str:
+        """Digest exact durable consent, authorization generation, preferences and scope.
+
+        Controllers obtain this snapshot before assessment. Prepare and confirm compare
+        it inside their write transaction. External identities still require fresh trusted
+        controller checks; this digest makes no claim about remote or filesystem state.
+        """
+        keys = (
+            META_SERVICE_SETTINGS,
+            META_SERVICE_DRAFT_ROOTS,
+            META_SERVICE_AUTHORIZATION_REVISION,
+            META_ONBOARDING_RECONFIRMATION_REQUIRED,
+        )
+        rows = self._conn.execute(
+            "SELECT key, CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?"
+            " AND instr(value, char(0)) = 0 THEN value ELSE NULL END FROM meta"
+            " WHERE key IN (?, ?, ?, ?)",
+            (MAX_ONBOARDING_JSON_CHARS, *keys),
+        ).fetchall()
+        local = dict(rows)
+        row = self._conn.execute(
+            "SELECT CASE WHEN typeof(document_json) = 'text'"
+            " AND length(CAST(document_json AS BLOB)) <= ?"
+            " AND instr(document_json, char(0)) = 0 THEN document_json ELSE NULL END"
+            " FROM onboarding WHERE singleton = 1",
+            (MAX_ONBOARDING_JSON_CHARS,),
+        ).fetchone()
+        if any(value is None for value in local.values()) or (row is not None and row[0] is None):
+            raise StateError("invalid local rebaseline binding")
+        local["consent"] = None if row is None else row[0]
+        self.get_service_authorization_revision()  # Existing authorization-generation validation.
+        try:
+            for key, kind in (
+                ("consent", dict),
+                (META_SERVICE_SETTINGS, dict),
+                (META_SERVICE_DRAFT_ROOTS, list),
+            ):
+                if (
+                    key in local
+                    and local[key] is not None
+                    and not isinstance(json.loads(local[key]), kind)
+                ):
+                    raise ValueError("invalid local authorization document")
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise StateError("invalid local rebaseline binding") from exc
+        return _rebaseline_digest(local)
+
+    def _rebaseline_owner_tx(self, session_sha256: str, iso: str) -> str:
+        """Bind stable ownership; check live expiry but exclude rotating CSRF/expiry fields."""
+        _require_hex64(session_sha256, "rebaseline owner session proof")
+        session = self.get_dashboard_session(session_sha256, int(_parse_iso(iso).timestamp()))
+        account = self.get_dashboard_account()
+        if session is None or account is None:
+            raise StateError("rebaseline owner session is unavailable")
+        return _rebaseline_digest(
+            {
+                "session": session_sha256,
+                "username": account.username,
+                "account_created_iso": account.created_iso,
+                "session_created_iso": session.created_iso,
+                "account": hashlib.sha256(
+                    account.password_hash.encode("utf-8") + account.signing_key
+                ).hexdigest(),
+            }
+        )
+
+    @staticmethod
+    def _validate_rebaseline_request(
+        assessment: SourceRebaselineAssessment, bindings: SourceRebaselineBindings, iso: str
+    ) -> None:
+        # Every timestamp is validated BEFORE entering a transaction, sharing 1A limits.
+        for stamp in (iso, assessment.started_iso, assessment.completed_iso):
+            _require_bounded_iso(stamp, name="iso", context="continuity")
+        for proof in (assessment.content_sha256, *asdict(bindings).values()):
+            _require_hex64(proof, "rebaseline assessment/binding proof")
+        if (
+            not _parse_iso(assessment.started_iso)
+            <= _parse_iso(assessment.completed_iso)
+            <= _parse_iso(iso)
+            or (_parse_iso(iso) - _parse_iso(assessment.started_iso)).total_seconds()
+            > MAX_SOURCE_REBASELINE_SECONDS
+            or assessment.observation.discovery_total is None
+        ):
+            raise StateError("complete fresh rebaseline assessment required")
+        for value in (
+            assessment.observation.instance_identity,
+            assessment.observation.roots_fingerprint,
+            assessment.observation.snapshot_summary_id,
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or "\x00" in value
+                or len(value.encode("utf-8")) > MAX_CONTINUITY_DOCUMENT_CHARS
+            ):
+                raise StateError("invalid rebaseline source observation")
+        _continuity_observation(assessment.observation)
+
+    def _rebaseline_current_tx(
+        self, assessment: SourceRebaselineAssessment, bindings: SourceRebaselineBindings
+    ) -> tuple[SourceContinuityHold, SourceContinuityCompleteObservation]:
+        review = self.get_source_continuity_review()
+        latest = review.latest_complete
+        if (
+            not review.requires_rebaseline
+            or review.evidence_status == "invalid"
+            or review.hold is None
+            or latest is None
+            or not review.latest_check_complete
+            or latest.observation != _continuity_observation(assessment.observation)
+            or latest.landed_count != self._linked_count_tx()
+            or bindings.local_state_sha256 != self.get_source_rebaseline_local_binding()
+        ):
+            raise StateError("source rebaseline evidence or authorization changed")
+        return review.hold, latest
+
+    @_mutation
+    def prepare_source_rebaseline(
+        self,
+        assessment: SourceRebaselineAssessment,
+        *,
+        expected_hold_id: str | None,
+        bindings: SourceRebaselineBindings,
+        owner_session_sha256: str,
+        iso: str,
+        expires_iso: str,
+    ) -> SourceRebaselinePrepared:
+        """Replace the single prepared review. No consent, pause, or write gate is cleared.
+
+        Only a trusted complete assessor may call this. A missing expected_hold_id is
+        accepted solely for a legacy hold lacking its first-cause record; initialization
+        occurs here (never in a getter) without inventing original counts or dates.
+        """
+        self._validate_rebaseline_request(assessment, bindings, iso)
+        _require_bounded_iso(expires_iso, name="iso", context="continuity")
+        _require_hex64(owner_session_sha256, "rebaseline owner session proof")
+        if expected_hold_id is not None:
+            try:
+                _continuity_nonce(expected_hold_id)
+            except ValueError as exc:
+                raise StateError("invalid rebaseline hold identity") from exc
+        if (
+            not 0
+            < (_parse_iso(expires_iso) - _parse_iso(iso)).total_seconds()
+            <= (MAX_SOURCE_REBASELINE_SECONDS)
+        ):
+            raise StateError("invalid rebaseline review lifetime")
+        with self._transaction():
+            before = self.get_source_continuity_review()
+            if before.hold is None and before.evidence_status == "legacy_unknown":
+                if expected_hold_id is not None:
+                    raise StateError("source rebaseline hold changed")
+                self._ensure_legacy_continuity_hold_tx(True)
+            hold, latest = self._rebaseline_current_tx(assessment, bindings)
+            if before.hold is not None and hold.hold_id != expected_hold_id:
+                raise StateError("source rebaseline hold changed")
+            prepared = SourceRebaselinePrepared(
+                1,
+                uuid.uuid4().hex,
+                hold.hold_id,
+                iso,
+                expires_iso,
+                assessment.content_sha256,
+                assessment.started_iso,
+                assessment.completed_iso,
+                latest.revision,
+                latest.content_sha256,
+                latest.observation,
+                latest.landed_count,
+                bindings,
+                self._rebaseline_owner_tx(owner_session_sha256, iso),
+            )
+            self._set_meta_tx(META_SOURCE_REBASELINE_PREPARED, _rebaseline_json(asdict(prepared)))
+        return prepared
+
+    @_mutation
+    def confirm_source_rebaseline(
+        self,
+        token: str,
+        assessment: SourceRebaselineAssessment,
+        *,
+        bindings: SourceRebaselineBindings,
+        owner_session_sha256: str,
+        iso: str,
+    ) -> SourceRebaselineAudit:
+        """Single-use atomic LOCAL acceptance after independent fresh complete assessment.
+
+        The authenticated controller must supply current trusted external bindings and
+        assessment collected strictly after preparation, never client echoes. This primitive
+        neither resumes the service nor authorizes writes. Normal authorization/canary/all
+        safety gates still apply.
+        """
+        self._validate_rebaseline_request(assessment, bindings, iso)
+        _require_hex64(owner_session_sha256, "rebaseline owner session proof")
+        try:
+            _continuity_nonce(token)
+        except ValueError as exc:
+            raise StateError("invalid rebaseline token") from exc
+        with self._transaction():
+            display = self.get_source_rebaseline_review()
+            prepared = display.prepared
+            if not display.valid or prepared is None:
+                raise StateError("source rebaseline review unavailable")
+            hold, latest = self._rebaseline_current_tx(assessment, bindings)
+            if (
+                prepared.token != token
+                or prepared.hold_id != hold.hold_id
+                or not _parse_iso(prepared.created_iso) < _parse_iso(assessment.started_iso)
+                or not _parse_iso(iso) < _parse_iso(prepared.expires_iso)
+                or prepared.assessment_sha256 != assessment.content_sha256
+                or prepared.latest_revision != latest.revision
+                or prepared.latest_content_sha256 != latest.content_sha256
+                or prepared.bindings != bindings
+                or prepared.owner_sha256 != self._rebaseline_owner_tx(owner_session_sha256, iso)
+            ):
+                raise StateError("source rebaseline review expired or changed")
+            audit = SourceRebaselineAudit(
+                1, prepared, hold, assessment.started_iso, assessment.completed_iso, iso
+            )
+            self._anchor_source_tx(assessment.observation, iso, clear_flag=True)
+            self._clear_continuity_evidence_tx()
+            # Any audit failure rolls back anchor, token consumption and flag together.
+            self._set_meta_tx(META_SOURCE_REBASELINE_AUDIT, _rebaseline_json(asdict(audit)))
+        return audit
+
+    def get_source_continuity_review(self) -> SourceContinuityReview:
+        """Read one consistent local snapshot, without initializing or repairing metadata.
+
+        Invalid documents expose no evidence. Legacy holds never borrow an advanced
+        anchor to invent their original count/time. Consumers must reject invalid or
+        incomplete evidence before preparing any future explicit recovery action.
+        """
+        keys = (
+            META_REQUIRES_REBASELINE,
+            META_SOURCE_CONTINUITY_HOLD,
+            META_SOURCE_CONTINUITY_LATEST,
+            META_SOURCE_CONTINUITY_CHECK_COMPLETE,
+        )
+        rows = self._conn.execute(
+            "SELECT key, CASE WHEN typeof(value) = 'text'"
+            " AND length(CAST(value AS BLOB)) <= ? AND instr(value, char(0)) = 0"
+            " THEN value ELSE NULL END FROM meta WHERE key IN (?, ?, ?, ?)",
+            (MAX_CONTINUITY_DOCUMENT_CHARS, *keys),
+        ).fetchall()
+        values = {row[0]: row[1] for row in rows}
+        held = META_REQUIRES_REBASELINE in values and values[META_REQUIRES_REBASELINE] != "0"
+        try:
+            if any(value is None for value in values.values()):
+                raise ValueError("invalid continuity metadata storage")
+            if values.get(META_REQUIRES_REBASELINE) not in (None, "0", "1"):
+                raise ValueError("invalid continuity hold flag")
+            raw_hold = values.get(META_SOURCE_CONTINUITY_HOLD)
+            hold = _decode_continuity_hold(raw_hold) if held and raw_hold is not None else None
+            raw_latest = values.get(META_SOURCE_CONTINUITY_LATEST)
+            latest = _decode_continuity_latest(raw_latest) if raw_latest is not None else None
+            complete = values.get(META_SOURCE_CONTINUITY_CHECK_COMPLETE)
+            if (
+                complete not in (None, "0", "1")
+                or (latest is not None and complete is None)
+                or (complete == "1" and latest is None)
+            ):
+                raise ValueError("invalid continuity completeness")
+        except (ValueError, TypeError, KeyError, StateError, OverflowError, RecursionError):
+            return SourceContinuityReview(held, None, None, False, "invalid")
+        status: Literal["available", "legacy_unknown", "invalid", "none"] = "none"
+        if held:
+            status = "legacy_unknown" if hold is None or hold.detected_iso is None else "available"
+        return SourceContinuityReview(held, hold, latest, complete == "1", status)
+
+    def _clear_continuity_evidence_tx(self) -> None:
+        self._conn.execute(
+            "DELETE FROM meta WHERE key IN (?, ?, ?, ?)",
+            (
+                META_SOURCE_CONTINUITY_HOLD,
+                META_SOURCE_CONTINUITY_LATEST,
+                META_SOURCE_CONTINUITY_CHECK_COMPLETE,
+                META_SOURCE_REBASELINE_PREPARED,
+            ),
+        )
+
+    def _record_continuity_latest_tx(self, observation: SourceObservation, iso: str) -> None:
+        proof = _continuity_observation(observation)
+        landed = self._linked_count_tx()
+        digest = hashlib.sha256(_continuity_content(proof, landed).encode("utf-8")).hexdigest()
+        revision = uuid.uuid4().hex
+        row = self._conn.execute(
+            "SELECT CASE WHEN typeof(value) = 'text'"
+            " AND length(CAST(value AS BLOB)) <= ? AND instr(value, char(0)) = 0"
+            " THEN value ELSE NULL END FROM meta WHERE key = ?",
+            (MAX_CONTINUITY_DOCUMENT_CHARS, META_SOURCE_CONTINUITY_LATEST),
+        ).fetchone()
+        raw = row[0] if row is not None else None
+        if raw is not None:
+            try:
+                previous = _decode_continuity_latest(raw)
+                if previous.content_sha256 == digest:
+                    revision = previous.revision
+            except (ValueError, TypeError, KeyError, StateError, OverflowError, RecursionError):
+                pass  # A trusted complete check can replace a corrupt latest observation.
+        latest = SourceContinuityCompleteObservation(1, revision, digest, iso, proof, landed)
+        self._set_meta_tx(META_SOURCE_CONTINUITY_LATEST, json.dumps(asdict(latest)))
+        self._set_meta_tx(META_SOURCE_CONTINUITY_CHECK_COMPLETE, "1")
+
+    def _ensure_legacy_continuity_hold_tx(self, latched: bool) -> None:
+        if not latched:
+            return
+        exists = self._conn.execute(
+            "SELECT 1 FROM meta WHERE key = ?", (META_SOURCE_CONTINUITY_HOLD,)
+        ).fetchone()
+        if exists is None:
+            hold = SourceContinuityHold(
+                1, uuid.uuid4().hex, None, (), None, None, None, None, None, None, None
+            )
+            self._set_meta_tx(META_SOURCE_CONTINUITY_HOLD, json.dumps(asdict(hold)))
+
     def _linked_count_tx(self) -> int:
         """Files whose link landed (VERIFIED / PARTIAL): non-null ``last_verified_iso``.
 
@@ -6397,6 +7133,7 @@ class StateStore:
         self._set_meta_tx(META_SOURCE_ANCHOR_BASIS, str(self._linked_count_tx()))
         if clear_flag:
             self._set_meta_tx(META_REQUIRES_REBASELINE, "0")
+            self._conn.execute("DELETE FROM meta WHERE key = ?", (META_SOURCE_REBASELINE_PREPARED,))
 
     @_mutation
     def record_source_observation(
@@ -6416,18 +7153,18 @@ class StateStore:
         callers can also use this recovery path to clear a hard hold; ordinary polls
         must pass the latched continuity check first.
         """
-        _require_iso(iso, "iso")
+        _require_bounded_iso(iso, name="iso", context="continuity")
         with self._transaction():
-            self._anchor_source_tx(
-                SourceObservation(
-                    instance_identity=instance_identity,
-                    roots_fingerprint=roots_fingerprint,
-                    snapshot_summary_id=snapshot_summary_hash,
-                    discovery_total=discovery_total,
-                ),
-                iso,
-                clear_flag=True,
+            if self.get_meta(META_REQUIRES_REBASELINE) == "1":
+                self._clear_continuity_evidence_tx()
+            observation = SourceObservation(
+                instance_identity=instance_identity,
+                roots_fingerprint=roots_fingerprint,
+                snapshot_summary_id=snapshot_summary_hash,
+                discovery_total=discovery_total,
             )
+            self._record_continuity_latest_tx(observation, iso)
+            self._anchor_source_tx(observation, iso, clear_flag=True)
 
     @_mutation
     def clear_requires_rebaseline(self, iso: str) -> None:
@@ -6439,6 +7176,7 @@ class StateStore:
         _require_iso(iso, "iso")
         with self._transaction():
             self._set_meta_tx(META_REQUIRES_REBASELINE, "0")
+            self._clear_continuity_evidence_tx()
 
     @_mutation
     def check_source_continuity(
@@ -6488,7 +7226,9 @@ class StateStore:
         previously anchored total intact (a truncated page's inflated ``Total`` never
         re-anchors the continuity total).
         """
-        _require_iso(iso, "iso")
+        _require_bounded_iso(iso, name="iso", context="continuity")
+        _continuity_counter(discovery_total, optional=True)
+        _continuity_counter(tolerance)
         observation = SourceObservation(
             instance_identity=current_identity,
             roots_fingerprint=roots_fingerprint,
@@ -6497,9 +7237,12 @@ class StateStore:
         )
         with self._transaction():
             latched = self.get_meta(META_REQUIRES_REBASELINE) == "1"
+            self._ensure_legacy_continuity_hold_tx(latched)
             if not complete:
+                self._set_meta_tx(META_SOURCE_CONTINUITY_CHECK_COMPLETE, "0")
                 # Truncated discovery: neutral, never anchors, never triggers a drop.
                 return ContinuityVerdict(not latched, ("discovery_incomplete",), latched)
+            self._record_continuity_latest_tx(observation, iso)
             known = self.get_meta(META_SOURCE_INSTANCE)
             if known is None:
                 self._anchor_source_tx(observation, iso, clear_flag=not latched)
@@ -6531,6 +7274,30 @@ class StateStore:
             if latched:
                 reasons.append("requires_rebaseline")
             requires = bool(reasons)
+            if requires and not latched:
+                basis_raw = self.get_meta(META_SOURCE_ANCHOR_BASIS)
+                anchored = 0 if basis_raw is None else int(basis_raw)
+                landed = self._linked_count_tx()
+                prior = SourceObservation(
+                    known,
+                    known_roots or "",
+                    self.get_meta(META_SONARR_STATUS_SNAPSHOT_ID) or "",
+                    None if known_total_raw is None else int(known_total_raw),
+                )
+                hold = SourceContinuityHold(
+                    1,
+                    uuid.uuid4().hex,
+                    iso,
+                    tuple(reasons),
+                    _continuity_observation(prior),
+                    _continuity_observation(observation),
+                    self.get_meta(META_SOURCE_LAST_OBSERVED_ISO),
+                    anchored,
+                    landed,
+                    max(0, landed - anchored),
+                    tolerance,
+                )
+                self._set_meta_tx(META_SOURCE_CONTINUITY_HOLD, json.dumps(asdict(hold)))
             # Re-anchor every evaluated cycle: the anchor tracks the source forward, so
             # growth never accumulates as a permanent discontinuity.
             self._anchor_source_tx(observation, iso, clear_flag=not requires)

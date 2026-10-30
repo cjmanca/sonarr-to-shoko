@@ -193,7 +193,7 @@ def run_service(
 def run_dashboard_worker(
     server: HTTPServer,
     *,
-    worker_tick: Callable[[], None],
+    worker_tick: Callable[[], float | None],
     stop_requested: Callable[[], bool],
     monotonic: Callable[[], float],
     worker_interval_seconds: float,
@@ -206,6 +206,10 @@ def run_dashboard_worker(
     The caller owns the HTTP server loop. On shutdown the listener is closed before waiting
     for the worker, while the worker thread is joined without force-termination so a protected
     Shoko operation can finish and preserve its durable recovery state.
+
+    A tick may return a positive delay for bounded explicit work that needs another
+    slice. None retains the ordinary configured polling interval. All waits remain
+    interruptible by controls and shutdown.
     """
     if worker_interval_seconds <= 0 or request_poll_seconds <= 0:
         raise ValueError("service intervals must be positive")
@@ -221,13 +225,18 @@ def run_dashboard_worker(
                     wake.clear()
                     next_worker_tick = monotonic()
                 continue
+            continuation_delay = None
             try:
-                worker_tick()
+                continuation_delay = worker_tick()
             except Exception:
                 _logger.exception("Service worker tick failed; it will be retried.")
             try:
                 interval = (
-                    worker_interval_seconds if interval_provider is None else interval_provider()
+                    continuation_delay
+                    if continuation_delay is not None and continuation_delay > 0
+                    else worker_interval_seconds
+                    if interval_provider is None
+                    else interval_provider()
                 )
             except Exception:
                 _logger.warning("Service interval unavailable; using the default retry interval.")

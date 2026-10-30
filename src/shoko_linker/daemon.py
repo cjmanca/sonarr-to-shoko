@@ -2579,10 +2579,36 @@ def _preflight_failure_outcome(
     file_id: int,
     verdict: PreflightVerdict,
     now_iso: str,
+    *,
+    attempted: FileRecord | None,
+    plan: LinkPlan,
 ) -> _ApplyOutcome:
     """Defer only wholly retryable verdicts; persist every hard block for operator review."""
+    # The pre-I/O snapshot must describe the attempted plan, not a replaced source.
+    if attempted is not None and (
+        attempted.sonarr_series_id,
+        attempted.sonarr_file_id,
+        attempted.sonarr_path,
+        attempted.sonarr_size,
+        canonical_ed2k(attempted.identity.ed2k) if attempted.identity is not None else None,
+    ) != (
+        plan.sonarr_series_id,
+        plan.sonarr_episode_file_id,
+        plan.sonarr_path,
+        plan.sonarr_size,
+        canonical_ed2k(plan.shoko_ed2k),
+    ):
+        attempted = None
     if preflight_reasons_are_retryable(verdict.reasons):
         reason = verdict.reasons[0].value
+        if attempted is not None:
+            deps.store.record_preflight_deferral(
+                attempted,
+                expected_targets=_resolved_targets(plan),
+                code=reason,
+                message="; ".join(verdict.details) or "Retry later; no link was submitted",
+                observed_iso=now_iso,
+            )
         if PreflightReason.TARGET_UNAVAILABLE in verdict.reasons:
             detail = "; ".join(verdict.details) or (
                 "Shoko target metadata is unavailable; target identity cannot be confirmed, "
@@ -3635,6 +3661,7 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
     )
     if not verdict.eligible:
         return _ApplyOutcome(0, 0, tuple(verdict.reasons), ())
+    attempted = deps.store.get_file(file_id)
     gate = preflight(
         deps.shoko,
         plan,
@@ -3653,7 +3680,9 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
         check_targets=False,
     )
     if not gate.ok:
-        return _preflight_failure_outcome(deps, file_id, gate, send_iso)
+        return _preflight_failure_outcome(
+            deps, file_id, gate, send_iso, attempted=attempted, plan=plan
+        )
     source = check_plan_sonarr_source(deps, plan, deadline=source_check_deadline)
     if source.status is SourceRelationshipStatus.UNAVAILABLE:
         return _ApplyOutcome(
@@ -3684,7 +3713,9 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
         deps.shoko, plan, deadline=source_check_deadline, clock=deps.monotonic
     )
     if not target_gate.ok:
-        return _preflight_failure_outcome(deps, file_id, target_gate, deps.now())
+        return _preflight_failure_outcome(
+            deps, file_id, target_gate, deps.now(), attempted=attempted, plan=plan
+        )
     file_gate = preflight_file(
         deps.shoko,
         plan,
@@ -3716,7 +3747,9 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
             if stale_after is not None:
                 return stale_after
             if not file_gate.ok:
-                return _preflight_failure_outcome(deps, file_id, file_gate, send_iso)
+                return _preflight_failure_outcome(
+                    deps, file_id, file_gate, send_iso, attempted=attempted, plan=plan
+                )
             prepared = deps.store.prepare_send(
                 file_id,
                 plan.fingerprint,

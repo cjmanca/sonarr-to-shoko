@@ -35,6 +35,7 @@ from .onboarding import (
     OnboardingStatus,
 )
 from .scan_status import ScanExclusionPage, ScanSummary
+from .source_review import SourceReviewView
 from .state import (
     DASHBOARD_SIGNING_KEY_BYTES,
     MAX_DASHBOARD_USERNAME_CHARS,
@@ -43,6 +44,7 @@ from .state import (
     ServiceFileCounts,
     ServiceFilePage,
     ServiceFileStatus,
+    SourceRebaselineAudit,
     StateError,
     StateStore,
     TablePage,
@@ -291,6 +293,9 @@ class DashboardApplication:
         setup_action: Callable[[str, Mapping[str, str]], str] | None = None,
         settings_provider: Callable[[], DashboardSettingsView] | None = None,
         settings_action: Callable[[Mapping[str, str]], str] | None = None,
+        source_review_provider: Callable[[str], SourceReviewView] | None = None,
+        source_review_assess: Callable[[str], SourceReviewView] | None = None,
+        source_review_confirm: Callable[[str, str], SourceReviewView] | None = None,
         control_changed: Callable[[], None] = lambda: None,
     ) -> None:
         self.state_path = Path(state_path)
@@ -303,6 +308,9 @@ class DashboardApplication:
         self.setup_action = setup_action
         self.settings_provider = settings_provider
         self.settings_action = settings_action
+        self.source_review_provider = source_review_provider
+        self.source_review_assess = source_review_assess
+        self.source_review_confirm = source_review_confirm
         self.control_changed = control_changed
 
     @staticmethod
@@ -432,6 +440,12 @@ class DashboardApplication:
             table=table,
             view=view,
             pause_reason=pause_reason,
+            source_review=(
+                self.source_review_provider(session.session_id_hash)
+                if self.source_review_provider
+                else None
+            ),
+            source_audit=store.get_source_rebaseline_review().last_audit,
             refresh_url=(path if path != "/" else "/status") + ("?" + query if query else ""),
         )
         return self._html(HTTPStatus.OK, page)
@@ -452,6 +466,8 @@ class DashboardApplication:
         control_paths = {
             "/pause",
             "/resume",
+            "/source-review/assess",
+            "/source-review/confirm",
             "/setup/scope",
             "/setup/confirm",
             "/setup/edit",
@@ -501,7 +517,7 @@ class DashboardApplication:
             return self._error(HTTPStatus.SERVICE_UNAVAILABLE, "Please try signing in again.")
         return self._redirect("/status", set_cookie=cookie)
 
-    def _control(  # noqa: PLR0911 - authenticated controls retain distinct refusal responses
+    def _control(  # noqa: PLR0911, PLR0912 - authenticated routes retain distinct refusals
         self,
         store: StateStore,
         path: str,
@@ -512,6 +528,10 @@ class DashboardApplication:
         session = None if account is None else self._read_session(store, account, cookie_header)
         if account is None or session is None:
             return self._error(HTTPStatus.FORBIDDEN, "Sign in to continue.")
+        if path.startswith("/source-review/"):
+            refusal = self._validate_source_review_form(path, form)
+            if refusal is not None:
+                return refusal
         token = form.get("csrf_token", "")
         supplied_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         if not token or not hmac.compare_digest(token, session.csrf_token):
@@ -528,6 +548,8 @@ class DashboardApplication:
         cookie = self._encode_session_cookie(
             account.signing_key, session.session_id, session.expires_epoch, next_csrf
         )
+        if path.startswith("/source-review/"):
+            return self._source_review_action(store, path, form, session, next_csrf, cookie)
         manager = OnboardingManager(store)
         if path == "/pause":
             manager.pause(iso=now.isoformat())
@@ -594,6 +616,65 @@ class DashboardApplication:
             )
         self.control_changed()
         return self._redirect("/status", set_cookie=cookie)
+
+    def _validate_source_review_form(
+        self, path: str, form: Mapping[str, str]
+    ) -> DashboardResponse | None:
+        expected = {"csrf_token"}
+        if path == "/source-review/confirm":
+            expected |= {"review_token", "acknowledge"}
+        if set(form) != expected or (
+            path == "/source-review/confirm"
+            and (
+                form.get("acknowledge") != "yes"
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", form.get("review_token", ""))
+            )
+        ):
+            return self._error(
+                HTTPStatus.BAD_REQUEST, "Review and explicitly accept the source change."
+            )
+        if (
+            self.source_review_provider is None
+            or self.source_review_assess is None
+            or self.source_review_confirm is None
+        ):
+            return self._error(HTTPStatus.NOT_FOUND, "Source review is unavailable.")
+        return None
+
+    def _source_review_action(
+        self,
+        store: StateStore,
+        path: str,
+        form: Mapping[str, str],
+        session: _SessionToken,
+        next_csrf: str,
+        cookie: str,
+    ) -> DashboardResponse:
+        assert self.source_review_assess is not None
+        assert self.source_review_confirm is not None
+        assert self.source_review_provider is not None
+        message = "Fresh source collection queued. All linking safety checks still apply."
+        try:
+            if path == "/source-review/assess":
+                self.source_review_assess(session.session_id_hash)
+            else:
+                self.source_review_confirm(form["review_token"], session.session_id_hash)
+        except StateError:
+            message = "This review is unavailable or changed. Request a new assessment."
+        paused, pause_reason = store.get_service_pause()
+        return self._html(
+            HTTPStatus.OK,
+            self._status_page(
+                self.status_provider(),
+                next_csrf,
+                paused=paused,
+                pause_reason=pause_reason,
+                acknowledgement=message,
+                source_review=self.source_review_provider(session.session_id_hash),
+                source_audit=store.get_source_rebaseline_review().last_audit,
+            ),
+            set_cookie=cookie,
+        )
 
     def _new_session(self, store: StateStore, signing_key: bytes, now: datetime) -> str | None:
         session_id = secrets.token_urlsafe(32)
@@ -751,6 +832,8 @@ class DashboardApplication:
         view: str = "review",
         pause_reason: str = "",
         refresh_url: str = "",
+        source_review: SourceReviewView | None = None,
+        source_audit: SourceRebaselineAudit | None = None,
     ) -> str:
         if settings is not None:
             route = "/settings"
@@ -781,6 +864,7 @@ class DashboardApplication:
             "conflicts and safety issues are included. These are locally tracked files "
             "across scans, not a partition of Shoko's current unrecognized list."
             "</p></section></div>"
+            + DashboardApplication._source_review_section(source_review, source_audit, csrf_token)
             + DashboardApplication._scan_section(status.last_scan)
             + DashboardApplication._metadata_section(status.metadata)
             + '<details class="panel diagnostics" data-live="diagnostics">'
@@ -825,15 +909,127 @@ class DashboardApplication:
             f'<nav aria-label="Dashboard navigation">{nav}</nav></aside>'
             '<div class="workspace" '
             f'data-refresh-url="{html.escape(canonical_refresh, quote=True)}">'
-            + DashboardApplication._header(
-                status, csrf_token, paused=paused, pause_reason=pause_reason
-            )
             + f'<h1>{titles[route]}</h1><div data-live="acknowledgement" role="status">'
             + (f"<p>{html.escape(acknowledgement)}</p>" if acknowledgement else "")
             + '</div><p id="update-status" role="status" hidden></p>'
+            + '<div data-live="source-hold">'
+            + (
+                '<aside class="panel" role="status"><strong>Source collection changed.</strong> '
+                "Linking is held until you review fresh source evidence. "
+                '<a href="/status#source-review">Review source change</a></aside>'
+                if source_review and source_review.continuity.requires_rebaseline
+                else ""
+            )
+            + "</div>"
             + body
             + "</div></div>",
             live=True,
+            header_content=DashboardApplication._header(
+                status, csrf_token, paused=paused, pause_reason=pause_reason
+            ),
+        )
+
+    @staticmethod
+    def _source_review_section(  # noqa: PLR0912 - explicit evidence and form states
+        review: SourceReviewView | None, audit: SourceRebaselineAudit | None, csrf_token: str
+    ) -> str:
+        """Render only local evidence; no endpoint URLs or remote action history."""
+
+        def safe(value: str) -> str:
+            return html.escape(diagnostic_text(value))
+
+        body = ""
+        if review is not None and review.continuity.requires_rebaseline:
+            continuity = review.continuity
+            hold = continuity.hold
+            body = (
+                "<h2>Source collection changed</h2><p>Automatic linking is held because "
+                "the source collection no longer matches its previous baseline. "
+                "Review a fresh read-only collection before accepting a new baseline.</p>"
+            )
+            if continuity.evidence_status == "legacy_unknown":
+                body += "<p>The original cause and counts were not retained by this older hold.</p>"
+            elif hold is not None:
+                prior = None if hold.prior is None else hold.prior.discovery_total
+                current = None if hold.current is None else hold.current.discovery_total
+                body += (
+                    '<p>Original hold: previous unrecognized files: '
+                    f'{prior if prior is not None else "unknown"}; '
+                    f'current: {current if current is not None else "unknown"}.</p>'
+                )
+            if continuity.latest_complete is not None:
+                latest = continuity.latest_complete
+                latest_count = latest.observation.discovery_total
+                body += (
+                    f"<p>Latest complete observation: {safe(latest.observed_iso)}; "
+                    "unrecognized files: "
+                    f"{latest_count if latest_count is not None else 'unknown'}.</p>"
+                )
+            labels = {
+                "idle": "Ready to assess",
+                "queued": "Fresh assessment queued",
+                "assessing": "Collecting fresh source evidence",
+                "ready": "Review fresh evidence",
+                "confirming": "Rechecking fresh evidence before acceptance",
+                "changed": "Source content changed again. Review and accept this new evidence.",
+                "confirmed": "Baseline accepted; safety checks still apply",
+                "error": "Assessment needs attention",
+            }
+            body += f'<p role="status">{labels[review.status]}</p>'
+            if review.message:
+                body += f"<p>{safe(review.message)}</p>"
+            if review.started_iso:
+                body += f"<p>Fresh collection started: {safe(review.started_iso)}"
+                if review.completed_iso:
+                    body += f"; completed: {safe(review.completed_iso)}"
+                body += ".</p>"
+            if review.summary is not None:
+                summary = review.summary
+                body += (
+                    f"<p>Current selected scope: {summary.selected_roots} roots; "
+                    f"Sonarr: {summary.sonarr_series} series, {summary.sonarr_files} files; "
+                    f"Shoko: {summary.shoko_files} unrecognized files, "
+                    f"{summary.shoko_folders} import folders.</p>"
+                )
+            token = html.escape(csrf_token, quote=True)
+            if review.token is not None and review.status in {"ready", "changed"}:
+                review_token = html.escape(review.token, quote=True)
+                body += (
+                    '<form method="post" action="/source-review/confirm" '
+                    f'data-review-token="{review_token}">'
+                    f'<input type="hidden" name="csrf_token" value="{token}">'
+                    f'<input type="hidden" name="review_token" value="{review_token}">'
+                    '<label><input type="checkbox" name="acknowledge" value="yes" required> '
+                    "I reviewed this source change and accept this new continuity baseline.</label>"
+                    "<p>Acceptance rechecks fresh evidence. It grants no write permission and "
+                    "does not clear other safety holds or your pause.</p>"
+                    '<button type="submit">Accept new baseline</button></form>'
+                )
+            elif review.status not in {"queued", "assessing", "confirming"}:
+                body += (
+                    '<form method="post" action="/source-review/assess">'
+                    f'<input type="hidden" name="csrf_token" value="{token}">'
+                    '<button type="submit">Assess source change</button></form>'
+                )
+            if review.service_pause[0]:
+                body += "<p>The service is paused. Baseline acceptance will keep that pause.</p>"
+            if review.writes_disabled:
+                body += "<p>A separate write safety hold is active and will remain in place.</p>"
+        if audit is not None:
+            body += (
+                "<h3>Local baseline audit</h3>"
+                f"<p>Baseline accepted: {safe(audit.accepted_iso)}. "
+                "This local record is separate from remote mutation History. "
+                "Linking still depends on current authorization and safety checks.</p>"
+            )
+        return (
+            (
+                '<section id="source-review" class="panel" data-live="source-review">'
+                + body
+                + "</section>"
+            )
+            if body
+            else '<div data-live="source-review"></div>'
         )
 
     @staticmethod
@@ -847,7 +1043,8 @@ class DashboardApplication:
             else ("Running" if status.automatic_linking else "Waiting for safety checks")
         )
         metrics = "".join(
-            f'<a class="quick-total {key}" href="{target}" title="{label}">'
+            f'<a class="quick-total {key}" href="{target}" title="{label}" '
+            f'data-header-focus="{key}">'
             f'{_icon(symbol)}<span class="sr-only">{label}: </span>{count:,}</a>'
             for key, target, label, symbol, count in (
                 ("verified", "/files/verified", "Verified files", "check", status.linked_files),
@@ -856,13 +1053,14 @@ class DashboardApplication:
             )
         )
         return (
-            '<header class="dashboard-toolbar" data-live="metrics">'
+            '<div class="dashboard-toolbar" data-live="metrics">'
             f'<span class="service-state">{state}</span><div class="quick-totals">{metrics}</div>'
             f'<form method="post" action="/{control.lower()}">'
             f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
-            f'<button class="icon-button" aria-label="{control} automatic linking" '
+            f'<button class="icon-button" data-header-focus="toggle" '
+            f'aria-label="{control} automatic linking" '
             f'title="{control} automatic linking">{_icon("play" if paused else "pause")}'
-            '</button></form></header>'
+            '</button></form></div>'
         )
 
     @staticmethod
@@ -888,6 +1086,7 @@ class DashboardApplication:
         if table is None:
             return tabs + '<section class="panel" data-live="table">' + unavailable + "</section>"
         rows: list[tuple[str, str, str, str, str, str]] = []
+        recorded_reasons: dict[int, str] = {}
         pagination: TablePage | None = None
         message = ""
         if table.files is not None:
@@ -897,6 +1096,19 @@ class DashboardApplication:
             )
             for index, item in enumerate(table.files.rows):
                 display = table.displays[index] if index < len(table.displays) else FileDisplay()
+                detail = diagnostic_text(item.detail).strip()
+                if detail and detail.casefold() not in {
+                    "new",
+                    "planned",
+                    diagnostic_text(item.message).strip().casefold(),
+                }:
+                    recorded_reasons[index] = (
+                        f'<details data-disclosure="file-reason-{item.shoko_file_id}">'
+                        "<summary>Recorded reason</summary>"
+                        "<p>Last recorded file detail; this is not a fresh check. "
+                        "Current service holds are shown separately.</p>"
+                        f"<p>{html.escape(detail)}</p></details>"
+                    )
                 rows.append(
                     (
                         item.reason,
@@ -971,10 +1183,13 @@ class DashboardApplication:
             + "</td>"
             + "".join(
                 f"<td>{html.escape(diagnostic_text(value))}</td>"
-                for value in (filename, relative, library, detail)
+                for value in (filename, relative, library)
             )
+            + f"<td>{html.escape(diagnostic_text(detail))}"
+            + recorded_reasons.get(index, "")
+            + "</td>"
             + "</tr>"
-            for kind, explanation, filename, relative, library, detail in rows
+            for index, (kind, explanation, filename, relative, library, detail) in enumerate(rows)
         )
         return (
             tabs + '<section class="panel table-panel" data-live="table">'
@@ -1500,6 +1715,15 @@ _DASHBOARD_JS: Final[str] = r"""
     for (const current of document.querySelectorAll('[data-live]')) {
       const fresh = next.querySelector('[data-live="' + current.dataset.live + '"]');
       if (!fresh) continue;
+      if (current.dataset.live === 'source-review') {
+        const oldForm = current.querySelector('form[data-review-token]');
+        const newForm = fresh.querySelector('form[data-review-token]');
+        if (oldForm && newForm && oldForm.dataset.reviewToken === newForm.dataset.reviewToken) {
+          const oldAck = oldForm.querySelector('input[name="acknowledge"]');
+          const newAck = newForm.querySelector('input[name="acknowledge"]');
+          if (oldAck && newAck) newAck.checked = oldAck.checked;
+        }
+      }
       if (current.dataset.live === 'setup') {
         const oldPanel = current.querySelector('[data-setup-digest]');
         const newPanel = fresh.querySelector('[data-setup-digest]');
@@ -1541,6 +1765,14 @@ _DASHBOARD_JS: Final[str] = r"""
       }
       let scrolls = [];
       let focused = null;
+      let headerFocus = null;
+      if (current.dataset.live === 'metrics') {
+        const active = document.activeElement;
+        const key = active?.dataset.headerFocus;
+        if (['verified', 'waiting', 'review', 'toggle'].includes(key) && current.contains(active)) {
+          headerFocus = key;
+        }
+      }
       if (current.dataset.live === 'table') {
         prepareTables(fresh);
         scrolls = Array.from(current.querySelectorAll('table[data-table]'), table =>
@@ -1552,6 +1784,10 @@ _DASHBOARD_JS: Final[str] = r"""
       }
       if (current.outerHTML !== fresh.outerHTML) {
         current.replaceWith(fresh);
+        if (headerFocus) {
+          fresh.querySelector('[data-header-focus="' + headerFocus + '"]')
+            ?.focus({preventScroll: true});
+        }
         if (current.dataset.live === 'table') {
           for (const table of fresh.querySelectorAll('table[data-table]')) {
             if (focused && table.dataset.table === focused[0]) {
@@ -1617,8 +1853,8 @@ _DASHBOARD_CSS: Final[str] = """
 body { margin: 0; min-height: 100vh; }
 .site-header { background: var(--surface); border-bottom: 1px solid var(--line); }
 .header-inner {
-  max-width: 1160px; margin: auto; padding: 21px 32px; display: flex;
-  align-items: center; justify-content: space-between; gap: 20px;
+  max-width: 1560px; margin: auto; padding: 16px 24px; display: flex;
+  align-items: center; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap;
 }
 .brand { display: flex; align-items: center; gap: 12px; font-size: 17px;
   font-weight: 750; letter-spacing: -.4px; }
@@ -1637,15 +1873,16 @@ main { max-width: 1560px; margin: auto; padding: 28px 24px; }
 .sidebar a:hover, .sidebar a[aria-current] { color: var(--accent); background: #e9f1ff; }
 .workspace { min-width: 0; }
 .icon { width: 20px; height: 20px; flex-shrink: 0; vertical-align: middle; }
-.dashboard-toolbar { display: flex; align-items: center; gap: 16px; margin-bottom: 26px;
-  padding: 12px 0 20px; border-bottom: 1px solid var(--line); }
-.service-state { margin-right: auto; color: var(--muted); font-size: 13px; }
-.quick-totals { display: flex; gap: 10px; }
+.dashboard-toolbar { display: flex; align-items: center; gap: 16px; margin-left: auto;
+  max-width: 100%; flex-wrap: wrap; }
+.service-state { color: var(--muted); font-size: 13px; }
+.quick-totals { display: flex; flex-wrap: wrap; gap: 10px; }
 .quick-total { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
   text-decoration: none; border-radius: 6px; font-weight: 700; background: #f1f5f9; }
 .quick-total.verified { color: #176546; }
 .quick-total.waiting { color: #875b12; }
 .quick-total.review { color: #b23535; }
+.quick-total:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .dashboard-toolbar form { margin: 0; }
 .icon-button { padding: 8px 10px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -1772,7 +2009,7 @@ footer { max-width: 1160px; padding: 24px 32px 32px; margin: auto;
   .sidebar { border-right: 0; padding: 0; }
   .sidebar nav { display: flex; overflow-x: auto; position: static; }
   .sidebar a { padding: 10px; white-space: nowrap; }
-  .dashboard-toolbar { gap: 8px; flex-wrap: wrap; }
+  .dashboard-toolbar { gap: 8px; }
   .overview-grid { grid-template-columns: 1fr; }
   .metrics { gap: 12px; }
   .metric { padding: 18px; }
@@ -1798,9 +2035,21 @@ footer { max-width: 1160px; padding: 24px 32px 32px; margin: auto;
 """
 
 
-def _page(title: str, body: str, *, compact: bool = False, live: bool = False) -> str:
+def _page(
+    title: str,
+    body: str,
+    *,
+    compact: bool = False,
+    live: bool = False,
+    header_content: str | None = None,
+) -> str:
     main_class = ' class="compact"' if compact else ""
     content = f'<div class="auth-card">{body}</div>' if compact else body
+    header_content = (
+        '<span class="header-caption">Your anime library, connected</span>'
+        if header_content is None
+        else header_content
+    )
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -1808,8 +2057,7 @@ def _page(title: str, body: str, *, compact: bool = False, live: bool = False) -
         f"<style>{_DASHBOARD_CSS}</style></head><body>"
         '<header class="site-header"><div class="header-inner">'
         '<div class="brand"><span class="brand-mark" aria-hidden="true">&#8644;</span>'
-        'Shoko&ndash;Sonarr Linker</div><span class="header-caption">Your anime library, connected'
-        "</span></div></header>"
+        f"Shoko&ndash;Sonarr Linker</div>{header_content}</div></header>"
         f"<main{main_class}>{content}</main>"
         "<footer>Sonarr metadata. Shoko connections. One organized library.</footer>"
         + (f"<script>{_DASHBOARD_JS}</script>" if live else "")

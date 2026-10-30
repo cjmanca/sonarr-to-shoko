@@ -161,11 +161,12 @@ def test_durable_safety_hold_overrides_cached_active_status(tmp_path: Path, hold
         status = runtime.status()
         assert not status.automatic_linking
         assert "processing eligible" not in status.next_action
-        assert (
-            "Resume" in status.next_action
-            if hold == "pause"
-            else "safety check" in status.next_action
-        )
+        if hold == "pause":
+            assert "Resume" in status.next_action
+        elif hold == "rebaseline":
+            assert "Review source change on Overview" in status.next_action
+        else:
+            assert "safety check" in status.next_action
         if hold == "pause":
             restarted = cli._NormalServiceRuntime(bootstrap, endpoint, endpoint, cli.StopState())
             assert "Resume" in restarted.status().next_action

@@ -58,6 +58,49 @@ def login(app: DashboardApplication) -> str:
     return dict(response.headers)["Set-Cookie"].split(";", 1)[0]
 
 
+def assert_shared_header(text: str) -> None:
+    text = text.split("<script>", 1)[0]
+    before_main, main = text.split("<main", 1)
+    header = before_main.split('<header class="site-header">', 1)[1].split("</header>", 1)[0]
+    assert text.count("<header") == 1
+    assert text.count('data-live="metrics"') == 1
+    assert 'data-live="metrics"' in header
+    for target in ("/files/verified", "/files/waiting", "/issues"):
+        assert f'href="{target}"' in header
+    assert header.count('class="icon-button"') == 1
+    assert 'class="header-caption"' not in header
+    assert 'data-live="metrics"' not in main
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "/status",
+        "/issues",
+        "/issues?view=exclusions",
+        "/files/verified",
+        "/files/waiting",
+        "/history",
+        "/settings",
+    ],
+)
+def test_authenticated_controls_share_original_site_header(tmp_path: Path, route: str) -> None:
+    app = dashboard.make_app(tmp_path)
+    text = app.handle("GET", route, request_headers(login(app))).body.decode()
+    assert_shared_header(text)
+
+
+def test_enrollment_and_login_keep_caption_without_service_controls(tmp_path: Path) -> None:
+    app = dashboard.make_app(tmp_path)
+    enrollment = app.handle("GET", "/", {}).body.decode()
+    login(app)
+    sign_in = app.handle("GET", "/", {}).body.decode()
+    for text in (enrollment, sign_in):
+        assert '<span class="header-caption">Your anime library, connected</span>' in text
+        assert 'data-live="metrics"' not in text
+        assert 'class="icon-button"' not in text
+
+
 def runtime_app(tmp_path: Path) -> tuple[DashboardApplication, list[str], ApiEndpoint]:
     app = dashboard.make_app(tmp_path, onboarding=True)
     with open_state(app.state_path, budget_limits=LIMITS) as store:
@@ -235,6 +278,7 @@ def test_persisted_system_pause_offers_resume_but_refusal_preserves_safety_hold(
         "POST", "/resume", headers, urlencode({"csrf_token": dashboard.csrf_from(text)}).encode()
     )
     assert response.status == 200
+    assert_shared_header(response.body.decode())
     assert "Complete setup before automatic linking can resume" in response.body.decode()
     assert 'action="/resume"' in response.body.decode()
     with open_state(app.state_path) as store:
