@@ -1097,7 +1097,7 @@ def test_campaign_source_episode_drift_after_preflight_is_quarantined(
         store.close()
 
 
-def test_campaign_revalidates_series_type_despite_other_anime_in_authorized_root(
+def test_campaign_revalidates_supported_series_type_despite_other_anime_in_authorized_root(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
     candidate = specs(1)[0]
@@ -1117,7 +1117,7 @@ def test_campaign_revalidates_series_type_despite_other_anime_in_authorized_root
 
     def drift_series_during_preflight(path: str) -> None:
         if path.startswith("/api/v3/Series/AniDB/"):
-            env.stubs.series_metadata[candidate.series_id] = {"seriesType": "standard"}
+            env.stubs.series_metadata[candidate.series_id] = {"seriesType": "unknown"}
 
     env.stubs.get_hook = drift_series_during_preflight
 

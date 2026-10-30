@@ -1517,7 +1517,8 @@ def _correspond(
     if len(missing) == len(unique_paths):
         return None, (
             ExclusionReason.NOT_IN_INVENTORY,
-            f"no Sonarr file exists at the exact path {unique_paths[0]!r} "
+            f"no exact matching file was found in the collected Sonarr inventory at "
+            f"{unique_paths[0]!r} "
             "(basename equality alone never matches)",
         )
     if missing:

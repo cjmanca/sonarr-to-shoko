@@ -390,7 +390,7 @@ def test_failed_fragment_cannot_complete_a_later_rotation_from_old_sweep_members
 
 @pytest.mark.parametrize("anime_only", [None, False, True])
 @pytest.mark.parametrize("series_type", ["standard", "daily", "unknown", "", None])
-def test_all_inventory_paths_preserve_only_anime_series_in_shared_root(
+def test_all_inventory_paths_admit_known_types_only_in_selected_root(
     base_document: dict[str, Any],
     write_document: Writer,
     anime_only: bool | None,
@@ -415,6 +415,7 @@ def test_all_inventory_paths_preserve_only_anime_series_in_shared_root(
     stub.files[shared_live_id] = [
         file_entry(7000, shared_live_id, f"{ANIME_ROOT}/Live/S01E01.mkv", 900)
     ]
+    stub.series.append(series_entry(701, "Unselected daily", "/data/media/anime-old/Show", "daily"))
 
     endpoint = sonarr_endpoint(stub.handler)
     try:
@@ -422,10 +423,20 @@ def test_all_inventory_paths_preserve_only_anime_series_in_shared_root(
     finally:
         endpoint.client.close()
 
-    assert {item.series.id for item in inventory.eligible_series} == {SERIES_ANIME}
-    if series_type:
+    if series_type in {"standard", "daily"}:
+        assert {item.series.id for item in inventory.eligible_series} == {
+            SERIES_ANIME,
+            shared_live_id,
+        }
+        assert stub.secondary_series_ids() == {SERIES_ANIME, shared_live_id}
+        assert any(file.episode_file_id == 7000 for file in inventory.files)
+    else:
+        assert {item.series.id for item in inventory.eligible_series} == {SERIES_ANIME}
+        assert stub.secondary_series_ids() == {SERIES_ANIME}
+    if series_type == "unknown":
         assert shared_live_id in {item.id for item in inventory.excluded_series}
-    assert stub.secondary_series_ids() == {SERIES_ANIME}
+    assert 701 in {item.id for item in inventory.excluded_series}
+    assert SERIES_LIVE in {item.id for item in inventory.excluded_series}
 
 
 def test_series_parser_records_verified_series_type() -> None:

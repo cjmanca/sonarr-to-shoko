@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -191,7 +192,7 @@ def response_endpoint(
     return ApiEndpoint(client, lambda: sonarr_headers(SONARR_KEY)), requests
 
 
-def test_single_anime_root_is_presented_for_one_time_confirmation() -> None:
+def test_known_types_offer_all_roots_for_explicit_selection() -> None:
     endpoint, requests = endpoint_for(
         series=[
             series_entry(1, ANIME_ROOT),
@@ -204,9 +205,11 @@ def test_single_anime_root_is_presented_for_one_time_confirmation() -> None:
     finally:
         endpoint.client.close()
 
-    assert discovery.status is ScopeStatus.CONFIRM_SCOPE
-    assert [(root.path, root.series_ids) for root in discovery.candidates] == [(ANIME_ROOT, (1,))]
-    assert discovery.message == f"Confirm this Sonarr anime folder: {ANIME_ROOT}"
+    assert discovery.status is ScopeStatus.SELECT_SCOPE
+    assert [(root.path, root.series_ids) for root in discovery.candidates] == [
+        (ANIME_ROOT, (1,)),
+        (LIVE_ROOT, (2,)),
+    ]
     assert [(request.method, request.url.path) for request in requests] == [
         ("GET", "/api/v3/series"),
         ("GET", "/api/v3/rootfolder"),
@@ -240,8 +243,22 @@ def test_unidentified_series_type_does_not_guess_anime_scope() -> None:
 
     assert discovery.status is ScopeStatus.BLOCKED
     assert discovery.candidates == ()
-    assert "supported anime series types" in discovery.message
+    assert "supported series types" in discovery.message
     assert discovery.read_status is ScopeReadStatus.INCOMPLETE
+
+
+@pytest.mark.parametrize("series_type", ["standard", "daily"])
+def test_root_with_only_non_anime_numbering_requires_confirmation(series_type: str) -> None:
+    endpoint, _ = endpoint_for(
+        series=[series_entry(1, ANIME_ROOT, series_type=series_type)],
+        roots=[root_entry(ANIME_ROOT)],
+    )
+    try:
+        discovery = discover_sonarr_scope(endpoint)
+    finally:
+        endpoint.client.close()
+    assert discovery.status is ScopeStatus.CONFIRM_SCOPE
+    assert [(root.path, root.series_ids) for root in discovery.candidates] == [(ANIME_ROOT, (1,))]
 
 
 def test_inaccessible_anime_root_blocks_scope_discovery() -> None:
@@ -494,11 +511,19 @@ def test_setup_readiness_blocks_unsupported_apis_and_ambiguous_scope() -> None:
     assert scope_result.message == "Which Sonarr folder contains your anime?"
 
 
-def test_infers_a_unique_mapping_from_exact_relative_path_and_size() -> None:
+@pytest.mark.parametrize("series_type", ["anime", "standard", "daily"])
+def test_infers_a_unique_mapping_from_exact_relative_path_and_size(series_type: str) -> None:
     sonarr_root = "/data/media/anime"
     sonarr_path = f"{sonarr_root}/Show A/S01/E01.mkv"
     shoko_path = f"{SHOKO_ROOT}/Show A/S01/E01.mkv"
     inventory = inventory_for(((1, sonarr_root, 11, sonarr_path, FILE_SIZE),))
+    inventory = replace(
+        inventory,
+        eligible_series=tuple(
+            replace(item, series=replace(item.series, series_type=series_type))
+            for item in inventory.eligible_series
+        ),
+    )
     discovery = shoko_snapshot((shoko_file(101, shoko_path),))
 
     result = infer_path_mappings(inventory, discovery)

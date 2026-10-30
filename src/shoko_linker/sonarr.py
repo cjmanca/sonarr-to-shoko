@@ -1,9 +1,9 @@
 """Read-only Sonarr v3 inventory, eligibility filtering, and baseline identity.
 
 Only series whose ``rootFolderPath`` lies component-aware inside a configured
-``sonarr.allowed_roots`` entry are eligible. The normal service additionally requires
-the verified Sonarr ``seriesType == "anime"`` field; legacy advanced YAML can retain
-the previous explicit-root-only behavior. Only eligible series trigger
+``sonarr.allowed_roots`` entry are eligible. Normal and advanced modes require
+one of Sonarr's known ``anime``, ``standard``, or ``daily`` series types. Series type
+controls Sonarr numbering, not whether a series has an AniDB mapping. Only eligible series trigger
 ``api/v3/episode`` and ``api/v3/episodefile`` reads — an excluded series produces
 zero secondary requests.
 
@@ -52,6 +52,7 @@ ROOTFOLDER_PATH: Final[str] = "api/v3/rootfolder"
 MIN_SUCCESS_STATUS: Final[int] = 200
 MAX_SUCCESS_STATUS: Final[int] = 300
 SERIES_CHILD_RESPONSE_COUNT: Final[int] = 2
+SUPPORTED_SERIES_TYPES: Final[frozenset[str]] = frozenset({"anime", "standard", "daily"})
 
 ROOTFOLDER_UNAVAILABLE_DETAIL: Final[str] = "root folder listing unavailable"
 ROOTFOLDER_NOT_LISTED_SUFFIX: Final[str] = "is not listed by Sonarr /rootfolder"
@@ -90,7 +91,7 @@ class RebaselineReason(Enum):
 
 @dataclass(frozen=True)
 class SonarrSeries:
-    """One Sonarr series resource; an absent ``series_type`` is never anime evidence."""
+    """One Sonarr series resource; an absent ``series_type`` is unsupported."""
 
     id: int
     title: str
@@ -309,20 +310,20 @@ def select_eligible_series(
     series: Sequence[SonarrSeries],
     allowed_roots: Sequence[str],
     *,
-    anime_only: bool = True,  # noqa: ARG001 - compatibility; scope cannot be widened
+    anime_only: bool = True,  # noqa: ARG001 - compatibility; explicit roots define scope
 ) -> tuple[tuple[EligibleSeries, ...], tuple[SonarrSeries, ...]]:
     """Split series by exact component-aware root containment.
 
-    Only the positively identified Sonarr type ``anime`` is admitted, even when a
-    live-action series shares the same allowed root. ``anime_only`` is retained for
-    caller compatibility and cannot disable this invariant. A series whose root is unusable
+    All known Sonarr numbering types are admitted inside explicitly selected roots.
+    ``anime_only`` is retained for caller compatibility; verified TVDB-to-AniDB mappings
+    still determine linkable episode targets. A series whose root is unusable
     as a POSIX path (or absent from the allowlist) is excluded. Output order is by series
     ID, independent of API enumeration order.
     """
     eligible: list[EligibleSeries] = []
     excluded: list[SonarrSeries] = []
     for item in series:
-        if item.series_type != "anime":
+        if item.series_type not in SUPPORTED_SERIES_TYPES:
             excluded.append(item)
             continue
         root = _matching_root(item.root_folder_path, allowed_roots)
@@ -984,10 +985,10 @@ def _check_current_series_identity(  # noqa: PLR0911
             f"Sonarr reports duplicate series id {series_id}",
         )
     current_series = matching_series[0]
-    if current_series.series_type != "anime":
+    if current_series.series_type not in SUPPORTED_SERIES_TYPES:
         return SourceRelationshipVerdict(
             SourceRelationshipStatus.CHANGED,
-            f"Sonarr series {series_id} is no longer positively identified as anime",
+            f"Sonarr series {series_id} no longer has a supported series type",
         )
     if current_series.tvdb_id != tvdb_series_id:
         return SourceRelationshipVerdict(

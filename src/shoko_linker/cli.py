@@ -56,6 +56,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Final, Literal, cast
 
+from .action_history import action_history_page, action_history_view
 from .attestation import (
     SCOPE_DAEMON,
     AttestationError,
@@ -112,8 +113,14 @@ from .daemon import (
     run_cycle,
     run_daemon,
 )
-from .dashboard import DashboardApplication, DashboardStatus, create_dashboard_server
+from .dashboard import (
+    DashboardApplication,
+    DashboardStatus,
+    DashboardTable,
+    create_dashboard_server,
+)
 from .errors import ConfigError, HttpPolicyError, LinkerError, PolicyError
+from .file_display import file_display, tracked_file_display
 from .http import ApiEndpoint, make_shoko_client, make_sonarr_client
 from .logging_setup import configure_logging, register_secret
 from .mapping_store import (
@@ -161,7 +168,6 @@ from .reporting import (
     cycle_report_payload,
     cycle_summary_line,
     daemon_report_payload,
-    discovery_exclusion_payload,
     health_payload,
     json_payload,
     mapping_status_payload,
@@ -169,6 +175,7 @@ from .reporting import (
     refresh_payload,
     report_payload,
 )
+from .scan_status import last_scan_evidence, scan_context_identity, scan_exclusion_page
 from .service import (
     SERVICE_POLL_SECONDS,
     bootstrap_endpoints,
@@ -1087,7 +1094,8 @@ class _NormalServiceRuntime:
                     else cast(str, latest["next_action"])
                 ),
             )
-            counts = store.service_file_counts()
+            tracked_files = store.service_file_status()
+            counts = tracked_files.counts
             preferences = load_service_settings(store, self.settings)
             metadata = (
                 metadata_status_view(
@@ -1100,11 +1108,11 @@ class _NormalServiceRuntime:
                     message="Restart the container to check the saved Shoko server."
                 )
             )
-            exclusions = discovery_exclusion_payload(store)
-            exclusion_counts = tuple(sorted(exclusions["counts"].items()))
+            scan = last_scan_evidence(store, preferences["sonarr_url"], preferences["shoko_url"])
+            exclusion_counts = () if scan is None else scan.exclusion_counts
             exclusion_diagnostics = tuple(
-                f"Excluded Shoko file {item['shoko_file_id']}: {item['reason']}: {item['detail']}"
-                for item in exclusions["examples"][:5]
+                f"Excluded Shoko file {item.shoko_file_id}: {item.reason}: {item.detail}"
+                for item in (() if scan is None else scan.examples[:5])
             )
             return DashboardStatus(
                 message,
@@ -1118,21 +1126,24 @@ class _NormalServiceRuntime:
                     *exclusion_diagnostics,
                 ),
                 mapping_cache_status=cast(str, latest["mapping_cache"]),
-                excluded_files=exclusions["total"],
-                scope_excluded_files=exclusions["scope_excluded"],
+                excluded_files=None if scan is None else scan.summary.excluded_files,
+                scope_excluded_files=None if scan is None else scan.summary.outside_scope_files,
                 exclusion_counts=exclusion_counts,
                 skipped_file_details=tuple(
-                    f"{item['detail']} (Shoko file ID {item['shoko_file_id']})"
+                    f"{item.detail} (Shoko file ID {item.shoko_file_id})"
                     + (
                         " Check that the recorded path exists and is readable inside Shoko; "
                         "a read-only mount is sufficient."
-                        if item["reason"] == "inaccessible_location"
+                        if item.reason == "inaccessible_location"
                         else ""
                     )
-                    for item in exclusions["examples"]
+                    for item in (() if scan is None else scan.examples)
                 ),
                 worker_activity=cast(str, latest["worker_activity"]),
                 metadata=metadata,
+                tracked_files=tracked_files,
+                last_scan=None if scan is None else scan.summary,
+                action_history=action_history_view(store),
             )
         finally:
             store.close()
@@ -1140,6 +1151,47 @@ class _NormalServiceRuntime:
     def _checking_activity(self, message: str) -> None:
         # Activity describes read-only work; it never grants write authorization.
         self._update_latest(authorized=False, worker_activity=message, next_action=message)
+
+    def table(self, kind: str, page: int, page_size: int) -> DashboardTable:
+        """Read local pagination and confirmed display scope; never refresh remote state."""
+        store = StateStore(self.settings.database_path)
+        try:
+            preferences = load_service_settings(store, self.settings)
+            urls = (preferences["sonarr_url"], preferences["shoko_url"])
+            identity = scan_context_identity(store, *urls)
+            record = OnboardingManager(store).record() if identity is not None else None
+            roots = () if record is None else record.binding.roots
+            mappings = () if record is None else record.binding.path_mappings
+            if kind == "history":
+                history = action_history_page(store, page=page, page_size=page_size)
+                displays = tuple(
+                    file_display(
+                        row.current_path,
+                        (),
+                        roots,
+                        mappings,
+                        paths_complete=row.current_path_complete,
+                    )
+                    for row in history.rows
+                )
+                result = DashboardTable(history=history, displays=displays, counts=history.counts)
+            elif kind == "exclusions":
+                exclusions = scan_exclusion_page(store, *urls, page=page, page_size=page_size)
+                counts = store.service_file_page("review", page=1, page_size=1).counts
+                result = DashboardTable(exclusions=exclusions, counts=counts)
+            else:
+                files = store.service_file_page(kind, page=page, page_size=page_size)
+                displays = tuple(tracked_file_display(row, roots, mappings) for row in files.rows)
+                result = DashboardTable(files=files, displays=displays, counts=files.counts)
+            current_preferences = load_service_settings(store, self.settings)
+            if (
+                current_preferences["sonarr_url"],
+                current_preferences["shoko_url"],
+            ) != urls or scan_context_identity(store, *urls) != identity:
+                result = replace(result, displays=(), exclusions=None)
+            return result
+        finally:
+            store.close()
 
     def worker_tick(self) -> None:
         started = time.monotonic()
@@ -1480,6 +1532,7 @@ def _run_service(_args: argparse.Namespace) -> int:
         application = DashboardApplication(
             settings.database_path,
             status_provider=runtime.status,
+            table_provider=runtime.table,
             onboarding_context=dashboard_onboarding_context,
             setup_provider=dashboard_setup.view,
             setup_action=dashboard_setup.action,

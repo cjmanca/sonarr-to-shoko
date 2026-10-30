@@ -61,6 +61,7 @@ def test_v7_migration_preserves_history_and_fresh_database(tmp_path: Path) -> No
         send = prepare(store)
         assert send.accepted
         before = store.connection.execute("SELECT * FROM sends").fetchall()
+        store.connection.execute("DROP TABLE latest_scan_exclusions")
         store.connection.execute("DROP TABLE metadata_operation_history")
         store.connection.execute("DROP TABLE metadata_operations")
         store.connection.execute("PRAGMA user_version=7")
@@ -446,6 +447,7 @@ def test_v8_migration_failure_keeps_prior_history_intact(
     path = tmp_path / "state.db"
     with open_state(path, budget_limits=LIMITS) as store:
         store.set_meta("historical", "preserve")
+        store.connection.execute("DROP TABLE latest_scan_exclusions")
         store.connection.execute("DROP TABLE metadata_operation_history")
         store.connection.execute("DROP TABLE metadata_operations")
         store.connection.execute("PRAGMA user_version=7")
@@ -705,14 +707,15 @@ def test_v8_ready_upgrade_preserves_unknown_coverage_and_refuses_rearm(tmp_path:
     with open_state(path, budget_limits=LIMITS) as store:
         operation = prepare_anime(store)
         ready = store.record_metadata_operation(operation, M.READY, iso=T1)
+        store.connection.execute("DROP TABLE latest_scan_exclusions")
         store.connection.execute("DROP TABLE metadata_operation_history")
         for column in ("required_targets_json", "missing_targets_json", "verified_targets_json"):
             store.connection.execute(f"ALTER TABLE metadata_operations DROP COLUMN {column}")
-        store.connection.execute("DELETE FROM schema_version WHERE version=9")
+        store.connection.execute("DELETE FROM schema_version WHERE version>=9")
         store.connection.execute("PRAGMA user_version=8")
         original = store.connection.execute("SELECT * FROM metadata_operations").fetchone()
     with open_state(path, budget_limits=LIMITS) as store:
-        assert store.schema_version() == 9
+        assert store.schema_version() == SCHEMA_VERSION
         assert (
             store.connection.execute("SELECT * FROM metadata_operations").fetchone()[:14]
             == original

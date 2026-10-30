@@ -26,7 +26,11 @@ from shoko_linker.mappings import (
 from shoko_linker.mappings import resolve as resolve_mapping
 from shoko_linker.policies import RunPolicy
 from shoko_linker.shoko import collect_shoko_discovery
-from shoko_linker.sonarr import collect_sonarr_inventory
+from shoko_linker.sonarr import (
+    SourceRelationshipStatus,
+    check_current_file_relationship,
+    collect_sonarr_inventory,
+)
 from shoko_linker.state import FileState
 
 
@@ -141,6 +145,131 @@ def test_missing_anime_is_retryable_frozen_demand_then_fresh_ready_plan(harness:
     record = harness.deps.store.get_file(500)
     assert record is not None
     assert record.state is FileState.PLANNED
+
+
+@pytest.mark.parametrize("series_type", ["standard", "daily"])
+def test_known_numbering_types_match_exact_complex_path_and_verify_full_chain(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, series_type: str
+) -> None:
+    relative = (
+        "Magic Repo Man - Dumped by My Party, I'll Cash In with a Cute Support Fairy "
+        "to Become the Strongest! (2026) [imdb-tt43650419]/Season 01/"
+        "Magic Repo Man - Dumped by My Party, I'll Cash In with a Cute Support Fairy "
+        "to Become the Strongest! (2026) - S01E03 - Investment "
+        "[WEBDL-1080p][opus 2.0][hevc][1.19 gb]-SUGOI-Advo.mkv"
+    )
+    original_series = td.SonarrStub._series
+    original_location = harness.shoko._location
+
+    def series(stub: td.SonarrStub) -> list[dict[str, Any]]:
+        rows = original_series(stub)
+        rows[0]["seriesType"] = series_type
+        rows[0]["rootFolderPath"] = td.SONARR_ROOT
+        return rows
+
+    def location(file: td.SpecFile) -> dict[str, Any]:
+        row = original_location(file)
+        row["RelativePath"] = relative
+        return row
+
+    monkeypatch.setattr(td.SonarrStub, "_series", series)
+    monkeypatch.setattr(td, "_sonarr_path", lambda _file: f"{td.SONARR_ROOT}/{relative}")
+    monkeypatch.setattr(td, "_shoko_path", lambda _file: f"{td.SHOKO_ROOT}/{relative}")
+    monkeypatch.setattr(harness.shoko, "_location", location)
+    harness.shoko.missing_anime.clear()
+    result = harness.reconcile()
+    assert result.skip_reasons == {}
+    plan = result.plans[500]
+    assert plan.status is PlanStatus.LINKABLE
+    assert plan.episode_ids == (td.SHOKO_EP,)
+    assert plan.sonarr_path == f"{td.SONARR_ROOT}/{relative}"
+    inventory = collect_sonarr_inventory(harness.deps.sonarr, harness.deps.settings)
+    file = inventory.files[0]
+    verdict = check_current_file_relationship(
+        harness.deps.sonarr,
+        series_id=file.series_id,
+        episode_file_id=file.episode_file_id,
+        path=file.path,
+        size=file.size,
+        episode_identities=tuple(
+            (ep.id, ep.tvdb_id, ep.season_number, ep.episode_number, ep.absolute_episode_number)
+            for ep in file.episodes
+        ),
+        tvdb_series_id=td.TVDB_SERIES,
+        allowed_roots=harness.deps.settings.sonarr.allowed_roots,
+    )
+    assert verdict.status is SourceRelationshipStatus.CURRENT
+
+
+def test_previously_excluded_unknown_type_recovers_when_standard_inventory_is_available(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = td.SonarrStub._series
+    current_type = "anime"
+
+    def series(stub: td.SonarrStub) -> list[dict[str, Any]]:
+        rows = original(stub)
+        rows[0]["seriesType"] = current_type
+        return rows
+
+    monkeypatch.setattr(td.SonarrStub, "_series", series)
+    harness.shoko.missing_anime.clear()
+    assert harness.reconcile().plans[500].status is PlanStatus.LINKABLE
+    current_type = "unknown"
+    first = harness.reconcile()
+    assert first.skip_reasons[500].startswith("exclusion:not_in_inventory:")
+    record = harness.deps.store.get_file(500)
+    assert record is not None
+    assert record.state_detail.startswith("source_exclusion:not_in_inventory:")
+    current_type = "standard"
+    recovered = harness.reconcile()
+    assert recovered.skip_reasons == {}
+    assert recovered.plans[500].status is PlanStatus.LINKABLE
+
+
+@pytest.mark.parametrize("series_type", ["standard", "daily"])
+@pytest.mark.parametrize("tvdb_id", [None, 0, -1, True, "123", 999_999])
+def test_known_type_cannot_bypass_invalid_or_unmapped_tvdb_identity(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, series_type: str, tvdb_id: Any
+) -> None:
+    original = td.SonarrStub._series
+
+    def series(stub: td.SonarrStub) -> list[dict[str, Any]]:
+        rows = original(stub)
+        rows[0]["seriesType"] = series_type
+        rows[0]["tvdbId"] = tvdb_id
+        return rows
+
+    monkeypatch.setattr(td.SonarrStub, "_series", series)
+    harness.shoko.missing_anime.clear()
+    result = harness.reconcile()
+    assert result.plans == {}
+    assert result.metadata_demands == {}
+
+
+@pytest.mark.parametrize("series_type", ["standard", "daily"])
+def test_known_type_cannot_bypass_malformed_episode_identity(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, series_type: str
+) -> None:
+    original_series = td.SonarrStub._series
+    original_episodes = td.SonarrStub._episodes
+
+    def series(stub: td.SonarrStub) -> list[dict[str, Any]]:
+        rows = original_series(stub)
+        rows[0]["seriesType"] = series_type
+        return rows
+
+    def episodes(stub: td.SonarrStub, series_id: int) -> list[dict[str, Any]]:
+        rows = original_episodes(stub, series_id)
+        rows[0]["episodeNumber"] = "2026-10-29"
+        return rows
+
+    monkeypatch.setattr(td.SonarrStub, "_series", series)
+    monkeypatch.setattr(td.SonarrStub, "_episodes", episodes)
+    harness.shoko.missing_anime.clear()
+    result = harness.reconcile()
+    assert result.plans == {}
+    assert result.metadata_demands == {}
 
 
 def test_internal_episode_wait_retains_positive_pending_id_and_stable_demand(

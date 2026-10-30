@@ -1482,26 +1482,38 @@ def test_source_episode_change_during_shoko_preflight_is_fail_closed(
 
 
 @pytest.mark.parametrize(
-    "series_change",
+    ("series_change", "current_type", "expected_submissions"),
     [
-        "standard",
-        "daily",
-        "unknown",
-        "tvdb_id",
-        "root",
-        "path",
-        "series_id",
-        "unavailable",
-        "malformed",
+        pytest.param("type", "standard", 1, id="standard-supported-transition"),
+        pytest.param("type", "daily", 1, id="daily-supported-transition"),
+        pytest.param("type", None, 0, id="unknown-type"),
+        pytest.param("type", "unsupported", 0, id="unsupported-type"),
+        pytest.param("malformed_type", ["anime"], 0, id="malformed-type"),
+        pytest.param("missing_type", "anime", 0, id="missing-type"),
+        pytest.param("tvdb_id", "anime", 0, id="tvdb_id"),
+        pytest.param("root", "anime", 0, id="root"),
+        pytest.param("path", "anime", 0, id="path"),
+        pytest.param("series_id", "anime", 0, id="series_id"),
+        pytest.param("unavailable", "anime", 0, id="unavailable"),
+        pytest.param("malformed", "anime", 0, id="malformed"),
+        pytest.param("root", "standard", 0, id="standard-root-drift"),
+        pytest.param("root", "daily", 0, id="daily-root-drift"),
+        pytest.param("tvdb_id", "standard", 0, id="standard-tvdb-drift"),
+        pytest.param("tvdb_id", "daily", 0, id="daily-tvdb-drift"),
     ],
 )
-def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, series_change: str
+def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(  # noqa: PLR0915
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    series_change: str,
+    current_type: object,
+    expected_submissions: int,
 ) -> None:
-    """A still-authorized root and a second anime cannot mask candidate series drift."""
+    """Supported type changes retain eligibility; root and mapped identity must stay fixed."""
     monkeypatch.setenv("SHOKO_LINKER_ALLOW_APPLY", "1")
     candidate = SpecFile(series_id=1, file_id=10, shoko_id=500)
     current_sonarr_files = [candidate]
+    events: list[tuple[str, str]] = []
 
     class MutableSeriesSonarrStub(SonarrStub):
         series_reads = 0
@@ -1513,13 +1525,8 @@ def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(
             if request.url.path == "/api/v3/series":
                 self.series_reads += 1
                 if self.series_reads == 2:
-                    if series_change in {"standard", "daily", "unknown"}:
-                        self.candidate_metadata["seriesType"] = {
-                            "standard": "standard",
-                            "daily": "daily",
-                            "unknown": None,
-                        }[series_change]
-                    elif series_change == "tvdb_id":
+                    self.candidate_metadata["seriesType"] = current_type
+                    if series_change == "tvdb_id":
                         self.candidate_metadata["tvdbId"] = 999_999
                     elif series_change == "root":
                         self.candidate_metadata["rootFolderPath"] = f"{SONARR_ROOT}-old/series1"
@@ -1540,6 +1547,8 @@ def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(
             rows = super()._series()
             row = next(item for item in rows if item["id"] == 1)
             row.update(self.candidate_metadata)
+            if self.series_reads >= 2 and series_change == "missing_type":
+                row.pop("seriesType")
             if self.malformed_candidate:
                 row["id"] = "1"
             # This positively identified anime shares the authorized root, but is not the
@@ -1566,6 +1575,9 @@ def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(
     store = open_tmp_store(tmp_path)
     seed_baseline(store, [SpecFile(series_id=99, file_id=990, shoko_id=999)])
     shoko = ShokoStub([candidate])
+    sonarr.on_get = lambda request: events.append(("sonarr", request.url.path))
+    shoko.on_get = lambda path: events.append(("shoko", path))
+    shoko.on_post = lambda: events.append(("post", "/api/v3/File/500/Link"))
     deps = build_deps(
         tmp_path,
         store=store,
@@ -1599,12 +1611,49 @@ def test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read(
         deps.mapping_source.client.close()
         store.close()
 
-    assert report.counts.submitted == 0
-    assert shoko.posts == []
-    assert final_shoko_reads == []
     assert record is not None
     assert frozen_targets is not None
-    if series_change in {"unavailable", "malformed"}:
+    assert json.loads(frozen_targets) == {
+        json.dumps((TVDB_SERIES, 1, 1, None, ANIME_ID, 1, "Episode")): [ANIDB_EP, SHOKO_EP]
+    }
+    assert sonarr.series_reads == 2
+    assert report.counts.submitted == expected_submissions
+    if expected_submissions:
+        assert report.counts.verified == 1
+        assert shoko.posts == [{"EpisodeIDs": [SHOKO_EP]}]
+        assert [
+            (request.method, request.url.path)
+            for request in shoko.requests
+            if request.method != "GET"
+        ] == [("POST", "/api/v3/File/500/Link")]
+        assert record.state is FileState.VERIFIED
+        assert not quarantined
+        assert len(final_shoko_reads) == 2  # Protected-link preflight, then verification.
+        post = events.index(("post", "/api/v3/File/500/Link"))
+        source_series = max(
+            index for index, event in enumerate(events) if event == ("sonarr", "/api/v3/series")
+        )
+        last_source = max(
+            index for index, event in enumerate(events[:post]) if event[0] == "sonarr"
+        )
+        assert events[source_series + 1 : last_source + 1] == [
+            ("sonarr", "/api/v3/episode"),
+            ("sonarr", "/api/v3/episodefile"),
+        ]
+        assert events[last_source + 1 : post] == [
+            ("shoko", "/api/v3/Queue"),
+            ("shoko", "/api/v3/Queue/Items"),
+            ("shoko", "/api/v3/Queue"),
+            ("shoko", f"/api/v3/Series/AniDB/{ANIME_ID}/Episode"),
+            ("shoko", f"/api/v3/Episode/AniDB/{ANIDB_EP}/Episode"),
+            ("shoko", "/api/v3/File/500"),
+        ]
+        assert events[post + 1] == ("shoko", "/api/v3/File/500")
+        return
+
+    assert shoko.posts == []
+    assert final_shoko_reads == []
+    if series_change in {"unavailable", "malformed", "malformed_type"}:
         assert record.state is FileState.PLANNED
         assert not quarantined
         assert any("sonarr_source_unavailable" in reason for reason in report.reasons)
@@ -8848,14 +8897,17 @@ def test_owner_quarantine_restart_preserves_verified_links_and_quarantines_unsen
 
 
 @pytest.mark.parametrize("hostile", [False, True])
-def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: PLR0915
+def test_inaccessible_file_is_identifiable_on_authenticated_issue_exclusions(  # noqa: PLR0915
     tmp_path: Path,
     hostile: bool,
 ) -> None:
+    from test_onboarding import make_binding
+
     from shoko_linker import cli
     from shoko_linker.bootstrap import BootstrapSettings
     from shoko_linker.config import SecretRef
     from shoko_linker.logging_setup import register_secret
+    from shoko_linker.onboarding import OnboardingRecord
 
     secret = "synthetic-exclusion-secret-123456"
     register_secret(secret)
@@ -8874,6 +8926,11 @@ def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: P
     activate_mapping(tmp_path, mapping_xml())
     store = open_tmp_store(tmp_path)
     seed_baseline(store, [file])
+    binding = make_binding()
+    store.save_onboarding_json(
+        OnboardingRecord(binding, binding.digest, binding.unverifiable_facts, True, T0).to_json(),
+        T0,
+    )
     shoko = InaccessibleShoko([file])
     deps = build_deps(
         tmp_path,
@@ -8917,8 +8974,10 @@ def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: P
             tmp_path / "state.sqlite3",
         )
         runtime = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
-        app = DashboardApplication(bootstrap.database_path, status_provider=runtime.status)
-        anonymous = app.handle("GET", "/status", {})
+        app = DashboardApplication(
+            bootstrap.database_path, status_provider=runtime.status, table_provider=runtime.table
+        )
+        anonymous = app.handle("GET", "/issues?view=exclusions", {})
         assert absolute not in anonymous.body.decode()
         created = app.handle(
             "POST",
@@ -8934,9 +8993,8 @@ def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: P
         )
         assert created.status == 303
         cookie = dict(created.headers)["Set-Cookie"].split(";", 1)[0]
-        page = app.handle("GET", "/status", {"cookie": cookie}).body.decode()
-        ordinary = page.split('data-live="skipped-files"', 1)[1].split("</section>", 1)[0]
-        assert "Shoko file ID 142" in ordinary
+        page = app.handle("GET", "/issues?view=exclusions", {"cookie": cookie}).body.decode()
+        ordinary = page.split('data-live="table"', 1)[1].split("</section>", 1)[0]
         assert "location ID 999" in ordinary
         assert "Shoko path:" in ordinary
         assert secret not in page
@@ -8949,8 +9007,8 @@ def test_inaccessible_file_is_identifiable_on_authenticated_overview(  # noqa: P
             assert absolute in ordinary
         # Authenticated polling uses the same status provider and persisted evidence.
         assert (
-            app.handle("GET", "/status", {"cookie": cookie}).body
-            == app.handle("GET", "/status", {"cookie": cookie}).body
+            app.handle("GET", "/issues?view=exclusions", {"cookie": cookie}).body
+            == app.handle("GET", "/issues?view=exclusions", {"cookie": cookie}).body
         )
     finally:
         for endpoint in (deps.sonarr, deps.shoko, deps.mapping_source):

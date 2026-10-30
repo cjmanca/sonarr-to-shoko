@@ -235,9 +235,8 @@ def test_login_is_generic_and_status_requires_authentication(tmp_path: Path) -> 
             assert "2" in page.text
             assert "No action is needed." in page.text
             assert "Episode mappings are available." in page.text
-            assert "Latest cycle exclusions" in page.text
-            assert "Excluded outside scope" in page.text
-            assert "size_mismatch: 2" in page.text
+            assert "Scan totals are unavailable until a completed scan" in page.text
+            assert "size_mismatch: 2" not in page.text
             assert "internal trace sentinel" in page.text
             assert API_SECRET_SENTINEL not in page.text
         with httpx.Client(follow_redirects=False) as visitor:
@@ -406,8 +405,17 @@ def test_authenticated_status_and_poll_preserve_runtime_next_action(
                     for headers in ({}, {"Cache-Control": "no-cache"}):
                         page = client.get(f"{base_url}{path}", headers=headers)
                         assert page.status_code == 200
-                        assert f'<p class="next-action">{expected}</p>' in page.text
-                        badge = "Running" if condition == "running" else "Paused"
+                        if path == "/status":
+                            assert f'<p class="next-action">{expected}</p>' in page.text
+                        badge = (
+                            "Running"
+                            if condition == "running"
+                            else (
+                                "Paused by you"
+                                if condition == "user_paused"
+                                else "Paused for service checks"
+                            )
+                        )
                         assert f"{badge}</span>" in page.text
         finally:
             stop_server(server, thread)
@@ -431,7 +439,7 @@ def test_resume_refusal_overrides_cached_runtime_guidance(tmp_path: Path) -> Non
                 '<p class="next-action">Complete setup before automatic linking can resume.</p>'
                 in response.text
             )
-            assert "Paused</span>" in response.text
+            assert "Waiting for safety checks</span>" in response.text
     finally:
         stop_server(server, thread)
 
@@ -543,7 +551,7 @@ def test_setup_scope_and_safety_controls_are_authenticated_and_csrf_protected(
             assert "Setup checks start automatically" in page.text
             assert 'action="/setup/scope"' not in page.text
             assert 'action="/setup/confirm"' not in page.text
-            assert page.text.index("Set up automatic linking") < page.text.index("Verified files")
+            assert page.text.index("Set up automatic linking") < page.text.index("Service health")
             discovering = False
             page = client.get(f"{base_url}/status")
             assert "Choose the Sonarr folder" in page.text

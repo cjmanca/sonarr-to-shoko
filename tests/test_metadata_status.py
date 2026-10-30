@@ -229,11 +229,16 @@ def test_real_scheduler_persists_filename_and_runtime_reopens_without_http(
     assert example.state == "accepted"
     assert example.next_read_only_check_iso is None
     assert status.linked_files == 0
+    assert status.action_history.total == 1
+    assert status.action_history.examples[0].operation == "metadata_refresh"
+    assert "accepted" in status.action_history.examples[0].message
     assert deps.store.get_service_canary() is None
     # A saved endpoint change must not display the old server's operation.
     preferences["shoko_url"] = "http://other-shoko:8111/"
     deps.store.set_meta(META_SERVICE_SETTINGS, json.dumps(preferences))
     assert runtime.status().metadata.examples == ()
+    assert runtime.status().action_history.total == 1
+    assert "across all" in runtime.status().action_history.scope_message
     assert len(service.shoko.requests) == before
 
 

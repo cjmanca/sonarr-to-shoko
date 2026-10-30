@@ -12,7 +12,7 @@ import re
 import secrets
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
@@ -21,8 +21,10 @@ from pathlib import Path
 from socket import SHUT_RDWR
 from threading import Timer
 from typing import Final
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
+from .action_history import ActionHistoryPage, ActionHistoryView
+from .file_display import FileDisplay
 from .logging_setup import diagnostic_text
 from .metadata_status import MAX_EXAMPLES, MetadataStatusView
 from .onboarding import (
@@ -32,13 +34,18 @@ from .onboarding import (
     OnboardingManager,
     OnboardingStatus,
 )
+from .scan_status import ScanExclusionPage, ScanSummary
 from .state import (
     DASHBOARD_SIGNING_KEY_BYTES,
     MAX_DASHBOARD_USERNAME_CHARS,
     BudgetLimits,
     DashboardAccount,
+    ServiceFileCounts,
+    ServiceFilePage,
+    ServiceFileStatus,
     StateError,
     StateStore,
+    TablePage,
     open_state,
 )
 
@@ -53,6 +60,7 @@ MAX_DASHBOARD_PASSWORD_CHARS: Final[int] = 256
 MAX_DASHBOARD_FORM_FIELDS: Final[int] = 64
 MAX_DASHBOARD_COOKIE_CHARS: Final[int] = 2048
 MAX_DASHBOARD_BASE64_CHARS: Final[int] = 256
+MAX_TABLE_QUERY_CHARS: Final[int] = 2048
 SCRYPT_FIELD_COUNT: Final[int] = 6
 _COOKIE_NAME: Final[str] = "shoko_linker_session"
 _SCRYPT_N: Final[int] = 1 << 14
@@ -77,12 +85,26 @@ class DashboardStatus:
     next_action: str
     diagnostics: tuple[str, ...] = ()
     mapping_cache_status: str = "Waiting for setup."
-    excluded_files: int = 0
-    scope_excluded_files: int = 0
+    excluded_files: int | None = None
+    scope_excluded_files: int | None = None
     exclusion_counts: tuple[tuple[str, int], ...] = ()
     worker_activity: str = ""
     skipped_file_details: tuple[str, ...] = ()
     metadata: MetadataStatusView = field(default_factory=MetadataStatusView)
+    tracked_files: ServiceFileStatus = field(default_factory=ServiceFileStatus)
+    last_scan: ScanSummary | None = None
+    action_history: ActionHistoryView = field(default_factory=ActionHistoryView)
+
+
+@dataclass(frozen=True)
+class DashboardTable:
+    """Read-only paginated data; absent providers never fabricate empty results."""
+
+    files: ServiceFilePage | None = None
+    history: ActionHistoryPage | None = None
+    exclusions: ScanExclusionPage | None = None
+    displays: tuple[FileDisplay, ...] = ()
+    counts: ServiceFileCounts | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +285,7 @@ class DashboardApplication:
         budget_limits: BudgetLimits | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         status_provider: Callable[[], DashboardStatus] | None = None,
+        table_provider: Callable[[str, int, int], DashboardTable] | None = None,
         onboarding_context: Callable[[], OnboardingContext | None] | None = None,
         setup_provider: Callable[[], DashboardSetupView | None] | None = None,
         setup_action: Callable[[str, Mapping[str, str]], str] | None = None,
@@ -274,6 +297,7 @@ class DashboardApplication:
         self.budget_limits = budget_limits
         self.clock = clock
         self.status_provider = status_provider or self._default_status
+        self.table_provider = table_provider
         self.onboarding_context = onboarding_context
         self.setup_provider = setup_provider
         self.setup_action = setup_action
@@ -301,7 +325,8 @@ class DashboardApplication:
     ) -> DashboardResponse:
         normalized_headers = {key.lower(): value for key, value in headers.items()}
         try:
-            path = urlsplit(target).path or "/"
+            parsed_target = urlsplit(target)
+            path = parsed_target.path or "/"
         except ValueError:
             return self._error(HTTPStatus.BAD_REQUEST, "Invalid request target.")
         refusal = self._request_refusal(method, normalized_headers, body)
@@ -310,7 +335,7 @@ class DashboardApplication:
         try:
             with open_state(self.state_path, budget_limits=self.budget_limits) as store:
                 if method == "GET":
-                    response = self._get(store, path, normalized_headers)
+                    response = self._get(store, path, normalized_headers, parsed_target.query)
                 else:
                     response = self._post(store, path, normalized_headers, body)
         except _DashboardInputError as exc:
@@ -342,9 +367,19 @@ class DashboardApplication:
             return self._error(HTTPStatus.FORBIDDEN, "Request could not be verified.")
         return None
 
-    def _get(self, store: StateStore, path: str, headers: Mapping[str, str]) -> DashboardResponse:
+    def _get(
+        self, store: StateStore, path: str, headers: Mapping[str, str], query: str = ""
+    ) -> DashboardResponse:
         account = store.get_dashboard_account()
-        if path not in {"/", "/status", "/settings"}:
+        if path not in {
+            "/",
+            "/status",
+            "/settings",
+            "/issues",
+            "/files/verified",
+            "/files/waiting",
+            "/history",
+        }:
             return self._error(HTTPStatus.NOT_FOUND, "Page not found.")
         if account is None:
             return (
@@ -359,16 +394,45 @@ class DashboardApplication:
                 if path == "/"
                 else self._redirect("/")
             )
-        paused, _reason = store.get_service_pause()
+        try:
+            page_number, page_size, view = _table_query(path, query)
+        except ValueError:
+            return self._error(HTTPStatus.BAD_REQUEST, "Invalid table query.")
+        paused, pause_reason = store.get_service_pause()
         status = self.status_provider()
-        setup = None if self.setup_provider is None else self.setup_provider()
+        setup = self.setup_provider() if path in {"/", "/status"} and self.setup_provider else None
+        table = None
+        kind = {
+            "/files/verified": "verified",
+            "/files/waiting": "waiting",
+            "/issues": view,
+            "/history": "history",
+        }.get(path)
+        if kind is not None and self.table_provider is not None:
+            table = self.table_provider(kind, page_number, page_size)
+            if table.counts is not None:
+                status = replace(
+                    status,
+                    linked_files=table.counts.verified_files,
+                    waiting_files=table.counts.waiting_files,
+                    review_files=table.counts.review_files,
+                )
         settings = (
             self.settings_provider()
             if path == "/settings" and self.settings_provider is not None
             else None
         )
         page = self._status_page(
-            status, session.csrf_token, paused=paused, setup=setup, settings=settings
+            status,
+            session.csrf_token,
+            paused=paused,
+            setup=setup,
+            settings=settings,
+            route=path,
+            table=table,
+            view=view,
+            pause_reason=pause_reason,
+            refresh_url=(path if path != "/" else "/status") + ("?" + query if query else ""),
         )
         return self._html(HTTPStatus.OK, page)
 
@@ -477,10 +541,15 @@ class DashboardApplication:
             else:
                 decision = manager.resume_context(context, iso=now.isoformat())
             if decision.status is not OnboardingStatus.AUTHORIZED:
+                paused, pause_reason = store.get_service_pause()
                 return self._html(
                     HTTPStatus.OK,
                     self._status_page(
-                        self.status_provider(), next_csrf, paused=True, next_action=decision.message
+                        replace(self.status_provider(), automatic_linking=False),
+                        next_csrf,
+                        paused=paused,
+                        pause_reason=pause_reason,
+                        next_action=decision.message,
                     ),
                     set_cookie=cookie,
                 )
@@ -488,12 +557,14 @@ class DashboardApplication:
             if self.settings_action is None or self.settings_provider is None:
                 return self._error(HTTPStatus.NOT_FOUND, "Settings are unavailable.")
             message = self.settings_action(form)
+            paused, pause_reason = store.get_service_pause()
             return self._html(
                 HTTPStatus.OK,
                 self._status_page(
                     self.status_provider(),
                     next_csrf,
-                    paused=store.get_service_pause()[0],
+                    paused=paused,
+                    pause_reason=pause_reason,
                     acknowledgement=message,
                     setup=None if self.setup_provider is None else self.setup_provider(),
                     settings=self.settings_provider(),
@@ -508,12 +579,14 @@ class DashboardApplication:
             message = self.setup_action(action, form)
             self.control_changed()
             setup = None if self.setup_provider is None else self.setup_provider()
+            paused, pause_reason = store.get_service_pause()
             return self._html(
                 HTTPStatus.OK,
                 self._status_page(
                     self.status_provider(),
                     next_csrf,
-                    paused=store.get_service_pause()[0],
+                    paused=paused,
+                    pause_reason=pause_reason,
                     acknowledgement=message,
                     setup=setup,
                 ),
@@ -673,57 +746,21 @@ class DashboardApplication:
         acknowledgement: str = "",
         setup: DashboardSetupView | None = None,
         settings: DashboardSettingsView | None = None,
+        route: str = "/status",
+        table: DashboardTable | None = None,
+        view: str = "review",
+        pause_reason: str = "",
+        refresh_url: str = "",
     ) -> str:
-        active = status.automatic_linking and not paused
+        if settings is not None:
+            route = "/settings"
+        canonical_refresh = _canonical_refresh_url(refresh_url or route)
         action = next_action or status.next_action
         diagnostics = "".join(f"<li>{html.escape(item)}</li>" for item in status.diagnostics)
-        exclusion_categories = (
-            ", ".join(
-                f"{html.escape(reason)}: {count}"
-                for reason, count in status.exclusion_counts
-                if count
-            )
-            or "None"
-        )
-        skipped_files = "".join(
-            f"<li>{html.escape(item)}</li>" for item in status.skipped_file_details
-        )
-        controls = (
-            f'<form method="post" action="/pause">'
-            f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
-            '<button class="secondary">Pause</button></form>'
-            f'<form method="post" action="/resume">'
-            f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
-            "<button>Resume</button></form>"
-        )
-        return _page(
-            "Service settings" if settings else "Automatic linking status",
-            '<header class="page-heading" data-live="heading"><div>'
-            '<div class="eyebrow">Library overview</div>'
-            f"<h1>{'Settings' if settings else 'Automatic linking'}</h1>"
-            '<p>Keep your anime library in sync.</p></div>'
-            f'<span class="status-badge {"running" if active else "paused"}">'
-            f'<span aria-hidden="true" class="status-dot"></span>'
-            f"{'Running' if active else 'Paused'}</span></header>"
-            '<nav class="section-nav" aria-label="Dashboard navigation">'
-            f'<a href="/status"{" aria-current=\"page\"" if not settings else ""}>Overview</a>'
-            f'<a href="/settings"{" aria-current=\"page\"" if settings else ""}>Settings</a></nav>'
-            + '<div data-live="acknowledgement" role="status">'
-            + (f"<p>{html.escape(acknowledgement)}</p>" if acknowledgement else "")
-            + "</div>"
-            + (DashboardApplication._settings_section(settings, csrf_token) if settings else "")
-            + '<p id="update-status" role="status" hidden></p>'
+        overview = (
             '<div data-live="setup">'
-            f"{DashboardApplication._setup_section(setup, csrf_token)}"
-            '</div><dl class="metrics" data-live="metrics">'
-            '<div class="metric verified"><dt>Verified files</dt>'
-            f'<dd>{status.linked_files:,}</dd><dd class="metric-note">Confirmed in Shoko</dd></div>'
-            '<div class="metric waiting"><dt>Waiting</dt>'
-            f'<dd>{status.waiting_files:,}</dd><dd class="metric-note">'
-            "Preparing or confirming links"
-            '</dd></div><div class="metric review"><dt>Need review</dt>'
-            f'<dd>{status.review_files:,}</dd><dd class="metric-note">Files needing attention'
-            '</dd></div></dl><div class="overview-grid" data-live="overview">'
+            f"{DashboardApplication._setup_section(setup, csrf_token)}</div>"
+            '<div class="overview-grid" data-live="overview">'
             '<section class="panel"><div class="eyebrow">Service health</div>'
             "<h2>Connections &amp; mappings</h2>"
             f'<p class="connection-message">{html.escape(status.connection_message)}</p>'
@@ -735,29 +772,263 @@ class DashboardApplication:
             )
             + '<dl class="facts"><div><dt>Episode mappings</dt>'
             f"<dd>{html.escape(status.mapping_cache_status)}</dd></div>"
-            f"<div><dt>Latest cycle exclusions</dt><dd>{status.excluded_files}</dd></div>"
-            f"<div><dt>Excluded outside scope</dt><dd>{status.scope_excluded_files}</dd></div>"
-            f"<div><dt>Exclusion categories</dt><dd>{exclusion_categories}</dd></div>"
             "</dl></section>"
             '<section class="panel control-panel"><div class="eyebrow">Your next step</div>'
             f'<h2>Linking controls</h2><p class="next-action">{html.escape(action)}</p>'
-            f'<nav aria-label="Linking controls">{controls}</nav>'
             '<p class="hint">Waiting includes work being prepared or waiting for Shoko '
-            "to confirm a link. Partial or uncertain link results need attention; "
-            "conflicts and safety issues are included.</p></section></div>"
+            "to confirm a link. It can remain nonzero when Shoko's queue is empty. "
+            "Partial or uncertain link results need attention; "
+            "conflicts and safety issues are included. These are locally tracked files "
+            "across scans, not a partition of Shoko's current unrecognized list."
+            "</p></section></div>"
+            + DashboardApplication._scan_section(status.last_scan)
             + DashboardApplication._metadata_section(status.metadata)
-            + '<section class="panel" data-live="skipped-files"><h2>Files skipped</h2>'
-            + (
-                "<p>Recent examples from the latest scan. Other eligible files can continue.</p>"
-                f"<ul>{skipped_files}</ul>"
-                if skipped_files
-                else "<p>No skipped-file examples from the latest scan.</p>"
-            )
-            + "</section>"
             + '<details class="panel diagnostics" data-live="diagnostics">'
             "<summary>Advanced diagnostics</summary>"
-            f"<ul>{diagnostics}</ul></details>",
+            f"<ul>{diagnostics}</ul></details>"
+        )
+        titles = {
+            "/status": "Overview",
+            "/": "Overview",
+            "/issues": "Issues",
+            "/files/verified": "Verified files",
+            "/files/waiting": "Waiting files",
+            "/history": "History",
+            "/settings": "Settings",
+        }
+        if route in {"/", "/status"}:
+            body = overview
+        elif route == "/settings":
+            body = (
+                DashboardApplication._settings_section(settings, csrf_token)
+                if settings
+                else "<p>Settings are unavailable.</p>"
+            )
+        else:
+            body = DashboardApplication._table_section(route, view, table)
+        nav = "".join(
+            f'<a href="{target}"'
+            + (' aria-current="page"' if target == ("/status" if route == "/" else route) else "")
+            + f">{_icon(symbol)}<span>{label}</span></a>"
+            for target, label, symbol in (
+                ("/status", "Overview", "home"),
+                ("/issues", "Issues", "warning"),
+                ("/files/verified", "Verified", "check"),
+                ("/files/waiting", "Waiting", "clock"),
+                ("/history", "History", "history"),
+                ("/settings", "Settings", "settings"),
+            )
+        )
+        return _page(
+            titles[route],
+            '<div class="app-shell"><aside class="sidebar">'
+            f'<nav aria-label="Dashboard navigation">{nav}</nav></aside>'
+            '<div class="workspace" '
+            f'data-refresh-url="{html.escape(canonical_refresh, quote=True)}">'
+            + DashboardApplication._header(
+                status, csrf_token, paused=paused, pause_reason=pause_reason
+            )
+            + f'<h1>{titles[route]}</h1><div data-live="acknowledgement" role="status">'
+            + (f"<p>{html.escape(acknowledgement)}</p>" if acknowledgement else "")
+            + '</div><p id="update-status" role="status" hidden></p>'
+            + body
+            + "</div></div>",
             live=True,
+        )
+
+    @staticmethod
+    def _header(
+        status: DashboardStatus, csrf_token: str, *, paused: bool, pause_reason: str = ""
+    ) -> str:
+        control = "Resume" if paused else "Pause"
+        state = (
+            ("Paused by you" if pause_reason == "user_paused" else "Paused for service checks")
+            if paused
+            else ("Running" if status.automatic_linking else "Waiting for safety checks")
+        )
+        metrics = "".join(
+            f'<a class="quick-total {key}" href="{target}" title="{label}">'
+            f'{_icon(symbol)}<span class="sr-only">{label}: </span>{count:,}</a>'
+            for key, target, label, symbol, count in (
+                ("verified", "/files/verified", "Verified files", "check", status.linked_files),
+                ("waiting", "/files/waiting", "Waiting linker work", "clock", status.waiting_files),
+                ("review", "/issues", "Needs review", "warning", status.review_files),
+            )
+        )
+        return (
+            '<header class="dashboard-toolbar" data-live="metrics">'
+            f'<span class="service-state">{state}</span><div class="quick-totals">{metrics}</div>'
+            f'<form method="post" action="/{control.lower()}">'
+            f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+            f'<button class="icon-button" aria-label="{control} automatic linking" '
+            f'title="{control} automatic linking">{_icon("play" if paused else "pause")}'
+            '</button></form></header>'
+        )
+
+    @staticmethod
+    def _table_section(route: str, view: str, table: DashboardTable | None) -> str:
+        tabs = (
+            '<nav class="section-nav" aria-label="Issue views">'
+            f'<a href="/issues"{" aria-current=\"page\"" if view == "review" else ""}>'
+            'Needs review</a>'
+            f'<a href="/issues?view=exclusions"'
+            f'{" aria-current=\"page\"" if view == "exclusions" else ""}>'
+            'Latest scan exclusions</a></nav>'
+            '<p>Tracked review files and scan exclusions are separate views; their totals '
+            'are not added together.</p>'
+            if route == "/issues"
+            else ""
+        )
+        unavailable = "<p>File data is unavailable for this view.</p>"
+        if route == "/issues" and view == "exclusions":
+            unavailable += (
+                "<p>A completed scan for the current server and selected scope is needed "
+                "before exclusions can be shown.</p>"
+            )
+        if table is None:
+            return tabs + '<section class="panel" data-live="table">' + unavailable + "</section>"
+        rows: list[tuple[str, str, str, str, str, str]] = []
+        pagination: TablePage | None = None
+        message = ""
+        if table.files is not None:
+            pagination = table.files.pagination
+            message = (
+                "Locally tracked files across scans. Waiting is linker work, not Shoko queue size."
+            )
+            for index, item in enumerate(table.files.rows):
+                display = table.displays[index] if index < len(table.displays) else FileDisplay()
+                rows.append(
+                    (
+                        item.reason,
+                        item.message,
+                        display.filename
+                        or (
+                            item.filename
+                            if item.filename and item.filename != "Filename unavailable"
+                            else f"Shoko file {item.shoko_file_id}"
+                        ),
+                        display.relative_path or "Unavailable",
+                        display.library or "Unavailable",
+                        item.message,
+                    )
+                )
+        elif table.exclusions is not None:
+            pagination = table.exclusions.pagination
+            message = table.exclusions.message
+            for exclusion in table.exclusions.rows:
+                rows.append(
+                    (
+                        exclusion.row.reason,
+                        exclusion.row.detail,
+                        exclusion.display.filename or f"Shoko file {exclusion.row.shoko_file_id}",
+                        exclusion.display.relative_path or "Unavailable",
+                        exclusion.display.library or "Unavailable",
+                        exclusion.row.detail,
+                    )
+                )
+        elif table.history is not None:
+            pagination = table.history.pagination
+            message = table.history.scope_message
+            for index, recent in enumerate(table.history.rows):
+                display = table.displays[index] if index < len(table.displays) else FileDisplay()
+                filename = recent.filename or (
+                    f"AniDB anime {recent.subject_id}"
+                    if recent.operation == "metadata_refresh"
+                    else f"Shoko file {recent.subject_id}"
+                )
+                rows.append(
+                    (
+                        recent.operation,
+                        recent.message,
+                        filename,
+                        display.relative_path or "Unavailable",
+                        display.library or "Unavailable",
+                        (
+                            "Metadata retrieval: "
+                            if recent.operation == "metadata_refresh"
+                            else "Link request: "
+                        )
+                        + recent.message
+                        + " Request recorded: "
+                        + (recent.requested_iso or "Unavailable")
+                        + ". Last update: "
+                        + (recent.recorded_iso or "Unavailable"),
+                    )
+                )
+        if pagination is None:
+            return tabs + '<section class="panel" data-live="table">' + unavailable + "</section>"
+        table_key = route.strip("/").replace("/", "-") + "-" + view
+        columns = (
+            ("type", "Type"),
+            ("filename", "Filename"),
+            ("path", "Relative path"),
+            ("library", "Library"),
+            ("status", "Status"),
+        )
+        content = "".join(
+            "<tr><td>"
+            + _type_icon(kind, explanation)
+            + "</td>"
+            + "".join(
+                f"<td>{html.escape(diagnostic_text(value))}</td>"
+                for value in (filename, relative, library, detail)
+            )
+            + "</tr>"
+            for kind, explanation, filename, relative, library, detail in rows
+        )
+        return (
+            tabs + '<section class="panel table-panel" data-live="table">'
+            f"<p>{html.escape(diagnostic_text(message, limit=2048))}</p>"
+            + _pagination(route, view, pagination)
+            + f'<div class="table-scroll"><table class="file-table" data-table="{table_key}">'
+            '<caption class="sr-only">Files and recorded linker outcomes</caption><colgroup>'
+            + "".join(f'<col data-column="{key}">' for key, _ in columns)
+            + "</colgroup><thead><tr>"
+            + "".join(
+                f'<th scope="col" data-column="{key}">{label}'
+                f'<span class="column-resize" data-resize="{key}" tabindex="0" '
+                f'role="separator" aria-orientation="vertical" '
+                f'aria-label="Resize {label} column"></span></th>'
+                for key, label in columns
+            )
+            + "</tr></thead><tbody>"
+            + (content or '<tr><td colspan="5">No records in this view.</td></tr>')
+            + "</tbody></table></div></section>"
+        )
+
+    @staticmethod
+    def _scan_section(scan: ScanSummary | None) -> str:
+        heading = '<section class="panel" data-live="last-scan"><h2>Last completed scan</h2>'
+        if scan is None:
+            return (
+                heading + "<p>Scan totals are unavailable until a completed scan for the current "
+                "sources and selected scope has been recorded.</p></section>"
+            )
+        reported = (
+            f"{scan.reported_unrecognized:,}"
+            if scan.reported_unrecognized is not None
+            else "Unavailable"
+        )
+        facts = (
+            ("Shoko reported unrecognized files", reported),
+            ("Unique files observed", f"{scan.observed_files:,}"),
+            ("Matched to selected Sonarr files", f"{scan.matched_files:,}"),
+            ("Excluded during scan", f"{scan.excluded_files:,}"),
+            ("Outside scope (included in exclusions)", f"{scan.outside_scope_files:,}"),
+        )
+        return (
+            heading
+            + "<p>Observed from "
+            + html.escape(diagnostic_text(scan.observed_from))
+            + " to "
+            + html.escape(diagnostic_text(scan.observed_until))
+            + ".</p>"
+            '<dl class="facts">'
+            + "".join(f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in facts)
+            + "</dl><p>Observed files = matched files + exclusions. A Sonarr match does not "
+            "mean a verified link. Shoko's reported total may differ because its file list "
+            "can change while pages are scanned. This is historical scan evidence, not "
+            "a live file count or Shoko queue size.</p></section>"
         )
 
     @staticmethod
@@ -808,7 +1079,8 @@ class DashboardApplication:
             f"<p>{text(metadata.message)}</p>"
             '<p>Manage retrieval in <a href="/settings">Settings</a>. Changing the option '
             "requires setup confirmation. Turning it off cannot cancel accepted Shoko jobs.</p>"
-            "<h3>Latest metadata observations</h3>"
+            '<details data-disclosure="metadata-observations">'
+            "<summary>Latest metadata observations</summary>"
             "<p>Recent examples, not a complete pending-work count. Metadata readiness does "
             "not mean the file has been linked; verified links are counted above.</p>"
             + (
@@ -823,7 +1095,7 @@ class DashboardApplication:
                 if any(item.state == "queue_unknown" for item in metadata.examples[:MAX_EXAMPLES])
                 else ""
             )
-            + "</section>"
+            + "</details></section>"
         )
 
     @staticmethod
@@ -991,13 +1263,316 @@ def _error(message: str) -> str:
     return "" if not message else f'<p role="alert">{html.escape(message)}</p>'
 
 
-_DASHBOARD_JS: Final[str] = """
+def _table_query(path: str, query: str) -> tuple[int, int, str]:
+    if len(query) > MAX_TABLE_QUERY_CHARS or _BAD_ESCAPE_RE.search(query):
+        raise ValueError("invalid query")
+    fields = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
+    allowed = {"page", "page_size"}
+    if path == "/issues":
+        allowed.add("view")
+    if path in {"/", "/status", "/settings"}:
+        allowed = set()
+    if set(fields) - allowed or any(len(values) != 1 for values in fields.values()):
+        raise ValueError("unknown or duplicate query")
+    values = []
+    for key, default, maximum in (("page", "1", 2**63 - 1), ("page_size", "50", 100)):
+        value = fields.get(key, [default])[0]
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", value) or int(value) > maximum:
+            raise ValueError("invalid pagination")
+        values.append(int(value))
+    view = fields.get("view", ["review"])[0]
+    if view not in {"review", "exclusions"}:
+        raise ValueError("unknown issue view")
+    return values[0], values[1], view
+
+
+def _canonical_refresh_url(value: str) -> str:
+    """Only rendered GET views and validated table queries may become poll targets."""
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.fragment
+            or parsed.path
+            not in {
+                "/status",
+                "/settings",
+                "/issues",
+                "/files/verified",
+                "/files/waiting",
+                "/history",
+            }
+        ):
+            return "/status"
+        _table_query(parsed.path, parsed.query)
+    except ValueError:
+        return "/status"
+    fields = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=3)
+    query = urlencode({key: values[0] for key, values in fields.items()})
+    return parsed.path + ("?" + query if query else "")
+
+
+def _icon(kind: str) -> str:
+    shapes = {
+        "home": '<path d="m3 10 9-7 9 7v10H3z"/>',
+        "check": '<path d="m5 12 4 4L19 6"/>',
+        "clock": '<circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/>',
+        "warning": '<path d="m12 3 10 18H2zM12 9v5m0 3v1"/>',
+        "history": '<path d="M3 11a9 9 0 1 1 2 7M3 4v7h7M12 7v6l4 2"/>',
+        "settings": '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/>',
+        "pause": '<path d="M8 5v14M16 5v14"/>',
+        "play": '<path d="m7 4 14 8-14 8z"/>',
+    }
+    return (
+        '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" '
+        'fill="none" stroke="currentColor" stroke-width="2">'
+        + shapes.get(kind, shapes["warning"])
+        + "</svg>"
+    )
+
+
+def _type_icon(kind: str, explanation: str) -> str:
+    symbol = (
+        "check"
+        if kind == "verified"
+        else "clock"
+        if kind in {"pre_send", "metadata", "retry", "verification", "metadata_refresh"}
+        else "history"
+        if kind == "file_link"
+        else "warning"
+    )
+    label = html.escape(diagnostic_text(explanation), quote=True)
+    return (
+        f'<span class="row-type" title="{label}">{_icon(symbol)}'
+        f'<span class="sr-only">{label}</span></span>'
+    )
+
+
+def _pagination(route: str, view: str, page: TablePage) -> str:
+    def link(number: int, label: str) -> str:
+        fields = {"page": str(number), "page_size": str(page.page_size)}
+        if route == "/issues" and view == "exclusions":
+            fields["view"] = view
+        return f'<a href="{route}?{html.escape(urlencode(fields), quote=True)}">{label}</a>'
+
+    return (
+        '<nav class="pagination" aria-label="Table pages">'
+        f"<span>Showing {page.start:,}&ndash;{page.end:,} of {page.total:,}; "
+        f"page {page.page:,} of {page.page_count:,}</span>"
+        + (link(page.page - 1, "Previous") if page.page > 1 else "")
+        + (link(page.page + 1, "Next") if page.page < page.page_count else "")
+        + "</nav>"
+    )
+
+
+_DASHBOARD_JS: Final[str] = r"""
 (() => {
   let stopped = false;
   const notice = document.getElementById('update-status');
+  // One bounded numeric preference shared by every file table; never persist row data.
+  const widthKey = 'shoko-linker:table-widths:v1';
+  const limits = {type: [45, 140, 55], filename: [100, 900, 260],
+    path: [100, 900, 220], library: [100, 900, 220], status: [120, 1200, 320]};
+  const widths = Object.fromEntries(Object.entries(limits).map(([key, rule]) => [key, rule[2]]));
+  function clamp(key, value) {
+    return Math.round(Math.max(limits[key][0], Math.min(limits[key][1], value)));
+  }
+  try {
+    const raw = window.localStorage.getItem(widthKey);
+    if (raw && raw.length <= 512) {
+      const saved = JSON.parse(raw);
+      if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+        for (const key of Object.keys(limits)) {
+          if (Object.hasOwn(saved, key) && typeof saved[key] === 'number' &&
+              Number.isFinite(saved[key])) widths[key] = clamp(key, saved[key]);
+        }
+      }
+    }
+  } catch (_) { /* Storage is optional, including privacy mode and corrupt preferences. */ }
+  function saveWidths() {
+    try { window.localStorage.setItem(widthKey, JSON.stringify(widths)); }
+    catch (_) { /* Optional. */ }
+  }
+  function prepareTables(root) {
+    for (const table of root.querySelectorAll('table[data-table]')) {
+      let total = 0;
+      for (const col of table.querySelectorAll('col[data-column]')) {
+        const key = col.dataset.column;
+        if (!Object.hasOwn(limits, key)) continue;
+        col.style.width = widths[key] + 'px';
+        total += widths[key];
+      }
+      // An explicit sum prevents the fixed-layout algorithm compressing a dragged column.
+      table.style.width = total + 'px';
+      for (const handle of table.querySelectorAll('[data-resize]')) {
+        const key = handle.dataset.resize;
+        if (!Object.hasOwn(limits, key)) continue;
+        handle.setAttribute('aria-valuemin', limits[key][0]);
+        handle.setAttribute('aria-valuemax', limits[key][1]);
+        handle.setAttribute('aria-valuenow', widths[key]);
+      }
+    }
+  }
+  let gesture = null;
+  let pending = null;
+  function finishResize(event) {
+    if (!gesture || (event?.pointerId !== undefined && event.pointerId !== gesture.id)) return;
+    const old = gesture;
+    gesture = null;
+    document.documentElement.classList.remove('resizing-columns');
+    try { old.handle.releasePointerCapture(old.id); } catch (_) { /* Already released. */ }
+    saveWidths();
+    if (pending) {
+      const next = pending;
+      pending = null;
+      applyUpdate(next);
+    }
+  }
+  document.addEventListener('pointerdown', event => {
+    const handle = event.target.closest('[data-resize]');
+    if (!handle || !handle.closest('table[data-table]') || event.button !== 0 || gesture ||
+        !Object.hasOwn(limits, handle.dataset.resize)) return;
+    event.preventDefault();
+    handle.focus({preventScroll: true});
+    try { handle.setPointerCapture(event.pointerId); } catch (_) { return; }
+    gesture = {handle, id: event.pointerId, key: handle.dataset.resize,
+      x: event.clientX, width: widths[handle.dataset.resize]};
+    document.documentElement.classList.add('resizing-columns');
+  });
+  document.addEventListener('pointermove', event => {
+    if (!gesture || event.pointerId !== gesture.id) return;
+    event.preventDefault();
+    widths[gesture.key] = clamp(gesture.key, gesture.width + event.clientX - gesture.x);
+    prepareTables(document);
+  });
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    document.addEventListener(name, finishResize);
+  }
+  document.addEventListener('keydown', event => {
+    const handle = event.target.closest('[data-resize]');
+    if (!handle || !handle.closest('table[data-table]') || gesture ||
+        !Object.hasOwn(limits, handle.dataset.resize) ||
+        !['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    event.preventDefault();
+    const key = handle.dataset.resize;
+    widths[key] = clamp(key, widths[key] + (event.key === 'ArrowRight' ? 10 : -10));
+    prepareTables(document);
+    saveWidths();
+  });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) finishResize(); });
+  window.addEventListener('blur', () => finishResize());
+  window.addEventListener('pagehide', () => finishResize());
+  prepareTables(document);
+  function safeRefresh(value) {
+    if (typeof value !== 'string' || value.length > 2100) return null;
+    const match = value.match(
+      /^(\/status|\/settings|\/issues|\/files\/verified|\/files\/waiting|\/history)(\?[^#]*)?$/);
+    if (!match) return null;
+    const query = match[2] ? match[2].slice(1) : '';
+    if ((match[1] === '/status' || match[1] === '/settings') && query) return null;
+    const seen = new Set();
+    if (query) for (const field of query.split('&')) {
+      const pair = field.split('=');
+      if (pair.length !== 2 || seen.has(pair[0])) return null;
+      seen.add(pair[0]);
+      if (pair[0] === 'view') {
+        if (match[1] !== '/issues' || !['review', 'exclusions'].includes(pair[1])) return null;
+      } else if (pair[0] === 'page' || pair[0] === 'page_size') {
+        if (!/^[1-9][0-9]{0,18}$/.test(pair[1])) return null;
+        const limit = pair[0] === 'page' ? 9223372036854775807n : 100n;
+        if (BigInt(pair[1]) > limit) return null;
+      } else return null;
+    }
+    return value;
+  }
+  function renderedRefresh(root) {
+    return safeRefresh(root.querySelector('[data-refresh-url]')?.dataset.refreshUrl);
+  }
+  let refreshUrl = renderedRefresh(document)
+    || safeRefresh(window.location.pathname + (window.location.search || '')) || '/status';
+  function applyUpdate(next) {
+    refreshUrl = renderedRefresh(next) || refreshUrl;
+    let changedSetup = false;
+    const currentToken = next.querySelector('input[name="csrf_token"]');
+    if (currentToken) document.querySelectorAll('input[name="csrf_token"]').forEach(
+      input => { input.value = currentToken.value; });
+    for (const current of document.querySelectorAll('[data-live]')) {
+      const fresh = next.querySelector('[data-live="' + current.dataset.live + '"]');
+      if (!fresh) continue;
+      if (current.dataset.live === 'setup') {
+        const oldPanel = current.querySelector('[data-setup-digest]');
+        const newPanel = fresh.querySelector('[data-setup-digest]');
+        // Retain choices during cache refreshes and while the same facts are displayed.
+        if (oldPanel && newPanel && oldPanel.dataset.loading !== 'true' &&
+            (newPanel.dataset.loading === 'true' ||
+             oldPanel.dataset.setupDigest === newPanel.dataset.setupDigest)) {
+          const checking = newPanel.dataset.loading === 'true';
+          current.querySelectorAll('button').forEach(button => { button.disabled = checking; });
+          current.querySelector('.setup-recheck')?.remove();
+          if (checking) {
+            const progress = document.createElement('div');
+            progress.className = 'setup-recheck';
+            const explanation = document.createElement('p');
+            explanation.textContent = 'Rechecking setup. Your choices are kept; '
+              + 'submission will be available when checks finish.';
+            progress.append(explanation);
+            for (const element of newPanel.querySelectorAll('.setup-progress, .progress-label')) {
+              progress.append(element.cloneNode(true));
+            }
+            current.append(progress);
+          }
+          const token = next.querySelector('input[name="csrf_token"]');
+          if (token) current.querySelectorAll('input[name="csrf_token"]').forEach(
+            input => { input.value = token.value; });
+          continue;
+        }
+        changedSetup = Boolean(oldPanel && newPanel &&
+          oldPanel.dataset.loading !== 'true' && newPanel.dataset.loading !== 'true');
+      }
+      if (current.tagName === 'DETAILS') fresh.open = current.open;
+      const disclosures = new Map(Array.from(
+        current.querySelectorAll('details[data-disclosure]'),
+        detail => [detail.dataset.disclosure, detail.open]));
+      for (const detail of fresh.querySelectorAll('details[data-disclosure]')) {
+        if (disclosures.has(detail.dataset.disclosure)) {
+          detail.open = disclosures.get(detail.dataset.disclosure);
+        }
+      }
+      let scrolls = [];
+      let focused = null;
+      if (current.dataset.live === 'table') {
+        prepareTables(fresh);
+        scrolls = Array.from(current.querySelectorAll('table[data-table]'), table =>
+          [table.dataset.table, table.closest('.table-scroll').scrollLeft]);
+        const active = document.activeElement;
+        if (current.contains(active) && active?.dataset.resize) {
+          focused = [active.closest('table[data-table]').dataset.table, active.dataset.resize];
+        }
+      }
+      if (current.outerHTML !== fresh.outerHTML) {
+        current.replaceWith(fresh);
+        if (current.dataset.live === 'table') {
+          for (const table of fresh.querySelectorAll('table[data-table]')) {
+            if (focused && table.dataset.table === focused[0]) {
+              for (const handle of table.querySelectorAll('[data-resize]')) {
+                if (handle.dataset.resize === focused[1]) handle.focus({preventScroll: true});
+              }
+            }
+            const scroll = scrolls.find(item => item[0] === table.dataset.table);
+            if (scroll) table.closest('.table-scroll').scrollLeft = scroll[1];
+          }
+        }
+      }
+    }
+    notice.textContent = changedSetup
+      ? 'Setup facts changed. Review the updated choices and confirmations.'
+      : '';
+    notice.hidden = !changedSetup;
+  }
   async function update() {
     try {
-      const statusUrl = window.location.pathname === '/settings' ? '/settings' : '/status';
+      const statusUrl = refreshUrl;
       const response = await fetch(statusUrl, {
         credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10000)
       });
@@ -1005,58 +1580,16 @@ _DASHBOARD_JS: Final[str] = """
       const next = new DOMParser().parseFromString(await response.text(), 'text/html');
       if (!next.querySelector('[data-live="metrics"]')) {
         stopped = true;
+        pending = null;
+        finishResize();
         notice.hidden = false;
         notice.textContent = 'Your session expired. ';
         const login = document.createElement('a');
         login.href = '/'; login.textContent = 'Sign in again'; notice.append(login);
         return;
       }
-      let changedSetup = false;
-      const currentToken = next.querySelector('input[name="csrf_token"]');
-      if (currentToken) document.querySelectorAll('input[name="csrf_token"]').forEach(
-        input => { input.value = currentToken.value; });
-      for (const current of document.querySelectorAll('[data-live]')) {
-        const fresh = next.querySelector('[data-live="' + current.dataset.live + '"]');
-        if (!fresh) continue;
-        if (current.dataset.live === 'setup') {
-          const oldPanel = current.querySelector('[data-setup-digest]');
-          const newPanel = fresh.querySelector('[data-setup-digest]');
-          // Retain choices during cache refreshes and while the same facts are displayed.
-          if (oldPanel && newPanel && oldPanel.dataset.loading !== 'true' &&
-              (newPanel.dataset.loading === 'true' ||
-               oldPanel.dataset.setupDigest === newPanel.dataset.setupDigest)) {
-            const checking = newPanel.dataset.loading === 'true';
-            current.querySelectorAll('button').forEach(button => { button.disabled = checking; });
-            current.querySelector('.setup-recheck')?.remove();
-            if (checking) {
-              const progress = document.createElement('div');
-              progress.className = 'setup-recheck';
-              const explanation = document.createElement('p');
-              explanation.textContent = 'Rechecking setup. Your choices are kept; '
-                + 'submission will be available when checks finish.';
-              progress.append(explanation);
-              for (const element of newPanel.querySelectorAll('.setup-progress, .progress-label')) {
-                progress.append(element.cloneNode(true));
-              }
-              current.append(progress);
-            }
-            const token = next.querySelector('input[name="csrf_token"]');
-            if (token) current.querySelectorAll('input[name="csrf_token"]').forEach(
-              input => { input.value = token.value; });
-            continue;
-          }
-          changedSetup = Boolean(oldPanel && newPanel &&
-            oldPanel.dataset.loading !== 'true' && newPanel.dataset.loading !== 'true');
-        }
-        if (current.tagName === 'DETAILS') fresh.open = current.open;
-        if (current.outerHTML !== fresh.outerHTML) {
-          current.replaceWith(fresh);
-        }
-      }
-      notice.textContent = changedSetup
-        ? 'Setup facts changed. Review the updated choices and confirmations.'
-        : '';
-      notice.hidden = !changedSetup;
+      if (gesture) pending = next;
+      else applyUpdate(next);
     } catch (_) {
       notice.hidden = false;
       notice.textContent = 'Live updates interrupted. Retrying automatically…';
@@ -1095,7 +1628,47 @@ body { margin: 0; min-height: 100vh; }
   box-shadow: 0 4px 10px #5146cf26;
 }
 .header-caption { color: var(--muted); font-size: 13px; }
-main { max-width: 1160px; margin: auto; padding: 44px 32px 24px; }
+main { max-width: 1560px; margin: auto; padding: 28px 24px; }
+.app-shell { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 28px; }
+.sidebar { border-right: 1px solid var(--line); padding-right: 16px; }
+.sidebar nav { position: sticky; top: 20px; display: grid; gap: 6px; }
+.sidebar a { display: flex; align-items: center; gap: 12px; padding: 12px;
+  color: var(--muted); text-decoration: none; border-radius: 7px; font-weight: 600; }
+.sidebar a:hover, .sidebar a[aria-current] { color: var(--accent); background: #e9f1ff; }
+.workspace { min-width: 0; }
+.icon { width: 20px; height: 20px; flex-shrink: 0; vertical-align: middle; }
+.dashboard-toolbar { display: flex; align-items: center; gap: 16px; margin-bottom: 26px;
+  padding: 12px 0 20px; border-bottom: 1px solid var(--line); }
+.service-state { margin-right: auto; color: var(--muted); font-size: 13px; }
+.quick-totals { display: flex; gap: 10px; }
+.quick-total { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
+  text-decoration: none; border-radius: 6px; font-weight: 700; background: #f1f5f9; }
+.quick-total.verified { color: #176546; }
+.quick-total.waiting { color: #875b12; }
+.quick-total.review { color: #b23535; }
+.dashboard-toolbar form { margin: 0; }
+.icon-button { padding: 8px 10px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.table-panel { padding: 18px; }
+.table-scroll { overflow-x: auto; }
+.file-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.file-table th, .file-table td { text-align: left; vertical-align: top; padding: 12px 10px;
+  border-bottom: 1px solid var(--line); overflow-wrap: anywhere; font-size: 13px; }
+.file-table th { position: relative; padding-right: 18px; color: var(--muted); font-size: 12px; }
+.file-table col[data-column="type"] { width: 45px; }
+.file-table col[data-column="filename"] { width: 25%; }
+.file-table col[data-column="path"] { width: 19%; }
+.file-table col[data-column="library"] { width: 18%; }
+.column-resize { position: absolute; right: 0; top: 0; bottom: 0; width: 12px;
+  cursor: col-resize; touch-action: none; border-right: 2px solid var(--line); }
+.column-resize:hover, .column-resize:focus-visible { background: #5146cf26;
+  outline: 2px solid var(--accent); outline-offset: -2px; }
+.resizing-columns, .resizing-columns * { cursor: col-resize !important;
+  user-select: none !important; }
+.row-type { color: #875b12; }
+.pagination { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin: 16px 0; }
+.pagination span { margin-right: auto; font-size: 13px; color: var(--muted); }
 h1, h2, p, dl { margin-top: 0; }
 h1 { font-size: clamp(26px, 4vw, 34px); line-height: 1.2;
   letter-spacing: -1.1px; margin-bottom: 12px; }
@@ -1195,6 +1768,11 @@ details ul { font-family: ui-monospace, monospace; font-size: 12px; padding-left
 footer { max-width: 1160px; padding: 24px 32px 32px; margin: auto;
   color: var(--muted); font-size: 12px; text-align: center; }
 @media (max-width: 760px) {
+  .app-shell { grid-template-columns: 1fr; gap: 16px; }
+  .sidebar { border-right: 0; padding: 0; }
+  .sidebar nav { display: flex; overflow-x: auto; position: static; }
+  .sidebar a { padding: 10px; white-space: nowrap; }
+  .dashboard-toolbar { gap: 8px; flex-wrap: wrap; }
   .overview-grid { grid-template-columns: 1fr; }
   .metrics { gap: 12px; }
   .metric { padding: 18px; }

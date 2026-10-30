@@ -1222,6 +1222,8 @@ def test_shoko_copy_at_an_unknown_path_is_not_in_inventory(
     assert [(item.shoko_file_id, item.reason) for item in result.exclusions] == [
         (301, ExclusionReason.NOT_IN_INVENTORY)
     ]
+    assert "collected Sonarr inventory" in result.exclusions[0].detail
+    assert "no Sonarr file exists" not in result.exclusions[0].detail
 
 
 def test_two_shoko_files_at_the_same_path_and_size_are_both_excluded(

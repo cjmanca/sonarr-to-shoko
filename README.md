@@ -58,6 +58,30 @@ The [Unraid template](unraid.xml) uses the same published `latest` image, requir
 the same four connection settings, persists `/data`, and leaves dashboard port
 publishing optional.
 
+The dashboard's **Waiting** count is local linker work, including planning,
+missing metadata, and confirmation of earlier requests; Shoko's queue can be empty
+while files are waiting. **Needs review** lists a separate group of tracked files
+with safety, mapping, conflict, or uncertain-result problems. Each group has
+a paginated filename/path table with plain reasons. **Latest scan exclusions** is
+independent of those tracked groups. **Last completed scan** explains the observed
+unrecognized files and selected Sonarr matches, including its observation times;
+these historical counts need not equal Shoko's current unrecognized-file total.
+
+**History** shows retained linking and metadata request records,
+including their recorded time and outcome. It includes all retained server
+sources and modes; file request records do not preserve the historical server
+endpoint, and displayed paths are current retained context. Prepared or possibly
+sent records do not prove delivery, and available metadata does not prove a file
+was linked. This is request history, not an audit of Shoko's media changes or hooks.
+
+Use the left navigation to switch between Overview, Issues, Verified, Waiting,
+History and Settings. Overview focuses on health and setup; Issues separates
+tracked review files from latest scan exclusions. The header totals link to their
+file tables. The single Pause/Resume button reflects the saved pause state,
+including service pauses; the status text identifies user and service pauses separately.
+Resume still checks authorization and cannot bypass a safety hold. File tables show paginated
+filenames, relative directories and the confirmed library root when known.
+
 The application runs as `PUID:PGID`, defaulting to `1000:1000`. For Unraid,
 set `PUID=99` and `PGID=100` (the template includes these defaults). Compose
 users can add these optional values to `.env`. Startup briefly uses root to
@@ -71,7 +95,12 @@ For reproducible deployments, replace `latest` in the Compose `image` line with 
 published immutable `sha-<40-character-commit>` tag from the GHCR package versions.
 Unraid users can select the same SHA-tagged image in the template's repository field.
 
-If Sonarr has several anime roots, select the folders to include. If the service
+Sonarr's **Anime**, **Standard**, and **Daily** series types are supported within
+the folders you explicitly select. A series still needs verified TVDB-to-AniDB
+episode mappings before any file can be linked. The service does not infer episode
+identities from filenames or air dates, or include unselected folders.
+
+If Sonarr has several library roots, select the folders to include. If the service
 cannot prove how a Sonarr folder corresponds to a Shoko folder, it will ask you to
 choose the match. Unsafe or unavailable Shoko settings and physical/plugin safety
 facts require review before linking can start. Uncertain matches are left for

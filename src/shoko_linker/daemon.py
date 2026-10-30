@@ -88,6 +88,7 @@ from .attestation import SCOPE_DAEMON, AttestationVerdict
 from .backoff import capped_backoff
 from .config import Settings, apply_gate
 from .errors import ConfigError, HttpPolicyError
+from .file_display import MAX_DISPLAY_LOCATIONS, safe_display_path
 from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .linking import (
     EpisodeIdResolver,
@@ -167,6 +168,7 @@ from .rate_control import (
     encode_rate_state,
     service_budget_limits,
 )
+from .scan_status import ScanSummary, scan_context_identity, scan_summary_payload
 from .shoko import (
     ExclusionReason,
     ImportFolder,
@@ -199,7 +201,6 @@ from .state import (
     META_CAMPAIGN_DEFERRED_UNTIL,
     META_CAMPAIGN_ZERO_PROGRESS,
     META_GLOBAL_PAUSE_ORIGIN,
-    META_LAST_DISCOVERY_EXCLUSIONS,
     META_NEXT_FULL_RECONCILE_ISO,
     META_RECOVERY_CURSOR,
     ApplyLockUnavailableError,
@@ -216,6 +217,7 @@ from .state import (
     LockHeldError,
     MetadataOperation,
     MetadataOperationState,
+    ScanExclusionRow,
     SendToken,
     StateError,
     StateStore,
@@ -1801,7 +1803,7 @@ def _metadata_candidate_allowed(deps: DaemonDeps, match: Any) -> bool:
 
 def _record_exclusions(
     deps: DaemonDeps, result: ShokoMatchResult, discovery: ShokoDiscovery, now_iso: str
-) -> tuple[dict[int, str], Mapping[str, int], int]:
+) -> tuple[dict[int, str], Mapping[str, int], int, dict[str, Any]]:
     """Retain categorized exclusions without admitting them to the write plan."""
     skipped: dict[int, str] = {}
     files = {file.id: file for file in discovery.files}
@@ -1881,12 +1883,74 @@ def _record_exclusions(
         "scope_excluded": scope_excluded,
         "examples": examples,
     }
-    with contextlib.suppress(WriteDisabledError, StateError):
-        deps.store.set_meta(
-            META_LAST_DISCOVERY_EXCLUSIONS,
-            json.dumps(summary, sort_keys=True, separators=(",", ":")),
+    return skipped, MappingProxyType(counts), scope_excluded, summary
+
+
+def _persist_reconciliation_summary(
+    deps: DaemonDeps,
+    result: ShokoMatchResult,
+    discovery: ShokoDiscovery,
+    now_iso: str,
+    scan_context: str | None,
+    exclusion_summary: dict[str, Any],
+) -> None:
+    # Complete matching partitions unique discovered files into one correspondence
+    # match or one exclusion each. This describes source matching, never link success.
+    if not result.eligible:
+        return
+    files = {file.id: file for file in discovery.files}
+    matched_ids = {match.shoko_file_id for match in result.matches}
+    excluded_ids = {item.shoko_file_id for item in result.exclusions}
+    if (
+        len(files) != len(discovery.files)
+        or len(excluded_ids) != len(result.exclusions)
+        or len(matched_ids) != len(result.matches)
+        or matched_ids & excluded_ids
+        or matched_ids | excluded_ids != files.keys()
+    ):
+        return
+    if scan_context is not None and scan_context == scan_context_identity(
+        deps.store, deps.settings.sonarr.url, deps.settings.shoko.url, settings=deps.settings
+    ):
+        times = [now_iso, deps.now()]
+        if discovery.progress is not None:
+            times.extend(discovery.progress.fetched_at.values())
+        try:
+            observed = sorted(_parse_iso(value) for value in times)
+        except (TypeError, ValueError):
+            return
+        exclusion_summary["scan"] = scan_summary_payload(
+            ScanSummary(
+                context_identity=scan_context,
+                observed_from=observed[0].isoformat(),
+                observed_until=observed[-1].isoformat(),
+                reported_unrecognized=discovery.total_reported,
+                observed_files=len({file.id for file in discovery.files}),
+                matched_files=len(result.matches),
+                excluded_files=len(result.exclusions),
+                outside_scope_files=exclusion_summary["scope_excluded"],
+            )
         )
-    return skipped, MappingProxyType(counts), scope_excluded
+    rows = []
+    for exclusion in result.exclusions:
+        file = files[exclusion.shoko_file_id]
+        paths = tuple(safe_display_path(location.absolute_path) for location in file.locations)
+        complete = len(paths) <= MAX_DISPLAY_LOCATIONS and all(path is not None for path in paths)
+        source = exclusion.sonarr_file
+        rows.append(
+            ScanExclusionRow(
+                exclusion.shoko_file_id,
+                exclusion.reason.value,
+                diagnostic_text(exclusion.detail, limit=MAX_EXCLUSION_EXAMPLE_CHARS),
+                (safe_display_path(source.path) or "") if source is not None else "",
+                tuple(path for path in paths[:MAX_DISPLAY_LOCATIONS] if path is not None),
+                complete,
+            )
+        )
+    # Rows are display evidence only; atomically replace the latest complete set,
+    # never the durable file/send history. No summary is published before this step.
+    with contextlib.suppress(WriteDisabledError, StateError):
+        deps.store.replace_latest_scan_exclusions(exclusion_summary, rows)
 
 
 def _resolution_deadline(deps: DaemonDeps, cycle_start_mono: float) -> float:
@@ -2189,6 +2253,7 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
     resolution_limit: int | None = None,
     resolution_deadline: float | None = None,
     resolution_priority_file_ids: frozenset[int] = frozenset(),
+    scan_context: str | None = None,
 ) -> _ReconcileResult:
     series_tvdb = {
         item.series.id: item.series.tvdb_id
@@ -2222,7 +2287,7 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
     resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic, deadline=resolution_deadline)
     plans: dict[int, LinkPlan] = {}
     metadata_demands: dict[int, MetadataDemand] = {}
-    skip_reasons, exclusion_counts, scope_excluded_count = _record_exclusions(
+    skip_reasons, exclusion_counts, scope_excluded_count, exclusion_summary = _record_exclusions(
         deps, match_result, discovery, now_iso
     )
     fresh_campaign_quarantines: set[int] = set()
@@ -2331,6 +2396,9 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
     deps.store.advance_bulk(planned_ids, FileState.PLANNED, "planned", iso=now_iso)
     backlog, new_arrival = _cohort_counts(
         [(file_id, cohort) for file_id, cohort in cohorts.items()]
+    )
+    _persist_reconciliation_summary(
+        deps, match_result, discovery, now_iso, scan_context, exclusion_summary
     )
     return _ReconcileResult(
         inserted=inserted,
@@ -4470,7 +4538,7 @@ def _bind_service_authorization(deps: DaemonDeps, deadline: float) -> DaemonDeps
     )
 
 
-def _run_cycle_body(
+def _run_cycle_body(  # noqa: PLR0915 - retain the bounded cycle phase ordering
     deps: DaemonDeps,
     *,
     now_iso: str,
@@ -4491,6 +4559,9 @@ def _run_cycle_body(
     reasons: list[str] = []
     drift: list[str] = []
     existing_link: list[str] = []
+    scan_context = scan_context_identity(
+        deps.store, deps.settings.sonarr.url, deps.settings.shoko.url, settings=deps.settings
+    )
 
     if not deps.service_mode:
         reasons.extend(attestation_gate(deps, now_iso, mutate=mode is CycleMode.APPLY))
@@ -4587,6 +4658,7 @@ def _run_cycle_body(
         discovery,
         active,
         now_iso,
+        scan_context=scan_context,
         policy=policy,
         campaign_quarantine_limit=campaign_quarantine_limit,
         affected_sonarr_series=affected_sonarr_series,

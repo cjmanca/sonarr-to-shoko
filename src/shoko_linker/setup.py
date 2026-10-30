@@ -30,6 +30,7 @@ from .shoko import (
 from .sonarr import (
     ROOTFOLDER_PATH,
     SERIES_PATH,
+    SUPPORTED_SERIES_TYPES,
     SonarrFile,
     SonarrInventory,
     SonarrSeries,
@@ -69,7 +70,7 @@ class RootFolder:
 
 @dataclass(frozen=True)
 class AnimeRootCandidate:
-    """One registered Sonarr root containing positively identified anime series."""
+    """One registered Sonarr root containing series with supported numbering types."""
 
     path: str
     series_ids: tuple[int, ...]
@@ -331,19 +332,19 @@ def _blocked(
 def select_anime_roots(
     series: Sequence[SonarrSeries], root_folders: Sequence[RootFolder]
 ) -> AnimeScopeDiscovery:
-    """Select root candidates only from `seriesType=anime` within accessible registered roots."""
-    anime_series = tuple(item for item in series if item.series_type == "anime")
-    unknown_type = tuple(item for item in series if item.series_type is None)
+    """Offer known-type series roots for explicit confirmation, never auto-selection."""
+    anime_series = tuple(item for item in series if item.series_type in SUPPORTED_SERIES_TYPES)
+    unknown_type = tuple(item for item in series if item.series_type not in SUPPORTED_SERIES_TYPES)
     if not anime_series:
         if unknown_type:
             return _blocked(
-                "Sonarr did not identify supported anime series types; check its API version "
+                "Sonarr did not identify supported series types; check its API version "
                 "and series metadata."
             )
         return AnimeScopeDiscovery(
             ScopeStatus.NO_ANIME,
             (),
-            "No Sonarr anime series were found. Check the series types in Sonarr.",
+            "No supported Sonarr series were found.",
         )
 
     problems: list[str] = []
@@ -503,7 +504,7 @@ def _anime_roots_by_series(
 ) -> tuple[dict[int, str], str | None]:
     roots: dict[int, str] = {}
     for eligible in inventory.eligible_series:
-        if eligible.series.series_type != "anime":
+        if eligible.series.series_type not in SUPPORTED_SERIES_TYPES:
             continue
         try:
             root = normalize_posix(eligible.root)

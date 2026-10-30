@@ -128,6 +128,7 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
         (7, "migrated from 6"),
         (8, "migrated from 7"),
         (9, "migrated from 8"),
+        (10, "migrated from 9"),
     ]
     conn = sqlite3.connect(path)
     try:

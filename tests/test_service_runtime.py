@@ -114,7 +114,7 @@ def test_failed_initial_link_stays_visibly_held_after_healthy_cycle_and_restart(
         assert "Review advanced diagnostics" in status.next_action
         assert "retry safely" not in status.next_action
         page = DashboardApplication._status_page(status, "csrf-token", paused=False)
-        assert "Paused</span>" in page
+        assert "Waiting for safety checks</span>" in page
         assert "initial link could not be verified" in page
 
         restarted = cli._NormalServiceRuntime(bootstrap, deps.sonarr, deps.shoko, cli.StopState())
@@ -546,7 +546,9 @@ def test_swallowed_completion_failure_defers_status_and_next_real_cycle_recovers
         store.close()
 
 
-def test_dashboard_status_reads_persisted_categorized_exclusion_counts(tmp_path: Path) -> None:
+def test_dashboard_status_does_not_present_legacy_exclusions_as_current_scan(
+    tmp_path: Path,
+) -> None:
     state_path = tmp_path / "state.sqlite3"
     with open_state(state_path) as store:
         store.set_meta(
@@ -583,10 +585,12 @@ def test_dashboard_status_reads_persisted_categorized_exclusion_counts(tmp_path:
         sonarr.client.close()
         shoko.client.close()
 
-    assert status.excluded_files == 3
-    assert status.scope_excluded_files == 1
-    assert status.exclusion_counts == (("outside_allowed_root", 1), ("size_mismatch", 2))
-    assert any("Shoko file 501: size_mismatch" in detail for detail in status.diagnostics)
+    assert status.last_scan is None
+    assert status.excluded_files is None
+    assert status.scope_excluded_files is None
+    assert status.exclusion_counts == ()
+    assert status.skipped_file_details == ()
+    assert not any("Shoko file 501: size_mismatch" in detail for detail in status.diagnostics)
 
 
 def test_status_surfaces_classify_all_persisted_file_states_after_restart_without_remote_io(  # noqa: PLR0915 - full status integration
@@ -725,7 +729,8 @@ def test_status_surfaces_classify_all_persisted_file_states_after_restart_withou
         assert verifying_status.linked_files == 0
         assert verifying_status.waiting_files == 1
         assert verifying_status.review_files == 0
-        assert "<dt>Waiting</dt><dd>1</dd>" in verifying_page
+        assert 'title="Waiting linker work"' in verifying_page
+        assert "</span>1</a>" in verifying_page
 
         review_runtime = cli._NormalServiceRuntime(
             replace(bootstrap, database_path=review_only_path), sonarr, shoko, cli.StopState()
@@ -752,7 +757,26 @@ def test_status_surfaces_classify_all_persisted_file_states_after_restart_withou
         assert dashboard_status.review_files == 5
         assert "waiting for shoko to confirm a link" in dashboard_page.lower()
         assert "partial or uncertain link results need attention" in dashboard_page.lower()
-        assert "910" not in dashboard_page
+        # Dedicated tables explain the same waiting/review counters without
+        # inventing relative paths while confirmed scope is unavailable.
+        waiting_page = DashboardApplication._status_page(
+            dashboard_status,
+            "csrf-token",
+            paused=False,
+            route="/files/waiting",
+            table=runtime.table("waiting", 1, 50),
+        )
+        review_page = DashboardApplication._status_page(
+            dashboard_status,
+            "csrf-token",
+            paused=False,
+            route="/issues",
+            table=runtime.table("review", 1, 50),
+        )
+        assert "91001.mkv" in waiting_page
+        assert "91011.mkv" in review_page
+        assert "Shoko file ID 910" not in dashboard_page
+        assert "indeterminate_write" not in dashboard_page
         assert "STATUS_API_KEY_SENTINEL" not in dashboard_page
 
         assert cli.main(["status"]) == cli.EXIT_OK
@@ -1098,7 +1122,7 @@ def test_service_durable_stop_from_second_handle_during_final_file_get_prevents_
         store.close()
 
 
-def test_real_service_authorization_callback_cannot_mask_current_non_anime_series(
+def test_real_service_authorization_callback_cannot_mask_current_unsupported_series_type(
     tmp_path: Path,
 ) -> None:
     assessment = assess_settings_payload({"FileQualityFilterEnabled": False})
@@ -1127,7 +1151,7 @@ def test_real_service_authorization_callback_cannot_mask_current_non_anime_serie
 
         def _series(self) -> list[dict[str, Any]]:
             rows = super()._series()
-            rows[0]["seriesType"] = "anime" if self.candidate_is_anime else "standard"
+            rows[0]["seriesType"] = "anime" if self.candidate_is_anime else "unknown"
             rows.append(
                 {
                     "id": 2,

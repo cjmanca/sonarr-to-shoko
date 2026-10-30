@@ -162,8 +162,9 @@ from pathlib import Path
 from typing import Any, Final, Literal, LiteralString, ParamSpec, TypeVar, cast
 
 from .errors import LinkerError
+from .file_display import MAX_DISPLAY_LOCATIONS, safe_display_path
 from .linking import SendOutcome, VerificationVerdict
-from .logging_setup import redact
+from .logging_setup import diagnostic_text, redact
 from .mappings import EpisodeType
 from .metadata_identity import metadata_source_key_for_url
 
@@ -206,7 +207,7 @@ SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
 SYSTEM_RECONFIRMATION_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
     {"setup_changed", "unsafe_shoko_settings"}
 )
-SCHEMA_VERSION: Final[int] = 9
+SCHEMA_VERSION: Final[int] = 10
 MAPPING_RESOLVED_ID_COUNT: Final[int] = 2  # AniDB episode ID, Shoko episode ID
 META_MAPPING_TARGET_QUARANTINE_PREFIX: Final[str] = "file_mapping_quarantine:v1:"
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
@@ -426,6 +427,237 @@ class ServiceFileCounts:
     verified_files: int
     waiting_files: int
     review_files: int
+
+
+@dataclass(frozen=True)
+class ServiceFileExample:
+    shoko_file_id: int
+    state: str
+    reason: str
+    message: str
+    filename: str
+    sonarr_path: str
+    shoko_paths: tuple[str, ...]
+    detail: str
+    updated_iso: str
+    display_paths_complete: bool = True
+
+
+@dataclass(frozen=True)
+class ServiceFileGroup:
+    total: int = 0
+    reason_counts: tuple[tuple[str, int], ...] = ()
+    examples: tuple[ServiceFileExample, ...] = ()
+
+
+@dataclass(frozen=True)
+class ServiceFileStatus:
+    """Historical local work, not a snapshot of Shoko's job queue or file list."""
+
+    counts: ServiceFileCounts = field(default_factory=lambda: ServiceFileCounts(0, 0, 0))
+    waiting: ServiceFileGroup = field(default_factory=ServiceFileGroup)
+    review: ServiceFileGroup = field(default_factory=ServiceFileGroup)
+
+
+TABLE_PAGE_SIZE_MAX: Final[int] = 100
+SCAN_GENERATION_CHARS: Final[int] = 32
+MAX_SCAN_EVIDENCE_CHARS: Final[int] = 65_536
+
+
+@dataclass(frozen=True)
+class TablePage:
+    """One-based pagination; empty results have page 1 and range 0-0."""
+
+    requested_page: int
+    page: int
+    page_size: int
+    page_count: int
+    total: int
+    start: int
+    end: int
+
+
+def validate_table_page(page: int, page_size: int) -> None:
+    if type(page) is not int or not 1 <= page <= 2**63 - 1:
+        raise ValueError("page must be an integer between 1 and 9223372036854775807")
+    if type(page_size) is not int or not 1 <= page_size <= TABLE_PAGE_SIZE_MAX:
+        raise ValueError("page_size must be an integer between 1 and 100")
+
+
+def table_page(total: int, page: int, page_size: int) -> TablePage:
+    validate_table_page(page, page_size)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    effective = min(page, page_count)
+    offset = (effective - 1) * page_size
+    return TablePage(
+        page,
+        effective,
+        page_size,
+        page_count,
+        total,
+        offset + 1 if total else 0,
+        min(offset + page_size, total),
+    )
+
+
+@dataclass(frozen=True)
+class ServiceFilePage:
+    group: str
+    pagination: TablePage
+    counts: ServiceFileCounts
+    rows: tuple[ServiceFileExample, ...]
+
+
+@dataclass(frozen=True)
+class ActionRowsPage:
+    pagination: TablePage
+    counts: ServiceFileCounts
+    rows: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ScanExclusionRow:
+    shoko_file_id: int
+    reason: str
+    detail: str
+    sonarr_path: str = ""
+    shoko_paths: tuple[str, ...] = ()
+    paths_complete: bool = True
+
+
+@dataclass(frozen=True)
+class ScanExclusionRowsPage:
+    pagination: TablePage
+    rows: tuple[ScanExclusionRow, ...]
+
+
+SERVICE_FILE_EXAMPLE_LIMIT: Final[int] = 20
+
+
+_SERVICE_REASON_SQL: Final[str] = (
+    "CASE WHEN state IN ('request_may_have_been_sent', 'verifying') THEN 'verification'"
+    " WHEN state = 'waiting' AND state_detail = 'pending_metadata' THEN 'metadata'"
+    " WHEN state = 'waiting' THEN 'retry'"
+    " WHEN state IN ('discovered', 'matched', 'mapped', 'planned', 'prepared_not_sent')"
+    " THEN 'pre_send' ELSE state END"
+)
+SERVICE_FILE_REASON_MESSAGES: Final[Mapping[str, str]] = {
+    "verified": "The complete requested episode associations were verified in Shoko.",
+    "pre_send": "Not submitted; awaiting planning or a safe linking opportunity.",
+    "metadata": "Awaiting verified episode metadata; a Shoko job may not be queued.",
+    "retry": "Not currently confirmed complete; waiting for a safe retry or prerequisite.",
+    "verification": "Awaiting read-only confirmation of a possibly submitted link; "
+    "Shoko may no longer have a queued job.",
+    "ambiguous": "The file or its episode mapping could not be resolved safely.",
+    "conflict": "Conflicting source information or existing episode associations need review.",
+    "partial": "Only part of the expected episode association was confirmed.",
+    "indeterminate_write": "A request's result remains uncertain; it will not be blindly resent.",
+    "blocked_safety": "A safety check needs attention before linking can proceed.",
+}
+
+
+def _scan_exclusion_row(row: Sequence[Any]) -> ScanExclusionRow:
+    # Table constraints bound scalar text; bound location decoding independently.
+    try:
+        paths = json.loads(row[4])
+    except (ValueError, TypeError, RecursionError):
+        paths = None
+    complete = bool(row[5])
+    if (
+        not isinstance(paths, list)
+        or len(paths) > MAX_DISPLAY_LOCATIONS
+        or not all(isinstance(path, str) and safe_display_path(path) == path for path in paths)
+    ):
+        paths, complete = [], False
+    source = safe_display_path(row[3])
+    if row[3] and source is None:
+        complete = False
+    return ScanExclusionRow(
+        int(row[0]),
+        diagnostic_text(row[1], limit=128),
+        diagnostic_text(row[2], limit=512),
+        source or "",
+        tuple(paths),
+        complete,
+    )
+
+
+def _service_file_group(state: FileState) -> str:
+    if state in _SERVICE_WAITING_FILE_STATES:
+        return "waiting"
+    if state in _SERVICE_REVIEW_FILE_STATES:
+        return "review"
+    if state is FileState.VERIFIED:
+        return "verified"
+    raise StateError(f"ordinary status does not classify file state {state.value!r}")
+
+
+# Project all identity-bearing display inputs together and carry proof loss across
+# every SQL discard. Missing evidence differs from evidence we could not inspect.
+_SERVICE_SOURCE_DISPLAY_VALID_SQL: Final[str] = (
+    "(sonarr_path IS NULL OR (typeof(sonarr_path)='text'"
+    " AND instr(sonarr_path,char(0))=0 AND length(sonarr_path)<=8192))"
+)
+_SERVICE_IDENTITY_DISPLAY_VALID_SQL: Final[str] = (
+    "(identity_hash_json IS NULL OR (typeof(identity_hash_json)='text'"
+    " AND instr(identity_hash_json,char(0))=0 AND length(identity_hash_json)<=65536))"
+)
+_SERVICE_FILE_DISPLAY_SQL: Final[str] = (
+    " CASE WHEN "
+    + _SERVICE_SOURCE_DISPLAY_VALID_SQL
+    + " THEN COALESCE(sonarr_path,'') ELSE '' END,"
+    " CASE WHEN length(state_detail)<=8192 THEN state_detail ELSE '' END,"
+    " CASE WHEN length(updated_iso)<=128 THEN updated_iso ELSE '' END,"
+    " CASE WHEN " + _SERVICE_IDENTITY_DISPLAY_VALID_SQL + " THEN identity_hash_json ELSE NULL END,"
+    " (" + _SERVICE_SOURCE_DISPLAY_VALID_SQL + " AND " + _SERVICE_IDENTITY_DISPLAY_VALID_SQL + ")"
+)
+
+
+def _service_file_example(row: Any) -> ServiceFileExample:
+    file_id, state, reason, source_path, detail, updated, raw_identity, display_complete = row
+    paths: tuple[str, ...] = ()
+    paths_complete = bool(display_complete)
+    if raw_identity is not None:
+        try:
+            identity = json.loads(raw_identity)
+        except (ValueError, RecursionError):
+            identity = None
+        if isinstance(identity, dict) and isinstance(identity.get("paths"), list):
+            paths_complete = (
+                paths_complete
+                and len(identity["paths"]) <= MAX_DISPLAY_LOCATIONS
+                and all(
+                    isinstance(path, str) and safe_display_path(path) is not None
+                    for path in identity["paths"]
+                )
+            )
+            paths = tuple(
+                diagnostic_text(path, limit=8192)
+                for path in identity["paths"][:20]
+                if isinstance(path, str) and path
+            )
+        else:
+            paths_complete = False
+    # Derive a basename only from a stored path, never from a file ID or a guess.
+    safe_source = diagnostic_text(source_path, limit=8192)
+    paths_complete = (
+        paths_complete
+        and safe_source == source_path
+        and (not source_path or safe_display_path(source_path) is not None)
+    )
+    filename = (safe_source or (paths[0] if paths else "")).replace("\\", "/").rsplit("/", 1)[-1]
+    return ServiceFileExample(
+        file_id,
+        state,
+        reason,
+        SERVICE_FILE_REASON_MESSAGES[reason],
+        diagnostic_text(filename) or "Filename unavailable",
+        safe_source,
+        paths,
+        diagnostic_text(detail),
+        diagnostic_text(updated),
+        paths_complete,
+    )
 
 
 class Cohort(Enum):
@@ -1191,6 +1423,20 @@ CREATE INDEX idx_metadata_history_identity
 """
 
 
+_SCAN_EXCLUSION_SCHEMA_SQL: Final[str] = """
+CREATE TABLE latest_scan_exclusions (
+    shoko_file_id INTEGER PRIMARY KEY CHECK (shoko_file_id > 0),
+    generation TEXT NOT NULL CHECK (length(generation) = 32),
+    reason TEXT NOT NULL CHECK (length(reason) <= 128),
+    detail TEXT NOT NULL CHECK (length(detail) <= 512),
+    sonarr_path TEXT NOT NULL CHECK (length(sonarr_path) <= 8192),
+    shoko_paths_json TEXT NOT NULL CHECK (length(shoko_paths_json) <= 262144),
+    paths_complete INTEGER NOT NULL CHECK (paths_complete IN (0, 1))
+);
+CREATE INDEX idx_latest_scan_generation ON latest_scan_exclusions (generation, shoko_file_id);
+"""
+
+
 _SCHEMA_SQL: Final[str] = (
     """
 CREATE TABLE schema_version (
@@ -1331,6 +1577,7 @@ CREATE INDEX idx_dashboard_sessions_expiry ON dashboard_sessions (expires_epoch)
 """
     + _METADATA_SCHEMA_SQL
     + _METADATA_V9_SCHEMA_SQL
+    + _SCAN_EXCLUSION_SCHEMA_SQL
 )
 
 
@@ -1876,6 +2123,10 @@ def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
     _execute_schema_statements(conn, _METADATA_V9_SCHEMA_SQL)
 
 
+def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+    _execute_schema_statements(conn, _SCAN_EXCLUSION_SCHEMA_SQL)
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
 # v5 adds timestamped reservations; v6 preserves data without inferring campaign ownership.
 # v7 adds immutable send ownership, fail-closed legacy attribution, and monotonic attempt totals.
@@ -1890,6 +2141,7 @@ _MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {
     6: _migrate_v6_to_v7,
     7: _migrate_v7_to_v8,
     8: _migrate_v8_to_v9,
+    9: _migrate_v9_to_v10,
 }
 
 
@@ -3801,8 +4053,203 @@ class StateStore:
             counts[state] = _as_int(raw_count, "file count")
         return ServiceFileCounts(
             verified_files=counts.get(FileState.VERIFIED, 0),
-            waiting_files=sum(counts.get(state, 0) for state in _SERVICE_WAITING_FILE_STATES),
-            review_files=sum(counts.get(state, 0) for state in _SERVICE_REVIEW_FILE_STATES),
+            waiting_files=sum(
+                n for state, n in counts.items() if _service_file_group(state) == "waiting"
+            ),
+            review_files=sum(
+                n for state, n in counts.items() if _service_file_group(state) == "review"
+            ),
+        )
+
+    def service_file_status(
+        self, *, example_limit: int = SERVICE_FILE_EXAMPLE_LIMIT
+    ) -> ServiceFileStatus:
+        """Exact local totals and bounded examples from one read-only SQLite snapshot.
+
+        The snapshot includes historical tracked rows, even those no longer in Shoko's
+        unrecognized list. Nothing here queries Shoko or authorizes/retries a write.
+        """
+        if type(example_limit) is not int or not 0 <= example_limit <= SERVICE_FILE_EXAMPLE_LIMIT:
+            raise ValueError("status example_limit must be between 0 and 20")
+        self._conn.execute("SAVEPOINT service_file_status")
+        try:
+            counts = self.service_file_counts()
+            reasons: dict[str, dict[str, int]] = {"waiting": {}, "review": {}}
+            rows = self._conn.execute(
+                "SELECT state, "  # noqa: S608 - fixed SQL fragments
+                + _SERVICE_REASON_SQL
+                + ", COUNT(*) FROM files GROUP BY state, 2"
+            ).fetchall()
+            for raw_state, reason, count in rows:
+                group = _service_file_group(FileState(raw_state))
+                if group in reasons:
+                    reasons[group][reason] = reasons[group].get(reason, 0) + count
+            groups: dict[str, ServiceFileGroup] = {}
+            for group, states, total in (
+                ("waiting", _SERVICE_WAITING_FILE_STATES, counts.waiting_files),
+                ("review", _SERVICE_REVIEW_FILE_STATES, counts.review_files),
+            ):
+                # Placeholders and classifications derive solely from the shared enum sets.
+                placeholders = ",".join("?" for _ in states)
+                examples = self._conn.execute(
+                    "SELECT shoko_file_id, state, "  # noqa: S608 - enum-only placeholders
+                    + _SERVICE_REASON_SQL
+                    + ","
+                    + _SERVICE_FILE_DISPLAY_SQL
+                    + f" FROM files WHERE state IN ({placeholders})"
+                    " ORDER BY shoko_file_id LIMIT ?",
+                    (*sorted(state.value for state in states), example_limit),
+                ).fetchall()
+                groups[group] = ServiceFileGroup(
+                    total,
+                    tuple(sorted(reasons[group].items())),
+                    tuple(_service_file_example(row) for row in examples),
+                )
+            return ServiceFileStatus(counts, groups["waiting"], groups["review"])
+        finally:
+            self._conn.execute("RELEASE service_file_status")
+
+    def service_file_page(
+        self, group: str, *, page: int = 1, page_size: int = 50
+    ) -> ServiceFilePage:
+        """Bounded tracked group and header totals from one local read snapshot.
+
+        Out-of-range pages explicitly clamp to the last page. Stable file-ID ordering
+        has no duplicates while the database is unchanged; navigation is not a frozen scan.
+        """
+        validate_table_page(page, page_size)
+        if type(group) is not str or group not in {"verified", "waiting", "review"}:
+            raise ValueError("group must be verified, waiting, or review")
+        states = {
+            "verified": frozenset({FileState.VERIFIED}),
+            "waiting": _SERVICE_WAITING_FILE_STATES,
+            "review": _SERVICE_REVIEW_FILE_STATES,
+        }[group]
+        self._conn.execute("SAVEPOINT service_file_page")
+        try:
+            counts = self.service_file_counts()
+            total = {
+                "verified": counts.verified_files,
+                "waiting": counts.waiting_files,
+                "review": counts.review_files,
+            }[group]
+            pagination = table_page(total, page, page_size)
+            placeholders = ",".join("?" for _ in states)
+            rows = self._conn.execute(
+                "WITH selected AS MATERIALIZED ("  # noqa: S608 - enum-only placeholders
+                f" SELECT shoko_file_id FROM files WHERE state IN ({placeholders})"
+                " ORDER BY shoko_file_id LIMIT ? OFFSET ?)"
+                " SELECT f.shoko_file_id, state, "
+                + _SERVICE_REASON_SQL
+                + ","
+                + _SERVICE_FILE_DISPLAY_SQL
+                + " FROM selected JOIN files f USING (shoko_file_id)"
+                " ORDER BY f.shoko_file_id",
+                (
+                    *sorted(state.value for state in states),
+                    page_size,
+                    (pagination.page - 1) * page_size,
+                ),
+            ).fetchall()
+            return ServiceFilePage(
+                group, pagination, counts, tuple(_service_file_example(row) for row in rows)
+            )
+        finally:
+            self._conn.execute("RELEASE service_file_page")
+
+    @_mutation
+    def replace_latest_scan_exclusions(
+        self, document: dict[str, Any], rows: Sequence[ScanExclusionRow]
+    ) -> None:
+        """Replace only the latest scan rows and their summary in one transaction."""
+        if type(document.get("total")) is not int or document["total"] != len(rows):
+            raise StateError("Complete scan exclusion total does not match rows")
+        if len({row.shoko_file_id for row in rows}) != len(rows):
+            raise StateError("Complete scan contains duplicate excluded file IDs")
+        for row in rows:
+            if (
+                len(row.shoko_paths) > MAX_DISPLAY_LOCATIONS
+                or any(safe_display_path(path) != path for path in row.shoko_paths)
+                or (row.sonarr_path and safe_display_path(row.sonarr_path) != row.sonarr_path)
+                or diagnostic_text(row.reason, limit=128) != row.reason
+                or diagnostic_text(row.detail, limit=512) != row.detail
+            ):
+                raise StateError("Complete scan rows contain unsafe display evidence")
+        generation = uuid.uuid4().hex
+        payload = {**document, "exclusion_rows_generation": generation}
+        with self._transaction():
+            self._conn.execute("DELETE FROM latest_scan_exclusions")
+            self._conn.executemany(
+                "INSERT INTO latest_scan_exclusions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        row.shoko_file_id,
+                        generation,
+                        row.reason,
+                        row.detail,
+                        row.sonarr_path,
+                        json.dumps(row.shoko_paths, ensure_ascii=False, separators=(",", ":")),
+                        int(row.paths_complete),
+                    )
+                    for row in rows
+                ),
+            )
+            self._set_meta_tx(
+                META_LAST_DISCOVERY_EXCLUSIONS,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
+
+    def latest_scan_exclusion_page(
+        self, generation: str, expected_total: int, *, page: int = 1, page_size: int = 50
+    ) -> ScanExclusionRowsPage | None:
+        """Generation-bound count and SQL-limited hydration from one read snapshot."""
+        validate_table_page(page, page_size)
+        if (
+            len(generation) != SCAN_GENERATION_CHARS
+            or any(char not in "0123456789abcdef" for char in generation)
+            or type(expected_total) is not int
+            or expected_total < 0
+        ):
+            return None
+        self._conn.execute("SAVEPOINT scan_exclusion_page")
+        try:
+            if not self._scan_generation_is_current_tx(generation):
+                return None
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM latest_scan_exclusions WHERE generation=?", (generation,)
+            ).fetchone()[0]
+            if total != expected_total:
+                return None
+            pagination = table_page(total, page, page_size)
+            raw_rows = self._conn.execute(
+                "SELECT shoko_file_id, reason, detail, sonarr_path,"
+                " shoko_paths_json, paths_complete"
+                " FROM latest_scan_exclusions WHERE generation=? ORDER BY shoko_file_id"
+                " LIMIT ? OFFSET ?",
+                (generation, page_size, (pagination.page - 1) * page_size),
+            ).fetchall()
+            rows = tuple(_scan_exclusion_row(row) for row in raw_rows)
+            return ScanExclusionRowsPage(pagination, rows)
+        finally:
+            self._conn.execute("RELEASE scan_exclusion_page")
+
+    def _scan_generation_is_current_tx(self, generation: str) -> bool:
+        """An empty row set proves no generation identity; use its persisted summary."""
+        row = self._conn.execute(
+            "SELECT CASE WHEN length(value)<=? THEN value ELSE NULL END FROM meta WHERE key=?",
+            (MAX_SCAN_EVIDENCE_CHARS, META_LAST_DISCOVERY_EXCLUSIONS),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return False
+        try:
+            document = json.loads(row[0])
+        except (ValueError, RecursionError):
+            return False
+        return (
+            isinstance(document, dict)
+            and type(document.get("version")) is int
+            and document["version"] == 1
+            and document.get("exclusion_rows_generation") == generation
         )
 
     def files_in_cohort(self, cohort: Cohort) -> tuple[FileRecord, ...]:
@@ -6628,6 +7075,86 @@ class StateStore:
     def campaign_files(self, campaign_id: str) -> tuple[FileRecord, ...]:
         rows = self._conn.execute(_SQL_CAMPAIGN_FILES, (campaign_id,)).fetchall()
         return tuple(_row_to_file_record(row) for row in rows)
+
+    def action_rows_page(self, *, page: int = 1, page_size: int = 50) -> ActionRowsPage:
+        """Page retained requests and header counts in one local read snapshot."""
+        validate_table_page(page, page_size)
+        self._conn.execute("SAVEPOINT action_rows_page")
+        try:
+            counts = self.service_file_counts()
+            total = self._conn.execute(
+                "SELECT (SELECT COUNT(*) FROM sends) +"
+                " (SELECT COUNT(*) FROM metadata_operations WHERE reservation_owned=1) +"
+                " (SELECT COUNT(*) FROM metadata_operation_history WHERE reservation_owned=1)"
+            ).fetchone()[0]
+            pagination = table_page(total, page, page_size)
+            _, rows = self._action_rows(limit=page_size, offset=(pagination.page - 1) * page_size)
+            return ActionRowsPage(pagination, counts, rows)
+        finally:
+            self._conn.execute("RELEASE action_rows_page")
+
+    def recent_action_rows(self) -> tuple[int, tuple[dict[str, Any], ...]]:
+        return self._action_rows(limit=SERVICE_FILE_EXAMPLE_LIMIT, offset=0)
+
+    def _action_rows(self, *, limit: int, offset: int) -> tuple[int, tuple[dict[str, Any], ...]]:
+        """Bounded read-only ledger projection, across all retained server sources.
+
+        Sends have no immutable endpoint/path snapshot. Joined paths are current
+        retained context only. External metadata observations are not our requests.
+        Materialize only the requested bounded keys/times before joining any
+        display fields. Scalar counts share the same statement snapshot. No
+        target/history JSON is read or decoded for status.
+        """
+        rows = self._conn.execute(
+            "WITH keys AS ("  # noqa: S608 - fixed shared display predicate
+            " SELECT 0 AS kind, send_id AS row_key,"
+            " COALESCE(verified_iso,attempted_iso) AS recorded_iso FROM sends"
+            " UNION ALL SELECT 1, rowid, updated_iso"
+            " FROM metadata_operations WHERE reservation_owned=1"
+            " UNION ALL SELECT 2, rowid, updated_iso"
+            " FROM metadata_operation_history WHERE reservation_owned=1"
+            "), recent AS MATERIALIZED ("
+            " SELECT kind,row_key,"
+            " CASE WHEN length(recorded_iso)<=128 THEN recorded_iso END AS recorded_iso,"
+            " julianday(CASE WHEN length(recorded_iso)<=128 THEN recorded_iso END) AS sort_time"
+            " FROM keys ORDER BY sort_time DESC,kind DESC,row_key DESC LIMIT ? OFFSET ?"
+            "), payload AS ("
+            " SELECT r.*,"
+            " CASE WHEN r.kind=0 THEN 'file_link' ELSE 'metadata_refresh' END AS operation,"
+            " CASE WHEN r.kind=0 THEN 'file:' || r.row_key"
+            " WHEN length(COALESCE(m.claim,h.claim))<=128"
+            " THEN 'metadata:' || COALESCE(m.claim,h.claim)"
+            " ELSE 'metadata:unknown:' || r.kind || ':' || r.row_key END AS action_id,"
+            " COALESCE(s.shoko_file_id,m.anidb_anime_id,h.anidb_anime_id) AS subject_id,"
+            " COALESCE(s.outcome,m.state,h.state) AS state,"
+            " COALESCE(s.attempted_iso,m.attempted_iso,m.created_iso,"
+            " h.attempted_iso,h.created_iso) AS requested_iso,"
+            " CASE WHEN typeof(s.http_status)='integer' THEN s.http_status END AS http_status,"
+            " s.verification, CASE WHEN "
+            + _SERVICE_SOURCE_DISPLAY_VALID_SQL
+            + " THEN f.sonarr_path ELSE NULL END AS current_path,"
+            " COALESCE(m.transport_admitted,h.transport_admitted) AS transport_admitted"
+            " FROM recent r"
+            " LEFT JOIN sends s ON r.kind=0 AND s.send_id=r.row_key"
+            " LEFT JOIN files f ON r.kind=0 AND f.shoko_file_id=s.shoko_file_id"
+            " LEFT JOIN metadata_operations m ON r.kind=1 AND m.rowid=r.row_key"
+            " LEFT JOIN metadata_operation_history h ON r.kind=2 AND h.rowid=r.row_key"
+            ") SELECT operation,action_id,subject_id,"
+            " CASE WHEN length(state)<=128 THEN state END AS state,"
+            " CASE WHEN length(requested_iso)<=128 THEN requested_iso END AS requested_iso,"
+            " recorded_iso,http_status,"
+            " CASE WHEN length(verification)<=128 THEN verification END AS verification,"
+            " current_path,"
+            " transport_admitted,"
+            " (SELECT COUNT(*) FROM sends) +"
+            " (SELECT COUNT(*) FROM metadata_operations WHERE reservation_owned=1) +"
+            " (SELECT COUNT(*) FROM metadata_operation_history WHERE reservation_owned=1) AS total"
+            " FROM payload ORDER BY sort_time DESC,kind DESC,row_key DESC",
+            (limit, offset),
+        )
+        columns = tuple(item[0] for item in rows.description)
+        result = tuple(dict(zip(columns, row, strict=True)) for row in rows.fetchall())
+        return (int(result[0]["total"]) if result else 0), result
 
     def campaign_send_history(self, campaign_id: str) -> tuple[SendHistoryRow, ...]:
         """F19: every send row ever attempted for one campaign, in send order (read-only).
