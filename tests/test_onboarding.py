@@ -114,10 +114,12 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
         assert after[table] == before[table]
     legacy_send_fields = len(before["sends"][0])
     assert [row[:legacy_send_fields] for row in after["sends"]] == before["sends"]
+    # The verified send retains T2; the other sends retain only their T1 attempt.
+    # Their files' later T2 updates are not per-request events and must not be borrowed.
     assert [row[legacy_send_fields:] for row in after["sends"]] == [
-        (None, "unknown", None, ""),
-        (None, "unknown", None, ""),
-        (None, "unknown", None, ""),
+        (None, "unknown", None, "", v1fx.T2),
+        (None, "unknown", None, "", v1fx.T1),
+        (None, "unknown", None, "", v1fx.T1),
     ]
     assert after["schema_version"][: len(before["schema_version"])] == before["schema_version"]
     assert [row[0:3:2] for row in after["schema_version"][len(before["schema_version"]) :]] == [
@@ -129,6 +131,7 @@ def test_schema_v2_migrates_in_place_without_rewriting_history(tmp_path: Path) -
         (8, "migrated from 7"),
         (9, "migrated from 8"),
         (10, "migrated from 9"),
+        (11, "migrated from 10"),
     ]
     conn = sqlite3.connect(path)
     try:

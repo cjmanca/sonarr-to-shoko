@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import IntEnum
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -32,6 +33,14 @@ from .state import (
 ReviewStatus = Literal[
     "idle", "queued", "assessing", "ready", "confirming", "changed", "confirmed", "error"
 ]
+
+
+class SourceReviewTick(IntEnum):
+    """Only IDLE permits ordinary work in the current operation."""
+
+    IDLE = 0
+    OWNED = 1
+    ACCEPTED = 2
 
 
 @dataclass(frozen=True)
@@ -153,8 +162,9 @@ def _owner_identity(store: StateStore, owner: str, now: datetime) -> str:
 class SourceReviewController:
     """A single owned review job; requests queue, local views never schedule work.
 
-    Return True from worker_tick means this operation belongs to review, including a
-    failed/expired review. The caller must skip its ordinary link cycle for that tick.
+    A non-IDLE worker_tick result owns this operation, including a failed/expired
+    review. The caller must skip its ordinary link cycle for that tick; ACCEPTED
+    requests a prompt separate operation to reassess ordinary authorization gates.
     No threads, polling, I/O on status reads, or automatic expiry refresh are started.
     A restart requires a new explicit assessment; durable old tokens alone cannot
     create confirmation work without this controller's current owned review.
@@ -188,6 +198,7 @@ class SourceReviewController:
         self._summary: SourceReviewSummary | None = None
         self._interval: tuple[str | None, str | None] = (None, None)
         self._message = ""
+        self._display_hold_id: str | None = None
 
     def view(self, owner_session_sha256: str) -> SourceReviewView:
         """Local reads only, including expiry checks; never repair or enqueue."""
@@ -202,7 +213,16 @@ class SourceReviewController:
         message = ""
         summary = None
         interval: tuple[str | None, str | None] = (None, None)
-        if identity == self._owner:
+        if self._status == "confirmed":
+            audit = store.get_source_rebaseline_review().last_audit
+            same_lifecycle = (
+                not continuity.requires_rebaseline
+                and audit is not None
+                and audit.prepared.hold_id == self._display_hold_id
+            )
+        else:
+            same_lifecycle = self._matches_hold(continuity, self._display_hold_id)
+        if identity == self._owner and same_lifecycle:
             status, message, summary, interval = (
                 self._status,
                 self._message,
@@ -244,7 +264,7 @@ class SourceReviewController:
         with self._lock, open_state(self._path) as store:
             now = self._now()
             identity = _owner_identity(store, owner_session_sha256, now)
-            self._require_available(identity, now)
+            self._require_available(store, identity, now)
             current = self._view(store, owner_session_sha256, now)
             if self._job is not None:
                 return current
@@ -265,7 +285,7 @@ class SourceReviewController:
         with self._lock, open_state(self._path) as store:
             now = self._now()
             identity = _owner_identity(store, owner_session_sha256, now)
-            self._require_available(identity, now)
+            self._require_available(store, identity, now)
             current = self._view(store, owner_session_sha256, now)
             prepared = store.get_source_rebaseline_review().prepared
             if self._job is not None and self._job.prepared is not None:
@@ -285,7 +305,25 @@ class SourceReviewController:
         self._wake()
         return result
 
-    def _require_available(self, identity: str, now: datetime) -> None:
+    @staticmethod
+    def _matches_hold(review: SourceContinuityReview, hold_id: str | None) -> bool:
+        return (
+            review.requires_rebaseline
+            and (None if review.hold is None else review.hold.hold_id) == hold_id
+        )
+
+    def _require_available(self, store: StateStore, identity: str, now: datetime) -> None:
+        # Only explicit requests retire obsolete local ownership. GET remains read-only;
+        # an adapter currently running still owns its progress until its next check.
+        review = store.get_source_continuity_review()
+        if (
+            self._job is not None
+            and not self._job.running
+            and not self._matches_hold(review, self._job.hold_id)
+        ):
+            self._job = None
+        if self._ready is not None and not self._matches_hold(review, self._ready.prepared.hold_id):
+            self._ready = None
         if self._job is not None:
             # A running adapter owns its progress even if its session just expired.
             if self._job.running or not self._expired(self._job, now):
@@ -323,6 +361,7 @@ class SourceReviewController:
         else:
             self._ready = None
         self._owner = identity
+        self._display_hold_id = None if review.hold is None else review.hold.hold_id
         self._job = _Job(
             owner,
             identity,
@@ -354,9 +393,8 @@ class SourceReviewController:
             self._shutdown()
             or self._expired(job, now)
             or _owner_identity(store, job.owner_session, now) != job.owner_identity
-            or not review.requires_rebaseline
+            or not self._matches_hold(review, job.hold_id)
             or review.evidence_status == "invalid"
-            or (None if review.hold is None else review.hold.hold_id) != job.hold_id
         ):
             raise StateError("source review is no longer current")
         durable = store.get_source_rebaseline_review()
@@ -369,14 +407,14 @@ class SourceReviewController:
             raise StateError("source review authorization changed")
         return result
 
-    def worker_tick(self, deadline: float) -> bool:
-        """Run one bounded read-only slice; caller skips ordinary linking if True."""
+    def worker_tick(self, deadline: float) -> SourceReviewTick:
+        """Run one slice; acceptance requires a separate ordinary reassessment tick."""
         with self._lock:
             job = self._job
             if job is None:
-                return False
+                return SourceReviewTick.IDLE
             if job.running:
-                return True
+                return SourceReviewTick.OWNED
             job.running = True
             self._status = "assessing" if job.prepared is None else "confirming"
         try:
@@ -396,7 +434,10 @@ class SourceReviewController:
         finally:
             with self._lock:
                 job.running = False
-        return True
+        with self._lock:
+            return (
+                SourceReviewTick.ACCEPTED if self._status == "confirmed" else SourceReviewTick.OWNED
+            )
 
     def continuation_delay(self) -> float | None:
         """Yield between owned slices, including collectors that return no progress.
@@ -512,6 +553,7 @@ class SourceReviewController:
                 "The local source baseline was accepted. Existing pauses and safety gates remain."
             )
         with self._lock:
+            self._display_hold_id = job.hold_id
             self._ready = ready
             self._status, self._message = status, message
             self._summary = evidence.summary

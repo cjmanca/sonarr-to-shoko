@@ -22,6 +22,7 @@ function session(route) {
     getElementById: () => notice,
     querySelector: () => null,
     querySelectorAll(selector) {
+      if (['time[data-compact-time]', '[data-timezone]'].includes(selector)) return [];
       if (selector === 'table[data-table]') return [current.table];
       if (selector === '[data-live]') return [current, setup];
       throw Error(selector);
@@ -35,7 +36,8 @@ function session(route) {
     querySelectorAll: () => [], replaceWith() { throw Error('Setup choice lost'); }};
   function section(content) {
     const container = {scrollLeft: 0};
-    const columns = ['type', 'filename', 'path', 'library', 'status'];
+    const columns = ['type', 'filename', 'path', 'library', 'status',
+      ...(route === '/history' ? ['requested', 'updated'] : []), 'links'];
     const cols = columns.map(key => ({dataset: {column: key}, style: {}}));
     const table = {dataset: {table: 'files'}, style: {},
       closest: selector => { assert.equal(selector, '.table-scroll'); return container; },
@@ -65,7 +67,7 @@ function session(route) {
   const window = {localStorage, location: {pathname: route, search: '?view=exclusions&page=2'},
     addEventListener: (name, fn) => register(windowListeners, name, fn),
     setTimeout: fn => timers.push(fn)};
-  class DOMParser { parseFromString() { const fresh = incoming; return {
+  class DOMParser { parseFromString() { const fresh = incoming; return {querySelectorAll() { return []; },
     querySelector(selector) {
       if (selector === '[data-live="metrics"]') return {};
       if (selector === '[data-live="table"]') return fresh;
@@ -146,8 +148,17 @@ function session(route) {
   assert.equal(s.settingsForm.value, 'unsaved settings');
   assert(s.requests.every(url => url === '/issues?view=exclusions&page=2'));
   if (storageMode !== 'denied') {
-    assert.deepEqual(Object.keys(JSON.parse(stored)), ['type', 'filename', 'path', 'library', 'status']);
-    const navigated = session('/files/waiting');
+    assert.deepEqual(Object.keys(JSON.parse(stored)), ['type', 'filename', 'path', 'library', 'status',
+      'requested', 'updated', 'links']);
+    const navigated = session('/history');
+    assert.equal(navigated.current.cols[5].style.width, '115px');
+    assert.equal(navigated.current.cols[6].style.width, '115px');
+    assert.equal(navigated.current.cols[7].style.width, '70px');
+    assert(navigated.event('keydown', {target: navigated.current.handles[5], key: 'ArrowRight'}));
+    assert.equal(navigated.current.cols[5].style.width, '125px');
+    await navigated.poll('history updated');
+    assert.equal(navigated.current.cols[5].style.width, '125px');
+    assert.equal(navigated.document.activeElement, null);
     assert.equal(navigated.current.cols[1].style.width, '100px');
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

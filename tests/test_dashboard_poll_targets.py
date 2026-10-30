@@ -49,12 +49,14 @@ const vm = require('node:vm');
       querySelector(selector) {
         assert.equal(selector, '[data-refresh-url]'); return refresh(scenario.canonical);
       },
-      querySelectorAll(selector) { if (selector === 'table[data-table]') return [];
+      querySelectorAll(selector) {
+    if (['time[data-compact-time]', '[data-timezone]', 'table[data-table]']
+        .includes(selector)) return [];
     assert.equal(selector, '[data-live]'); return [setup]; }
     };
     class DOMParser {
       parseFromString() {
-        return {querySelector(selector) {
+        return {querySelectorAll() { return []; }, querySelector(selector) {
           if (selector === '[data-live="metrics"]') return {};
           if (selector === 'input[name="csrf_token"]') return null;
           if (selector === '[data-live="setup"]') return setup;

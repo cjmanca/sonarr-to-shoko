@@ -38,6 +38,7 @@ def prepare_anime(
     *,
     retry_unsent_claim: str | None = None,
     adopt_external_claim: str | None = None,
+    iso: str = T0,
 ) -> MetadataOperation:
     result = store.prepare_metadata_operation(
         SOURCE,
@@ -46,7 +47,7 @@ def prepare_anime(
         request_fingerprint=REQUEST,
         request_version=1,
         cycle_key="cycle",
-        iso=T0,
+        iso=iso,
         retry_unsent_claim=retry_unsent_claim,
         adopt_external_claim=adopt_external_claim,
     )
@@ -60,6 +61,7 @@ def test_v7_migration_preserves_history_and_fresh_database(tmp_path: Path) -> No
         walk_to_planned(store)
         send = prepare(store)
         assert send.accepted
+        store.connection.execute("ALTER TABLE sends DROP COLUMN updated_iso")
         before = store.connection.execute("SELECT * FROM sends").fetchall()
         store.connection.execute("DROP TABLE latest_scan_exclusions")
         store.connection.execute("DROP TABLE metadata_operation_history")
@@ -67,7 +69,7 @@ def test_v7_migration_preserves_history_and_fresh_database(tmp_path: Path) -> No
         store.connection.execute("PRAGMA user_version=7")
     with open_state(path, budget_limits=LIMITS) as store:
         assert store.schema_version() == SCHEMA_VERSION
-        assert store.connection.execute("SELECT * FROM sends").fetchall() == before
+        assert [row[:-1] for row in store.connection.execute("SELECT * FROM sends")] == before
         assert store.metadata_operations(SOURCE) == ()
         assert store.live_send_counts() == (1, 1)
         prepare_anime(store)
@@ -171,8 +173,9 @@ def test_unsent_cancel_retry_stale_sender_and_release_exactly_once(tmp_path: Pat
         store.record_metadata_operation(first, M.DEFINITELY_REJECTED, iso=T0)
         store.record_metadata_operation(first, M.DEFINITELY_REJECTED, iso=T0)
         assert store.budget_view().pending_file_requests == 0
-        second = prepare_anime(store, retry_unsent_claim=first.claim)
+        second = prepare_anime(store, retry_unsent_claim=first.claim, iso=T1)
         assert second.claim != first.claim
+        assert second.created_iso == T1
         with pytest.raises(StateError, match="stale"):
             store.mark_metadata_possibly_delivered(first, iso=T0, verification_deadline_iso=T1)
         with pytest.raises(StateError, match="stale"):
@@ -221,7 +224,8 @@ def test_external_work_no_budget_and_explicit_first_own_request_only(tmp_path: P
         assert not external.reservation_owned
         assert external.attempted_iso is None
         assert store.budget_view().pending_file_requests == 0
-        own = prepare_anime(store, adopt_external_claim=external.claim)
+        own = prepare_anime(store, adopt_external_claim=external.claim, iso=T1)
+        assert own.created_iso == T1
         store.mark_metadata_possibly_delivered(own, iso=T0, verification_deadline_iso=T1)
         observed = store.observe_external_metadata_operation(
             SOURCE,
@@ -547,6 +551,34 @@ def test_ready_new_episode_rearms_but_file_or_consent_change_does_not(tmp_path: 
         assert store.budget_view().pending_file_requests == 1
 
 
+def test_new_claim_generation_has_its_own_preparation_time(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.db", budget_limits=LIMITS) as store:
+        first = prepare_episode(store, (E1,))
+        assert isinstance(first, MetadataOperation)
+        ready = finish_episode(store, first)
+        snapshot = store.connection.execute("SELECT * FROM metadata_operations").fetchone()
+        second = store.prepare_metadata_operation(
+            SOURCE,
+            18208,
+            demand_fingerprint=DEMAND,
+            request_fingerprint=REQUEST,
+            request_version=1,
+            cycle_key="next-cycle",
+            iso=T2,
+            required_targets=(E2,),
+            missing_targets=(E2,),
+            after_ready_claim=ready.claim,
+        )
+        assert isinstance(second, MetadataOperation)
+        assert second.created_iso == T2
+        assert second.updated_iso == T2
+        assert second.attempted_iso is None
+        assert (
+            store.connection.execute("SELECT * FROM metadata_operation_history").fetchone()
+            == snapshot
+        )
+
+
 def test_accumulated_ready_coverage_survives_restart_and_cannot_alternate(tmp_path: Path) -> None:
     path = tmp_path / "state.db"
     with open_state(path, budget_limits=LIMITS) as store:
@@ -712,6 +744,7 @@ def test_v8_ready_upgrade_preserves_unknown_coverage_and_refuses_rearm(tmp_path:
         for column in ("required_targets_json", "missing_targets_json", "verified_targets_json"):
             store.connection.execute(f"ALTER TABLE metadata_operations DROP COLUMN {column}")
         store.connection.execute("DELETE FROM schema_version WHERE version>=9")
+        store.connection.execute("ALTER TABLE sends DROP COLUMN updated_iso")
         store.connection.execute("PRAGMA user_version=8")
         original = store.connection.execute("SELECT * FROM metadata_operations").fetchone()
     with open_state(path, budget_limits=LIMITS) as store:

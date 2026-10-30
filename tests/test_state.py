@@ -580,7 +580,7 @@ def test_f17_v1_migration_preserves_rows_and_holds_incoherent_ownership(tmp_path
     for table in ("meta", "baselines", "baseline_files", "files", "budgets"):
         assert after[table] == before[table]
     assert [row[: len(before["sends"][0])] for row in after["sends"]] == before["sends"]
-    assert [row[len(before["sends"][0]) :] for row in after["sends"]] == [
+    assert [row[len(before["sends"][0]) : -1] for row in after["sends"]] == [
         (None, "unknown", None, ""),
         (None, "unknown", None, ""),
         (None, "unknown", None, ""),
@@ -589,9 +589,9 @@ def test_f17_v1_migration_preserves_rows_and_holds_incoherent_ownership(tmp_path
     # not-authorized defaults; no campaign row is rewritten.
     assert [row[:13] for row in after["campaigns"]] == [row[:13] for row in before["campaigns"]]
     assert all(row[13:] == (None, None, "") for row in after["campaigns"])
-    # schema_version audit history: the v1 row survives, and v2-v10 are appended.
+    # schema_version audit history: the v1 row survives, and v2-v11 are appended.
     assert after["schema_version"][0] == before["schema_version"][0]
-    assert len(after["schema_version"]) == len(before["schema_version"]) + 9
+    assert len(after["schema_version"]) == len(before["schema_version"]) + SCHEMA_VERSION - 1
     assert [row[0:3:2] for row in after["schema_version"][1:]] == [
         (2, "migrated from 1"),
         (3, "migrated from 2"),
@@ -602,6 +602,7 @@ def test_f17_v1_migration_preserves_rows_and_holds_incoherent_ownership(tmp_path
         (8, "migrated from 7"),
         (9, "migrated from 8"),
         (10, "migrated from 9"),
+        (11, "migrated from 10"),
     ]
     assert second_view(path, "PRAGMA user_version") == [(SCHEMA_VERSION,)]
     assert second_view(
@@ -838,7 +839,7 @@ def test_f17_pending_and_indeterminate_sends_are_not_replayed(tmp_path: Path) ->
     migrated_sends = v1fx.snapshot_state(path)["sends"]
     legacy_field_count = len(before["sends"][0])
     assert [row[:legacy_field_count] for row in migrated_sends] == before["sends"]
-    assert [row[legacy_field_count:] for row in migrated_sends] == [
+    assert [row[legacy_field_count:-1] for row in migrated_sends] == [
         (None, "unknown", None, ""),
         (None, "unknown", None, ""),
         (None, "unknown", None, ""),
@@ -883,6 +884,7 @@ def test_f17_interim_v1_with_drain_columns_upgrades_cleanly(tmp_path: Path) -> N
     conn = sqlite3.connect(path)
     try:
         conn.executescript(state_module._SCHEMA_SQL)
+        conn.execute("ALTER TABLE sends DROP COLUMN updated_iso")
         conn.execute("DROP TABLE latest_scan_exclusions")
         conn.execute("DROP TABLE metadata_operation_history")
         conn.execute("DROP TABLE metadata_operations")
@@ -1257,6 +1259,7 @@ def _simulate_legacy_schema(store: StateStore, version: int) -> None:
     connection.execute("DROP TABLE metadata_operations")
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(sends)")}
     for name in (
+        "updated_iso",
         "campaign_ownership_note",
         "campaign_ownership_resolved_iso",
         "campaign_ownership",

@@ -89,6 +89,7 @@ from shoko_linker.state import (
     BaselineFile,
     BudgetLimits,
     Cohort,
+    FileSeriesDisplay,
     FileState,
     SendToken,
     StateError,
@@ -6372,6 +6373,14 @@ def test_first_scan_bulk_record_wall_time(tmp_path: Path, monkeypatch: pytest.Mo
     ]
     activate_mapping(tmp_path, mapping_xml())
     store = open_tmp_store(tmp_path)
+    display_batches: list[int] = []
+    remember_display = store.remember_file_series_names_bulk
+
+    def record_display_batch(rows: list[FileSeriesDisplay], **kwargs: Any) -> None:
+        display_batches.append(len(rows))
+        remember_display(rows, **kwargs)
+
+    monkeypatch.setattr(store, "remember_file_series_names_bulk", record_display_batch)
     try:
         deps = build_deps(
             tmp_path,
@@ -6392,6 +6401,7 @@ def test_first_scan_bulk_record_wall_time(tmp_path: Path, monkeypatch: pytest.Mo
     assert report.counts.backlog == FIRST_RUN_COUNT
     assert report.counts.submitted == 0  # first scan never applies the backlog
     assert elapsed < FIRST_SCAN_WALL_BUDGET_SECONDS
+    assert display_batches == [FIRST_RUN_COUNT]
 
 
 def test_run_mapping_check_is_due_only(tmp_path: Path) -> None:

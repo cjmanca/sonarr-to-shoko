@@ -1,3 +1,339 @@
+# Final recovery, metadata batching, and history validation — 2026-10-30T12:15:14.602829+00:00
+
+Baseline `32cbab3e95b341c71c4f8ca52d2d0c5de6c76613` on `main`; independently reviewed source/test delta remains uncommitted. This validator changed no source, tests, build inputs, or requirements. All checks below are fresh for the frozen current tree.
+
+Complete host quality gate passed: `uv sync --frozen --python 3.12`, `uv lock --check`, `uv pip check`, `uv run --frozen ruff check .`, `uv run --frozen ruff format --check .`, `uv run --frozen mypy`, `uv run --frozen pytest -q --junitxml=...`, and `git diff --check`. Complete host suite: 3737 passed, 1 skipped (Windows lacks POSIX mode bits). Ruff format checked 129 files; mypy checked 124 source files. Actual versions: {"uv-version": "uv 0.9.18 (0cee76417 2025-12-16)", "python-version": "Python 3.12.11", "ruff-version": "ruff 0.8.6", "mypy-version": "mypy 1.13.0 (compiled: yes)", "pytest-version": "pytest 8.4.2", "node-version": "v24.12.0", "docker-python-version": "Python 3.12.15"}; Docker engine 29.7.2 (full version output retained).
+
+Fresh `uv build` wheel and sdist passed. Isolated installed-wheel changed-behavior suite: 1765 passed, 1 Windows POSIX skip. Fresh `docker build --no-cache`, followed by `docker run --network none --user 1000:1000` installed-runtime suite: 1749 passed, zero skips; 16 Node-dependent cases and one historical git-schema fixture explicitly deselected in Docker only and executed on host and installed wheel. The exact 37-module selection is retained in `selected-tests.txt`; it includes all daemon tests and the unchanged <10-second 7,000-file first-scan assertion. First-scan testcase durations: {"host": 2.656, "installed_wheel": 2.867, "docker": 2.63}. Coverage includes metadata batching/queue/unknown/dry-run, schema v11 and per-request event history, source review/controller/fresh collector, proven series names/AniDB identities, dates/JS/columns/polling. The historical git fixture ran on host and installed wheel with explicit repository metadata environment; the image contains no git executable. No browser or Node runtime dependency was installed in the image. CLI help, offline config validation, apply-default-deny exit 3, installed imports/hash assertions, and configured identity/persistent-state/symlink-protection smoke passed. Docker root bootstrap smoke exercised default/custom non-root identities and rejected invalid identities.
+
+All 42 packaged source files (41 Python modules) match reviewed source bytes across wheel, sdist, isolated wheel installation, and Docker installed runtime; imports resolve to installed site-packages. Frozen 158-file input manifest includes untracked Python and JavaScript inputs, and is unchanged after all checks, excluding only DEBUG_SESSION and reserved PLAN/STATUS/ORCHESTRATION documents. Manifest SHA256 `f5efd27874c736bc3c9e907428d368c725d0a1c6402f1d20a1d778f954374376`. Artifact SHA256: `{"shoko_sonarr_linker-0.1.0-py3-none-any.whl": "f6f93deeffcc81197fd677916a7b71b43512efe61bdca788e0ed7a5cbe67c5ef", "shoko_sonarr_linker-0.1.0.tar.gz": "6ee97a05db437811a808c9db312fa6a499c6afef860e84d24a7aba025514002f"}`. Fresh image `sha256:e132fc7abd943262cec7b14de29cfad21ef1c2908df094a03de86c044e708c70` (`shoko-sonarr-linker:source-recovery-final-055720`). Evidence: `C:\Users\METHEJ~1\AppData\Local\Temp\sonarr-final-bulk-perf-gate-20261030-055720` (exact commands, outputs, JUnit files, versions, selected tests, hashes, before/after manifests).
+
+Validated dirty paths:
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/action_history.py
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/file_display.py
+ M src/shoko_linker/linking.py
+ M src/shoko_linker/metadata_status.py
+ M src/shoko_linker/queue_inventory.py
+ M src/shoko_linker/source_review.py
+ M src/shoko_linker/state.py
+ M tests/dashboard_resize.cjs
+ M tests/test_action_history.py
+ M tests/test_daemon.py
+ M tests/test_dashboard_action_history.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_poll_targets.py
+ M tests/test_dashboard_routes.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_metadata_state.py
+ M tests/test_metadata_status.py
+ M tests/test_onboarding.py
+ M tests/test_queue_inventory.py
+ M tests/test_scan_exclusion_rows.py
+ M tests/test_service_runtime.py
+ M tests/test_source_review.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+ M tests/test_tracked_file_status.py
+?? tests/test_dashboard_dates.py
+?? tests/test_series_display.py
+```
+
+Limits: upstream validation used offline/mocked fixtures; no live production collector/service writes, recovery/resume, commit, push, deployment, remote CI, or GHCR publication occurred. Final real-browser changed-token acknowledgment reset and exact 24-hour crossing remain visually unverified and have Node regression coverage; browser tab/viewport cleanup was not verified. No new blocker found. Root owns acceptance and the next authorized normal commit/push.
+
+---
+
+# Independent bulk display review checkpoint — 2026-10-30T11:56:20.393413+00:00
+
+Scoped review: review_bulk_display_and_renew_gate; current HEAD 32cbab3e95b341c71c4f8ca52d2d0c5de6c76613; ignore list EMPTY.
+Reviewed production delta: FileSeriesDisplay and remember_file_series_names_bulk in state.py; daemon.py _remember_series_display; associated tests/test_series_display.py and tests/test_daemon.py. No product source/test edits by this reviewer. This is the explicitly authorized DEBUG_SESSION checkpoint exception only.
+
+Three read-only passes: requirements and consumer interfaces; atomicity/concurrency/failure edges; actual diff and test strength. CLEAN: no P0/P1/P2/P3 findings. INSERT SELECT uses six bound parameters per row and exact persisted Shoko file, Sonarr series, episode-file and path identity under BEGIN IMMEDIATE. executemany shares one transaction and durable write-stop fence; an injected failure rolls back all labels before the existing database-failure stop. Boolean/nonpositive/oversized IDs, unsafe paths and invalid names remain excluded. Source/scope validation, redaction and bounded display hydration remain intact. No identity authority derives from title, size or hash; file state and budget unchanged. Singleton wrapper remains compatible. Daemon submits one inventory batch, excluding identity drifts. History retains its one-query snapshot, frozen metadata claim names and source/scope consumer checks.
+
+Independent commands actually run (offline, frozen uv Python 3.12):
+- uv run --frozen --python 3.12 python -m pytest -q tests/test_series_display.py tests/test_daemon.py::test_first_scan_bulk_record_wall_time --durations=5 — PASS, 69 tests (count independently confirmed by collection). Performance node call 2.54 s; original 10 s limit unchanged. Dedicated bulk test persists all 7,000 labels with one BEGIN/COMMIT.
+- uv run --frozen --python 3.12 python -m pytest -o addopts= -q tests/test_action_history.py tests/test_history_path_proof.py tests/test_tracked_file_status.py --durations=3 — 140 passed in 5.54 s.
+- uv run --frozen --python 3.12 python -m pytest -o addopts= -q tests/test_daemon.py::test_scope_exclusion_is_counted_separately_and_never_tracked_for_writes tests/test_daemon.py::test_identity_change_suppresses_apply_until_reanchored tests/test_daemon.py::test_restart_identity_drift_keeps_materialized_async_send_recoverable tests/test_daemon.py::test_current_sonarr_series_identity_is_revalidated_before_final_shoko_read --durations=3 — 22 passed in 2.97 s.
+- uv run --frozen --python 3.12 ruff check src/shoko_linker/state.py src/shoko_linker/daemon.py tests/test_series_display.py tests/test_daemon.py — PASS.
+- uv run --frozen --python 3.12 ruff format --check (same four paths) — PASS, four already formatted.
+- uv run --frozen --python 3.12 mypy (same four paths) — PASS, no issues in four source files.
+- git diff --check — PASS, line-ending notices only.
+
+Renewed all-12 matrix (narrow delta analysis; unchanged lanes retain supplied prior review evidence, not a fresh all-source audit):
+| Lane | Status/evidence |
+| --- | --- |
+| L1 paths/configuration | CLEAN NO CHANGES; retained final_state_mapping_history_delta_sweep |
+| L2 transport | CLEAN NO CHANGES; retained final_runtime_metadata_batch_delta_sweep |
+| L3 mappings | CLEAN NO CHANGES; retained final_state_mapping_history_delta_sweep |
+| L4 linking | CLEAN NO CHANGES; retained final_state_mapping_history_delta_sweep; daemon identity checks rerun |
+| L5 state/SQLite | CLEAN; direct atomicity/bindings/rollback/write-stop/concurrency review and targeted tests above |
+| L6 consent/scope | CLEAN NO CHANGES; retained runtime review; source/scope display checks rerun |
+| L7 service | CLEAN NO CHANGES; retained final_runtime_metadata_batch_delta_sweep |
+| L8 daemon/campaign/performance | CLEAN; direct one-batch/drift-exclusion review, safety tests and 7,000-file timing node |
+| L9 dashboard | CLEAN NO CHANGES; retained final_dashboard_history_delivery_sweep; shared projection regression tests rerun |
+| L10 CLI/runtime display/secrets | CLEAN; direct interface, sanitization, current source/scope and immutable claim-name checks |
+| L11 package/container | CLEAN NO CHANGES; retained final_dashboard_history_delivery_sweep |
+| L12 CI/workflows | CLEAN NO CHANGES; retained final_dashboard_history_delivery_sweep |
+
+Prior evidence supplied by orchestrator: state/mapping/history review CLEAN (105 tests and actual invalidation reproducer); runtime/metadata review CLEAN (104 plus 18); dashboard/history/delivery review CLEAN (325 plus 68); three-fixture correction review CLEAN (162 plus 105). Supplied full-host result: 3731 passed, one POSIX skip; full static checks passed. Supplied fresh wheel/sdist evidence: 42 files byte-identical and smoke checks passed. Installed suite actually FAILED: 1757 passed, one failed, two skipped; first-scan 7,000-file test exceeded 10 s at 12.152 s (isolated 7.043 s). These are historical supplied results, not reviewer reruns or full acceptance.
+
+Supplied profiler root cause: 7,036 transactions versus baseline 36; roughly seven seconds plain cycle versus 2.289 s baseline, about 4.7 s in commits. Bulk fix reduced separately profiled count to 37; supplied uninstrumented cycle wall/CPU pairs 2.477/1.906, 2.416/2.031, 4.094/1.969 seconds. Reviewer timing above independently confirms unchanged timing assertion passes. Profiling timings are not substituted for the normal performance gate.
+
+Next: fresh full host/installed validation and package/Docker checks. Installed historical-git test needs GIT_DIR/GIT_WORK_TREE in external validator; no source fix requested. Full acceptance remains pending. Standing authorization for ordinary commit/push applies ONLY after all required gates PASS; this reviewer made no commits/pushes, builds, live API calls or media operations. No PLAN/STATUS/ORCHESTRATION edits.
+
+Dirty paths at checkpoint (all preserved):
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/action_history.py
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/file_display.py
+ M src/shoko_linker/linking.py
+ M src/shoko_linker/metadata_status.py
+ M src/shoko_linker/queue_inventory.py
+ M src/shoko_linker/source_review.py
+ M src/shoko_linker/state.py
+ M tests/dashboard_resize.cjs
+ M tests/test_action_history.py
+ M tests/test_daemon.py
+ M tests/test_dashboard_action_history.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_poll_targets.py
+ M tests/test_dashboard_routes.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_metadata_state.py
+ M tests/test_metadata_status.py
+ M tests/test_onboarding.py
+ M tests/test_queue_inventory.py
+ M tests/test_scan_exclusion_rows.py
+ M tests/test_service_runtime.py
+ M tests/test_source_review.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+ M tests/test_tracked_file_status.py
+?? tests/test_dashboard_dates.py
+?? tests/test_series_display.py
+```
+
+--- Preserved prior DEBUG_SESSION bytes follow ---
+
+# Independent test-fixture review checkpoint — 2026-10-30T11:29:05.499560+00:00
+
+Scoped review: review_gate_fixtures_renew_all_lanes; base/current HEAD 32cbab3e95b341c71c4f8ca52d2d0c5de6c76613; ignore list EMPTY.
+Prior dedicated FULL gate FAILED: 3728 passed, 3 failed, 1 Windows/POSIX skip (681 s), as supplied by orchestrator. This checkpoint does not claim a full-gate PASS. Prior full static evidence supplied by orchestrator: Ruff/format 129 files, mypy 124, frozen sync/lock/pip checks passed; no builds run.
+
+Bounded implementation delta reviewed: only tests/test_dashboard_file_reasons.py (current global banner/link separate from historical reason), tests/test_onboarding.py (v11 column and migration audit; retained request T2/T1/T1, never borrowed mutable file timestamps), tests/test_tracked_file_status.py (exact selected-page path sequence: twice per projection row, once per selected-row series provenance). Total 14 insertions, 5 deletions. No new production source, build or workflow changes in this delta. Existing larger working-tree changes were covered by the preceding independent reviews supplied by the orchestrator.
+
+Three independent read-only passes: requirements/source correspondence; edge cases and snapshot/provenance constraints; actual diff/assertion strength. No P0/P1/P2/P3 findings. Legacy send columns, tables, budgets and absent normal-service/auth state remain asserted; banner cannot become a recorded file reason and GET triggers zero capture/wakes; exact path identity/order excludes all off-page rows rather than permitting loose counts.
+
+Independent commands actually run with frozen uv Python 3.12:
+- uv run --frozen --python 3.12 pytest -q tests/test_dashboard_file_reasons.py tests/test_onboarding.py tests/test_tracked_file_status.py — PASS, 162 tests (progress output; exit 0).
+- uv run --frozen --python 3.12 pytest -q -o addopts= tests/test_action_history.py tests/test_series_display.py — PASS, 105 passed in 8.46 s.
+- uv run --frozen --python 3.12 ruff check tests/test_dashboard_file_reasons.py tests/test_onboarding.py tests/test_tracked_file_status.py — PASS.
+- uv run --frozen --python 3.12 ruff format --check tests/test_dashboard_file_reasons.py tests/test_onboarding.py tests/test_tracked_file_status.py — PASS, 3 already formatted.
+- uv run --frozen --python 3.12 mypy tests/test_dashboard_file_reasons.py tests/test_onboarding.py tests/test_tracked_file_status.py — PASS, no issues in 3 source files.
+- git diff --check — PASS (line-ending notices only).
+All validation was local/offline; no live APIs, media actions, builds, commits or pushes performed by this reviewer.
+
+All-12 renewal matrix — test-only delta impact analysis, NOT a fresh deep audit of all lanes:
+| Lane | Scope | Renewal evidence |
+| --- | --- | --- |
+| L1 | Configuration/paths | CLEAN; unchanged, reuse final_state_mapping_history_delta_sweep |
+| L2 | Transport | CLEAN; unchanged, reuse final_runtime_metadata_batch_delta_sweep |
+| L3 | Mappings | CLEAN; unchanged, reuse final_state_mapping_history_delta_sweep |
+| L4 | Linking | CLEAN; unchanged, reuse final_state_mapping_history_delta_sweep |
+| L5 | State/SQLite | CLEAN; affected migration fixtures independently checked here; reuse preceding source review |
+| L6 | Setup/scope/consent | CLEAN; unchanged source, migration absent-consent/auth assertions preserved; reuse runtime sweep |
+| L7 | Service | CLEAN; unchanged, reuse final_runtime_metadata_batch_delta_sweep |
+| L8 | Daemon/campaign | CLEAN; unchanged, reuse final_runtime_metadata_batch_delta_sweep |
+| L9 | Dashboard/settings | CLEAN; affected hold/history/display fixtures independently checked here; reuse preceding source review |
+| L10 | CLI/reports/secrets | CLEAN; shared bounded runtime projection expectations checked here, CLI source unchanged; reuse final_dashboard_history_delivery_sweep |
+| L11 | Package/container interfaces | CLEAN; unchanged, reuse final_dashboard_history_delivery_sweep |
+| L12 | CI/workflows | CLEAN; unchanged, reuse final_dashboard_history_delivery_sweep |
+
+Preceding review evidence supplied by orchestrator: state/mapping/history sweep CLEAN after display-provenance P2 fix, 105 series/history tests plus actual runtime endpoint drift reproducer; runtime/metadata sweep CLEAN, 104 batch/admission/queue/handoff plus 18 status/runtime/campaign tests; dashboard/history/delivery sweep CLEAN, 325 dashboard/history/date/CLI/container/workflow plus 68 logging/settings/runtime tests. No production changes since those reviews, per scoped brief.
+
+Next: orchestrator reruns full gate, fresh wheel validation and Docker build/smoke. Only after every required gate actually PASSES may the orchestrator perform the already-authorized normal commit/push. No milestone completion or publishing claimed here. Reserved PLAN/STATUS files untouched.
+
+Current dirty paths at checkpoint:
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/action_history.py
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/file_display.py
+ M src/shoko_linker/linking.py
+ M src/shoko_linker/metadata_status.py
+ M src/shoko_linker/queue_inventory.py
+ M src/shoko_linker/source_review.py
+ M src/shoko_linker/state.py
+ M tests/dashboard_resize.cjs
+ M tests/test_action_history.py
+ M tests/test_dashboard_action_history.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_poll_targets.py
+ M tests/test_dashboard_routes.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_metadata_state.py
+ M tests/test_metadata_status.py
+ M tests/test_onboarding.py
+ M tests/test_queue_inventory.py
+ M tests/test_scan_exclusion_rows.py
+ M tests/test_service_runtime.py
+ M tests/test_source_review.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+ M tests/test_tracked_file_status.py
+?? tests/test_dashboard_dates.py
+?? tests/test_series_display.py
+```
+
+---
+
+# Final cross-change review checkpoint — 2026-10-30T11:11:02.504883+00:00
+
+Explicitly delegated bookkeeping exception: this UTF-8 prefix preserves every previous byte below. No PLAN, STATUS, ORCHESTRATION, product, test, workflow, or packaging files were edited by this reviewer. Ignored findings: EMPTY.
+
+Current requirements and implementation retained from the self-contained root brief and checked against PROJECT.md/source:
+- Overview Linking controls contains source recovery: native authenticated POST/303 to /status#source-review, immediate indeterminate progress, independent live fragment, same-token acknowledgment/focus preservation, fresh-token reset, accepted/current remaining-gate guidance, collapsed historical audit. GET/status performs no remote job collection. Acceptance binds fresh session/hold/evidence, changes only the local baseline, keeps user pause and independent safety gates, then schedules separate trusted reassessment (typed ACCEPTED, one-second continuation, stale reevaluation cache invalidated).
+- Metadata admissions require one complete empty whole-queue observation before a bounded initial batch; remaining hard allowance is independent of file canary throughput. Pending/failed canary, uncertainty, source/setup/write/safety holds and fresh per-request guards remain blockers; shared budgets remain enforced.
+- Schema v11 retains per-send Updated events and conservatively backfills only aware bounded retained request timestamps, never mutable file activity. Metadata rearm generations receive their own created time.
+- Display names are immutable metadata-claim snapshots or strict source/scope/identity-bound local fallbacks. History reads one SQL snapshot; current labels are fenced against initial/final source/scope drift. Immutable historical target IDs/names remain retained. All tables use bounded strict positive known IDs and canonical https://anidb.net/anime/<id> links, native accessible SVG, escaped untrusted labels; unknown identities yield no links.
+- History separates Requested and Updated compact date columns from Status; metadata uses the series name or explicit unavailable label. Structured UI times use shared server/browser formatting: absolute distance under 24 hours HH:mm, exactly 24 hours or farther YYYY-MM-DD, browser local time with one labelled UTC fallback hint and precise accessible timestamp details. Raw machine output/technical diagnostics retain ISO evidence. Mapping status supplies typed optional last/next fields. New width keys retain old preferences, correct empty colspan, native pagination and poll-safe pointer/keyboard resizing. No runtime Node/browser dependency is introduced.
+
+Final review evidence:
+- Root brief reports distinct earlier implementation reviews CLEAN and final lanes L1/L3/L4/L5 CLEAN (105 targeted tests plus actual endpoint reproduction), L2/L6/L7/L8 CLEAN (104 plus 18 targeted tests). This reviewer did not rerun or independently certify those earlier commands.
+- This distinct read-only reviewer completed the final delta/interface requirements, edge/failure and source/snapshot/test passes for L9 dashboard/settings, L10 CLI/report secrets, L11 packaging/container, L12 CI/workflows: ALL CLEAN, NO PRODUCT CHANGES. Combined with root-supplied earlier final sweeps, all 12 final lanes are CLEAN. No ignored findings, hypothetical refactor, new subagents, live API writes, media access, commit or push.
+- Actual command: uv run --frozen --python 3.12 python -m pytest -q tests/test_dashboard_source_review.py tests/test_dashboard_routes.py tests/test_dashboard_dates.py tests/test_dashboard_action_history.py tests/test_dashboard_live_updates.py tests/test_dashboard_poll_targets.py tests/test_dashboard_resize.py tests/test_series_display.py tests/test_cli.py tests/test_cli_m7.py tests/test_container_entrypoint.py tests/test_workflows.py — exit 0, all passed. Separate collect-only with -o addopts='' -q verified 325 tests.
+- Actual command: uv run --frozen --python 3.12 python -m pytest -o addopts='' -q tests/test_logging.py tests/test_service_settings.py tests/test_service_runtime.py — 68 passed in 12.93s.
+- Actual interpreter: Python 3.12.11; SQLite 3.49.1. Inspected unchanged pyproject Hatch package src/shoko_linker, Docker COPY src/noneditable install, .dockerignore, shared CI checks, workflow event/permission/provenance/promotion interfaces. All changed runtime Python modules are already tracked within the included package; new files are tests only. No wheel/sdist/container build in this sweep.
+- Root brief reports real local browser verification with actual app/controller/SQLite and synthetic collector/status stubs: assess/accept anchor and immediate progress; same-token acknowledgment/focus; accept clears stale source hold while preserving user pause/Resume; fresh hold acknowledgment; History names/dates/AniDB links across tables; resizing/poll/navigation; no page overflow at 320/375/760. Browser limits remain explicit: final changed-token visual reset and actual 24h crossing not browser-verified (production JS Node coverage exists); debugger detached, fixture ports closed, tab cleanup/reset failed at final 320x760. This reviewer did not repeat browser work.
+
+Actual HEAD: 32cbab3e95b341c71c4f8ca52d2d0c5de6c76613 (requested base 32cbab3 verified). Current working tree is dirty:
+```
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/action_history.py
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/file_display.py
+ M src/shoko_linker/linking.py
+ M src/shoko_linker/metadata_status.py
+ M src/shoko_linker/queue_inventory.py
+ M src/shoko_linker/source_review.py
+ M src/shoko_linker/state.py
+ M tests/dashboard_resize.cjs
+ M tests/test_action_history.py
+ M tests/test_dashboard_action_history.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_poll_targets.py
+ M tests/test_dashboard_routes.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_metadata_state.py
+ M tests/test_metadata_status.py
+ M tests/test_queue_inventory.py
+ M tests/test_scan_exclusion_rows.py
+ M tests/test_service_runtime.py
+ M tests/test_source_review.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+?? tests/test_dashboard_dates.py
+?? tests/test_series_display.py
+```
+
+CURRENT TREE HAS NOT PASSED THE DEDICATED FULL GATE. The previously reported 3558-pass baseline belongs to 32cbab3, not these production/schema11 changes. Next: dedicated full configured checks, fresh wheel/sdist installed-artifact validation, and fresh Docker build/smokes. Only after all pass may the root proceed with the standing-authorized normal commit/push. Remote CI/publication and live Sonarr/Shoko deployment remain separate/unverified.
+
+--- Prior DEBUG_SESSION.md bytes preserved below ---
+
+## UI column implementation checkpoint — 2026-10-30T10:45:49.415943+00:00
+
+Assigned sequential bounded UI implementation completed; acceptance/review remain with root orchestrator. Ignore list: EMPTY. HEAD: 32cbab3.
+
+Current requested behavior: History has separate resizable Requested and Updated columns, using the already independently reviewed shared compact timestamp formatter (browser local timezone, labelled UTC fallback, full accessible timestamp; exact 24h boundary uses date). Status contains outcome/message without appended date labels. Requested means retained attempt/local preparation and does not prove delivery; Updated means latest request event. Metadata History now uses retained series_name, falling back to Series name unavailable, preserving actual file names and retained source/proof semantics. Every shared actual table (Verified, Waiting, Issues, latest scan exclusions, History) has an accessible code-native AniDB icon Links column; only supplied bounded strict positive known IDs produce fixed https://anidb.net/anime/ID anchors, deduplicated; unknowns show em dash. User names are escaped/redacted. New width keys preserve existing v1 preferences; pagination, auth/CSRF, counters, polling/disclosures/focus/scroll/setup choices and GET read-only behavior remain in place.
+
+Prior review evidence supplied by root: shared compact timestamp formatter independently CLEAN (54+15 tests); display-data/action_history/file_display/linking/daemon/metadata_status/state changes independently CLEAN, including restart/archive names, validated known IDs, unchanged demand fingerprint, and local fallback evidence. These are supplied previous reviews, not a new review of this implementation. Prior complete 8d1 full gate is BASELINE ONLY, not a current dirty-worktree pass.
+
+This implementation changed only src/shoko_linker/dashboard.py, tests/test_dashboard_routes.py, tests/test_dashboard_action_history.py, tests/dashboard_resize.cjs, plus this explicitly authorized byte-preserving checkpoint. No worker/state/display-data changes, commits, pushes, live API requests, media access, full validation, or subagents.
+
+Current exact successful checks:
+- uv run --frozen --python 3.12 pytest -o addopts= -q tests/test_dashboard_routes.py tests/test_dashboard_action_history.py tests/test_dashboard_dates.py tests/test_dashboard_resize.py tests/test_dashboard_poll_targets.py tests/test_dashboard_live_updates.py : 77 passed in 12.97s (offline/mocked HTTP and Node DOM boundary doubles, not real-browser validation).
+- uv run --frozen --python 3.12 ruff check src/shoko_linker/dashboard.py tests/test_dashboard_routes.py tests/test_dashboard_action_history.py : All checks passed.
+- uv run --frozen --python 3.12 ruff format --check src/shoko_linker/dashboard.py tests/test_dashboard_routes.py tests/test_dashboard_action_history.py : 3 files already formatted.
+- uv run --frozen --python 3.12 mypy src/shoko_linker/dashboard.py tests/test_dashboard_routes.py tests/test_dashboard_action_history.py : Success, 3 source files.
+- git -c core.safecrlf=false diff --check : clean.
+
+Next: root arranges different sequential read-only UI reviewer, then local fixture browser verification, then final 12-lane sweep/full gate and package/Docker checks, then root-authorized normal commit/push. These remain unperformed here. Root owns acceptance and project bookkeeping. No PLAN/STATUS/ORCHESTRATION reads or edits by implementer.
+
+Dirty paths at checkpoint (includes preexisting user/root work; preserved):
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/action_history.py
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/file_display.py
+ M src/shoko_linker/linking.py
+ M src/shoko_linker/metadata_status.py
+ M src/shoko_linker/queue_inventory.py
+ M src/shoko_linker/source_review.py
+ M src/shoko_linker/state.py
+ M tests/dashboard_resize.cjs
+ M tests/test_action_history.py
+ M tests/test_dashboard_action_history.py
+ M tests/test_dashboard_live_updates.py
+ M tests/test_dashboard_poll_targets.py
+ M tests/test_dashboard_routes.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_metadata_state.py
+ M tests/test_metadata_status.py
+ M tests/test_queue_inventory.py
+ M tests/test_scan_exclusion_rows.py
+ M tests/test_service_runtime.py
+ M tests/test_source_review.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+?? tests/test_dashboard_dates.py
+?? tests/test_series_display.py
+```
+
+--- Prior DEBUG_SESSION.md bytes follow unchanged ---
+
+## 2026-10-30 — bounded History/date/series-link discovery checkpoint
+
+Latest outstanding user requirements: remove all request dates from History Status; add Requested and Updated columns with honest distinct event semantics. Compact dates everywhere in human dashboard: past 24h HH:mm, older YYYY-MM-DD; upcoming <=24h HH:mm, farther future YYYY-MM-DD. Full ISO/zone accessible in time/title; browser local enhancement and honest UTC server fallback. Preserve ISO machine API/CLI/report serialization and useful countdowns. Metadata history primary subject must be trustworthy retained series name; Links column on every actual table uses deduplicated positive verified AniDB IDs only, native accessible icon and fixed https://anidb.net/anime/{id}. No guessed associations or remote GETs. Preserve pagination, resizing, poll/disclosure behavior.
+
+Read-only discovery findings: dashboard.py has one shared table renderer (all tracked groups, exclusions, history); widths keyed by column name v1, not numeric indices; no existing sorting or browser timezone formatter. History currently appends both ISO timestamps into Status. state._action_rows uses COALESCE(verified_iso,attempted_iso) for file update; send acceptance/rejection/uncertainty/void/operator-resolution times are not persisted per send. verified_iso records pending/unknown/partial/conflict inspection times too, not only success. Metadata updated_iso is durable; attempted_iso is pretransport fence, created_iso local reservation. prepare_metadata_operation ON CONFLICT replaces claim but does not reset created_iso, so replacement prepared claims inherit old creation time. SonarrSeries has title in memory; inventory cache persists episodes/files/fetched_at only, not series title; no source_json cache. Titles must be retained display-only by worker from exact series context, including per metadata claim, never inferred from IDs/path or current mapping. Existing sends.target_ids_json and frozen file_mapping_targets:v1:{file_id} keys contain proven AniDB IDs (keys encode tvdb/season/episode/absolute/anime/number/type); bounded safe display decoding needed. Unmapped scan exclusions lack anime evidence and keep blank Links.
+
+Next bounded implementation: data/projection lane first. Add honest per-send updated timestamp migration and transition coverage with conservative legacy evidence; fix new metadata claim creation semantics; persist display-only title context from verified inventory/demand and expose bounded names/IDs without GET or write-authority coupling. Then sequential review. Shared UI lane after: one escaped <time> renderer plus browser-local formatter on initial render/polls, typed mapping-next-check fact instead of parsing diagnostics/prose, dynamic common columns and accessible AniDB link helper; History adds Requested/Updated and removes date strings from Status. Tests should cover lifecycle/legacy/archive/unknown/provenance, strict positive IDs/multi-target/bounds/redaction/no HTTP, all routes/time fields/boundaries/timezones/invalid dates and column counts. Browser fixture afterward; final all-lane delta sweep, dedicated full gate/package Docker remain outstanding. Three design choices for root: YYYY-MM-DD vs D MMM YYYY vs locale date (recommend YYYY-MM-DD); unknown title vs explicitly labelled folder fallback (recommend unknown); same-tab AniDB links vs safe new-tab rel=noopener noreferrer (recommend same-tab).
+
+HEAD observed: 32cbab3e95b341c71c4f8ca52d2d0c5de6c76613. Dirty paths before this checkpoint: PROJECT.md; src/shoko_linker/{cli.py,daemon.py,dashboard.py,metadata_status.py,queue_inventory.py,source_review.py}; tests/{test_dashboard_source_review.py,test_metadata_executor.py,test_metadata_scheduling.py,test_metadata_status.py,test_queue_inventory.py,test_source_review.py,test_source_review_scheduling.py}. Existing diffs preserved. Ignore list EMPTY. No implementation, tests, live APIs, media access, commits or push performed by this discovery.
+
+Prior results supplied by orchestrator, not rerun here and not current full gate: backend CLI/source review typed ACCEPTED with one-second normal cache invalidation/hold audit lifecycle, 108 tests; UI Linking controls/source-review POST303/status fragment progress, focus/poll/disclosure review 56 tests +31 rereview; metadata queue inventory/status daemon batch and safety coverage 11 relevant suites/551 collected passed, implementer final146+4 checks, four-suite independent review CLEAN. Sequential agents only; live production pause owner/hold verified per supplied context. Do not treat prior passes as final all-lane acceptance. Reserved empty PLAN/STATUS not read or edited.
+
 ## 2026-10-30T09:08:51.871240+00:00 — Final validation: source-review test clock alignment
 
 - HEAD `8d1b44d337db74282af9239f6888aef51fb55cc6` on `main`; only dirty input before checkpoint: `tests/test_source_review_collector.py` (test-only delta).

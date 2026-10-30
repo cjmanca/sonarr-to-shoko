@@ -47,7 +47,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Final, cast
 
@@ -287,6 +287,8 @@ class MetadataDemand:
     mapping_revision: str
     overrides_active: bool
     fingerprint: str
+    # Display only: never changes equality, fingerprints, or source authorization.
+    series_name: str = field(default="", compare=False, repr=False)
 
     @property
     def required_targets(self) -> frozenset[tuple[int, EpisodeType, int]]:

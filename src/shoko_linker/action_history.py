@@ -28,6 +28,9 @@ class RecentAction:
     current_path: str = ""
     http_status: int | None = None
     current_path_complete: bool = False
+    series_name: str = ""
+    known_anidb_ids: tuple[int, ...] = ()
+    series_display_context: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -36,7 +39,7 @@ class ActionHistoryView:
     examples: tuple[RecentAction, ...] = ()
     scope_message: str = (
         "Retained linker request records across all configured server sources and modes. "
-        "Paths are current retained context, not historical path snapshots. "
+        "Paths and legacy series labels are current retained context, not historical snapshots. "
         "Prepared or possibly sent requests do not prove an HTTP request reached Shoko. "
         "This is not an audit of media changes or Shoko hooks."
     )
@@ -90,7 +93,7 @@ def _iso(value: Any) -> str:
 
 
 def action_history_view(store: StateStore) -> ActionHistoryView:
-    """No HTTP, decoding of payload JSON, state mutation, or filesystem inspection."""
+    """No HTTP, state mutation, or filesystem inspection; bounded local display data only."""
     total, rows = store.recent_action_rows()
     return ActionHistoryView(total=total, examples=_actions(rows))
 
@@ -132,6 +135,9 @@ def _actions(rows: tuple[dict[str, Any], ...]) -> tuple[RecentAction, ...]:
         examples.append(
             RecentAction(
                 action_id=_text(row["action_id"]),
+                series_name=row["series_name"],
+                known_anidb_ids=row["known_anidb_ids"],
+                series_display_context=row["series_display_context"],
                 operation=operation,
                 subject_id=row["subject_id"],
                 requested_iso=_iso(row["requested_iso"]),

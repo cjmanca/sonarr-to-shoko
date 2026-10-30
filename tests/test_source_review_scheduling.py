@@ -20,7 +20,7 @@ from shoko_linker import cli
 from shoko_linker.bootstrap import BootstrapSettings
 from shoko_linker.config import SecretRef
 from shoko_linker.http import ApiEndpoint
-from shoko_linker.service import run_dashboard_worker
+from shoko_linker.service import ConnectionReport, run_dashboard_worker
 from shoko_linker.service_settings import ServiceSettingsController, load_service_settings
 from shoko_linker.source_review import SourceReviewController, SourceReviewWork
 from shoko_linker.state import META_SERVICE_SETTINGS, StateStore, open_state
@@ -142,10 +142,22 @@ def scheduled_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterato
 @pytest.mark.parametrize("confirm", [False, True])
 def test_production_scheduler_continues_paused_review_and_confirmation(
     scheduled_review: ScheduledReview,
+    monkeypatch: pytest.MonkeyPatch,
     confirm: bool,
 ) -> None:
     h = scheduled_review
     confirmation_requested = False
+    ordinary_ticks = 0
+
+    def ordinary() -> None:
+        nonlocal ordinary_ticks
+        ordinary_ticks += 1
+        assert h.runtime.source_review.view(SESSION).status == "confirmed"
+        assert not h.runtime.status().automatic_linking
+        assert "Resume" in h.runtime.status().next_action
+        h.runtime._tick_cycle_started = True
+
+    monkeypatch.setattr(h.runtime, "_worker_tick", ordinary)
 
     def on_wait(delay: float) -> bool:
         nonlocal confirmation_requested
@@ -164,8 +176,82 @@ def test_production_scheduler_continues_paused_review_and_confirmation(
     view = h.runtime.source_review.view(SESSION)
     assert view.status == ("confirmed" if confirm else "ready")
     assert len(h.collector.works) == (6 if confirm else 3)
-    assert h.waits == ([1, 1, 1000, 1, 1, 1, 1000] if confirm else [1, 1, 1000])
+    assert h.waits == ([1, 1, 1000, 1, 1, 1, 1, 1000] if confirm else [1, 1, 1000])
+    assert ordinary_ticks == int(confirm)
     assert view.service_pause == (True, "user_paused")
+
+
+@pytest.mark.parametrize("remaining", ["none", "user", "setup", "writes", "canary", "pending"])
+def test_acceptance_discards_cached_source_guidance_and_preserves_remaining_gates(
+    scheduled_review: ScheduledReview,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: str,
+) -> None:
+    h = scheduled_review
+    with open_state(h.runtime.settings.database_path) as store:
+        # The accepted baseline must not need Resume when no independent pause exists.
+        assert store.resume_onboarding_if_current(store.get_onboarding_json() or "", T1)
+        _, old_guidance = h.runtime._operational_status(
+            store, authorized=True, next_action="Processing eligible files."
+        )
+    h.runtime._update_latest(authorized=False, next_action=old_guidance)
+    assert "Review source change on Overview" in h.runtime.status().next_action
+    for _ in range(3):
+        h.runtime.worker_tick()
+        h.clock.advance()
+    token = h.runtime.source_review.view(SESSION).token
+    assert token is not None
+    h.runtime.source_review.request_confirmation(token, SESSION)
+    h.clock.advance()
+    delays = [h.runtime.worker_tick() for _ in range(3)]
+    assert delays == [1, 1, 1]
+    assert h.runtime.source_review.view(SESSION).status == "confirmed"
+    with open_state(h.runtime.settings.database_path) as store:
+        assert not store.get_source_continuity_review().requires_rebaseline
+        if remaining == "user":
+            store.pause_service_for_user(T1)
+        elif remaining == "setup":
+            store.pause_service_for_review("setup_changed", T1)
+        elif remaining == "writes":
+            store.disable_writes("independent safety stop")
+        elif remaining in ("canary", "pending"):
+            store.record_service_canary(500, T1)
+            if remaining == "canary":
+                store.set_service_canary_status("failed", T1)
+    status = h.runtime.status()
+    assert not status.automatic_linking
+    assert "Review source change on Overview" not in status.next_action
+    expected = {
+        "none": "accepted. Checking current requirements",
+        "user": "Resume",
+        "setup": "Confirm the current scope and safety setup again",
+        "writes": "stopped by a safety check",
+        "canary": "initial link could not be verified",
+        "pending": "Waiting for the initial link to be verified",
+    }
+    assert expected[remaining] in status.next_action
+
+    # The short handoff belongs to the NEXT operation and is consumed only once.
+    calls: list[str] = []
+
+    def probe(*_args: object) -> ConnectionReport:
+        calls.append("connections")
+        return ConnectionReport(True, True, ())
+
+    def context(*_args: object) -> None:
+        calls.append("setup")
+
+    monkeypatch.setattr(cli, "configured_bootstrap", lambda _: h.runtime.settings)
+    monkeypatch.setattr(cli, "probe_connections", probe)
+    monkeypatch.setattr(h.runtime.setup, "current_context", context)
+    monkeypatch.setattr(
+        h.runtime, "_worker_tick", lambda: cli._NormalServiceRuntime._worker_tick(h.runtime)
+    )
+    monkeypatch.setattr(h.runtime, "_recover_blocked_metadata", lambda *_: calls.append("recovery"))
+    assert h.runtime.worker_tick() is None
+    assert calls == ["connections", "setup", "recovery"]
+    assert not h.runtime.status().automatic_linking
+    assert "Review source change on Overview" not in h.runtime.status().next_action
 
 
 @pytest.mark.parametrize("end", ["stalled", "session", "failed", "busy"])

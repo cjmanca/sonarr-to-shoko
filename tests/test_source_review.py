@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from test_source_rebaseline import OBSERVATION, SESSION, T1, bindings, digest, setup, tables
+from test_source_rebaseline import OBSERVATION, SESSION, T1, bindings, digest, poll, setup, tables
 
 from shoko_linker.source_review import (
     SourceReviewController,
@@ -100,7 +100,7 @@ class Harness:
     wakes: list[bool]
 
     def tick(self) -> bool:
-        return self.controller.worker_tick(self.clock.mono + 60)
+        return bool(self.controller.worker_tick(self.clock.mono + 60))
 
     def ready(self) -> str:
         self.controller.request_assessment(SESSION)
@@ -529,6 +529,100 @@ def test_restart_does_not_automatically_recollect_or_accept_old_token(harness: H
     assert not restarted.worker_tick(h.clock.mono + 60)
     assert len(h.collector.works) == 1
     assert restarted.request_assessment(SESSION).status == "queued"
+
+
+@pytest.mark.parametrize("previous", ["confirmed", "ready", "error", "assessing"])
+def test_new_hold_never_displays_previous_review_lifecycle(harness: Harness, previous: str) -> None:
+    h = harness
+    token = h.ready()
+    if previous == "confirmed":
+        h.confirm(token)
+    elif previous == "error":
+        h.collector.mapping = "changed"
+        h.confirm(token)
+    elif previous == "assessing":
+        h.controller.request_confirmation(token, SESSION)
+        h.clock.advance()
+        h.collector.slices = 3
+        assert h.tick()
+    with open_state(h.path) as store:
+        old_hold = store.get_source_continuity_review().hold
+        audit = store.get_source_rebaseline_review().last_audit
+        if previous != "confirmed":
+            # Another local process accepts the old hold; this controller cannot
+            # transfer its ready, failed or in-progress display to the next hold.
+            store.set_meta("requires_rebaseline", "0")
+            store.connection.execute(
+                "DELETE FROM meta WHERE key = ?", (META_SOURCE_CONTINUITY_HOLD,)
+            )
+            store.connection.commit()
+        poll(store, total=55, at=h.clock.now.isoformat())
+        current = store.get_source_continuity_review()
+        assert current.hold is not None
+        assert current.hold.current is not None
+        assert current.hold.current.discovery_total == 55
+        if old_hold is not None:
+            assert current.hold.hold_id != old_hold.hold_id
+        before = tables(store)
+        before_meta = store.connection.execute(
+            "SELECT key, value FROM meta ORDER BY key"
+        ).fetchall()
+    calls, wakes = h.collector.capture_calls, len(h.wakes)
+    for _ in range(2):
+        view = h.controller.view(SESSION)
+        assert view.status == "idle"
+        assert view.continuity == current
+        assert view.token is None
+        assert view.summary is None
+        assert view.started_iso is None
+        assert view.completed_iso is None
+        assert view.message == ""
+    assert h.collector.capture_calls == calls
+    assert len(h.wakes) == wakes
+    with open_state(h.path) as store:
+        assert tables(store) == before
+        assert (
+            store.connection.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+            == before_meta
+        )
+        assert store.get_source_rebaseline_review().last_audit == audit
+    # A former owner/token cannot reserve the new hold against another session.
+    replacement = h.controller.request_assessment(OTHER_SESSION)
+    assert replacement.status == "queued"
+    assert replacement.token is None
+    with pytest.raises(StateError, match="another session"):
+        h.controller.request_assessment(SESSION)
+    with open_state(h.path) as store:
+        assert store.get_source_continuity_review() == current
+
+
+def test_another_controller_accepting_new_hold_cannot_revive_old_confirmation(
+    harness: Harness,
+) -> None:
+    h = harness
+    h.confirm(h.ready())
+    with open_state(h.path) as store:
+        poll(store, total=55, at=h.clock.now.isoformat())
+    other = SourceReviewController(
+        h.path,
+        h.collector,
+        wake=lambda: None,
+        shutdown_requested=lambda: False,
+        now=lambda: h.clock.now,
+        monotonic=lambda: h.clock.mono,
+    )
+    other.request_assessment(SESSION)
+    assert other.worker_tick(h.clock.mono + 60)
+    token = other.view(SESSION).token
+    assert token is not None
+    other.request_confirmation(token, SESSION)
+    h.clock.advance()
+    assert other.worker_tick(h.clock.mono + 60)
+    assert other.view(SESSION).status == "confirmed"
+    previous = h.controller.view(SESSION)
+    assert previous.status == "idle"
+    assert previous.summary is None
+    assert previous.token is None
 
 
 def test_ready_token_monotonic_expiry_survives_wall_clock_rollback(harness: Harness) -> None:

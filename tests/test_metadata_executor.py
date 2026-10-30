@@ -103,6 +103,7 @@ def executor(tmp_path: Path) -> Iterator[Executor]:
     store = td.open_tmp_store(tmp_path)
     td.seed_baseline(store, [], td.T0)
     shoko = RefreshStub([file])
+    shoko.queue_items = []
     sonarr = td.SonarrStub([file])
     clock = [0.0]
     deps = replace(
@@ -562,7 +563,7 @@ def test_changes_during_final_reads_reject_the_request(executor: Executor, chang
             executor.deps.store.pause_service_for_review("setup_changed", td.T1)
 
     if change == "queue_blocked":
-        executor.shoko.blocked_count = 1
+        executor.shoko.queue_items = [qf.item("Other.BlockedJob", "blocked")]
     else:
         executor.shoko.on_get = changed
     assert executor.run().attempted == 0
@@ -653,3 +654,36 @@ def test_direct_metadata_executor_binds_its_explicit_authorization_deadline(
     assert executor.shoko.refreshes == []
     assert executor.row() is None
     assert executor.deps.store.budget_view().pending_episode_jobs == 0
+
+
+@pytest.mark.parametrize("change", ["cycle", "server", "deadline", "demand"])
+def test_empty_queue_admission_cannot_be_reused_outside_its_operation(
+    executor: Executor, change: str
+) -> None:
+    admission = daemon._metadata_queue_admission(
+        executor.deps, {td.ANIME_ID: executor.demand}, "cycle-1", 100.0
+    )
+    assert isinstance(admission, daemon._MetadataBatchAdmission)
+    if change == "cycle":
+        admission = replace(admission, cycle_key="another-cycle")
+    elif change == "server":
+        admission = replace(admission, source_key="another-server")
+    elif change == "deadline":
+        admission = replace(admission, deadline=200.0)
+    else:
+        admission = replace(admission, demands=frozenset())
+    outcome = daemon.process_metadata_demand(
+        executor.deps,
+        executor.demand,
+        td.ANIME_ID,
+        executor.active,
+        executor.folders,
+        daemon._EligibilityFlags(None, None, True, True, True, True),
+        "cycle-1",
+        deadline=100.0,
+        _batch=admission,
+    )
+    assert outcome.reason == "metadata_authorization_or_demand_changed"
+    assert outcome.attempted == 0
+    assert executor.shoko.refreshes == []
+    assert executor.row() is None

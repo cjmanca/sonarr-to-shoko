@@ -99,6 +99,8 @@ class QueueInventory:
     complete: bool
     reason: InventoryReason
     pages_fetched: int
+    # All jobs, including kinds omitted from ``jobs``; only complete reads prove emptiness.
+    total_count: int | None = None
 
     def lookup(self, kind: QueueJobKind, subject_id: int) -> QueuePresence:
         """Positive identities survive an incomplete read; absence never does."""
@@ -431,5 +433,9 @@ def fetch_queue_inventory(
         sorted(set(jobs), key=lambda item: (item.kind.value, item.subject_id, item.state.value))
     )
     return QueueInventory(
-        unique_jobs, reason is InventoryReason.COMPLETE, reason, reader.pages_fetched
+        unique_jobs,
+        reason is InventoryReason.COMPLETE,
+        reason,
+        reader.pages_fetched,
+        initial.total if reason is InventoryReason.COMPLETE else None,
     )

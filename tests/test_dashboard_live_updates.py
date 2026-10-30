@@ -62,7 +62,8 @@ const document = {
   getElementById() { return notice; },
   querySelector(selector) { assert.equal(selector, '[data-refresh-url]'); return null; },
   querySelectorAll(selector) {
-    if (selector === 'table[data-table]') return [];
+    if (['time[data-compact-time]', '[data-timezone]', 'table[data-table]']
+        .includes(selector)) return [];
     assert.equal(selector, '[data-live]'); return [...current.values()];
   }
 };
@@ -71,7 +72,7 @@ const window = {addEventListener() {},
   setTimeout(fn) { timers.push(fn); }};
 class DOMParser {
   parseFromString() {
-    return {querySelector(selector) {
+    return {querySelectorAll() { return []; }, querySelector(selector) {
       if (selector === '[data-refresh-url]') return null;
       if (selector === 'input[name="csrf_token"]') return null;
       const key = selector.match(/^\[data-live="(.+)"\]$/)[1];

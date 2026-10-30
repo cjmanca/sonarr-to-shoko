@@ -171,6 +171,7 @@ def test_v9_upgrade_adds_only_latest_rows_table_preserving_file_and_send_history
         }
         store.connection.execute("DROP TABLE latest_scan_exclusions")
         store.connection.execute("DELETE FROM schema_version WHERE version>=10")
+        store.connection.execute("ALTER TABLE sends DROP COLUMN updated_iso")
         store.connection.execute("PRAGMA user_version=9")
     with open_state(path) as store:
         assert store.schema_version() == SCHEMA_VERSION

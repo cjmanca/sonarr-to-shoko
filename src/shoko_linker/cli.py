@@ -107,6 +107,7 @@ from .daemon import (
     CycleMode,
     CycleReport,
     DaemonDeps,
+    _metadata_scope_fingerprint,
     _no_shutdown_requested,
     compute_eligibility,
     full_cycle_due,
@@ -136,6 +137,7 @@ from .mapping_store import (
 from .mapping_store import (
     status as mapping_status,
 )
+from .metadata_identity import metadata_source_key_for_url
 from .metadata_operations import metadata_source_key, recover_metadata_operations
 from .metadata_status import MetadataStatusView, metadata_status_view
 from .onboarding import OnboardingContext, OnboardingManager, OnboardingStatus, ScopeBinding
@@ -190,7 +192,7 @@ from .service_settings import (
     load_service_settings,
 )
 from .service_setup import ServiceSetupController
-from .source_review import SourceReviewController
+from .source_review import SourceReviewController, SourceReviewTick
 from .source_review_collector import FreshSourceReviewCollector
 from .state import (
     ATTESTATION_PAUSE_REASON,
@@ -928,9 +930,12 @@ class _NormalServiceRuntime:
             "connection": None,
             "authorized": False,
             "next_action": self._INITIAL_ACTION,
+            "reassessment_pending": False,
             "diagnostics": (),
             "worker_activity": "",
             "mapping_cache": "Available after scope and safety setup is confirmed above.",
+            "mapping_next_check_iso": None,
+            "mapping_last_check_iso": None,
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
         self._tick_cycle_started = False
@@ -945,6 +950,8 @@ class _NormalServiceRuntime:
 
     def _update_latest(self, **changes: Any) -> None:
         with self._latest_lock:
+            if "next_action" in changes:
+                self.latest["reassessment_pending"] = False
             self.latest.update(changes)
 
     def _latest_snapshot(self) -> dict[str, Any]:
@@ -959,6 +966,7 @@ class _NormalServiceRuntime:
         next_action: str,
         report: CycleReport | None = None,
         mapping_action: str | None = None,
+        reassessment_pending: bool = False,
     ) -> tuple[bool, str]:
         """Project write availability separately from consent and cycle success."""
         paused, pause_reason = store.get_service_pause()
@@ -967,17 +975,11 @@ class _NormalServiceRuntime:
             # Before the first check, derive guidance from the durable hold instead.
             if (
                 authorized
+                or reassessment_pending
                 or next_action == _NormalServiceRuntime._INITIAL_ACTION
                 or pause_reason == "user_paused"
             ):
-                if pause_reason == "unsafe_shoko_settings":
-                    next_action = "Review and fix Shoko safety settings, then confirm setup again."
-                elif OnboardingManager(store).reconfirmation_required():
-                    next_action = "Confirm the current scope and safety setup again."
-                elif pause_reason == "user_paused":
-                    next_action = "Automatic linking is paused. Resume when you are ready."
-                else:
-                    next_action = "Review the current scope, safety setup and connections."
+                next_action = _NormalServiceRuntime._pause_guidance(store, pause_reason)
             return False, next_action
         continuity_held = store.get_meta("requires_rebaseline") == "1"
         if store.writes_disabled or continuity_held:
@@ -995,7 +997,11 @@ class _NormalServiceRuntime:
                 "Automatic linking is stopped because the initial link could not be verified. "
                 "Review advanced diagnostics before retrying."
             )
-        if not authorized:
+        if not authorized and not (
+            reassessment_pending and canary is not None and canary[1] == "pending"
+        ):
+            if reassessment_pending and OnboardingManager(store).reconfirmation_required():
+                next_action = "Confirm the current scope and safety setup again."
             return False, next_action
         if report is not None and (report.failed or report.writes_suppressed):
             next_action = "A service check needs attention; automatic linking will retry safely."
@@ -1012,6 +1018,16 @@ class _NormalServiceRuntime:
                 "The service will check again automatically."
             )
         return _NormalServiceRuntime._queue_wait_status(report, authorized, next_action)
+
+    @staticmethod
+    def _pause_guidance(store: StateStore, reason: str | None) -> str:
+        if reason == "unsafe_shoko_settings":
+            return "Review and fix Shoko safety settings, then confirm setup again."
+        if OnboardingManager(store).reconfirmation_required():
+            return "Confirm the current scope and safety setup again."
+        if reason == "user_paused":
+            return "Automatic linking is paused. Resume when you are ready."
+        return "Review the current scope, safety setup and connections."
 
     @staticmethod
     def _queue_wait_status(
@@ -1047,7 +1063,7 @@ class _NormalServiceRuntime:
         if status.next_due_iso is not None:
             due = datetime.fromisoformat(status.next_due_iso).astimezone(UTC)
             if due > now:
-                retry = f"Next mapping check: {due.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+                retry = "The next mapping check is scheduled automatically."
         retained = (
             " Last verified mappings are retained."
             if status.active_present
@@ -1105,6 +1121,7 @@ class _NormalServiceRuntime:
             active, next_action = self._operational_status(
                 store,
                 authorized=bool(latest["authorized"]),
+                reassessment_pending=bool(latest["reassessment_pending"]),
                 next_action=(
                     self._INITIAL_ACTION
                     if latest["worker_activity"] and store.get_service_pause()[0]
@@ -1143,6 +1160,8 @@ class _NormalServiceRuntime:
                     *exclusion_diagnostics,
                 ),
                 mapping_cache_status=cast(str, latest["mapping_cache"]),
+                mapping_next_check_iso=cast(str | None, latest["mapping_next_check_iso"]),
+                mapping_last_check_iso=cast(str | None, latest["mapping_last_check_iso"]),
                 excluded_files=None if scan is None else scan.summary.excluded_files,
                 scope_excluded_files=None if scan is None else scan.summary.outside_scope_files,
                 exclusion_counts=exclusion_counts,
@@ -1169,6 +1188,41 @@ class _NormalServiceRuntime:
         # Activity describes read-only work; it never grants write authorization.
         self._update_latest(authorized=False, worker_activity=message, next_action=message)
 
+    @staticmethod
+    def _current_series_labels(
+        table: DashboardTable,
+        context: tuple[str, str] | None,
+    ) -> DashboardTable:
+        """Current file labels require current scope; immutable request names do not."""
+        if table.files is not None:
+            table = replace(
+                table,
+                files=replace(
+                    table.files,
+                    rows=tuple(
+                        row
+                        if context is not None and row.series_display_context == context
+                        else replace(row, series_name="")
+                        for row in table.files.rows
+                    ),
+                ),
+            )
+        if table.history is not None:
+            table = replace(
+                table,
+                history=replace(
+                    table.history,
+                    rows=tuple(
+                        replace(row, series_name="")
+                        if (row.operation == "file_link" or row.series_display_context is not None)
+                        and (context is None or row.series_display_context != context)
+                        else row
+                        for row in table.history.rows
+                    ),
+                ),
+            )
+        return table
+
     def table(self, kind: str, page: int, page_size: int) -> DashboardTable:
         """Read local pagination and confirmed display scope; never refresh remote state."""
         store = StateStore(self.settings.database_path)
@@ -1179,6 +1233,17 @@ class _NormalServiceRuntime:
             record = OnboardingManager(store).record() if identity is not None else None
             roots = () if record is None else record.binding.roots
             mappings = () if record is None else record.binding.path_mappings
+            label_context = None
+            if record is not None and mappings:
+                effective = settings_for_scope(
+                    replace(self.settings, sonarr_url=urls[0], shoko_url=urls[1]),
+                    roots=roots,
+                    mappings=mappings,
+                )
+                label_context = (
+                    metadata_source_key_for_url(urls[1]),
+                    _metadata_scope_fingerprint(effective, RunPolicy.SERVICE),
+                )
             if kind == "history":
                 history = action_history_page(store, page=page, page_size=page_size)
                 displays = tuple(
@@ -1206,7 +1271,8 @@ class _NormalServiceRuntime:
                 current_preferences["shoko_url"],
             ) != urls or scan_context_identity(store, *urls) != identity:
                 result = replace(result, displays=(), exclusions=None)
-            return result
+                label_context = None
+            return self._current_series_labels(result, label_context)
         finally:
             store.close()
 
@@ -1227,8 +1293,19 @@ class _NormalServiceRuntime:
                     started + sync.max_cycle_seconds,
                     sync.max_recovery_rows_per_cycle,
                 )
-            review_operation = self.source_review.worker_tick(recovery_limits[0])
+            review_result = self.source_review.worker_tick(recovery_limits[0])
+            review_operation = review_result is not SourceReviewTick.IDLE
             if review_operation:
+                if review_result is SourceReviewTick.ACCEPTED:
+                    self._update_latest(
+                        authorized=False,
+                        next_action=(
+                            "The local source baseline was accepted. "
+                            "Checking current requirements before automatic linking can continue."
+                        ),
+                        reassessment_pending=True,
+                    )
+                    return 1.0
                 return self.source_review.continuation_delay()
             self._worker_tick()
         except Exception:
@@ -1473,6 +1550,8 @@ class _NormalServiceRuntime:
                     f"mapping_next_check:{mapping_view.next_due_iso or 'due'}",
                 ),
                 mapping_cache=mapping_guidance,
+                mapping_next_check_iso=mapping_view.next_due_iso,
+                mapping_last_check_iso=mapping_view.last_attempted_iso,
                 next_action=next_action,
             )
             # The daemon swallows callback failures; only a published status is complete.

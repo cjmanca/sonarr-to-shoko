@@ -24,7 +24,7 @@ from typing import Final
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .action_history import ActionHistoryPage, ActionHistoryView
-from .file_display import FileDisplay
+from .file_display import MAX_ANIDB_ID, MAX_DISPLAY_TARGETS, FileDisplay, series_display_name
 from .logging_setup import diagnostic_text
 from .metadata_status import MAX_EXAMPLES, MetadataStatusView
 from .onboarding import (
@@ -54,6 +54,7 @@ from .state import (
 _logger = logging.getLogger(__name__)
 
 DASHBOARD_SESSION_SECONDS: Final[int] = 12 * 60 * 60
+_COMPACT_TIME_SECONDS: Final[int] = 24 * 60 * 60
 MAX_DASHBOARD_REQUEST_BYTES: Final[int] = 8192
 MAX_DASHBOARD_DRAIN_BYTES: Final[int] = 65_536
 DASHBOARD_REQUEST_TIMEOUT_SECONDS: Final[float] = 5.0
@@ -96,6 +97,8 @@ class DashboardStatus:
     tracked_files: ServiceFileStatus = field(default_factory=ServiceFileStatus)
     last_scan: ScanSummary | None = None
     action_history: ActionHistoryView = field(default_factory=ActionHistoryView)
+    mapping_next_check_iso: str | None = None
+    mapping_last_check_iso: str | None = None
 
 
 @dataclass(frozen=True)
@@ -447,6 +450,7 @@ class DashboardApplication:
             ),
             source_audit=store.get_source_rebaseline_review().last_audit,
             refresh_url=(path if path != "/" else "/status") + ("?" + query if query else ""),
+            now=_now_utc(self.clock),
         )
         return self._html(HTTPStatus.OK, page)
 
@@ -569,6 +573,7 @@ class DashboardApplication:
                     self._status_page(
                         replace(self.status_provider(), automatic_linking=False),
                         next_csrf,
+                        now=_now_utc(self.clock),
                         paused=paused,
                         pause_reason=pause_reason,
                         next_action=decision.message,
@@ -585,6 +590,7 @@ class DashboardApplication:
                 self._status_page(
                     self.status_provider(),
                     next_csrf,
+                    now=_now_utc(self.clock),
                     paused=paused,
                     pause_reason=pause_reason,
                     acknowledgement=message,
@@ -607,6 +613,7 @@ class DashboardApplication:
                 self._status_page(
                     self.status_provider(),
                     next_csrf,
+                    now=_now_utc(self.clock),
                     paused=paused,
                     pause_reason=pause_reason,
                     acknowledgement=message,
@@ -653,20 +660,22 @@ class DashboardApplication:
         assert self.source_review_assess is not None
         assert self.source_review_confirm is not None
         assert self.source_review_provider is not None
-        message = "Fresh source collection queued. All linking safety checks still apply."
         try:
             if path == "/source-review/assess":
                 self.source_review_assess(session.session_id_hash)
             else:
                 self.source_review_confirm(form["review_token"], session.session_id_hash)
         except StateError:
-            message = "This review is unavailable or changed. Request a new assessment."
+            message = "This review is unavailable or changed. Check the library again."
+        else:
+            return self._redirect("/status#source-review", set_cookie=cookie)
         paused, pause_reason = store.get_service_pause()
         return self._html(
-            HTTPStatus.OK,
+            HTTPStatus.CONFLICT,
             self._status_page(
                 self.status_provider(),
                 next_csrf,
+                now=_now_utc(self.clock),
                 paused=paused,
                 pause_reason=pause_reason,
                 acknowledgement=message,
@@ -834,7 +843,9 @@ class DashboardApplication:
         refresh_url: str = "",
         source_review: SourceReviewView | None = None,
         source_audit: SourceRebaselineAudit | None = None,
+        now: datetime | None = None,
     ) -> str:
+        now = now or datetime.now(UTC)
         if settings is not None:
             route = "/settings"
         canonical_refresh = _canonical_refresh_url(refresh_url or route)
@@ -843,8 +854,8 @@ class DashboardApplication:
         overview = (
             '<div data-live="setup">'
             f"{DashboardApplication._setup_section(setup, csrf_token)}</div>"
-            '<div class="overview-grid" data-live="overview">'
-            '<section class="panel"><div class="eyebrow">Service health</div>'
+            '<div class="overview-grid">'
+            '<section class="panel" data-live="overview"><div class="eyebrow">Service health</div>'
             "<h2>Connections &amp; mappings</h2>"
             f'<p class="connection-message">{html.escape(status.connection_message)}</p>'
             + (
@@ -855,18 +866,27 @@ class DashboardApplication:
             )
             + '<dl class="facts"><div><dt>Episode mappings</dt>'
             f"<dd>{html.escape(status.mapping_cache_status)}</dd></div>"
-            "</dl></section>"
-            '<section class="panel control-panel"><div class="eyebrow">Your next step</div>'
-            f'<h2>Linking controls</h2><p class="next-action">{html.escape(action)}</p>'
+            + "".join(
+                f"<div><dt>{label}</dt><dd>{_compact_time(value, now=now)}</dd></div>"
+                for label, value in (
+                    ("Last mapping check", status.mapping_last_check_iso),
+                    ("Next mapping check", status.mapping_next_check_iso),
+                )
+                if value is not None
+            )
+            + "</dl>"
             '<p class="hint">Waiting includes work being prepared or waiting for Shoko '
             "to confirm a link. It can remain nonzero when Shoko's queue is empty. "
             "Partial or uncertain link results need attention; "
             "conflicts and safety issues are included. These are locally tracked files "
             "across scans, not a partition of Shoko's current unrecognized list."
-            "</p></section></div>"
-            + DashboardApplication._source_review_section(source_review, source_audit, csrf_token)
-            + DashboardApplication._scan_section(status.last_scan)
-            + DashboardApplication._metadata_section(status.metadata)
+            "</p></section>"
+            + DashboardApplication._source_review_section(
+                source_review, source_audit, csrf_token, action=action, now=now
+            )
+            + "</div>"
+            + DashboardApplication._scan_section(status.last_scan, now=now)
+            + DashboardApplication._metadata_section(status.metadata, now=now)
             + '<details class="panel diagnostics" data-live="diagnostics">'
             "<summary>Advanced diagnostics</summary>"
             f"<ul>{diagnostics}</ul></details>"
@@ -889,7 +909,7 @@ class DashboardApplication:
                 else "<p>Settings are unavailable.</p>"
             )
         else:
-            body = DashboardApplication._table_section(route, view, table)
+            body = DashboardApplication._table_section(route, view, table, now=now)
         nav = "".join(
             f'<a href="{target}"'
             + (' aria-current="page"' if target == ("/status" if route == "/" else route) else "")
@@ -914,14 +934,16 @@ class DashboardApplication:
             + '</div><p id="update-status" role="status" hidden></p>'
             + '<div data-live="source-hold">'
             + (
-                '<aside class="panel" role="status"><strong>Source collection changed.</strong> '
-                "Linking is held until you review fresh source evidence. "
-                '<a href="/status#source-review">Review source change</a></aside>'
-                if source_review and source_review.continuity.requires_rebaseline
+                '<aside class="panel" role="status"><strong>Library changes need review.</strong> '
+                '<a href="/status#source-review">Review library changes</a></aside>'
+                if route not in {"/", "/status"}
+                and source_review
+                and source_review.continuity.requires_rebaseline
                 else ""
             )
             + "</div>"
             + body
+            + '<p class="hint" data-timezone>Times shown in UTC.</p>'
             + "</div></div>",
             live=True,
             header_content=DashboardApplication._header(
@@ -930,107 +952,149 @@ class DashboardApplication:
         )
 
     @staticmethod
-    def _source_review_section(  # noqa: PLR0912 - explicit evidence and form states
-        review: SourceReviewView | None, audit: SourceRebaselineAudit | None, csrf_token: str
+    def _source_review_section(
+        review: SourceReviewView | None,
+        audit: SourceRebaselineAudit | None,
+        csrf_token: str,
+        *,
+        action: str = "",
+        now: datetime | None = None,
     ) -> str:
         """Render only local evidence; no endpoint URLs or remote action history."""
+
+        body = '<div class="eyebrow">Your next step</div><h2>Linking controls</h2>'
+        if review is not None and review.continuity.requires_rebaseline:
+            body += DashboardApplication._source_review_hold(review, csrf_token, now=now)
+        elif review is not None and review.status == "confirmed":
+            body += (
+                '<p role="status">Changes accepted. '
+                "Linking depends on the current requirements below.</p>"
+            )
+            if review.service_pause == (True, "user_paused"):
+                body += "<p>Linking is paused by you. Use Resume in the header to continue.</p>"
+            elif action:
+                body += f'<p class="next-action">{html.escape(action)}</p>'
+            if review.writes_disabled:
+                body += "<p>A separate write safety hold still needs attention.</p>"
+        elif action:
+            body += f'<p class="next-action">{html.escape(action)}</p>'
+        if audit is not None:
+            body += (
+                '<details data-disclosure="recovery-details"><summary>Recovery details</summary>'
+                f"<p>Library changes accepted: {_compact_time(audit.accepted_iso, now=now)}. "
+                "This local record is separate from remote request History. "
+                "Linking still depends on current authorization and safety checks.</p></details>"
+            )
+        return (
+            '<section id="source-review" tabindex="-1" class="panel control-panel" '
+            'data-live="source-review">' + body + "</section>"
+        )
+
+    @staticmethod
+    def _source_review_hold(
+        review: SourceReviewView, csrf_token: str, *, now: datetime | None = None
+    ) -> str:
+        """Current hold evidence and its single available recovery action."""
 
         def safe(value: str) -> str:
             return html.escape(diagnostic_text(value))
 
-        body = ""
-        if review is not None and review.continuity.requires_rebaseline:
-            continuity = review.continuity
-            hold = continuity.hold
-            body = (
-                "<h2>Source collection changed</h2><p>Automatic linking is held because "
-                "the source collection no longer matches its previous baseline. "
-                "Review a fresh read-only collection before accepting a new baseline.</p>"
-            )
-            if continuity.evidence_status == "legacy_unknown":
-                body += "<p>The original cause and counts were not retained by this older hold.</p>"
-            elif hold is not None:
-                prior = None if hold.prior is None else hold.prior.discovery_total
-                current = None if hold.current is None else hold.current.discovery_total
-                body += (
-                    '<p>Original hold: previous unrecognized files: '
-                    f'{prior if prior is not None else "unknown"}; '
-                    f'current: {current if current is not None else "unknown"}.</p>'
-                )
-            if continuity.latest_complete is not None:
-                latest = continuity.latest_complete
-                latest_count = latest.observation.discovery_total
-                body += (
-                    f"<p>Latest complete observation: {safe(latest.observed_iso)}; "
-                    "unrecognized files: "
-                    f"{latest_count if latest_count is not None else 'unknown'}.</p>"
-                )
-            labels = {
-                "idle": "Ready to assess",
-                "queued": "Fresh assessment queued",
-                "assessing": "Collecting fresh source evidence",
-                "ready": "Review fresh evidence",
-                "confirming": "Rechecking fresh evidence before acceptance",
-                "changed": "Source content changed again. Review and accept this new evidence.",
-                "confirmed": "Baseline accepted; safety checks still apply",
-                "error": "Assessment needs attention",
-            }
-            body += f'<p role="status">{labels[review.status]}</p>'
-            if review.message:
-                body += f"<p>{safe(review.message)}</p>"
-            if review.started_iso:
-                body += f"<p>Fresh collection started: {safe(review.started_iso)}"
-                if review.completed_iso:
-                    body += f"; completed: {safe(review.completed_iso)}"
-                body += ".</p>"
-            if review.summary is not None:
-                summary = review.summary
-                body += (
-                    f"<p>Current selected scope: {summary.selected_roots} roots; "
-                    f"Sonarr: {summary.sonarr_series} series, {summary.sonarr_files} files; "
-                    f"Shoko: {summary.shoko_files} unrecognized files, "
-                    f"{summary.shoko_folders} import folders.</p>"
-                )
-            token = html.escape(csrf_token, quote=True)
-            if review.token is not None and review.status in {"ready", "changed"}:
-                review_token = html.escape(review.token, quote=True)
-                body += (
-                    '<form method="post" action="/source-review/confirm" '
-                    f'data-review-token="{review_token}">'
-                    f'<input type="hidden" name="csrf_token" value="{token}">'
-                    f'<input type="hidden" name="review_token" value="{review_token}">'
-                    '<label><input type="checkbox" name="acknowledge" value="yes" required> '
-                    "I reviewed this source change and accept this new continuity baseline.</label>"
-                    "<p>Acceptance rechecks fresh evidence. It grants no write permission and "
-                    "does not clear other safety holds or your pause.</p>"
-                    '<button type="submit">Accept new baseline</button></form>'
-                )
-            elif review.status not in {"queued", "assessing", "confirming"}:
-                body += (
-                    '<form method="post" action="/source-review/assess">'
-                    f'<input type="hidden" name="csrf_token" value="{token}">'
-                    '<button type="submit">Assess source change</button></form>'
-                )
-            if review.service_pause[0]:
-                body += "<p>The service is paused. Baseline acceptance will keep that pause.</p>"
-            if review.writes_disabled:
-                body += "<p>A separate write safety hold is active and will remain in place.</p>"
-        if audit is not None:
-            body += (
-                "<h3>Local baseline audit</h3>"
-                f"<p>Baseline accepted: {safe(audit.accepted_iso)}. "
-                "This local record is separate from remote mutation History. "
-                "Linking still depends on current authorization and safety checks.</p>"
-            )
-        return (
-            (
-                '<section id="source-review" class="panel" data-live="source-review">'
-                + body
-                + "</section>"
-            )
-            if body
-            else '<div data-live="source-review"></div>'
+        continuity = review.continuity
+        hold = continuity.hold
+        body = (
+            "<h3>Library changes</h3><p>Linking is on hold because the library changed. "
+            "Check the library, then review and accept the changes to continue.</p>"
         )
+        if continuity.evidence_status == "legacy_unknown":
+            body += "<p>The original cause and counts were not retained by this older hold.</p>"
+        elif hold is not None:
+            causes = {
+                "instance_identity_changed": "The connected library source changed.",
+                "roots_changed": "The selected library roots changed.",
+                "snapshot_marker_missing": "The unrecognized-file count became unavailable.",
+                "discovery_total_drop": "The unrecognized-file count fell beyond recorded links.",
+            }
+            body += (
+                "<p>"
+                + " ".join(causes[reason] for reason in hold.reasons if reason in causes)
+                + "</p>"
+            )
+            prior = None if hold.prior is None else hold.prior.discovery_total
+            current = None if hold.current is None else hold.current.discovery_total
+            body += (
+                '<p>When linking stopped: previous unrecognized files: '
+                f'{prior if prior is not None else "unknown"}; '
+                f'current: {current if current is not None else "unknown"}.</p>'
+            )
+            body += (
+                f"<p>First hold: {_compact_time(hold.detected_iso, now=now)}; "
+                f"previous observation: {_compact_time(hold.previous_anchor_iso, now=now)}.</p>"
+            )
+        if continuity.latest_complete is not None:
+            latest = continuity.latest_complete
+            latest_count = latest.observation.discovery_total
+            body += (
+                f"<p>Latest complete observation: {_compact_time(latest.observed_iso, now=now)}; "
+                "unrecognized files: "
+                f"{latest_count if latest_count is not None else 'unknown'}.</p>"
+            )
+        labels = {
+            "idle": "Ready to check the library",
+            "queued": "Library check queued. This can take several minutes.",
+            "assessing": "Checking Sonarr and Shoko… this can take several minutes.",
+            "ready": "Review the library counts below, then accept the changes.",
+            "confirming": "Rechecking Sonarr and Shoko… this can take several minutes.",
+            "changed": "The library changed again. Review and accept these new counts.",
+            "confirmed": "Changes accepted. Checking current linking requirements.",
+            "error": "Library check needs attention",
+        }
+        body += f'<p role="status" data-review-progress>{labels[review.status]}</p>'
+        busy = review.status in {"queued", "assessing", "confirming"}
+        body += (
+            '<progress data-review-busy aria-label="Checking Sonarr and Shoko"'
+            + ("" if busy else " hidden")
+            + "></progress>"
+        )
+        if review.message and review.status == "error":
+            body += f"<p>{safe(review.message)}</p>"
+        if review.started_iso:
+            body += f"<p>Fresh collection started: {_compact_time(review.started_iso, now=now)}"
+            if review.completed_iso:
+                body += f"; completed: {_compact_time(review.completed_iso, now=now)}"
+            body += ".</p>"
+        if review.summary is not None:
+            summary = review.summary
+            body += (
+                f"<p>Current selected scope: {summary.selected_roots} roots; "
+                f"Sonarr: {summary.sonarr_series} series, {summary.sonarr_files} files; "
+                f"Shoko: {summary.shoko_files} unrecognized files, "
+                f"{summary.shoko_folders} import folders.</p>"
+            )
+        token = html.escape(csrf_token, quote=True)
+        if review.token is not None and review.status in {"ready", "changed"}:
+            review_token = html.escape(review.token, quote=True)
+            body += (
+                '<form method="post" action="/source-review/confirm" '
+                f'data-review-token="{review_token}">'
+                f'<input type="hidden" name="csrf_token" value="{token}">'
+                f'<input type="hidden" name="review_token" value="{review_token}">'
+                '<label><input type="checkbox" name="acknowledge" value="yes" required> '
+                "I reviewed these library changes and accept them.</label>"
+                "<p>Acceptance rechecks fresh evidence. It grants no write permission and "
+                "does not clear other safety holds or your pause.</p>"
+                '<button type="submit">Accept changes</button></form>'
+            )
+        elif review.status not in {"queued", "assessing", "confirming"}:
+            body += (
+                '<form method="post" action="/source-review/assess">'
+                f'<input type="hidden" name="csrf_token" value="{token}">'
+                '<button type="submit">Check library</button></form>'
+            )
+        if review.service_pause[0]:
+            body += "<p>The service is paused. Accepting changes keeps that pause.</p>"
+        if review.writes_disabled:
+            body += "<p>A separate write safety hold is active and will remain in place.</p>"
+        return body
 
     @staticmethod
     def _header(
@@ -1064,7 +1128,9 @@ class DashboardApplication:
         )
 
     @staticmethod
-    def _table_section(route: str, view: str, table: DashboardTable | None) -> str:
+    def _table_section(
+        route: str, view: str, table: DashboardTable | None, *, now: datetime | None = None
+    ) -> str:
         tabs = (
             '<nav class="section-nav" aria-label="Issue views">'
             f'<a href="/issues"{" aria-current=\"page\"" if view == "review" else ""}>'
@@ -1087,6 +1153,8 @@ class DashboardApplication:
             return tabs + '<section class="panel" data-live="table">' + unavailable + "</section>"
         rows: list[tuple[str, str, str, str, str, str]] = []
         recorded_reasons: dict[int, str] = {}
+        recorded_times: dict[int, tuple[str, str]] = {}
+        links: dict[int, str] = {}
         pagination: TablePage | None = None
         message = ""
         if table.files is not None:
@@ -1095,6 +1163,7 @@ class DashboardApplication:
                 "Locally tracked files across scans. Waiting is linker work, not Shoko queue size."
             )
             for index, item in enumerate(table.files.rows):
+                links[index] = _anidb_links(item.known_anidb_ids, item.series_name)
                 display = table.displays[index] if index < len(table.displays) else FileDisplay()
                 detail = diagnostic_text(item.detail).strip()
                 if detail and detail.casefold() not in {
@@ -1127,7 +1196,10 @@ class DashboardApplication:
         elif table.exclusions is not None:
             pagination = table.exclusions.pagination
             message = table.exclusions.message
-            for exclusion in table.exclusions.rows:
+            for index, exclusion in enumerate(table.exclusions.rows):
+                links[index] = _anidb_links(
+                    exclusion.row.known_anidb_ids, exclusion.row.series_name
+                )
                 rows.append(
                     (
                         exclusion.row.reason,
@@ -1140,13 +1212,23 @@ class DashboardApplication:
                 )
         elif table.history is not None:
             pagination = table.history.pagination
-            message = table.history.scope_message
+            message = (
+                table.history.scope_message
+                + " Requested is the recorded attempt time, or local preparation time "
+                "before an attempt; "
+                "it does not prove delivery. Updated is the latest recorded event for that request."
+            )
             for index, recent in enumerate(table.history.rows):
+                recorded_times[index] = (
+                    _compact_time(recent.requested_iso, now=now),
+                    _compact_time(recent.recorded_iso, now=now),
+                )
                 display = table.displays[index] if index < len(table.displays) else FileDisplay()
-                filename = recent.filename or (
-                    f"AniDB anime {recent.subject_id}"
+                links[index] = _anidb_links(recent.known_anidb_ids, recent.series_name)
+                filename = (
+                    series_display_name(recent.series_name) or "Series name unavailable"
                     if recent.operation == "metadata_refresh"
-                    else f"Shoko file {recent.subject_id}"
+                    else recent.filename or f"Shoko file {recent.subject_id}"
                 )
                 rows.append(
                     (
@@ -1160,11 +1242,7 @@ class DashboardApplication:
                             if recent.operation == "metadata_refresh"
                             else "Link request: "
                         )
-                        + recent.message
-                        + " Request recorded: "
-                        + (recent.requested_iso or "Unavailable")
-                        + ". Last update: "
-                        + (recent.recorded_iso or "Unavailable"),
+                        + recent.message,
                     )
                 )
         if pagination is None:
@@ -1176,6 +1254,8 @@ class DashboardApplication:
             ("path", "Relative path"),
             ("library", "Library"),
             ("status", "Status"),
+            *((("requested", "Requested"), ("updated", "Updated")) if table.history else ()),
+            ("links", "Links"),
         )
         content = "".join(
             "<tr><td>"
@@ -1188,6 +1268,10 @@ class DashboardApplication:
             + f"<td>{html.escape(diagnostic_text(detail))}"
             + recorded_reasons.get(index, "")
             + "</td>"
+            + "".join(
+                f'<td class="time-cell">{stamp}</td>' for stamp in recorded_times.get(index, ())
+            )
+            + f'<td class="links-cell">{links.get(index, "&mdash;")}</td>'
             + "</tr>"
             for index, (kind, explanation, filename, relative, library, detail) in enumerate(rows)
         )
@@ -1207,12 +1291,12 @@ class DashboardApplication:
                 for key, label in columns
             )
             + "</tr></thead><tbody>"
-            + (content or '<tr><td colspan="5">No records in this view.</td></tr>')
+            + (content or f'<tr><td colspan="{len(columns)}">No records in this view.</td></tr>')
             + "</tbody></table></div></section>"
         )
 
     @staticmethod
-    def _scan_section(scan: ScanSummary | None) -> str:
+    def _scan_section(scan: ScanSummary | None, *, now: datetime | None = None) -> str:
         heading = '<section class="panel" data-live="last-scan"><h2>Last completed scan</h2>'
         if scan is None:
             return (
@@ -1234,9 +1318,9 @@ class DashboardApplication:
         return (
             heading
             + "<p>Observed from "
-            + html.escape(diagnostic_text(scan.observed_from))
+            + _compact_time(scan.observed_from, now=now)
             + " to "
-            + html.escape(diagnostic_text(scan.observed_until))
+            + _compact_time(scan.observed_until, now=now)
             + ".</p>"
             '<dl class="facts">'
             + "".join(f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in facts)
@@ -1247,7 +1331,7 @@ class DashboardApplication:
         )
 
     @staticmethod
-    def _metadata_section(metadata: MetadataStatusView) -> str:
+    def _metadata_section(metadata: MetadataStatusView, *, now: datetime | None = None) -> str:
         # The projection is already sanitized. Repeat at the display boundary for
         # legacy/local providers, then escape HTML; these are text, never links.
         def text(value: str) -> str:
@@ -1278,11 +1362,14 @@ class DashboardApplication:
             if item.shoko_file_id is not None:
                 details += f"<div><dt>Shoko file ID</dt><dd>{item.shoko_file_id}</dd></div>"
             if item.observed_iso:
-                details += f"<div><dt>Last observation</dt><dd>{text(item.observed_iso)}</dd></div>"
+                details += (
+                    "<div><dt>Last observation</dt>"
+                    f"<dd>{_compact_time(item.observed_iso, now=now)}</dd></div>"
+                )
             if item.next_read_only_check_iso:
                 details += (
                     "<div><dt>Next read-only check</dt>"
-                    f"<dd>{text(item.next_read_only_check_iso)}</dd></div>"
+                    f"<dd>{_compact_time(item.next_read_only_check_iso, now=now)}</dd></div>"
                 )
             examples.append(
                 f"<li><h3>{text(item.filename) or 'File context unavailable'}</h3>"
@@ -1538,6 +1625,7 @@ def _icon(kind: str) -> str:
         "settings": '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/>',
         "pause": '<path d="M8 5v14M16 5v14"/>',
         "play": '<path d="m7 4 14 8-14 8z"/>',
+        "anidb": '<path d="m3 19 5-14 5 14M5 14h6M16 5v14h3a3 3 0 0 0 0-6h-3"/>',
     }
     return (
         '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" '
@@ -1545,6 +1633,28 @@ def _icon(kind: str) -> str:
         + shapes.get(kind, shapes["warning"])
         + "</svg>"
     )
+
+
+def _anidb_links(ids: tuple[int, ...], series_name: str = "") -> str:
+    """Render only bounded, explicitly known identities; labels are display context."""
+    if (
+        not isinstance(ids, tuple)
+        or len(ids) > MAX_DISPLAY_TARGETS
+        or any(type(value) is not int or not 0 < value <= MAX_ANIDB_ID for value in ids)
+    ):
+        return "&mdash;"
+    name = series_display_name(series_name)
+    links = []
+    for anime in dict.fromkeys(ids):
+        label = html.escape(
+            f"Open {name} on AniDB (anime {anime})" if name else f"AniDB anime {anime}",
+            quote=True,
+        )
+        links.append(
+            f'<a class="anidb-link" href="https://anidb.net/anime/{anime}" '
+            f'title="{label}" aria-label="{label}">{_icon("anidb")}</a>'
+        )
+    return " ".join(links) or "&mdash;"
 
 
 def _type_icon(kind: str, explanation: str) -> str:
@@ -1581,14 +1691,63 @@ def _pagination(route: str, view: str, page: TablePage) -> str:
     )
 
 
+def _compact_time(value: str | None, *, now: datetime | None = None) -> str:
+    """Escaped, aware ISO time with deterministic UTC fallback and full accessible detail."""
+    try:
+        parsed = datetime.fromisoformat(value or "")
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return "Unavailable"
+        parsed = parsed.astimezone(UTC)
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        compact = parsed.strftime(
+            "%H:%M"
+            if abs((current - parsed).total_seconds()) < _COMPACT_TIME_SECONDS
+            else "%Y-%m-%d"
+        )
+        canonical = html.escape(parsed.isoformat(), quote=True)
+        detail = f"{canonical} (UTC)"
+        return (
+            f'<time class="compact-time" data-compact-time datetime="{canonical}" '
+            f'title="{detail}" aria-label="{detail}">{compact}</time>'
+        )
+    except (ValueError, OverflowError):
+        return "Unavailable"
+
+
 _DASHBOARD_JS: Final[str] = r"""
 (() => {
   let stopped = false;
   const notice = document.getElementById('update-status');
+  function prepareTimes(root, now = Date.now()) {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    for (const label of root.querySelectorAll('[data-timezone]')) {
+      label.textContent = 'Times shown in ' + zone + '.';
+    }
+    for (const element of root.querySelectorAll('time[data-compact-time]')) {
+      const value = element.getAttribute('datetime');
+      const date = new Date(value || NaN);
+      if (!Number.isFinite(date.getTime())) {
+        element.textContent = 'Unavailable';
+        continue;
+      }
+      const pad = value => String(value).padStart(2, '0');
+      element.textContent = Math.abs(now - date.getTime()) < 86400000
+        ? pad(date.getHours()) + ':' + pad(date.getMinutes())
+        : date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
+      const detail = value + ' · ' + date.toLocaleString(undefined, {hour12: false})
+        + ' (' + zone + ')';
+      element.setAttribute('title', detail);
+      element.setAttribute('aria-label', detail);
+    }
+  }
+  prepareTimes(document);
   // One bounded numeric preference shared by every file table; never persist row data.
   const widthKey = 'shoko-linker:table-widths:v1';
   const limits = {type: [45, 140, 55], filename: [100, 900, 260],
-    path: [100, 900, 220], library: [100, 900, 220], status: [120, 1200, 320]};
+    path: [100, 900, 220], library: [100, 900, 220], status: [120, 1200, 320],
+    requested: [100, 240, 115], updated: [100, 240, 115], links: [60, 400, 70]};
   const widths = Object.fromEntries(Object.entries(limits).map(([key, rule]) => [key, rule[2]]));
   function clamp(key, value) {
     return Math.round(Math.max(limits[key][0], Math.min(limits[key][1], value)));
@@ -1707,6 +1866,8 @@ _DASHBOARD_JS: Final[str] = r"""
   let refreshUrl = renderedRefresh(document)
     || safeRefresh(window.location.pathname + (window.location.search || '')) || '/status';
   function applyUpdate(next) {
+    prepareTimes(document);
+    prepareTimes(next);
     refreshUrl = renderedRefresh(next) || refreshUrl;
     let changedSetup = false;
     const currentToken = next.querySelector('input[name="csrf_token"]');
@@ -1715,7 +1876,14 @@ _DASHBOARD_JS: Final[str] = r"""
     for (const current of document.querySelectorAll('[data-live]')) {
       const fresh = next.querySelector('[data-live="' + current.dataset.live + '"]');
       if (!fresh) continue;
+      let reviewFocus = null;
       if (current.dataset.live === 'source-review') {
+        const active = document.activeElement;
+        if (active && current.contains(active)) {
+          if (active.name === 'acknowledge') reviewFocus = 'input[name="acknowledge"]';
+          else if (active.tagName === 'BUTTON') reviewFocus = 'button[type="submit"]';
+          else if (active.tagName === 'SUMMARY') reviewFocus = 'summary';
+        }
         const oldForm = current.querySelector('form[data-review-token]');
         const newForm = fresh.querySelector('form[data-review-token]');
         if (oldForm && newForm && oldForm.dataset.reviewToken === newForm.dataset.reviewToken) {
@@ -1784,6 +1952,7 @@ _DASHBOARD_JS: Final[str] = r"""
       }
       if (current.outerHTML !== fresh.outerHTML) {
         current.replaceWith(fresh);
+        if (reviewFocus) fresh.querySelector(reviewFocus)?.focus({preventScroll: true});
         if (headerFocus) {
           fresh.querySelector('[data-header-focus="' + headerFocus + '"]')
             ?.focus({preventScroll: true});
@@ -1806,7 +1975,24 @@ _DASHBOARD_JS: Final[str] = r"""
       : '';
     notice.hidden = !changedSetup;
   }
+  document.addEventListener('submit', event => {
+    const form = event.target;
+    if (!form.matches(
+      'form[action="/source-review/assess"], form[action="/source-review/confirm"]')) return;
+    // Native validation has already run. Keep the normal POST/303 navigation.
+    for (const button of form.querySelectorAll('button[type="submit"]')) {
+      button.disabled = true;
+    }
+    const panel = form.closest('[data-live="source-review"]');
+    const activity = panel?.querySelector('[data-review-busy]');
+    if (activity) activity.hidden = false;
+    const progress = panel?.querySelector('[data-review-progress]');
+    if (progress) progress.textContent =
+      'Checking Sonarr and Shoko… this can take several minutes.';
+    form.setAttribute('aria-busy', 'true');
+  });
   async function update() {
+    prepareTimes(document);
     try {
       const statusUrl = refreshUrl;
       const response = await fetch(statusUrl, {
@@ -1850,6 +2036,7 @@ _DASHBOARD_CSS: Final[str] = """
   background: #f4f6fb; color: var(--ink); font-size: 15px; line-height: 1.6;
 }
 * { box-sizing: border-box; }
+.compact-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 body { margin: 0; min-height: 100vh; }
 .site-header { background: var(--surface); border-bottom: 1px solid var(--line); }
 .header-inner {
@@ -1894,6 +2081,10 @@ main { max-width: 1560px; margin: auto; padding: 28px 24px; }
   border-bottom: 1px solid var(--line); overflow-wrap: anywhere; font-size: 13px; }
 .file-table th { position: relative; padding-right: 18px; color: var(--muted); font-size: 12px; }
 .file-table col[data-column="type"] { width: 45px; }
+.file-table col[data-column="requested"], .file-table col[data-column="updated"] { width: 115px; }
+.file-table col[data-column="links"] { width: 70px; }
+.time-cell { white-space: nowrap; }
+.anidb-link { display: inline-block; padding: 3px; }
 .file-table col[data-column="filename"] { width: 25%; }
 .file-table col[data-column="path"] { width: 19%; }
 .file-table col[data-column="library"] { width: 18%; }

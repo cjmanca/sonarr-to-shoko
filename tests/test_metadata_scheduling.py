@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import queue_fixtures as qf
 import test_daemon as td
@@ -20,12 +21,19 @@ from shoko_linker.linking import QueueSnapshot, fetch_queue
 from shoko_linker.mapping_store import load_active
 from shoko_linker.mappings import Resolution, ResolutionStatus
 from shoko_linker.metadata_operations import metadata_source_key
+from shoko_linker.metadata_refresh import (
+    MetadataRefreshOutcome,
+    MetadataRefreshReason,
+    MetadataRefreshResult,
+    submit_metadata_refresh,
+)
 from shoko_linker.onboarding import (
     METADATA_MAINTENANCE_POLICY,
     OnboardingManager,
     required_confirmation_facts,
 )
 from shoko_linker.policies import RunPolicy
+from shoko_linker.queue_inventory import fetch_queue_inventory
 from shoko_linker.rate_control import RateState, decode_rate_state, encode_rate_state
 from shoko_linker.shoko import collect_import_folders
 from shoko_linker.state import (
@@ -197,46 +205,56 @@ def test_disabled_still_recovers_accepted_requests(service: Service) -> None:
     assert row.slot_released
 
 
-def _add_anime(service: Service, tmp_path: Path, *, missing: bool = True) -> td.SpecFile:
+def _add_anime(
+    service: Service, tmp_path: Path, *, missing: bool = True, anime: int = 2
+) -> td.SpecFile:
     other = td.SpecFile(
-        series_id=2,
-        file_id=20,
-        shoko_id=501,
-        anime_id=2,
-        tvdb_series=2,
+        series_id=anime,
+        file_id=anime * 10,
+        shoko_id=499 + anime,
+        anime_id=anime,
+        tvdb_series=anime,
         episodes=((1, 1, 20001, 30001),),
     )
-    td.activate_mapping(tmp_path, td.mapping_xml_mapped((2, 2)))
+    td.activate_mapping(
+        tmp_path,
+        td.mapping_xml_mapped(
+            *((f.tvdb_series, f.anime_id) for f in [*service.sonarr.files[1:], other])
+        ),
+    )
     service.sonarr.files.append(other)
-    service.sonarr.series_ids.append(2)
-    service.sonarr.series_tvdb[2] = 2
-    service.shoko.files[501] = other
+    service.sonarr.series_ids.append(anime)
+    service.sonarr.series_tvdb[anime] = anime
+    service.shoko.files[other.shoko_id] = other
     if missing:
-        service.shoko.missing_anime.add(2)
+        service.shoko.missing_anime.add(anime)
     return other
 
 
-def test_ready_links_get_shared_initial_allowance_before_metadata(
+def test_ready_links_run_before_metadata_with_separate_throughput_cap(
     service: Service, tmp_path: Path
 ) -> None:
     _add_anime(service, tmp_path, missing=False)
     first = service.cycle("ready-first")
     assert first.counts.submitted == 1
-    assert first.metadata_requests_attempted == 0
-    assert service.shoko.refreshes == []
+    assert first.metadata_requests_attempted == 1
+    posts = [r.url.path for r in service.shoko.requests if r.method == "POST"]
+    assert posts == ["/api/v3/File/501/Link", f"/api/v3/Series/AniDB/{td.ANIME_ID}/Refresh"]
     assert service.deps.store.get_service_canary() == (501, "verified")
     second = service.cycle("metadata-next")
     assert second.counts.submitted == 0
-    assert second.metadata_requests_attempted == 1
+    assert second.metadata_requests_attempted == 0
 
 
-def test_two_missing_anime_share_initial_cap_and_rotate(service: Service, tmp_path: Path) -> None:
+def test_two_missing_anime_share_configured_cap_without_canary(
+    service: Service, tmp_path: Path
+) -> None:
     _add_anime(service, tmp_path)
     first = service.cycle("first-anime")
-    assert first.metadata_requests_attempted == 1
-    assert len(service.shoko.refreshes) == 1
+    assert first.metadata_requests_attempted == 2
+    assert len(service.shoko.refreshes) == 2
     second = service.cycle("second-anime")
-    assert second.metadata_requests_attempted == 1
+    assert second.metadata_requests_attempted == 0
     assert {request.url.path for request in service.shoko.refreshes} == {
         f"/api/v3/Series/AniDB/{td.ANIME_ID}/Refresh",
         "/api/v3/Series/AniDB/2/Refresh",
@@ -370,7 +388,8 @@ def test_split_file_requests_each_anime_once_with_complete_frozen_demand(
     first = service.cycle("split-first")
     second = service.cycle("split-second")
     assert first.counts.pending == second.counts.pending == 1
-    assert first.metadata_requests_attempted == second.metadata_requests_attempted == 1
+    assert first.metadata_requests_attempted == 2
+    assert second.metadata_requests_attempted == 0
     for anime in (2, td.ANIME_ID):
         row = service.deps.store.get_metadata_operation(
             metadata_source_key(service.deps.shoko), anime
@@ -383,19 +402,19 @@ def test_split_file_requests_each_anime_once_with_complete_frozen_demand(
     assert len(service.shoko.refreshes) == 2
 
 
-def test_foreign_first_anime_does_not_starve_second(service: Service, tmp_path: Path) -> None:
+def test_foreign_first_anime_defers_entire_metadata_batch(service: Service, tmp_path: Path) -> None:
     _add_anime(service, tmp_path)
     service.shoko.queue_items = [qf.item("AniDB.GetAniDBAnimeJob_AnimeID:2")]
     first = service.cycle("foreign-first")
-    assert first.metadata_requests_attempted == 1
+    assert first.metadata_requests_attempted == 0
     assert first.metadata_observations == (
-        (2, "metadata_waiting_external_queue"),
-        (td.ANIME_ID, "metadata_accepted_waiting"),
+        (2, "metadata_queue_busy"),
+        (td.ANIME_ID, "metadata_queue_busy"),
     )
-    assert service.shoko.refreshes[0].url.path == f"/api/v3/Series/AniDB/{td.ANIME_ID}/Refresh"
+    assert service.shoko.refreshes == []
 
 
-def test_no_canary_keeps_initial_metadata_ceiling_one_even_with_saved_rate(
+def test_no_canary_does_not_clamp_metadata_even_with_saved_rate(
     service: Service, tmp_path: Path
 ) -> None:
     _add_anime(service, tmp_path)
@@ -403,8 +422,8 @@ def test_no_canary_keeps_initial_metadata_ceiling_one_even_with_saved_rate(
         encode_rate_state(RateState(20, 0, td.T1, "test")), td.T1
     )
     report = service.cycle("no-canary-initial-ceiling")
-    assert report.metadata_requests_attempted == 1
-    assert len(service.shoko.refreshes) == 1
+    assert report.metadata_requests_attempted == 2
+    assert len(service.shoko.refreshes) == 2
     assert service.deps.store.get_service_canary() is None
 
 
@@ -854,3 +873,151 @@ def test_rebinding_authorization_cannot_extend_an_owned_deadline(service: Servic
     assert deadlines == [1.0]
     assert updated.cap == 1
     assert updated.successful_streak == 0
+
+
+@pytest.mark.parametrize("cap", [1, 2, 20])
+def test_empty_queue_batch_uses_configured_cap_once_even_when_own_jobs_appear(
+    service: Service, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap: int
+) -> None:
+    _add_anime(service, tmp_path)
+    _add_anime(service, tmp_path, anime=3)
+    service.deps = replace(service.deps, max_submissions=cap)
+    original = submit_metadata_refresh
+    checked = 0
+    fetch = fetch_queue_inventory
+
+    def observe(*args: Any, **kwargs: Any) -> Any:
+        nonlocal checked
+        checked += 1
+        assert not service.shoko.refreshes
+        return fetch(*args, **kwargs)
+
+    def enqueue(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        assert service.shoko.queue_items is not None
+        service.shoko.queue_items.append(qf.item(f"AniDB.GetAniDBAnimeJob_AnimeID:{args[1]}"))
+        return result
+
+    monkeypatch.setattr(daemon, "fetch_queue_inventory", observe)
+    monkeypatch.setattr(daemon, "submit_metadata_refresh", enqueue)
+    report = service.cycle("empty-batch")
+    assert report.metadata_requests_attempted == min(3, cap)
+    assert checked == 1
+    assert service.deps.store.get_service_canary() is None
+    rate = decode_rate_state(service.deps.store.get_service_rate_state_json() or "")
+    assert rate.cap == 1
+    assert rate.successful_streak == 0
+
+
+@pytest.mark.parametrize("state", ["waiting", "running", "blocked"])
+def test_unrelated_job_of_any_state_blocks_metadata_batch(
+    service: Service, tmp_path: Path, state: str
+) -> None:
+    _add_anime(service, tmp_path)
+    service.shoko.queue_items = [qf.item("Other.UnrelatedJob", state)]
+    report = service.cycle("unrelated-busy")
+    assert report.metadata_requests_attempted == 0
+    assert {reason for _, reason in report.metadata_observations} == {"metadata_queue_busy"}
+    assert service.shoko.refreshes == []
+
+
+@pytest.mark.parametrize(
+    "failure", ["timeout", "429", "source", "mapping", "scope", "protected", "consent", "deadline"]
+)
+def test_batch_stops_after_uncertainty_or_fresh_safety_drift(
+    service: Service, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    _add_anime(service, tmp_path)
+    _add_anime(service, tmp_path, anime=3)
+    original = submit_metadata_refresh
+
+    def change(*args: Any, **kwargs: Any) -> Any:
+        if failure == "timeout":
+            service.shoko.fail_refresh = True
+        if failure == "429":
+            service.shoko.refreshes.append(httpx.Request("POST", "http://shoko/Refresh"))
+            return MetadataRefreshResult(
+                MetadataRefreshOutcome.UNKNOWN, MetadataRefreshReason.HTTP_RESPONSE, 429
+            )
+        result = original(*args, **kwargs)
+        if failure == "source":
+            service.sonarr.series_tvdb[3] = 9999
+        elif failure == "mapping":
+            service.deps.mapping_store.active_path.write_text("changed", encoding="utf-8")
+        elif failure == "scope":
+            monkeypatch.setattr(daemon, "_metadata_scope_fingerprint", lambda *_: "e" * 64)
+        elif failure == "protected":
+            service.shoko.link_unrelated(502)
+        elif failure == "consent":
+            service.deps.store.set_meta(
+                META_SERVICE_SETTINGS, json.dumps({"allow_missing_metadata_refresh": False})
+            )
+        elif failure == "deadline":
+            service.clock[0] = service.deps.max_cycle_seconds
+        return result
+
+    monkeypatch.setattr(daemon, "submit_metadata_refresh", change)
+    report = service.cycle("batch-drift")
+    assert report.metadata_requests_attempted == 1
+    assert len(service.shoko.refreshes) == 1
+    row = service.deps.store.get_metadata_operation(metadata_source_key(service.deps.shoko), 2)
+    assert row is not None
+    assert row.reservation_owned
+    assert not row.slot_released
+
+
+def test_busy_metadata_does_not_starve_ready_file_link(service: Service, tmp_path: Path) -> None:
+    _add_anime(service, tmp_path, missing=False)
+    service.shoko.queue_items = [qf.item("Other.UnrelatedJob")]
+    report = service.cycle("busy-but-ready")
+    assert report.counts.submitted == report.counts.verified == 1
+    assert report.metadata_requests_attempted == 0
+    assert report.metadata_observations == ((td.ANIME_ID, "metadata_queue_busy"),)
+
+
+def test_file_link_that_queues_work_defers_new_metadata_batch(
+    service: Service, tmp_path: Path
+) -> None:
+    _add_anime(service, tmp_path, missing=False)
+    service.shoko.on_post = lambda: setattr(
+        service.shoko, "queue_items", [qf.item("Other.FileProcessingJob")]
+    )
+    report = service.cycle("ready-creates-job")
+    assert report.counts.submitted == report.counts.verified == 1
+    assert report.metadata_requests_attempted == 0
+    assert service.shoko.refreshes == []
+
+
+@pytest.mark.parametrize(
+    "limit", ["per_cycle_new", "rolling_new", "max_pending_files", "max_pending_episode_jobs"]
+)
+def test_metadata_batch_cannot_exceed_shared_durable_budgets(
+    service: Service, tmp_path: Path, limit: str
+) -> None:
+    _add_anime(service, tmp_path)
+    _add_anime(service, tmp_path, anime=3)
+    bounds = td.WIDE_LIMITS
+    service.deps.store.budget_limits = replace(
+        bounds,
+        per_cycle_new=2 if limit == "per_cycle_new" else bounds.per_cycle_new,
+        rolling_new=2 if limit == "rolling_new" else bounds.rolling_new,
+        max_pending_files=2 if limit == "max_pending_files" else bounds.max_pending_files,
+        max_pending_episode_jobs=(
+            2 if limit == "max_pending_episode_jobs" else bounds.max_pending_episode_jobs
+        ),
+    )
+    report = service.cycle("bounded-metadata-batch")
+    assert report.metadata_requests_attempted == 2
+    assert len(service.shoko.refreshes) == 2
+
+
+def test_changing_queue_inventory_never_admits_metadata_batch(service: Service) -> None:
+    def change(path: str) -> None:
+        if path.endswith("/Queue/Items"):
+            service.shoko.queue_items = [qf.item("Other.ArrivedJob")]
+
+    service.shoko.on_get = change
+    report = service.cycle("incomplete-queue")
+    assert report.metadata_requests_attempted == 0
+    assert report.metadata_observations == ((td.ANIME_ID, "metadata_queue_not_clear"),)
+    assert service.shoko.refreshes == []

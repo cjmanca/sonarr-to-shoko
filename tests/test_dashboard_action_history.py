@@ -1,13 +1,15 @@
 """Authenticated request history is bounded local evidence, not a media audit."""
 
+import re
 from dataclasses import replace
 from pathlib import Path
 
 import httpx
+import pytest
 import test_dashboard as dashboard
 
 from shoko_linker.action_history import ActionHistoryPage, RecentAction
-from shoko_linker.dashboard import DashboardApplication, DashboardTable
+from shoko_linker.dashboard import DashboardApplication, DashboardTable, _anidb_links
 from shoko_linker.logging_setup import register_secret
 from shoko_linker.state import ServiceFileCounts, table_page
 
@@ -68,8 +70,9 @@ def test_history_status_and_poll_show_actual_outcomes_with_scope_limits(tmp_path
                 assert "verified linking is not yet recorded" in panel
                 assert "2026-10-29T12:00:00+00:00" in panel
                 assert "2026-10-29T12:01:00+00:00" in panel
-                assert "Paths are current retained context, not historical path snapshots" in panel
-                assert "AniDB anime 18208" in panel
+                assert "current retained context, not historical snapshots" in panel
+                assert "Series name unavailable" in panel
+                assert "AniDB anime 18208" not in panel
                 assert "Metadata retrieval:" in panel
                 assert "or that any file was linked" in panel
                 assert "Unavailable" in panel
@@ -109,5 +112,65 @@ def test_history_render_bounds_sanitizes_and_describes_empty_records_truthfully(
     empty = DashboardApplication._table_section(
         "/history", "review", DashboardTable(history=history)
     )
-    assert "No records in this view" in empty
+    assert '<td colspan="8">No records in this view' in empty
     assert "No media changes" not in empty
+
+
+@pytest.mark.parametrize("name", ['A <series> & "name"', ""])
+def test_authenticated_metadata_history_name_links_and_distinct_time_cells(
+    tmp_path: Path, name: str
+) -> None:
+    app = dashboard.make_app(tmp_path)
+    counts = ServiceFileCounts(0, 0, 0)
+    recent = replace(
+        action(),
+        operation="metadata_refresh",
+        subject_id=18208,
+        filename="AniDB anime 18208",
+        series_name=name,
+        known_anidb_ids=(18208, 12, 18208),
+    )
+    app.table_provider = lambda *_: DashboardTable(
+        history=ActionHistoryPage(table_page(1, 1, 50), counts, (recent,))
+    )
+    # Enrollment authenticates subsequent GETs without any upstream calls.
+    from test_dashboard_routes import login, request_headers
+
+    text = app.handle("GET", "/history", request_headers(login(app))).body.decode()
+    panel = text.split('data-live="table"', 1)[1].split("</section>", 1)[0]
+    row = re.search(r"<tbody><tr>(.*?)</tr>", panel)
+    assert row is not None
+    cells = re.findall(r"<td(?: [^>]*)?>(.*?)</td>", row[1])
+    assert len(cells) == 8
+    assert "<time" not in cells[4]
+    assert "Request recorded:" not in cells[4]
+    assert 'datetime="2026-10-29T12:00:00+00:00"' in cells[5]
+    assert 'datetime="2026-10-29T12:01:00+00:00"' in cells[6]
+    assert 'href="https://anidb.net/anime/18208"' in cells[7]
+    assert cells[7].count('href="https://anidb.net/anime/18208"') == 1
+    assert 'href="https://anidb.net/anime/12"' in cells[7]
+    assert 'aria-label="' in cells[7]
+    assert '<svg class="icon"' in cells[7]
+    assert "target=" not in cells[7]
+    assert "AniDB anime 18208" not in cells[1]
+    assert cells[1] == (
+        "A &lt;series&gt; &amp; &quot;name&quot;" if name else "Series name unavailable"
+    )
+    assert "Resize Requested column" in panel
+    assert "Resize Updated column" in panel
+    assert "Resize Links column" in panel
+
+
+@pytest.mark.parametrize("ids", [(), (True,), (-1,), (0,), (2**63,), (1, "2"), (1,) * 257])
+def test_anidb_links_reject_unknown_or_malformed_identity(ids: tuple[int, ...]) -> None:
+    assert _anidb_links(ids) == "&mdash;"
+
+
+def test_anidb_link_name_escaped_and_secret_redacted() -> None:
+    secret = "anidb-link-secret-sentinel"
+    register_secret(secret)
+    markup = _anidb_links((12,), f'<title> " {secret}')
+    assert secret not in markup
+    assert "&lt;title&gt; &quot;" in markup
+    assert 'href="https://anidb.net/anime/12"' in markup
+    assert "<title>" not in markup

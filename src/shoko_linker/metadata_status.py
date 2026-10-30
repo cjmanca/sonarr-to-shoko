@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .file_display import MAX_ANIDB_ID, series_display_name
 from .linking import LinkPlan, MetadataDemand, PlanStatus
 from .logging_setup import diagnostic_text
 from .state import MetadataOperation, MetadataOperationState, StateStore
@@ -29,6 +30,8 @@ class MetadataStatusExample:
     message: str
     observed_iso: str
     next_read_only_check_iso: str | None = None
+    series_name: str = ""
+    known_anidb_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,7 +45,7 @@ class MetadataStatusView:
 
 
 def _rows(store: StateStore, source_key: str) -> list[dict[str, Any]]:
-    return _decode_rows(store.get_meta(STATUS_KEY), source_key)
+    return _decode_rows(store.bounded_display_meta(STATUS_KEY), source_key)
 
 
 def _decode_rows(raw: str | None, source_key: str) -> list[dict[str, Any]]:
@@ -75,10 +78,14 @@ def _decode_rows(raw: str | None, source_key: str) -> list[dict[str, Any]]:
                 "anime_id": row["anime_id"],
                 "claim": claim,
                 "demand_fingerprint": _text(row, "demand_fingerprint", 64),
+                "scope_fingerprint": _text(row, "scope_fingerprint", 64),
                 "shoko_file_id": row.get("shoko_file_id")
                 if _positive(row.get("shoko_file_id"))
                 else None,
-                **{name: _text(row, name) for name in ("filename", "sonarr_path", "shoko_path")},
+                **{
+                    name: _text(row, name)
+                    for name in ("filename", "sonarr_path", "shoko_path", "series_name")
+                },
                 "reason": _text(row, "reason", 128),
                 "observed_iso": _text(row, "observed_iso", 64),
             }
@@ -87,7 +94,7 @@ def _decode_rows(raw: str | None, source_key: str) -> list[dict[str, Any]]:
 
 
 def _positive(value: object) -> bool:
-    return type(value) is int and value > 0
+    return type(value) is int and 0 < value <= MAX_ANIDB_ID
 
 
 def _text(row: dict[str, Any], name: str, limit: int = 512) -> str:
@@ -167,8 +174,12 @@ def observe_metadata_status(
             "shoko_file_id": existing.get("shoko_file_id")
             if _positive(existing.get("shoko_file_id"))
             else None,
-            **{name: _text(existing, name) for name in ("filename", "sonarr_path", "shoko_path")},
+            **{
+                name: _text(existing, name)
+                for name in ("filename", "sonarr_path", "shoko_path", "series_name")
+            },
             "demand_fingerprint": _text(existing, "demand_fingerprint", 64),
+            "scope_fingerprint": _text(existing, "scope_fingerprint", 64),
         }
     if demand is not None and (
         operation is None or operation.demand_fingerprint == demand.fingerprint
@@ -177,11 +188,13 @@ def observe_metadata_status(
         # first would strip its scheme and evade URL-payload scrubbing.
         path = diagnostic_text(demand.sonarr_path, limit=MAX_DOCUMENT_CHARS)
         row.update(
+            series_name=series_display_name(demand.series_name),
             shoko_file_id=demand.shoko_file_id,
             filename=diagnostic_text(path.replace("\\", "/").rsplit("/", 1)[-1]),
             sonarr_path=diagnostic_text(path),
             shoko_path=diagnostic_text(demand.shoko_paths[0]) if demand.shoko_paths else "",
             demand_fingerprint=demand.fingerprint,
+            scope_fingerprint=demand.scope_fingerprint,
         )
     if (
         existing is not None
@@ -255,6 +268,12 @@ def _description(reason: str) -> tuple[str, str]:  # noqa: PLR0911, PLR0912 - ex
             "waiting_queue",
             "Shoko metadata work is queued, running or blocked. "
             "Waiting without adding another request.",
+        )
+    if reason == "metadata_queue_busy":
+        return (
+            "waiting_queue",
+            "Shoko has queued, running or blocked jobs. Metadata retrieval waits for an empty "
+            "queue at a later service cycle.",
         )
     if reason == "metadata_waiting_external_file_queue":
         return (
@@ -371,6 +390,8 @@ def metadata_status_view(
         examples.append(
             MetadataStatusExample(
                 anime_id=anime,
+                series_name=series_display_name(row.get("series_name")),
+                known_anidb_ids=(anime,),
                 shoko_file_id=row.get("shoko_file_id")
                 if _positive(row.get("shoko_file_id"))
                 else None,

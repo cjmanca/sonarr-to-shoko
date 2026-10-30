@@ -411,7 +411,8 @@ def test_mapping_download_failure_guidance_survives_backoff_and_clears_after_act
         assert durable.last_outcome is failure
         assert durable.active_present is cached
         assert wording in failed_status.mapping_cache_status
-        assert "Next mapping check:" in failed_status.mapping_cache_status
+        assert failed_status.mapping_next_check_iso == durable.next_due_iso
+        assert failed_status.mapping_last_check_iso == durable.last_attempted_iso
         assert "secret-server-response" not in str(failed_status)
         assert td.SOURCE_URL not in str(failed_status)
         if not cached or failure is not RefreshOutcome.FAILED_SIZE:
@@ -441,8 +442,8 @@ def test_mapping_download_failure_guidance_survives_backoff_and_clears_after_act
         assert len(requests) == call_count
         assert wording in runtime.status().mapping_cache_status
         assert durable.next_due_iso is not None
-        expected_time = td._parse(durable.next_due_iso).strftime("%Y-%m-%d %H:%M:%S UTC")
-        assert expected_time in runtime.status().mapping_cache_status
+        assert runtime.status().mapping_next_check_iso == durable.next_due_iso
+        assert durable.next_due_iso not in runtime.status().mapping_cache_status
         assert all(report.counts.submitted == 0 for report in reports)
         recovered = True
         now = td._parse(durable.next_due_iso)

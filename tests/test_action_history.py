@@ -8,12 +8,185 @@ from pathlib import Path
 
 import pytest
 from test_metadata_operations import Server, operation
-from test_state import LIMITS, T0, T1, T2, prepare, walk_to_planned
+from test_state import LIMITS, T0, T1, T2, T3, prepare, walk_to_planned
 
+from shoko_linker import state as state_module
 from shoko_linker.action_history import RecentAction, action_history_page, action_history_view
 from shoko_linker.linking import SendOutcome, VerificationVerdict
 from shoko_linker.logging_setup import register_secret
-from shoko_linker.state import MetadataOperationState, SendToken, ServiceFileCounts, open_state
+from shoko_linker.state import (
+    MetadataOperationState,
+    SendToken,
+    ServiceFileCounts,
+    StateError,
+    StateStore,
+    open_state,
+)
+
+
+@pytest.mark.parametrize("outcome", list(SendOutcome))
+def test_outcome_records_its_own_request_update(tmp_path: Path, outcome: SendOutcome) -> None:
+    with open_state(tmp_path / "state.db", budget_limits=LIMITS) as store:
+        walk_to_planned(store)
+        token = prepare(store)
+        assert isinstance(token, SendToken)
+        store.mark_sent(token, iso=T1)
+        store.record_send_outcome(token, outcome, iso=T2)
+        item = action_history_view(store).examples[0]
+        assert item.requested_iso == T1
+        assert item.recorded_iso == T2
+
+
+@pytest.mark.parametrize("verdict", list(VerificationVerdict))
+def test_inspection_records_request_event_time(
+    tmp_path: Path, verdict: VerificationVerdict
+) -> None:
+    path = tmp_path / "state.db"
+    with open_state(path, budget_limits=LIMITS) as store:
+        walk_to_planned(store)
+        token = prepare(store, target_ids=((18208, 650, 777),))
+        store.mark_sent(token, iso=T0)
+        store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T1)
+        inspection = store.active_send_details(101)
+        assert inspection is not None
+        store.record_verification(101, verdict, iso=T2, inspection=inspection)
+        if verdict is VerificationVerdict.CONTRADICTION:
+            store.resolve_send(101, token.request_fingerprint, resolution="operator_closed", iso=T3)
+        if verdict is VerificationVerdict.VERIFIED:
+            store.record_verification(101, verdict, iso=T3)
+    with open_state(path) as store:
+        item = action_history_page(store).rows[0]
+        assert item.requested_iso == T0
+        assert item.recorded_iso == (T3 if verdict is VerificationVerdict.CONTRADICTION else T2)
+
+
+def test_void_new_attempt_and_failed_mutation_keep_separate_request_times(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.db", budget_limits=LIMITS) as store:
+        walk_to_planned(store)
+        first = prepare(store)
+        store.void_prepared_send(101, first.request_fingerprint, iso=T1, reason="cancel")
+        second = prepare(store, iso=T2, cycle_key="next")
+        assert isinstance(second, SendToken)
+        before = action_history_view(store)
+        assert {r.action_id: r.recorded_iso for r in before.examples} == {
+            f"file:{first.send_id}": T1,
+            f"file:{second.send_id}": T2,
+        }
+        with pytest.raises(StateError):
+            store.resolve_send(
+                101, second.request_fingerprint, resolution="operator_closed", iso=T3
+            )
+        with pytest.raises(StateError):
+            store.mark_sent(second, iso="invalid")
+        assert action_history_view(store) == before
+
+
+def test_v10_upgrade_retains_only_request_times_and_preserves_ledger(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    with open_state(path, budget_limits=LIMITS) as store:
+        walk_to_planned(store)
+        token = prepare(store)
+        store.mark_sent(token, iso=T0)
+        store.record_send_outcome(token, SendOutcome.ACCEPTED_UNVERIFIED, iso=T1)
+        store.connection.execute("ALTER TABLE sends DROP COLUMN updated_iso")
+        store.connection.execute(
+            "UPDATE sends SET verified_iso=?,campaign_ownership_resolved_iso=?", (T1, T2)
+        )
+        store.connection.execute("UPDATE files SET updated_iso=?", (T3,))
+        store.connection.execute(
+            "INSERT INTO sends (shoko_file_id,request_fingerprint,plan_fingerprint,"
+            "attempted_iso,outcome) VALUES (101,'unknown','unknown','invalid','resolved')"
+        )
+        before = store.connection.execute("SELECT * FROM sends").fetchall()
+        budget = store.budget_view()
+        reservations = store.connection.execute("SELECT * FROM budget_reservations").fetchall()
+        store.connection.execute("DELETE FROM schema_version WHERE version>=11")
+        store.connection.execute("PRAGMA user_version=10")
+    with open_state(path, budget_limits=LIMITS) as store:
+        rows = store.connection.execute("SELECT * FROM sends").fetchall()
+        assert [row[:-1] for row in rows] == before
+        assert [row[-1] for row in rows] == [T2, None]
+        assert store.budget_view() == budget
+        assert (
+            store.connection.execute("SELECT * FROM budget_reservations").fetchall() == reservations
+        )
+        assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert {row.action_id: row.recorded_iso for row in action_history_view(store).examples} == {
+            "file:1": T2,
+            "file:2": "",
+        }
+        # Ordinary ownership resolution is also a request-local event.
+        store.connection.execute("UPDATE sends SET campaign_ownership='unknown' WHERE send_id=1")
+        store.resolve_legacy_send_ownership(1, campaign_id=None, note="reviewed", iso=T3)
+        assert action_history_view(store).examples[0].recorded_iso == T3
+
+
+def test_v10_timestamp_migration_failure_rolls_back_added_column_and_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.db"
+    with open_state(path, budget_limits=LIMITS) as store:
+        walk_to_planned(store)
+        prepare(store)
+        store.connection.execute("ALTER TABLE sends DROP COLUMN updated_iso")
+        store.connection.execute("DELETE FROM schema_version WHERE version>=11")
+        store.connection.execute("PRAGMA user_version=10")
+        before = store.connection.execute("SELECT * FROM sends").fetchall()
+
+    real_step = state_module._MIGRATIONS[10]
+
+    def fail_after_backfill(connection: sqlite3.Connection) -> None:
+        real_step(connection)
+        raise sqlite3.OperationalError("injected timestamp migration failure")
+
+    monkeypatch.setattr(state_module, "_MIGRATIONS", {10: fail_after_backfill})
+    with pytest.raises(StateError, match="migration from schema version 10 failed"):
+        StateStore(path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
+        assert connection.execute("SELECT * FROM sends").fetchall() == before
+        assert "updated_iso" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(sends)")
+        }
+        assert connection.execute("SELECT version FROM schema_version").fetchall() == []
+
+
+@pytest.mark.parametrize(
+    ("attempted", "verified", "resolved", "expected"),
+    [
+        (T0, "20260102T000000+00:00", None, "20260102T000000+00:00"),
+        ("20260101T000000+00:00", T2, None, T2),
+        (T0, "2026-01-01T01:00:00+02:00", None, T0),
+        (T0, "2026-01-01T02:00:00+02:00", None, T0),
+        (T0, "2026-01-03T00:00:00", None, T0),
+        (T0, "0001-01-01T00:00:00+01:00", None, T0),
+        (T0, "9999-12-31T23:59:59-01:00", None, T0),
+        (T0, "invalid", b"2026-01-03T00:00:00+00:00", T0),
+        (T0, 20260103, "9" * 200, T0),
+        ("invalid", None, None, None),
+        ("2026-01-01T00:00:00", b"not text", 20260103, None),
+    ],
+)
+def test_v10_backfill_uses_displayable_aware_python_iso_times(
+    tmp_path: Path,
+    attempted: str,
+    verified: str | bytes | int | None,
+    resolved: str | bytes | int | None,
+    expected: str | None,
+) -> None:
+    path = tmp_path / "state.db"
+    with open_state(path, budget_limits=LIMITS) as store:
+        walk_to_planned(store)
+        prepare(store)
+        store.connection.execute("ALTER TABLE sends DROP COLUMN updated_iso")
+        store.connection.execute(
+            "UPDATE sends SET attempted_iso=?,verified_iso=?,campaign_ownership_resolved_iso=?",
+            (attempted, verified, resolved),
+        )
+        store.connection.execute("DELETE FROM schema_version WHERE version>=11")
+        store.connection.execute("PRAGMA user_version=10")
+    with open_state(path) as store:
+        assert store.connection.execute("SELECT updated_iso FROM sends").fetchone() == (expected,)
 
 
 @pytest.mark.parametrize(
@@ -152,7 +325,7 @@ def test_sanitized_paths_invalid_time_and_empty_history(tmp_path: Path) -> None:
             "UPDATE files SET sonarr_path=?",
             (f"/media/<script>/{secret}/http://host/unregistered-private-key.mkv",),
         )
-        connection.execute("UPDATE sends SET attempted_iso='not a date'")
+        connection.execute("UPDATE sends SET attempted_iso='not a date',updated_iso='not a date'")
     with open_state(path, budget_limits=LIMITS) as store:
         view = action_history_view(store)
         item = view.examples[0]
@@ -309,7 +482,7 @@ def test_history_pages_select_keys_before_payload_and_preserve_total(tmp_path: P
         assert len(paths) == 50
         query = next(s for s in statements if "WITH keys" in s)
         assert "LIMIT 50 OFFSET 50" in query
-        assert "json" not in query.lower()
+        assert "length(s.target_ids_json)<=65536" in query.lower()
         assert store.connection.total_changes == before
         assert not store.connection.in_transaction
         plan = store.connection.execute("EXPLAIN QUERY PLAN " + query).fetchall()

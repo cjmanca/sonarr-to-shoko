@@ -1,5 +1,6 @@
 """Authenticated route-specific tables share truthful counts and a single control."""
 
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -19,10 +20,12 @@ from shoko_linker.http import ApiEndpoint
 from shoko_linker.linking import SendOutcome
 from shoko_linker.logging_setup import register_secret
 from shoko_linker.onboarding import OnboardingManager
+from shoko_linker.scan_status import ScanEvidence, ScanExclusionPage, ScanExclusionView, ScanSummary
 from shoko_linker.service_settings import load_service_settings
 from shoko_linker.state import (
     Cohort,
     FileState,
+    ScanExclusionRow,
     SendToken,
     ServiceFileCounts,
     ServiceFileExample,
@@ -305,7 +308,10 @@ def test_history_displays_requests_not_just_current_verified_files(tmp_path: Pat
         assert "Showing 1&ndash;1 of 1" in text
         assert "Shoko accepted the request" in text
         assert "verified linking is not yet recorded" in text
-        assert "Request recorded: 2026-10-29T12:00:00+00:00" in text
+        assert 'datetime="2026-10-29T12:00:00+00:00"' in text
+        assert 'data-column="requested">Requested' in text
+        assert 'data-column="updated">Updated' in text
+        assert '<td class="time-cell"><time' in text
         assert "Episode-112.mkv" not in text
         assert requests == []
     finally:
@@ -357,3 +363,54 @@ def test_table_filename_library_relative_path_and_hover_text_are_escaped_and_red
     assert 'title="&lt;conflict&gt;' in text
     assert '<span class="sr-only">&lt;conflict&gt;' in text
     assert "<conflict>" not in text
+
+
+@pytest.mark.parametrize(
+    "route", ["/files/verified", "/files/waiting", "/issues", "/issues?view=exclusions"]
+)
+@pytest.mark.parametrize("empty", [False, True])
+def test_every_file_table_has_links_and_matching_column_counts(route: str, empty: bool) -> None:
+    counts = ServiceFileCounts(0, 0, 1)
+    row = ServiceFileExample(
+        1,
+        "conflict",
+        "conflict",
+        "Review this file",
+        "File.mkv",
+        "",
+        (),
+        "",
+        "",
+        known_anidb_ids=(12,),
+        series_name="Retained name",
+    )
+    table = DashboardTable(
+        files=ServiceFilePage(
+            "review", table_page(0 if empty else 1, 1, 50), counts, () if empty else (row,)
+        )
+    )
+    view = "exclusions" if "?" in route else "review"
+    if view == "exclusions":
+        exclusion = ScanExclusionRow(1, "outside_scope", "Outside selected library")
+        table = DashboardTable(
+            exclusions=ScanExclusionPage(
+                ScanEvidence(ScanSummary("context", "", "", 1, 1, 0, 1, 1), (), ()),
+                table_page(0 if empty else 1, 1, 50),
+                () if empty else (ScanExclusionView(exclusion, FileDisplay()),),
+                True,
+                "Exclusions",
+            )
+        )
+    panel = DashboardApplication._table_section(route.split("?", 1)[0], view, table)
+    assert panel.count('<th scope="col"') == 6
+    assert 'data-column="links">Links' in panel
+    if empty:
+        assert '<td colspan="6">No records in this view.' in panel
+    else:
+        body = panel.split("<tbody>", 1)[1]
+        assert len(re.findall(r"<td(?: [^>]*)?>", body)) == 6
+        if view == "exclusions":
+            assert '<td class="links-cell">&mdash;</td>' in body
+            assert "https://anidb.net" not in body
+        else:
+            assert 'href="https://anidb.net/anime/12"' in body

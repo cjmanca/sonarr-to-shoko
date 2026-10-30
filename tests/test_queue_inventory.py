@@ -542,3 +542,20 @@ def test_invalid_lookup_ids_are_rejected(subject_id: int) -> None:
     inventory, _ = _run([])
     with pytest.raises(ValueError, match="positive signed 32-bit"):
         inventory.lookup(ANIME_KIND, subject_id)
+
+
+@pytest.mark.parametrize("state", list(QueueJobState))
+def test_whole_queue_total_includes_unrecognized_job_kinds(state: QueueJobState) -> None:
+    inventory, _ = _run([_item("Other.UnrecognizedJob", state)])
+    assert inventory.complete
+    assert inventory.jobs == ()
+    assert inventory.total_count == 1
+
+
+def test_only_complete_empty_inventory_proves_zero_whole_queue_jobs() -> None:
+    empty, _ = _run([])
+    assert empty.complete
+    assert empty.total_count == 0
+    unknown, _ = _run([], max_body_bytes=1)
+    assert not unknown.complete
+    assert unknown.total_count is None

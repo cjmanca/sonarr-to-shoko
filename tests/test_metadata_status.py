@@ -300,6 +300,7 @@ def test_blocked_recovery_updates_retained_context_without_post(
     ("reason", "expected"),
     [
         ("metadata_waiting_external_queue", "waiting_queue"),
+        ("metadata_queue_busy", "waiting_queue"),
         ("metadata_waiting_external_file_queue", "waiting_file_queue"),
         ("metadata_queue_not_clear", "queue_unknown"),
         ("metadata_delivery_unknown", "uncertain"),

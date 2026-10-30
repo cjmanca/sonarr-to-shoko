@@ -283,9 +283,11 @@ def test_tracked_page_does_not_decode_off_page_identity(tmp_path: Path) -> None:
         store.connection.create_function("length", 1, measured_length)
         result = store.service_file_page("waiting", page=2)
         assert [row.shoko_file_id for row in result.rows] == list(range(51, 101))
+        # The bounded page projection checks each path twice (value and proof).
+        # Series-name provenance then checks only each selected row once more.
         assert evaluated == [
             f"/sonarr/Anime/Episode {i}.mkv" for i in range(51, 101) for _ in range(2)
-        ]
+        ] + [f"/sonarr/Anime/Episode {i}.mkv" for i in range(51, 101)]
 
 
 def test_paged_paths_keep_bounded_full_context_for_library_projection(tmp_path: Path) -> None:

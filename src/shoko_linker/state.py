@@ -150,6 +150,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -162,7 +163,14 @@ from pathlib import Path
 from typing import Any, Final, Literal, LiteralString, ParamSpec, TypeVar, cast
 
 from .errors import LinkerError
-from .file_display import MAX_DISPLAY_LOCATIONS, safe_display_path
+from .file_display import (
+    MAX_ANIDB_ID,
+    MAX_DISPLAY_LOCATIONS,
+    display_anidb_ids,
+    display_document,
+    safe_display_path,
+    series_display_name,
+)
 from .linking import SendOutcome, VerificationVerdict
 from .logging_setup import diagnostic_text, redact
 from .mappings import EpisodeType
@@ -207,7 +215,7 @@ SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
 SYSTEM_RECONFIRMATION_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
     {"setup_changed", "unsafe_shoko_settings"}
 )
-SCHEMA_VERSION: Final[int] = 10
+SCHEMA_VERSION: Final[int] = 11
 MAPPING_RESOLVED_ID_COUNT: Final[int] = 2  # AniDB episode ID, Shoko episode ID
 META_MAPPING_TARGET_QUARANTINE_PREFIX: Final[str] = "file_mapping_quarantine:v1:"
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5000
@@ -459,6 +467,9 @@ class ServiceFileExample:
     detail: str
     updated_iso: str
     display_paths_complete: bool = True
+    series_name: str = ""
+    known_anidb_ids: tuple[int, ...] = ()
+    series_display_context: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -541,6 +552,8 @@ class ScanExclusionRow:
     sonarr_path: str = ""
     shoko_paths: tuple[str, ...] = ()
     paths_complete: bool = True
+    series_name: str = ""
+    known_anidb_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -629,6 +642,43 @@ _SERVICE_FILE_DISPLAY_SQL: Final[str] = (
     " CASE WHEN " + _SERVICE_IDENTITY_DISPLAY_VALID_SQL + " THEN identity_hash_json ELSE NULL END,"
     " (" + _SERVICE_SOURCE_DISPLAY_VALID_SQL + " AND " + _SERVICE_IDENTITY_DISPLAY_VALID_SQL + ")"
 )
+
+
+def _file_series_display_name(
+    raw: object,
+    series_id: object,
+    episode_file_id: object,
+    path: object,
+    *,
+    source_key: str | None = None,
+) -> str:
+    doc = display_document(raw)
+    if (
+        not isinstance(doc, dict)
+        or type(doc.get("series_id")) is not int
+        or doc["series_id"] <= 0
+        or type(doc.get("episode_file_id")) is not int
+        or doc["episode_file_id"] <= 0
+        or not isinstance(doc.get("source_key"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", doc["source_key"]) is None
+        or not isinstance(doc.get("path"), str)
+        or safe_display_path(doc["path"]) != doc["path"]
+        or (source_key is not None and doc.get("source_key") != source_key)
+        or (series_id, episode_file_id, path)
+        != (doc.get("series_id"), doc.get("episode_file_id"), doc.get("path"))
+    ):
+        return ""
+    return series_display_name(doc.get("title"))
+
+
+def _file_series_display_context(raw: object) -> tuple[str, str] | None:
+    doc = display_document(raw)
+    if not isinstance(doc, dict) or not all(
+        isinstance(doc.get(key), str) and re.fullmatch(r"[a-f0-9]{64}", doc[key]) is not None
+        for key in ("source_key", "scope_fingerprint")
+    ):
+        return None
+    return doc["source_key"], doc["scope_fingerprint"]
 
 
 def _service_file_example(row: Any) -> ServiceFileExample:
@@ -891,6 +941,17 @@ class FileSeed:
     iso: str
     state: FileState = FileState.DISCOVERED
     identity: FileIdentitySnapshot | None = None
+
+
+@dataclass(frozen=True)
+class FileSeriesDisplay:
+    """Worker-observed label and exact retained Sonarr identity; display only."""
+
+    shoko_file_id: int
+    series_id: int
+    episode_file_id: int
+    path: str
+    title: str
 
 
 @dataclass(frozen=True)
@@ -1571,6 +1632,11 @@ CREATE INDEX idx_latest_scan_generation ON latest_scan_exclusions (generation, s
 """
 
 
+_SEND_TIMESTAMPS_SQL: Final[str] = """
+ALTER TABLE sends ADD COLUMN updated_iso TEXT;
+"""
+
+
 _SCHEMA_SQL: Final[str] = (
     """
 CREATE TABLE schema_version (
@@ -1712,6 +1778,7 @@ CREATE INDEX idx_dashboard_sessions_expiry ON dashboard_sessions (expires_epoch)
     + _METADATA_SCHEMA_SQL
     + _METADATA_V9_SCHEMA_SQL
     + _SCAN_EXCLUSION_SCHEMA_SQL
+    + _SEND_TIMESTAMPS_SQL
 )
 
 
@@ -2261,6 +2328,42 @@ def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
     _execute_schema_statements(conn, _SCAN_EXCLUSION_SCHEMA_SQL)
 
 
+def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    # Retain only known per-send events; file timestamps belong to mutable projections.
+    _execute_schema_statements(conn, _SEND_TIMESTAMPS_SQL)
+    # SQLite's date grammar differs from our Python ISO grammar. Stream bounded values
+    # and compare aware instants in UTC, retaining the original winning event string.
+    max_iso_length = 128
+    rows = conn.execute(
+        "SELECT send_id,"
+        " CASE WHEN typeof(attempted_iso)='text' AND length(CAST(attempted_iso AS BLOB))<=?"
+        " THEN attempted_iso END,"
+        " CASE WHEN typeof(verified_iso)='text' AND length(CAST(verified_iso AS BLOB))<=?"
+        " THEN verified_iso END,"
+        " CASE WHEN typeof(campaign_ownership_resolved_iso)='text'"
+        " AND length(CAST(campaign_ownership_resolved_iso AS BLOB))<=?"
+        " THEN campaign_ownership_resolved_iso END FROM sends ORDER BY send_id",
+        (max_iso_length, max_iso_length, max_iso_length),
+    )
+    for send_id, *candidates in rows:
+        latest: datetime | None = None
+        recorded_iso: str | None = None
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    continue
+                instant = parsed.astimezone(UTC)
+            except (ValueError, OverflowError):
+                continue
+            if latest is None or instant > latest:
+                latest, recorded_iso = instant, candidate
+        if recorded_iso is not None:
+            conn.execute("UPDATE sends SET updated_iso=? WHERE send_id=?", (recorded_iso, send_id))
+
+
 # Forward-only migration registry: each entry upgrades ``version`` to ``version + 1``.
 # v5 adds timestamped reservations; v6 preserves data without inferring campaign ownership.
 # v7 adds immutable send ownership, fail-closed legacy attribution, and monotonic attempt totals.
@@ -2276,6 +2379,7 @@ _MIGRATIONS: Final[Mapping[int, Callable[[sqlite3.Connection], None]]] = {
     7: _migrate_v7_to_v8,
     8: _migrate_v8_to_v9,
     9: _migrate_v9_to_v10,
+    10: _migrate_v10_to_v11,
 }
 
 
@@ -4451,11 +4555,131 @@ class StateStore:
                 groups[group] = ServiceFileGroup(
                     total,
                     tuple(sorted(reasons[group].items())),
-                    tuple(_service_file_example(row) for row in examples),
+                    tuple(self._file_display_example(row) for row in examples),
                 )
             return ServiceFileStatus(counts, groups["waiting"], groups["review"])
         finally:
             self._conn.execute("RELEASE service_file_status")
+
+    def bounded_display_meta(self, key: str) -> str | None:
+        """Discard oversized or NUL-bearing local display evidence before hydration."""
+        row = self._conn.execute(
+            "SELECT CASE WHEN typeof(value)='text' AND instr(value,char(0))=0"
+            " AND length(value)<=65536 THEN value END FROM meta WHERE key=?",
+            (key,),
+        ).fetchone()
+        return row[0] if row is not None and isinstance(row[0], str) else None
+
+    def remember_file_series_name(
+        self,
+        file_id: int,
+        *,
+        source_key: str,
+        series_id: int,
+        episode_file_id: int,
+        path: str,
+        title: str,
+        scope_fingerprint: str = "",
+    ) -> None:
+        """Worker-owned display context; exact source match only, no safety authority."""
+        self.remember_file_series_names_bulk(
+            (FileSeriesDisplay(file_id, series_id, episode_file_id, path, title),),
+            source_key=source_key,
+            scope_fingerprint=scope_fingerprint,
+        )
+
+    @_mutation
+    def remember_file_series_names_bulk(
+        self,
+        rows: Sequence[FileSeriesDisplay],
+        *,
+        source_key: str,
+        scope_fingerprint: str = "",
+    ) -> None:
+        """Persist one matched inventory's labels with one atomic write-stop fence.
+
+        Input is a finite worker-owned sequence, bounded by the observed inventory,
+        rather than an untrusted display document. Identity checks run under the
+        write lock so a concurrent change cannot attach a label to a different file.
+        """
+        _require_hex64(source_key, "source_key")
+        if scope_fingerprint:
+            _require_hex64(scope_fingerprint, "scope_fingerprint")
+        params = []
+        for row in rows:
+            name = series_display_name(row.title)
+            if (
+                not name
+                or safe_display_path(row.path) != row.path
+                or any(
+                    type(value) is not int or not 0 < value < 2**63
+                    for value in (row.shoko_file_id, row.series_id, row.episode_file_id)
+                )
+            ):
+                continue
+            params.append(
+                (
+                    f"file_series_display:v1:{row.shoko_file_id}",
+                    json.dumps(
+                        {
+                            "source_key": source_key,
+                            "scope_fingerprint": scope_fingerprint,
+                            "series_id": row.series_id,
+                            "episode_file_id": row.episode_file_id,
+                            "path": row.path,
+                            "title": name,
+                        }
+                    ),
+                    row.shoko_file_id,
+                    row.series_id,
+                    row.episode_file_id,
+                    row.path,
+                )
+            )
+        if not params:
+            return
+        with self._transaction():
+            self._conn.executemany(
+                "INSERT INTO meta (key,value) SELECT ?,? FROM files"
+                " WHERE shoko_file_id=? AND sonarr_series_id=? AND sonarr_file_id=?"
+                " AND sonarr_path=?"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params,
+            )
+
+    def file_series_name(self, file_id: int, *, source_key: str | None = None) -> str:
+        raw = self.bounded_display_meta(f"file_series_display:v1:{file_id}")
+        row = self._conn.execute(
+            "SELECT sonarr_series_id,sonarr_file_id,"
+            " CASE WHEN typeof(sonarr_path)='text' AND instr(sonarr_path,char(0))=0"
+            " AND length(sonarr_path)<=8192 THEN sonarr_path END FROM files WHERE shoko_file_id=?",
+            (file_id,),
+        ).fetchone()
+        return _file_series_display_name(raw, *row, source_key=source_key) if row else ""
+
+    def _file_display_example(self, row: Any) -> ServiceFileExample:
+        example = _service_file_example(row)
+        raw = self.bounded_display_meta(f"file_mapping_targets:v1:{example.shoko_file_id}")
+        ids = display_anidb_ids(raw, frozen=True)
+        if raw is None:
+            # Advanced campaigns predate frozen mapping context. Their immutable
+            # latest send still proves destinations; never use mutable current plans.
+            send = self._conn.execute(
+                "SELECT CASE WHEN typeof(target_ids_json)='text'"
+                " AND instr(target_ids_json,char(0))=0 AND length(target_ids_json)<=65536"
+                " THEN target_ids_json END FROM sends WHERE shoko_file_id=?"
+                " ORDER BY send_id DESC LIMIT 1",
+                (example.shoko_file_id,),
+            ).fetchone()
+            ids = display_anidb_ids(send[0]) if send else ()
+        return replace(
+            example,
+            series_name=self.file_series_name(example.shoko_file_id),
+            series_display_context=_file_series_display_context(
+                self.bounded_display_meta(f"file_series_display:v1:{example.shoko_file_id}")
+            ),
+            known_anidb_ids=ids,
+        )
 
     def service_file_page(
         self, group: str, *, page: int = 1, page_size: int = 50
@@ -4500,7 +4724,7 @@ class StateStore:
                 ),
             ).fetchall()
             return ServiceFilePage(
-                group, pagination, counts, tuple(_service_file_example(row) for row in rows)
+                group, pagination, counts, tuple(self._file_display_example(row) for row in rows)
             )
         finally:
             self._conn.execute("RELEASE service_file_page")
@@ -5447,7 +5671,7 @@ class StateStore:
             cursor = self._conn.execute(
                 "INSERT INTO sends (shoko_file_id, request_fingerprint, plan_fingerprint,"
                 " campaign_id, campaign_ownership, attempted_iso, outcome, episode_jobs,"
-                " target_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " target_ids_json, updated_iso) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     shoko_file_id,
                     request_fingerprint,
@@ -5460,6 +5684,7 @@ class StateStore:
                     OUTCOME_PREPARED,
                     jobs,
                     _encode_target_ids(target_ids),
+                    iso,
                 ),
             )
             send_id = _as_int(cursor.lastrowid, "send_id")
@@ -5541,8 +5766,9 @@ class StateStore:
                     ),
                 )
                 self._conn.execute(
-                    "UPDATE sends SET outcome = ?, attempted_iso = ? WHERE send_id = ?",
-                    (OUTCOME_ATTEMPTED, iso, token.send_id),
+                    "UPDATE sends SET outcome = ?, attempted_iso = ?, updated_iso = ?"
+                    " WHERE send_id = ?",
+                    (OUTCOME_ATTEMPTED, iso, iso, token.send_id),
                 )
         if limit_reached is not None:
             campaign_id, total, limit = limit_reached
@@ -5693,8 +5919,9 @@ class StateStore:
                 ),
             )
             self._conn.execute(
-                "UPDATE sends SET outcome = ?, http_status = ? WHERE send_id = ?",
-                (outcome.value, http_status, token.send_id),
+                "UPDATE sends SET outcome = ?, http_status = ?, updated_iso = ?"
+                " WHERE send_id = ?",
+                (outcome.value, http_status, iso, token.send_id),
             )
             if outcome in (SendOutcome.REJECTED, SendOutcome.REFUSED):
                 # P2-4/P1-A: release the *stored* reservation through the single-owner path
@@ -5838,9 +6065,9 @@ class StateStore:
                 send_id = _as_int(send_row[0], "send_id")
                 if target is FileState.VERIFIED:
                     self._conn.execute(
-                        "UPDATE sends SET outcome = ?, verification = ?, verified_iso = ?"
-                        " WHERE send_id = ?",
-                        ("verified", verdict.value, iso, send_id),
+                        "UPDATE sends SET outcome = ?, verification = ?, verified_iso = ?,"
+                        " updated_iso = ? WHERE send_id = ?",
+                        ("verified", verdict.value, iso, iso, send_id),
                     )
                 elif (
                     inspection is not None
@@ -5848,14 +6075,15 @@ class StateStore:
                     and _as_str(send_row[2], "send outcome") != OUTCOME_INSPECTED_REVIEW
                 ):
                     self._conn.execute(
-                        "UPDATE sends SET outcome = ?, verification = ?, verified_iso = ?"
-                        " WHERE send_id = ?",
-                        (OUTCOME_INSPECTED_REVIEW, verdict.value, iso, send_id),
+                        "UPDATE sends SET outcome = ?, verification = ?, verified_iso = ?,"
+                        " updated_iso = ? WHERE send_id = ?",
+                        (OUTCOME_INSPECTED_REVIEW, verdict.value, iso, iso, send_id),
                     )
                 else:
                     self._conn.execute(
-                        "UPDATE sends SET verification = ?, verified_iso = ? WHERE send_id = ?",
-                        (verdict.value, iso, send_id),
+                        "UPDATE sends SET verification = ?, verified_iso = ?, updated_iso = ?"
+                        " WHERE send_id = ?",
+                        (verdict.value, iso, iso, send_id),
                     )
             if target is FileState.VERIFIED:
                 # P1-A: release via the send row's ownership flag (file slot + stored jobs).
@@ -5943,7 +6171,8 @@ class StateStore:
         current = FileState(_as_str(file_row[0], "state"))
         validate_transition(current, FileState.PLANNED)
         self._conn.execute(
-            "UPDATE sends SET outcome = ? WHERE send_id = ?", (OUTCOME_VOIDED, send_id)
+            "UPDATE sends SET outcome = ?, updated_iso = ? WHERE send_id = ?",
+            (OUTCOME_VOIDED, iso, send_id),
         )
         self._conn.execute(
             "UPDATE files SET state = ?, state_detail = ?, updated_iso = ?"
@@ -6089,8 +6318,8 @@ class StateStore:
                 raise StateError(f"file {shoko_file_id} is verified: resolve_send is refused")
             validate_transition(current, target)
             self._conn.execute(
-                "UPDATE sends SET outcome = ? WHERE send_id = ?",
-                (OUTCOME_RESOLVED, send_id),
+                "UPDATE sends SET outcome = ?, updated_iso = ? WHERE send_id = ?",
+                (OUTCOME_RESOLVED, iso, send_id),
             )
             self._release_send_slot_tx(send_id, iso, f"resolve:{resolution}")
             self._conn.execute(
@@ -6384,6 +6613,7 @@ class StateStore:
         after_ready_claim: str | None = None,
         required_targets: Sequence[MetadataEpisodeIdentity] | None = None,
         missing_targets: Sequence[MetadataEpisodeIdentity] | None = None,
+        series_name: str = "",
     ) -> MetadataOperation | BudgetRefusal:
         """Reserve one request/one parent job, without inventing a file send.
 
@@ -6449,7 +6679,8 @@ class StateStore:
                 " claim=excluded.claim, demand_fingerprint=excluded.demand_fingerprint,"
                 " request_fingerprint=excluded.request_fingerprint,"
                 " request_version=excluded.request_version, state=excluded.state,"
-                " updated_iso=excluded.updated_iso, attempted_iso=NULL,"
+                " created_iso=excluded.created_iso, updated_iso=excluded.updated_iso,"
+                " attempted_iso=NULL,"
                 " verification_deadline_iso=NULL, transport_admitted=0,"
                 " reservation_owned=1, slot_released=0,"
                 " required_targets_json=excluded.required_targets_json,"
@@ -6470,6 +6701,9 @@ class StateStore:
             )
             result = self.get_metadata_operation(source_key, anidb_anime_id)
             assert result is not None
+            name = series_display_name(series_name)
+            if name:
+                self._set_meta_tx(f"metadata_series_display:v1:{result.claim}", name)
             return result
 
     @_mutation
@@ -7869,13 +8103,13 @@ class StateStore:
         Sends have no immutable endpoint/path snapshot. Joined paths are current
         retained context only. External metadata observations are not our requests.
         Materialize only the requested bounded keys/times before joining any
-        display fields. Scalar counts share the same statement snapshot. No
-        target/history JSON is read or decoded for status.
+        display fields. Scalar counts share the same statement snapshot.
+        Only selected bounded target/display JSON is decoded for status.
         """
         rows = self._conn.execute(
             "WITH keys AS ("  # noqa: S608 - fixed shared display predicate
             " SELECT 0 AS kind, send_id AS row_key,"
-            " COALESCE(verified_iso,attempted_iso) AS recorded_iso FROM sends"
+            " COALESCE(updated_iso,verified_iso,attempted_iso) AS recorded_iso FROM sends"
             " UNION ALL SELECT 1, rowid, updated_iso"
             " FROM metadata_operations WHERE reservation_owned=1"
             " UNION ALL SELECT 2, rowid, updated_iso"
@@ -7900,28 +8134,168 @@ class StateStore:
             " s.verification, CASE WHEN "
             + _SERVICE_SOURCE_DISPLAY_VALID_SQL
             + " THEN f.sonarr_path ELSE NULL END AS current_path,"
-            " COALESCE(m.transport_admitted,h.transport_admitted) AS transport_admitted"
+            " COALESCE(m.transport_admitted,h.transport_admitted) AS transport_admitted,"
+            " CASE WHEN typeof(s.target_ids_json)='text' AND instr(s.target_ids_json,char(0))=0"
+            " AND length(s.target_ids_json)<=65536 THEN s.target_ids_json END AS display_targets,"
+            " f.sonarr_series_id AS display_series_id,f.sonarr_file_id AS display_file_id,"
+            " CASE WHEN typeof(d.value)='text' AND instr(d.value,char(0))=0"
+            " AND length(d.value)<=65536 THEN d.value END AS display_context,"
+            " CASE WHEN length(COALESCE(m.claim,h.claim))<=128"
+            " THEN COALESCE(m.claim,h.claim) END AS display_claim,"
+            " CASE WHEN length(COALESCE(m.source_key,h.source_key))=64"
+            " THEN COALESCE(m.source_key,h.source_key) END AS display_source,"
+            " CASE WHEN length(COALESCE(m.demand_fingerprint,h.demand_fingerprint))=64"
+            " THEN COALESCE(m.demand_fingerprint,h.demand_fingerprint) END AS display_demand,"
+            " CASE WHEN typeof(ms.value)='text' AND instr(ms.value,char(0))=0"
+            " AND length(ms.value)<=65536 THEN ms.value END AS legacy_context"
             " FROM recent r"
             " LEFT JOIN sends s ON r.kind=0 AND s.send_id=r.row_key"
             " LEFT JOIN files f ON r.kind=0 AND f.shoko_file_id=s.shoko_file_id"
             " LEFT JOIN metadata_operations m ON r.kind=1 AND m.rowid=r.row_key"
             " LEFT JOIN metadata_operation_history h ON r.kind=2 AND h.rowid=r.row_key"
+            " LEFT JOIN meta d ON d.key=CASE WHEN r.kind=0"
+            " THEN 'file_series_display:v1:' || s.shoko_file_id"
+            " WHEN length(COALESCE(m.claim,h.claim))<=128"
+            " THEN 'metadata_series_display:v1:' || COALESCE(m.claim,h.claim) END"
+            " LEFT JOIN meta ms ON r.kind!=0 AND ms.key='service_metadata_status:v1'"
+            "), legacy_keys AS MATERIALIZED ("
+            " SELECT p.*, (SELECT e.value FROM json_each("
+            " CASE WHEN json_valid(p.legacy_context) THEN CASE"
+            " WHEN json_type(p.legacy_context,'$.examples')='array'"
+            " AND json_array_length(p.legacy_context,'$.examples')<=20"
+            " THEN p.legacy_context ELSE '{}' END ELSE '{}' END, '$.examples') e"
+            " WHERE e.type='object' AND json_extract("
+            " CASE WHEN e.type='object' THEN e.value ELSE '{}' END,'$.anime_id')=p.subject_id"
+            " LIMIT 1) AS legacy_row FROM payload p"
             ") SELECT operation,action_id,subject_id,"
-            " CASE WHEN length(state)<=128 THEN state END AS state,"
+            " CASE WHEN length(p.state)<=128 THEN p.state END AS state,"
             " CASE WHEN length(requested_iso)<=128 THEN requested_iso END AS requested_iso,"
             " recorded_iso,http_status,"
             " CASE WHEN length(verification)<=128 THEN verification END AS verification,"
             " current_path,"
-            " transport_admitted,"
+            " transport_admitted,display_targets,display_context,display_series_id,display_file_id,"
+            " display_claim,display_source,display_demand,legacy_context,legacy_row,"
+            " lf.shoko_file_id AS legacy_shoko_file_id,"
+            " lf.sonarr_series_id AS legacy_series_id,lf.sonarr_file_id AS legacy_file_id,"
+            " CASE WHEN typeof(lf.sonarr_path)='text' AND instr(lf.sonarr_path,char(0))=0"
+            " AND length(lf.sonarr_path)<=8192 THEN lf.sonarr_path END AS legacy_path,"
+            " CASE WHEN typeof(ld.value)='text' AND instr(ld.value,char(0))=0"
+            " AND length(ld.value)<=65536 THEN ld.value END AS legacy_file_context,"
+            " CASE WHEN typeof(lt.value)='text' AND instr(lt.value,char(0))=0"
+            " AND length(lt.value)<=65536 THEN lt.value END AS legacy_targets,"
             " (SELECT COUNT(*) FROM sends) +"
             " (SELECT COUNT(*) FROM metadata_operations WHERE reservation_owned=1) +"
             " (SELECT COUNT(*) FROM metadata_operation_history WHERE reservation_owned=1) AS total"
-            " FROM payload ORDER BY sort_time DESC,kind DESC,row_key DESC",
+            " FROM legacy_keys p LEFT JOIN files lf"
+            " ON json_type(p.legacy_row,'$.shoko_file_id')='integer'"
+            " AND lf.shoko_file_id=json_extract(p.legacy_row,'$.shoko_file_id')"
+            " LEFT JOIN meta ld ON ld.key='file_series_display:v1:' || lf.shoko_file_id"
+            " LEFT JOIN meta lt ON lt.key='file_mapping_targets:v1:' || lf.shoko_file_id"
+            " ORDER BY sort_time DESC,kind DESC,row_key DESC",
             (limit, offset),
         )
         columns = tuple(item[0] for item in rows.description)
         result = tuple(dict(zip(columns, row, strict=True)) for row in rows.fetchall())
+        for item in result:
+            item["series_display_context"] = None
+            if item["operation"] == "file_link":
+                item["series_display_context"] = _file_series_display_context(
+                    item["display_context"]
+                )
+                item["series_name"] = _file_series_display_name(
+                    item["display_context"],
+                    item["display_series_id"],
+                    item["display_file_id"],
+                    item["current_path"],
+                )
+                item["known_anidb_ids"] = display_anidb_ids(item.pop("display_targets"))
+            else:
+                item["series_name"] = series_display_name(item["display_context"])
+                if not item["series_name"]:
+                    item["series_name"] = self._legacy_metadata_series_name(item)
+                    if item["series_name"]:
+                        item["series_display_context"] = _file_series_display_context(
+                            item["legacy_file_context"]
+                        )
+                anime = item["subject_id"]
+                item["known_anidb_ids"] = (anime,) if type(anime) is int and anime > 0 else ()
+                item.pop("display_targets")
+            for key in (
+                "display_context",
+                "display_series_id",
+                "display_file_id",
+                "display_claim",
+                "display_source",
+                "display_demand",
+                "legacy_context",
+                "legacy_row",
+                "legacy_shoko_file_id",
+                "legacy_series_id",
+                "legacy_file_id",
+                "legacy_path",
+                "legacy_file_context",
+                "legacy_targets",
+            ):
+                item.pop(key)
         return (int(result[0]["total"]) if result else 0), result
+
+    @staticmethod
+    def _legacy_metadata_series_name(item: dict[str, Any]) -> str:
+        """Current retained label only when the original demand still has exact context.
+
+        An anime ID alone never identifies a Sonarr series. Most old/archive rows
+        lack this bounded evidence and deliberately remain unavailable.
+        """
+        doc = display_document(item["legacy_context"])
+        if not all(
+            isinstance(item[key], str) and re.fullmatch(pattern, item[key]) is not None
+            for key, pattern in (
+                ("display_source", r"[a-f0-9]{64}"),
+                ("display_demand", r"[a-f0-9]{64}"),
+                ("display_claim", r"[a-f0-9]{32}"),
+            )
+        ):
+            return ""
+        if (
+            not isinstance(doc, dict)
+            or type(doc.get("version")) is not int
+            or doc["version"] != 1
+            or doc.get("source_key") != item["display_source"]
+            or not isinstance(doc.get("examples"), list)
+            or len(doc["examples"]) > SERVICE_FILE_EXAMPLE_LIMIT
+        ):
+            return ""
+        context = display_document(item["legacy_row"])
+        if (
+            not isinstance(context, dict)
+            or type(context.get("anime_id")) is not int
+            or context["anime_id"] != item["subject_id"]
+            or context.get("claim") != item["display_claim"]
+            or context.get("demand_fingerprint") != item["display_demand"]
+            or type(context.get("shoko_file_id")) is not int
+            or not 0 < context["shoko_file_id"] <= MAX_ANIDB_ID
+            or context["shoko_file_id"] != item["legacy_shoko_file_id"]
+        ):
+            return ""
+        file_doc = display_document(item["legacy_file_context"])
+        if (
+            not isinstance(file_doc, dict)
+            or not isinstance(context.get("sonarr_path"), str)
+            or not context["sonarr_path"]
+            or file_doc.get("path") != context["sonarr_path"]
+            or not isinstance(context.get("scope_fingerprint"), str)
+            or re.fullmatch(r"[a-f0-9]{64}", context["scope_fingerprint"]) is None
+            or file_doc.get("scope_fingerprint") != context["scope_fingerprint"]
+            or item["subject_id"] not in display_anidb_ids(item["legacy_targets"], frozen=True)
+        ):
+            return ""
+        return _file_series_display_name(
+            item["legacy_file_context"],
+            item["legacy_series_id"],
+            item["legacy_file_id"],
+            item["legacy_path"],
+            source_key=item["display_source"],
+        )
 
     def campaign_send_history(self, campaign_id: str) -> tuple[SendHistoryRow, ...]:
         """F19: every send row ever attempted for one campaign, in send order (read-only).
@@ -8074,9 +8448,9 @@ class StateStore:
                 next_ownership = CAMPAIGN_OWNERSHIP_NON_CAMPAIGN
             self._conn.execute(
                 "UPDATE sends SET campaign_id = ?, campaign_ownership = ?,"
-                " campaign_ownership_resolved_iso = ?, campaign_ownership_note = ?"
+                " campaign_ownership_resolved_iso = ?, campaign_ownership_note = ?, updated_iso = ?"
                 " WHERE send_id = ?",
-                (campaign_id, next_ownership, iso, _clip(note), send_id),
+                (campaign_id, next_ownership, iso, _clip(note), iso, send_id),
             )
             if campaign_id is not None:
                 campaign = self._conn.execute(

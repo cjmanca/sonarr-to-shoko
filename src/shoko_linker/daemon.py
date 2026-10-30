@@ -88,7 +88,7 @@ from .attestation import SCOPE_DAEMON, AttestationVerdict
 from .backoff import capped_backoff
 from .config import Settings, apply_gate
 from .errors import ConfigError, HttpPolicyError
-from .file_display import MAX_DISPLAY_LOCATIONS, safe_display_path
+from .file_display import MAX_DISPLAY_LOCATIONS, safe_display_path, series_display_name
 from .http import ApiEndpoint, BoundedJsonError, get_bounded_json
 from .linking import (
     EpisodeIdResolver,
@@ -213,6 +213,7 @@ from .state import (
     FileIdentitySnapshot,
     FileRecord,
     FileSeed,
+    FileSeriesDisplay,
     FileState,
     LockHeldError,
     MetadataOperation,
@@ -2240,6 +2241,33 @@ def _resolution_order(
         yield match, due
 
 
+def _remember_series_display(
+    deps: DaemonDeps,
+    inventory: SonarrInventory,
+    matches: Sequence[Any],
+    identity_drifts: Mapping[int, Any],
+) -> None:
+    """Display labels from the exact selected inventory; never infer identity from a title."""
+    series_titles = {item.series.id: item.series.title for item in inventory.eligible_series}
+    source_key = metadata_source_key(deps.shoko)
+    display_scope = _metadata_scope_fingerprint(deps.settings, RunPolicy.SERVICE)
+    deps.store.remember_file_series_names_bulk(
+        [
+            FileSeriesDisplay(
+                match.shoko_file_id,
+                series_id=match.sonarr_file.series_id,
+                episode_file_id=match.sonarr_file.episode_file_id,
+                path=match.sonarr_file.path,
+                title=series_titles.get(match.sonarr_file.series_id, ""),
+            )
+            for match in matches
+            if match.shoko_file_id not in identity_drifts
+        ],
+        source_key=source_key,
+        scope_fingerprint=display_scope,
+    )
+
+
 def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transitions in phase order
     deps: DaemonDeps,
     inventory: SonarrInventory,
@@ -2284,9 +2312,11 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
         now_iso,
         preserve_unresolved=preserve_unresolved,
     )
+    _remember_series_display(deps, inventory, match_result.matches, identity_drifts)
     resolver = EpisodeIdResolver(deps.shoko, clock=deps.monotonic, deadline=resolution_deadline)
     plans: dict[int, LinkPlan] = {}
     metadata_demands: dict[int, MetadataDemand] = {}
+    series_titles = {item.series.id: item.series.title for item in inventory.eligible_series}
     skip_reasons, exclusion_counts, scope_excluded_count, exclusion_summary = _record_exclusions(
         deps, match_result, discovery, now_iso
     )
@@ -2370,7 +2400,10 @@ def _reconcile(  # noqa: PLR0915 - keep safety checks and durable state transiti
             _advance(deps, file_id, FileState.AMBIGUOUS, frozen.reason, now_iso)
             continue
         if isinstance(frozen, _MetadataWait):
-            metadata_demands[file_id] = frozen.demand
+            metadata_demands[file_id] = replace(
+                frozen.demand,
+                series_name=series_display_name(series_titles.get(match.sonarr_file.series_id)),
+            )
             _advance(deps, file_id, FileState.WAITING, "pending_metadata", now_iso)
             if frozen.plan is not None:
                 plans[file_id] = frozen.plan
@@ -3129,6 +3162,17 @@ class MetadataExecutionOutcome:
     attempted: int = 0
 
 
+@dataclass(frozen=True)
+class _MetadataBatchAdmission:
+    """Empty-queue observation scoped to this locked cycle's frozen demands."""
+
+    store: StateStore
+    source_key: str
+    cycle_key: str
+    deadline: float
+    demands: frozenset[tuple[int, str]]
+
+
 def _metadata_mapping_current(demand: MetadataDemand, active: ActiveMappings) -> bool:
     if (
         not demand.mapped_targets
@@ -3298,6 +3342,52 @@ def _fresh_metadata_missing(
     return frozenset(missing) if deps.monotonic() < deadline else None
 
 
+def _metadata_queue_admission(
+    deps: DaemonDeps,
+    groups: Mapping[int, MetadataDemand],
+    cycle_key: str,
+    deadline: float,
+) -> _MetadataBatchAdmission | str:
+    inventory = fetch_queue_inventory(deps.shoko, deadline=deadline, clock=deps.monotonic)
+    if not inventory.complete or inventory.total_count is None:
+        return "metadata_queue_not_clear"
+    if inventory.total_count != 0:
+        if len(groups) == 1:
+            anime, demand = next(iter(groups.items()))
+            if inventory.lookup(QueueJobKind.ANIME_METADATA, anime).presence is Presence.PRESENT:
+                source_key = metadata_source_key(deps.shoko)
+                with contextlib.suppress(StateError):
+                    if deps.store.get_metadata_operation(source_key, anime) is None:
+                        deps.store.observe_external_metadata_operation(
+                            source_key,
+                            anime,
+                            demand_fingerprint=demand.fingerprint,
+                            request_fingerprint=_metadata_request_fingerprint(source_key, anime),
+                            request_version=1,
+                            iso=deps.now(),
+                            required_targets=tuple(
+                                t for t in demand.required_targets if t[0] == anime
+                            ),
+                            missing_targets=tuple(
+                                t for t in demand.missing_targets if t[0] == anime
+                            ),
+                        )
+                return "metadata_waiting_external_queue"
+            if (
+                inventory.lookup(QueueJobKind.MANUAL_LINK, demand.shoko_file_id).presence
+                is Presence.PRESENT
+            ):
+                return "metadata_waiting_external_file_queue"
+        return "metadata_queue_busy"
+    return _MetadataBatchAdmission(
+        deps.store,
+        metadata_source_key(deps.shoko),
+        cycle_key,
+        deadline,
+        frozenset((anime, demand.fingerprint) for anime, demand in groups.items()),
+    )
+
+
 def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered send boundary
     deps: DaemonDeps,
     demand: MetadataDemand,
@@ -3308,6 +3398,7 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
     cycle_key: str,
     *,
     deadline: float,
+    _batch: _MetadataBatchAdmission | None = None,
 ) -> MetadataExecutionOutcome:
     """Authorize and execute at most one normal-service metadata request.
 
@@ -3387,28 +3478,19 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
         # after source reads; no remote authorization follows the protected file read.
         if not deps.service_authorized():
             return MetadataExecutionOutcome("metadata_authorization_changed")
-        queue = fetch_queue(deps.shoko, deadline=deadline, clock=deps.monotonic)
-        if queue is None or queue.blocked_count > effective_blocked_over(deps):
-            return MetadataExecutionOutcome("metadata_queue_unavailable_or_blocked")
-        inventory = fetch_queue_inventory(deps.shoko, deadline=deadline, clock=deps.monotonic)
-        presence = inventory.lookup(QueueJobKind.ANIME_METADATA, anime_id).presence
-        if presence is Presence.PRESENT:
-            deps.store.observe_external_metadata_operation(
-                source_key,
-                anime_id,
-                demand_fingerprint=demand.fingerprint,
-                request_fingerprint=_metadata_request_fingerprint(source_key, anime_id),
-                request_version=1,
-                iso=deps.now(),
-                required_targets=required,
-                missing_targets=tuple(t for t in demand.missing_targets if t[0] == anime_id),
-            )
-            return MetadataExecutionOutcome("metadata_waiting_external_queue")
-        file_job = inventory.lookup(QueueJobKind.MANUAL_LINK, demand.shoko_file_id).presence
-        if presence is Presence.UNKNOWN or file_job is Presence.UNKNOWN:
-            return MetadataExecutionOutcome("metadata_queue_not_clear")
-        if file_job is Presence.PRESENT:
-            return MetadataExecutionOutcome("metadata_waiting_external_file_queue")
+        if _batch is not None:
+            if (
+                _batch.store is not deps.store
+                or _batch.source_key != source_key
+                or _batch.cycle_key != cycle_key
+                or _batch.deadline != deadline
+                or (anime_id, demand.fingerprint) not in _batch.demands
+            ):
+                return MetadataExecutionOutcome("metadata_authorization_or_demand_changed")
+        else:
+            refusal = _metadata_queue_admission(deps, {anime_id: demand}, cycle_key, deadline)
+            if isinstance(refusal, str):
+                return MetadataExecutionOutcome(refusal)
         missing = _fresh_metadata_missing(deps, demand, deadline)
         if missing is None:
             return MetadataExecutionOutcome("metadata_targets_unavailable")
@@ -3437,6 +3519,7 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
                 expected_document_json=expected,
                 required_targets=required,
                 missing_targets=selected_missing,
+                series_name=demand.series_name,
                 retry_unsent_claim=(
                     prior.claim
                     if prior is not None
@@ -4925,6 +5008,7 @@ def _metadata_rate_health(reason: str) -> _MetadataRateHealth | None:
         "metadata_service_not_eligible",  # includes ordinary durable budget headroom waits
         "metadata_waiting_external_queue",
         "metadata_waiting_external_file_queue",
+        "metadata_queue_busy",
         "metadata_replan",
         "metadata_not_sent",  # transport proves the deadline expired before any HTTP
         "metadata_accepted_waiting",
@@ -5078,7 +5162,7 @@ class _MetadataScheduleReport:
     observations: tuple[tuple[int, str], ...] = ()
 
 
-def _schedule_metadata_demands(
+def _schedule_metadata_demands(  # noqa: PLR0912 - ordered bounded batch admission and execution
     deps: DaemonDeps,
     demands: Mapping[int, MetadataDemand],
     flags: _EligibilityFlags,
@@ -5115,10 +5199,24 @@ def _schedule_metadata_demands(
             deferred=len(groups), observations=((0, "metadata_disabled"),)
         )
     canary_hold = _service_canary_hold_reason(deps)
-    if canary_hold is not None:
-        return _MetadataScheduleReport(deferred=len(groups), observations=((0, canary_hold),))
-    if deps.store.get_service_canary() is None:
-        remaining_submissions = min(remaining_submissions, 1)
+    if canary_hold is not None or remaining_submissions <= 0:
+        return _MetadataScheduleReport(
+            deferred=len(groups),
+            observations=() if canary_hold is None else ((0, canary_hold),),
+        )
+    admission = _metadata_queue_admission(deps, groups, cycle_key, deadline)
+    if isinstance(admission, str):
+        for anime, demand in list(groups.items())[:20]:
+            with contextlib.suppress(StateError):
+                observe_metadata_status(
+                    deps.store, source_key, anime, admission, deps.now(), demand=demand
+                )
+        return _MetadataScheduleReport(
+            deferred=len(groups),
+            observations=tuple(
+                (anime, admission) for anime in sorted(groups)[:MAX_SERVICE_CYCLE_SUBMISSIONS]
+            ),
+        )
     cursor_key = "service_metadata_schedule_cursor:v1"
     try:
         cursor = int(deps.store.get_meta(cursor_key) or "0")
@@ -5140,7 +5238,15 @@ def _schedule_metadata_demands(
         ):
             break
         outcome = process_metadata_demand(
-            deps, groups[anime], anime, active, folders, flags, cycle_key, deadline=deadline
+            deps,
+            groups[anime],
+            anime,
+            active,
+            folders,
+            flags,
+            cycle_key,
+            deadline=deadline,
+            _batch=admission,
         )
         attempted += outcome.attempted
         observations.append((anime, outcome.reason))
@@ -5149,6 +5255,14 @@ def _schedule_metadata_demands(
                 deps.store, source_key, anime, outcome.reason, deps.now(), demand=groups[anime]
             )
         deps.store.set_meta(cursor_key, str(anime))
+        if outcome.reason not in {
+            "metadata_accepted_waiting",
+            "metadata_operation_retained",
+            "metadata_replan",
+            "metadata_anime_not_required",
+        }:
+            # An uncertain/refused transport or lost guard invalidates the remaining batch.
+            break
     return _MetadataScheduleReport(attempted, len(groups) - attempted, tuple(observations))
 
 
@@ -5211,7 +5325,7 @@ def _run_apply(
         active,
         folders,
         cycle_key,
-        remaining_submissions=max(0, max_submissions - submitted),
+        remaining_submissions=max(0, configured_limit - submitted),
         deadline=cycle_start_mono + deps.max_cycle_seconds,
     )
     reasons.extend(reason for _anime, reason in metadata.observations)
