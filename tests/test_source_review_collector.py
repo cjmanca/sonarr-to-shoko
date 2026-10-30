@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -321,17 +322,51 @@ def test_unknown_association_identity_never_becomes_ready(h: Harness, refs: obje
         assert store.get_source_continuity_review().requires_rebaseline
 
 
+@pytest.mark.parametrize("partial", [False, True])
 def test_review_owns_runtime_operation_before_pause_and_skips_metadata_recovery(
-    h: Harness, monkeypatch: pytest.MonkeyPatch
+    h: Harness, monkeypatch: pytest.MonkeyPatch, partial: bool
 ) -> None:
     def forbidden(*args: Any, **kwargs: Any) -> None:
         pytest.fail("ordinary work ran in a source review operation")
 
     monkeypatch.setattr(h.runtime, "_worker_tick", forbidden)
     monkeypatch.setattr(h.runtime, "_recover_blocked_metadata", forbidden)
+    # Runtime deadlines and the injected controller/collector clock must share
+    # an origin; a host's real monotonic clock may still be below fake time 1000.
+    monkeypatch.setattr(time, "monotonic", h.clock.monotonic)
+    with open_state(h.path) as store:
+        document = load_service_settings(store, h.runtime.settings)
+        document["sync"]["max_cycle_seconds"] = 2
+        store.set_meta(META_SERVICE_SETTINGS, json.dumps(document))
+    calls: list[int] = []
+
+    def budget(request: httpx.Request) -> None:
+        if request.url.path == "/api/v3/episode":
+            series_id = int(request.url.params["seriesId"])
+            calls.append(series_id)
+            if partial and calls == [1, 2]:
+                h.clock.advance(2)
+
+    h.sonarr_hook = budget
+    if partial:
+        h.world.sonarr.add_series(2, eh.SONARR_ROOT, 300_002)
     h.controller.request_assessment(SESSION)
-    h.runtime.worker_tick()
+    delay = h.runtime.worker_tick()
+    if partial:
+        assert delay == 1
+        assert h.controller.view(SESSION).status == "assessing"
+        assert calls == [1, 2]
+        h.clock.advance(delay)
+        assert h.runtime.worker_tick() is None
+        assert calls == [1, 2, 2]
+    else:
+        assert delay is None
+        assert calls == [1]
     assert h.controller.view(SESSION).status == "ready"
+    with open_state(h.path) as store:
+        assert store.get_service_pause() == (True, "user_paused")
+        assert store.get_source_continuity_review().requires_rebaseline
+    assert not h.world.shoko.posts
 
 
 def test_pure_review_evaluation_preserves_tables_and_normal_pause(h: Harness) -> None:
