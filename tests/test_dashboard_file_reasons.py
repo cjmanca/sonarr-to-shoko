@@ -1,9 +1,11 @@
 """Authenticated file tables expose retained reasons without claiming fresh checks."""
 
 import html
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from test_dashboard_dates import Text
 from test_dashboard_routes import login, request_headers, runtime_app
 from test_dashboard_source_review import fixture
 from test_state import LIMITS, walk_to_planned
@@ -89,8 +91,20 @@ def test_empty_or_generic_file_details_do_not_add_disclosures(tmp_path: Path, de
         endpoint.client.close()
 
 
-def test_preflight_detail_is_historical_and_keeps_observed_time(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("observed", "compact"),
+    [
+        ("2026-10-30T11:01:00+00:00", "11:01"),
+        ("2026-10-28T12:01:00+00:00", "2026-10-28"),
+        ("2026-10-29T12:00:00+00:00", "2026-10-29"),
+        ("2026-10-30T05:01:00-06:00", "11:01"),
+    ],
+)
+def test_preflight_detail_is_historical_and_keeps_observed_time(
+    tmp_path: Path, observed: str, compact: str
+) -> None:
     app, requests, endpoint = runtime_app(tmp_path)
+    app.clock = lambda: datetime(2026, 10, 30, 12, tzinfo=UTC)
     try:
         with open_state(app.state_path, budget_limits=LIMITS) as store:
             walk_to_planned(store, file_id=201)
@@ -103,18 +117,105 @@ def test_preflight_detail_is_historical_and_keeps_observed_time(tmp_path: Path) 
                 expected_targets=targets,
                 code="target_unavailable",
                 message="Shoko episode metadata could not be read",
-                observed_iso="2026-10-29T12:01:00+00:00",
+                observed_iso=observed,
             )
             expected = store.service_file_page("waiting", page=3, page_size=50)
             recorded = next(row for row in expected.rows if row.shoko_file_id == 201)
-        text = app.handle(
-            "GET", "/files/waiting?page=3&page_size=50", request_headers(login(app))
-        ).body.decode()
-        assert text.count(html.escape(recorded.detail)) == 1
-        assert "observed 2026-10-29T12:01:00+00:00 (last attempted preflight)" in text
+        headers = request_headers(login(app))
+        with open_state(app.state_path, budget_limits=LIMITS) as store:
+            before = tuple(store.connection.iterdump())
+        text = app.handle("GET", "/files/waiting?page=3&page_size=50", headers).body.decode()
+        reason = text.split('data-disclosure="file-reason-201"', 1)[1].split("</details>", 1)[0]
+        visible = "".join(Text(reason).parts)
+        assert (
+            "preflight_deferred:target_unavailable: Shoko episode metadata could not be read"
+            in visible
+        )
+        assert f"Last attempted preflight: {compact}" in visible
+        assert observed not in visible
+        canonical = datetime.fromisoformat(observed).astimezone(UTC).isoformat()
+        assert f'datetime="{canonical}"' in reason
+        assert f'title="{canonical} (UTC)"' in reason
+        assert f'aria-label="{canonical} (UTC)"' in reason
+        with open_state(app.state_path, budget_limits=LIMITS) as store:
+            assert tuple(store.connection.iterdump()) == before
+            record = store.get_file(201)
+            assert record is not None
+            assert record.state_detail == recorded.detail
         assert "Last recorded file detail; this is not a fresh check" in text
         assert "Not submitted; awaiting planning or a safe linking opportunity." in text
         assert 'data-disclosure="file-reason-201"' in text
+        assert requests == []
+    finally:
+        endpoint.client.close()
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "preflight_deferred:target_unavailable: observed 2026-10-30T11:00:00 "
+        "(last attempted preflight): naive",
+        "preflight_deferred:target_unavailable: observed invalid (last attempted preflight): bad",
+        "preflight_deferred:target_unavailable: observed "
+        + "2026-10-30T11:00:00."
+        + "1" * 64
+        + "+00:00 (last attempted preflight): oversized",
+        "preflight_deferred:"
+        + "x" * 129
+        + ": observed 2026-10-30T11:00:00Z (last attempted preflight): oversized code",
+        "preflight_deferred:<img src=x>: observed 2026-10-30T11:00:00Z "
+        "(last attempted preflight): injected code",
+        "preflight_deferred:target_unavailable: observed <img src=x> "
+        "(last attempted preflight): injected time",
+        "prefix preflight_deferred:target_unavailable: observed 2026-10-30T11:00:00Z "
+        "(last attempted preflight): not anchored",
+        "preflight_deferred:target_unavailable: observed 2026-10-30T11:00:00Z "
+        "(last attempted preflight) wrong delimiter",
+        "mapping_incomplete: 2026-10-30T11:00:00Z.mkv",
+    ],
+)
+def test_unknown_preflight_detail_keeps_escaped_diagnostic(tmp_path: Path, detail: str) -> None:
+    app, requests, endpoint = runtime_app(tmp_path)
+    try:
+        with open_state(app.state_path, budget_limits=LIMITS) as store:
+            store.connection.execute(
+                "UPDATE files SET state_detail=? WHERE shoko_file_id=1", (detail,)
+            )
+        text = app.handle("GET", "/files/waiting", request_headers(login(app))).body.decode()
+        reason = text.split('data-disclosure="file-reason-1"', 1)[1].split("</details>", 1)[0]
+        assert f"<p>{html.escape(detail)}</p>" in reason
+        assert "data-compact-time" not in reason
+        assert "Last attempted preflight:" not in reason
+        assert "<img" not in reason
+        assert requests == []
+    finally:
+        endpoint.client.close()
+
+
+def test_preflight_message_is_sanitized_without_reformatting_embedded_dates(tmp_path: Path) -> None:
+    app, requests, endpoint = runtime_app(tmp_path)
+    secret = "preflight-message-registered-secret"
+    register_secret(secret)
+    detail = (
+        "preflight_deferred:target_unavailable: observed 2026-10-30T11:00:00Z "
+        f"(last attempted preflight): <img src=x> {secret} "
+        "2026-10-30T01:02:03Z.mkv https://private.invalid/2026-10-30T01:02:03Z"
+    )
+    try:
+        with open_state(app.state_path, budget_limits=LIMITS) as store:
+            store.connection.execute(
+                "UPDATE files SET state_detail=? WHERE shoko_file_id=1", (detail,)
+            )
+        text = app.handle("GET", "/files/waiting", request_headers(login(app))).body.decode()
+        reason = text.split('data-disclosure="file-reason-1"', 1)[1].split("</details>", 1)[0]
+        assert reason.count("data-compact-time") == 1
+        assert "2026-10-30T01:02:03Z.mkv" in "".join(Text(reason).parts)
+        assert "&lt;img src=x&gt;" in reason
+        assert "<img" not in reason
+        assert "***REDACTED***" in reason
+        assert "[URL omitted]" in reason
+        assert secret not in reason
+        assert "private.invalid" not in reason
         assert requests == []
     finally:
         endpoint.client.close()

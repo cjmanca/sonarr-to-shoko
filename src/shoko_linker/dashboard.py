@@ -1176,7 +1176,7 @@ class DashboardApplication:
                         "<summary>Recorded reason</summary>"
                         "<p>Last recorded file detail; this is not a fresh check. "
                         "Current service holds are shown separately.</p>"
-                        f"<p>{html.escape(detail)}</p></details>"
+                        f"{_recorded_reason(detail, now=now)}</details>"
                     )
                 rows.append(
                     (
@@ -1689,6 +1689,24 @@ def _pagination(route: str, view: str, page: TablePage) -> str:
         + (link(page.page + 1, "Next") if page.page < page.page_count else "")
         + "</nav>"
     )
+
+
+def _recorded_reason(detail: str, *, now: datetime | None = None) -> str:
+    """Present only the known preflight observation field as a structured time."""
+    match = re.fullmatch(
+        r"preflight_deferred:([a-z][a-z0-9_]{0,127}): observed "
+        r"([^\r\n]{1,64}) \(last attempted preflight\): (.*)",
+        detail,
+    )
+    if match is not None:
+        code, observed, message = match.groups()
+        timestamp = _compact_time(observed, now=now)
+        if timestamp != "Unavailable":
+            return (
+                f"<p>{html.escape(f'preflight_deferred:{code}: {message}')}</p>"
+                f"<p>Last attempted preflight: {timestamp}</p>"
+            )
+    return f"<p>{html.escape(detail)}</p>"
 
 
 def _compact_time(value: str | None, *, now: datetime | None = None) -> str:

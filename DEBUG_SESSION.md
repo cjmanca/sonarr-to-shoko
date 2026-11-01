@@ -1,3 +1,64 @@
+# Final cold CI and dashboard date validation — 2026-11-01T02:10:46.535838+00:00
+
+Baseline `7ced30dd9f1e31900d0619f53947c6341e6945c4` on `main`. Frozen reviewed delta: the bounded known-preflight observation decoder in `dashboard.py`, its file-reason regressions, and the collector test harness `SourceReviewTick` return annotation plus explicit OWNED/ACCEPTED/IDLE assertions. No production collector/worker behavior changed. The validator changed no source, tests, or build inputs.
+
+Fresh complete quality gate passed: `uv sync --frozen --python 3.12`, `uv lock --check`, `uv pip check`, Ruff lint and format (129 files), and mandatory full `uv run --frozen mypy --no-incremental --cache-dir <fresh-directory>` (124 source files). The exact `bash scripts/ci_checks.sh` also passed under Git Bash on Windows, using a second fresh mypy cache and JUnit output for its complete pytest run: 3750 passed, 1 skipped (Windows POSIX permissions). The exact script includes full Ruff lint/format, mypy, full pytest, and `git diff --check`. This is local Windows validation, not hosted Linux CI. The previous conflicting local mypy result's historical cause remains unknown; this fresh cold full check passed without ignores, casts, or weakened assertions. Versions: {"uv-version": "uv 0.9.18 (0cee76417 2025-12-16)", "python-version": "Python 3.12.11", "ruff-version": "ruff 0.8.6", "mypy-version": "mypy 1.13.0 (compiled: yes)", "pytest-version": "pytest 8.4.2", "node-version": "v24.12.0", "docker-python-version": "Python 3.12.15"}. Full Docker engine version is retained in `docker-version.log`.
+
+Fresh wheel and sdist built with `uv build`. Isolated installed-wheel behavioral suite: 1778 passed, 1 Windows POSIX skip. Fresh `docker build --no-cache`; installed-runtime suite with `--network none --user 1000:1000`: 1762 passed, zero skips. Docker explicitly deselected 16 Node-dependent cases and one historical git-schema fixture, all covered on host and isolated installed wheel. Installed imports resolve to site-packages, with no application source PYTHONPATH escape. Exact 37-module selection is in `selected-tests.txt` and covers changed recorded reasons, UTC boundaries/local browser formatter/DST/polling, authenticated read-only routes, collector/controller/scheduling handoff, daemon, identity/persistence/state and metadata behavior. Unchanged 7,000-file first-scan <10-second performance assertion passed; measured testcase durations: {"host": 2.571, "installed_wheel": 2.548, "docker": 2.717}. CLI help, offline validation, default-deny exit 3, configured root-to-nonroot identity and persistent-state/symlink smoke, schema v11 and integrity check passed. No Node/browser runtime was installed in Docker.
+
+All 42 packaged source files (41 Python modules) byte-match source, wheel, sdist, isolated installed wheel, and Docker installed runtime. Frozen input manifest includes all tracked/untracked nonignored source/test/build/doc inputs except DEBUG_SESSION and reserved PLAN/STATUS/ORCHESTRATION: 158 files, unchanged after the gate. Manifest SHA256 `532aaf6c9b0a4c81dd58ccb2fe5a78f4c0c62bf6e5ad2b959afc1e72ee49f690`. Artifact SHA256 `{"shoko_sonarr_linker-0.1.0-py3-none-any.whl": "d4a56a2bb7f72e2fa9068975bb13c9519085ae80ddb1b48580af6949dd0ae2fc", "shoko_sonarr_linker-0.1.0.tar.gz": "41ee2904d0a62f5764952c338067a53656b82825a9523b557c0aa54473a1ce86"}`. Fresh Docker image `sha256:121d26fa5addab83bc7fa759bb975dc5a2f769da78efd28fdd53068781180d3c` (`shoko-sonarr-linker:cold-dates-final-195319`). Evidence: `C:\Users\METHEJ~1\AppData\Local\Temp\sonarr-final-cold-dates-gate-20261031-195319` with exact commands/outcomes, JUnit files, versions, hashes, before/after manifests, and selections.
+
+Validated dirty paths:
+```text
+ M DEBUG_SESSION.md
+ M src/shoko_linker/dashboard.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_source_review_collector.py
+```
+
+Limits: offline/mocked upstream validation only; no live writes, deployment, remote CI, GHCR publishing, commit or push. Existing production Node tests cover browser time formatting; no new real-browser attempt was made. No blocking defect found in this final gate. Root owns acceptance and the next standing-authorized normal commit/push. This checkpoint is an atomic UTF-8 prepend preserving all 669161 previous bytes, SHA256 `d708082dca9886062e8e38c079a3510b42d35cc261b1edacfe167d1b79d90b40`.
+
+---
+
+# Narrow date/reason delta independent review and 12-lane renewal — 2026-11-01T01:52:06.494683+00:00
+
+Current HEAD: `7ced30dd9f1e31900d0619f53947c6341e6945c4`. Ignore list: EMPTY. Exactly three dirty paths before this authorized checkpoint:
+
+```text
+ M src/shoko_linker/dashboard.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_source_review_collector.py
+```
+
+Current requests: correct the CI-reported collector harness bool annotation to SourceReviewTick with explicit OWNED/ACCEPTED/IDLE expectations; apply the dashboard time/date convention everywhere structured, including the previously omitted known preflight Recorded reason observation. This reviewer made no source or test edits. The CI annotation fix was independently reviewed separately and cold checked; its prior apparent pass cause remains unproven and is not characterized as a platform/cache bug.
+
+Independent read-only review of actual narrow diff: CLEAN, no new findings after requirement/historical-semantics, parser/malformed-input, and security/diff/call-site passes. The known preflight observation alone uses existing compact timestamp rendering; code/message are redacted then escaped, unknown/malformed/naive/oversized evidence falls back to escaped diagnostics, stored canonical detail remains unchanged, no GET remote reads/writes or linking authority changes. Existing disclosure keys, polling date refresh, open/closed disclosures and focus handling are preserved. Arbitrary filenames, URLs, messages, YAML/JSON remain outside timestamp rewriting. No alternative fix is needed because no additional defect was found.
+
+Fresh reviewer checks (frozen Python 3.12):
+- `uv run --frozen --python 3.12 python -m pytest -q tests/test_dashboard_dates.py tests/test_dashboard_file_reasons.py tests/test_dashboard_routes.py tests/test_dashboard_live_updates.py tests/test_dashboard_poll_targets.py`: exit 0; all 80 tests passed, zero skip output. A separate `--collect-only` invocation with `-o addopts= -q` confirmed 80 collected cases. Includes production Node formatter local timezone/DST/exact-24h and polling transitions, authenticated reason rendering, unchanged database dump, no upstream requests, escaped/redacted negative payloads, keyed disclosure preservation and polling targets. These are local mocked/Node tests, not browser/live API validation.
+- `uv run --frozen --python 3.12 mypy --no-incremental src/shoko_linker/dashboard.py tests/test_dashboard_file_reasons.py tests/test_source_review_collector.py`: success, 3 source files.
+- `uv run --frozen --python 3.12 ruff check src/shoko_linker/dashboard.py tests/test_dashboard_file_reasons.py tests/test_source_review_collector.py`: all checks passed.
+- `uv run --frozen --python 3.12 ruff format --check src/shoko_linker/dashboard.py tests/test_dashboard_file_reasons.py tests/test_source_review_collector.py`: 3 files already formatted.
+- `git diff --check`: exit 0 (existing CRLF-to-LF advisory only).
+
+All 12 lanes renewed for this narrow delta; direct versus retained evidence is explicit:
+- L1 configuration/paths: retained supplied published-baseline clean review; no changed implementation.
+- L2 transport: retained supplied published-baseline clean review; no changed implementation.
+- L3 mappings: retained supplied published-baseline clean review; no changed implementation.
+- L4 linking: retained supplied published-baseline clean review; no changed implementation.
+- L5 state/history: direct canonical-value/no-mutation check plus retained baseline review; no state implementation change.
+- L6 scope/consent: retained supplied published-baseline clean review; no changed implementation or authority.
+- L7 service: retained supplied published-baseline clean review; no changed implementation.
+- L8 daemon: retained supplied published-baseline clean review, including prior bulk-display performance review; no changed implementation.
+- L9 dashboard: direct current-diff requirements/parser/security review and 80 focused cases, CLEAN.
+- L10 CLI/report/typed consumer interfaces: direct helper/typed consumer signature and cold scoped mypy review, with prior separate enum-fix independent review retained; CLI/report outputs unchanged, CLEAN.
+- L11 package/container: retained supplied published-baseline clean review; no changed build policy. Fresh artifact equivalence still pending for changed source bytes.
+- L12 CI/interfaces: retained prior baseline review plus separate enum-fix independent review and fresh cold scoped mypy; complete CI-equivalent validation still pending.
+
+Prior published-baseline validation (3737 host, 1765 installed wheel, 1749 Docker, 42 packaged-source byte identities) is historical evidence, not a new current-tree full PASS. User subsequently reported the CI type error. Next: dedicated full cold `mypy --no-incremental`, full pytest and configured gates, rebuilt/installed artifact changed-behavior validation and appropriate Docker checks. Only after all required checks pass should the orchestrator use the standing authorization for a normal commit and push. No commit/push/live API/media operations were performed by this reviewer. No PLAN/STATUS/ORCHESTRATION files were read or edited.
+
+---
+
 # Final recovery, metadata batching, and history validation — 2026-10-30T12:15:14.602829+00:00
 
 Baseline `32cbab3e95b341c71c4f8ca52d2d0c5de6c76613` on `main`; independently reviewed source/test delta remains uncommitted. This validator changed no source, tests, build inputs, or requirements. All checks below are fresh for the frozen current tree.

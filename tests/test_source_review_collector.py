@@ -27,6 +27,7 @@ from shoko_linker.sonarr import collect_sonarr_inventory
 from shoko_linker.source_review import (
     SourceReviewController,
     SourceReviewEvidence,
+    SourceReviewTick,
     SourceReviewWork,
 )
 from shoko_linker.source_review_collector import FreshSourceReviewCollector
@@ -61,12 +62,12 @@ class Harness:
     def path(self) -> Path:
         return self.runtime.settings.database_path
 
-    def tick(self, seconds: float = 60) -> bool:
+    def tick(self, seconds: float = 60) -> SourceReviewTick:
         return self.controller.worker_tick(self.clock.mono + seconds)
 
     def ready(self) -> str:
         self.controller.request_assessment(SESSION)
-        assert self.tick()
+        assert self.tick() is SourceReviewTick.OWNED
         view = self.controller.view(SESSION)
         assert view.status == "ready", view.message
         assert view.token is not None
@@ -175,7 +176,7 @@ def test_fresh_first_and_confirmation_sweeps_preserve_user_pause(h: Harness) -> 
     h.requests.clear()
     h.controller.request_confirmation(token, SESSION)
     h.clock.advance(1)
-    assert h.tick()
+    assert h.tick() is SourceReviewTick.ACCEPTED
     assert h.controller.view(SESSION).status == "confirmed"
     assert ("sonarr", "/api/v3/episode") in h.requests
     assert ("sonarr", "/api/v3/episodefile") in h.requests
@@ -242,7 +243,7 @@ def test_views_are_local_and_never_schedule(h: Harness) -> None:
     for _ in range(5):
         assert h.controller.view(SESSION).status == "idle"
     assert h.requests == []
-    assert not h.tick()
+    assert h.tick() is SourceReviewTick.IDLE
     with open_state(h.path) as store:
         assert _snapshot(store) == before
 
