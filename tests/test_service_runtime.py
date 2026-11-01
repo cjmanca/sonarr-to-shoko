@@ -135,7 +135,7 @@ def test_failed_initial_link_stays_visibly_held_after_healthy_cycle_and_restart(
         store.close()
 
 
-@pytest.mark.parametrize("hold", ["write_stop", "rebaseline", "pause"])
+@pytest.mark.parametrize("hold", ["write_stop", "pause"])
 def test_durable_safety_hold_overrides_cached_active_status(tmp_path: Path, hold: str) -> None:
     state_path = tmp_path / "state.sqlite3"
     bootstrap = BootstrapSettings(
@@ -154,8 +154,6 @@ def test_durable_safety_hold_overrides_cached_active_status(tmp_path: Path, hold
         with open_state(state_path) as store:
             if hold == "write_stop":
                 store.disable_writes("test safety hold")
-            elif hold == "rebaseline":
-                store.set_meta("requires_rebaseline", "1")
             else:
                 OnboardingManager(store).pause(iso=td.T0)
         status = runtime.status()

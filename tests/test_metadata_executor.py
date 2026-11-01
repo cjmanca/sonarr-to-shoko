@@ -29,6 +29,7 @@ from shoko_linker.metadata_refresh import (
 )
 from shoko_linker.onboarding import (
     METADATA_MAINTENANCE_POLICY,
+    OnboardingContext,
     OnboardingManager,
     required_confirmation_facts,
 )
@@ -687,3 +688,70 @@ def test_empty_queue_admission_cannot_be_reused_outside_its_operation(
     assert outcome.attempted == 0
     assert executor.shoko.refreshes == []
     assert executor.row() is None
+
+
+def test_normal_metadata_count_hold_uses_complete_current_source_proof(executor: Executor) -> None:
+    store = executor.deps.store
+    record = OnboardingManager(store).record()
+    assert record is not None
+    context = OnboardingContext(
+        record.binding,
+        to.safe_assessment(),
+        record.to_json(),
+        store.get_service_authorization_revision(),
+        settings_json=store.get_meta(META_SERVICE_SETTINGS),
+    )
+    deps = replace(executor.deps, service_context=lambda: context)
+    store.set_meta("requires_rebaseline", "1")
+    executor.deps = daemon._bind_normal_source_proof(
+        deps,
+        collect_sonarr_inventory(deps.sonarr, deps.settings),
+        collect_shoko_discovery(deps.shoko),
+        deadline=100.0,
+    )
+    assert daemon._normal_source_current(executor.deps)
+    assert executor.run() == daemon.MetadataExecutionOutcome("metadata_accepted_waiting", 1)
+    assert store.get_meta("requires_rebaseline") == "1"
+    # Its own durable queue work does not invalidate consent/source proof.
+    assert daemon._normal_source_current(executor.deps)
+    assert executor.run().reason == "metadata_operation_retained"
+    assert len(executor.shoko.refreshes) == 1
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["prepare_metadata_operation", "mark_metadata_possibly_delivered", "admit_metadata_transport"],
+)
+def test_normal_metadata_proof_is_rechecked_in_each_transaction(
+    executor: Executor,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    store = executor.deps.store
+    record = OnboardingManager(store).record()
+    assert record is not None
+    context = OnboardingContext(
+        record.binding,
+        to.safe_assessment(),
+        record.to_json(),
+        store.get_service_authorization_revision(),
+        settings_json=store.get_meta(META_SERVICE_SETTINGS),
+    )
+    deps = replace(executor.deps, service_context=lambda: context)
+    store.set_meta("requires_rebaseline", "1")
+    executor.deps = daemon._bind_normal_source_proof(
+        deps,
+        collect_sonarr_inventory(deps.sonarr, deps.settings),
+        collect_shoko_discovery(deps.shoko),
+        deadline=100.0,
+    )
+    original: Callable[..., Any] = getattr(store, boundary)
+
+    def change_settings_before_transaction(*args: Any, **kwargs: Any) -> Any:
+        executor.revoke()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, boundary, change_settings_before_transaction)
+    assert executor.run().attempted == 0
+    assert executor.shoko.refreshes == []
+    assert store.get_meta("requires_rebaseline") == "1"

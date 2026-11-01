@@ -91,6 +91,7 @@ from shoko_linker.state import (
     Cohort,
     FileSeriesDisplay,
     FileState,
+    NormalSourceProof,
     SendToken,
     StateError,
     StateStore,
@@ -6009,7 +6010,9 @@ def test_prepared_crash_row_voided_and_reprepared(
     shoko = ShokoStub([a])
     sleeper = Sleeper()
 
-    def boom(_token: Any, *, iso: str) -> None:
+    def boom(
+        _token: SendToken, *, iso: str, normal_source_proof: NormalSourceProof | None = None
+    ) -> None:
         raise RuntimeError("crash between prepare_send and transport")
 
     monkeypatch.setattr(store, "mark_sent", boom)

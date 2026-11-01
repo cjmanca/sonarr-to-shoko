@@ -207,6 +207,90 @@ def collect(stub: SonarrStub, settings: Settings) -> SonarrInventory:
         endpoint.client.close()
 
 
+@pytest.mark.parametrize("outside_root", ["/data/media/tv", f"{ANIME_ROOT}-old"])
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        {"title": None},
+        {"tvdbId": "invalid"},
+        {"seriesType": []},
+        {"title": None, "seriesType": "unknown"},
+    ],
+)
+def test_scoped_inventory_ignores_separate_malformed_series_metadata(
+    outside_root: str, bad_fields: dict[str, Any]
+) -> None:
+    stub = standard_stub()
+    stub.rootfolders = [{"path": ANIME_ROOT}, {"path": outside_root}]
+    stub.series[1] = dict(series_entry(SERIES_LIVE, "Outside", outside_root), **bad_fields)
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        inventory = collect_sonarr_inventory(endpoint, allowed_roots=[ANIME_ROOT], anime_only=True)
+    finally:
+        endpoint.client.close()
+    assert inventory.verdict.complete is True
+    assert {file.series_id for file in inventory.files} == {SERIES_ANIME}
+    assert stub.secondary_series_ids() == {SERIES_ANIME}
+    assert VerdictReason.MALFORMED_RESPONSE in parse_series_entries(stub.series).reasons
+
+
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        {"title": None, "rootFolderPath": ANIME_ROOT},
+        {"title": None, "rootFolderPath": f"{ANIME_ROOT}/nested"},
+        {"title": None, "rootFolderPath": "/data/media"},
+        {"rootFolderPath": None},
+        {"rootFolderPath": 123},
+        {"rootFolderPath": "relative/tv"},
+        {"rootFolderPath": "/data/tv\x00"},
+        {"rootFolderPath": "/data/../tv"},
+        {"id": None},
+        {"id": True},
+        {"id": "2"},
+    ],
+)
+def test_scoped_inventory_does_not_hide_unknown_or_selected_malformed_rows(
+    bad_fields: dict[str, Any],
+) -> None:
+    stub = standard_stub()
+    stub.series[1].update(bad_fields)
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        inventory = collect_sonarr_inventory(endpoint, allowed_roots=[ANIME_ROOT], anime_only=True)
+    finally:
+        endpoint.client.close()
+    assert inventory.verdict.complete is False
+    assert VerdictReason.MALFORMED_RESPONSE in inventory.verdict.reasons
+    assert stub.secondary_series_ids() == {SERIES_ANIME}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("selected_collision", [False, True])
+def test_scoped_inventory_keeps_global_duplicate_id_protection(
+    reverse: bool, selected_collision: bool
+) -> None:
+    stub = standard_stub()
+    collision_id = SERIES_ANIME if selected_collision else SERIES_LIVE
+    stub.series.append({"id": collision_id, "rootFolderPath": "/separate/tv"})
+    if reverse:
+        stub.series.reverse()
+    endpoint = sonarr_endpoint(stub.handler)
+    try:
+        inventory = collect_sonarr_inventory(endpoint, allowed_roots=[ANIME_ROOT], anime_only=True)
+    finally:
+        endpoint.client.close()
+    assert inventory.verdict.complete is False
+    assert VerdictReason.INCONSISTENT_ENUMERATION in inventory.verdict.reasons
+    assert collision_id not in stub.secondary_series_ids()
+
+
+@pytest.mark.parametrize("roots", [[], ["relative"], ["/tv\x00"], [None], [True]])
+def test_scoped_parser_refuses_invalid_allowlist(roots: list[Any]) -> None:
+    with pytest.raises(ValueError, match="valid nonempty roots"):
+        parse_series_entries([], allowed_roots=roots)
+
+
 def test_read_only_scope_inventory_does_not_require_an_unconfirmed_path_mapping() -> None:
     stub = standard_stub()
     endpoint = sonarr_endpoint(stub.handler)
@@ -904,7 +988,9 @@ def test_windows_style_series_root_is_excluded_at_collection(
     stub = standard_stub()
     stub.series.append(series_entry(SERIES_OLD, "Windows Show", "C:\\media\\anime\\Show"))
     inventory = collect(stub, settings_with_roots(base_document, write_document, [ANIME_ROOT]))
-    assert {item.id for item in inventory.excluded_series} == {SERIES_LIVE, SERIES_OLD}
+    assert {item.id for item in inventory.excluded_series} == {SERIES_LIVE}
+    assert inventory.verdict.complete is False
+    assert VerdictReason.MALFORMED_RESPONSE in inventory.verdict.reasons
     assert stub.secondary_series_ids() == {SERIES_ANIME}
 
 

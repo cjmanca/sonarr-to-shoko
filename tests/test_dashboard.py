@@ -707,8 +707,8 @@ def test_setup_provider_cache_miss_does_not_block_status_pause_or_resume(  # noq
         if status_responsive:
             page = status_result["response"]
             assert page.status_code == 200
-            assert "Checking current Sonarr and Shoko setup" in page.text
-            assert 'role="progressbar"' in page.text
+            assert "Checking saved libraries" in page.text
+            assert 'action="/setup/confirm"' not in page.text
             assert "fetch(statusUrl" in page.text
             pause = client.post(
                 f"{base_url}/pause",
@@ -1050,15 +1050,15 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
             ("Cannot verify Sonarr compatibility.",),
         )
         expected_pause = "setup_unavailable"
-        expected_status = OnboardingStatus.PAUSED
+        expected_status = OnboardingStatus.AUTHORIZED
     elif failure == "scope_unavailable":
         scope_state["value"] = replace(scope, read_status=ScopeReadStatus.UNAVAILABLE)
         expected_pause = "setup_unavailable"
-        expected_status = OnboardingStatus.PAUSED
+        expected_status = OnboardingStatus.AUTHORIZED
     elif failure == "folders_unavailable":
         folder_state["value"] = None
         expected_pause = "setup_unavailable"
-        expected_status = OnboardingStatus.PAUSED
+        expected_status = OnboardingStatus.AUTHORIZED
     elif failure == "safety_unavailable":
         unavailable_client = httpx.Client(
             base_url="http://shoko:8111/",
@@ -1071,7 +1071,7 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
         finally:
             unavailable_client.close()
         expected_pause = "setup_unavailable"
-        expected_status = OnboardingStatus.PAUSED
+        expected_status = OnboardingStatus.AUTHORIZED
     else:
         compatibility_state["value"] = ApiCompatibility(
             binding.sonarr_version,
@@ -1120,7 +1120,11 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
         assert current is not None
         decision = OnboardingManager(store).evaluate_context(current, iso=T0.isoformat())
         assert decision.status is expected_status
-        assert store.get_service_pause() == (True, expected_pause)
+        assert store.get_service_pause() == (
+            (True, expected_pause)
+            if expected_status is not OnboardingStatus.AUTHORIZED
+            else (False, "")
+        )
     recovered = controller.refresh_view()
     if failure not in {"drift", "drift_then_outage"}:
         assert recovered is None
@@ -1180,7 +1184,7 @@ def test_authenticated_recovery_keeps_system_review_actionable(  # noqa: PLR0915
             with open_state(state_path) as store:
                 assert store.get_service_pause() == (False, "")
         else:
-            assert "Resume" in page.text
+            assert "Pause" in page.text
             assert "Confirm setup" not in page.text
 
         resumed = client.post(

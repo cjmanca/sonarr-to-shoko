@@ -92,6 +92,15 @@ def _preview_safety(
     return replace(preview, digest=digest)
 
 
+def _parse_draft_roots(encoded: str | None) -> tuple[str, ...]:
+    if encoded is None:
+        return ()
+    raw = json.loads(encoded)
+    if not isinstance(raw, list) or not all(isinstance(root, str) for root in raw):
+        raise StateError("Saved library selection is invalid.")
+    return tuple(raw)
+
+
 def _setup_snapshot_digest(
     view: DashboardSetupView,
     compatibility: ApiCompatibility,
@@ -110,9 +119,7 @@ def _setup_snapshot_digest(
         "scope": {
             "status": scope.status.value,
             "read_status": scope.read_status.value,
-            "candidates": tuple(
-                (candidate.path, candidate.series_ids) for candidate in scope.candidates
-            ),
+            "candidates": tuple(candidate.path for candidate in scope.candidates),
             "root_options": view.root_options,
             "selected_roots": view.selected_roots,
         },
@@ -190,7 +197,18 @@ class ServiceSetupController:
             self.sonarr, self.shoko, deadline=deadline, clock=clock
         )
         self._set_progress("Discovering Sonarr anime folders and eligible series.", 8)
-        scope = discover_sonarr_scope(self.sonarr, deadline=deadline, clock=clock)
+        record = self._saved_record()
+        roots = self._selected_roots if record is None else record.binding.roots
+        if record is None:
+            with open_state(self.state_path) as store:
+                draft = store.get_meta(DRAFT_ROOTS_META)
+            roots = _parse_draft_roots(draft) or roots
+        scope = discover_sonarr_scope(
+            self.sonarr,
+            selected_roots=roots,
+            deadline=deadline,
+            clock=clock,
+        )
         self._set_progress("Checking Shoko safety settings.", 15)
         assessment = inspect_shoko_safety_settings(self.shoko, deadline=deadline, clock=clock)
         return compatibility, scope, assessment
@@ -331,6 +349,7 @@ class ServiceSetupController:
             if configured_bootstrap(self.bootstrap) != self.bootstrap:
                 return None
             settings_json = store.get_meta(META_SERVICE_SETTINGS)
+            temporary_pause_token = store.temporary_setup_pause_token()
             authorization_revision = store.get_service_authorization_revision()
             policy = current_metadata_maintenance_policy(store)
             consent_json = store.get_onboarding_json()
@@ -393,7 +412,14 @@ class ServiceSetupController:
                 metadata_maintenance_policy=policy,
             )
             return (
-                OnboardingContext(binding, assessment, consent_json, authorization_revision)
+                OnboardingContext(
+                    binding,
+                    assessment,
+                    consent_json,
+                    authorization_revision,
+                    temporary_pause_token,
+                    settings_json,
+                )
                 if (
                     (deadline is None or clock() < deadline)
                     and store.get_meta(META_SERVICE_SETTINGS) == settings_json
@@ -625,6 +651,30 @@ class ServiceSetupController:
             message = assessment.message
         return message
 
+    def _saved_readiness_view(self, message: str) -> DashboardSetupView | None:
+        with open_state(self.state_path) as store:
+            record = self.onboarding(store).record()
+            if (
+                record is None
+                or self.onboarding(store).reconfirmation_required()
+                or record.binding.sonarr_url != self.bootstrap.sonarr_url
+                or record.binding.shoko_url != self.bootstrap.shoko_url
+                or record.binding.metadata_maintenance_policy
+                != current_metadata_maintenance_policy(store)
+                or record.binding.settings_observation is None
+                or record.binding.selected_folders_observation is None
+                or self._editing_scope
+                or store.get_meta(DRAFT_ROOTS_META) is not None
+                or configured_bootstrap(self.bootstrap) != self.bootstrap
+            ):
+                return None
+        return DashboardSetupView(
+            message,
+            (),
+            confirmation_enabled=False,
+            saved_setup=True,
+        )
+
     @staticmethod
     def _loading_view(
         message: str = "Checking current Sonarr and Shoko setup.", percent: int = 0
@@ -664,7 +714,9 @@ class ServiceSetupController:
             # presentation state: current_context still checks fresh safety facts.
             if self._view_cache is not None and self._view_cache[1] is None:
                 return None
-        return self._loading_view(progress, percent)
+        return self._saved_readiness_view(
+            "Checking saved libraries. Saved choices are retained."
+        ) or (self._loading_view(progress, percent))
 
     def _refresh_in_background(self) -> None:
         try:
@@ -755,14 +807,7 @@ class ServiceSetupController:
             ), environment
         with open_state(self.state_path) as store:
             encoded_draft = store.get_meta(DRAFT_ROOTS_META)
-        draft_roots: tuple[str, ...] = ()
-        if encoded_draft is not None:
-            raw_draft = json.loads(encoded_draft)
-            if not isinstance(raw_draft, list) or not all(
-                isinstance(root, str) for root in raw_draft
-            ):
-                raise StateError("Saved library selection is invalid.")
-            draft_roots = tuple(raw_draft)
+        draft_roots = _parse_draft_roots(encoded_draft)
         roots = (
             draft_roots
             or (selected_roots if self._editing_scope or saved_record is None else ())
@@ -778,6 +823,17 @@ class ServiceSetupController:
             )
             else ()
         )
+        if saved_record is not None and (
+            not compatibility.compatible
+            or scope.read_status is not ScopeReadStatus.COMPLETE
+            or _folders is None
+        ):
+            readiness = self._saved_readiness_view(
+                "Checking saved libraries. Waiting for Sonarr/Shoko readiness; "
+                "checks will retry automatically. Saved choices are retained."
+            )
+            if readiness is not None:
+                return readiness, environment
         inventory, discovery, path_result, inferred, mapping_required, mapping_options = (
             self._mapping_state(compatibility, roots, scope)
         )
@@ -864,6 +920,13 @@ class ServiceSetupController:
                 if not reconfirmation_required and not self._editing_scope:
                     return None, environment
 
+        readiness = self._saved_readiness_view(
+            "Waiting for Sonarr/Shoko readiness; checks will retry automatically. "
+            "Saved libraries and safety consent are retained."
+        )
+        if readiness is not None and not has_complete_inventory:
+            return readiness, environment
+
         message = self._message(
             compatibility,
             scope,
@@ -943,8 +1006,8 @@ class ServiceSetupController:
             compatibility != shown_compatibility
             or scope.status is not shown_scope.status
             or scope.read_status is not shown_scope.read_status
-            or tuple((candidate.path, candidate.series_ids) for candidate in scope.candidates)
-            != tuple((candidate.path, candidate.series_ids) for candidate in shown_scope.candidates)
+            or tuple(candidate.path for candidate in scope.candidates)
+            != tuple(candidate.path for candidate in shown_scope.candidates)
             or _assessment.digest != shown_assessment.digest
             or _assessment.status is not shown_assessment.status
             or _assessment.unverifiable_facts != shown_assessment.unverifiable_facts
@@ -1019,8 +1082,8 @@ class ServiceSetupController:
             compatibility != shown_compatibility
             or scope.status is not shown_scope.status
             or scope.read_status is not shown_scope.read_status
-            or tuple((candidate.path, candidate.series_ids) for candidate in scope.candidates)
-            != tuple((candidate.path, candidate.series_ids) for candidate in shown_scope.candidates)
+            or tuple(candidate.path for candidate in scope.candidates)
+            != tuple(candidate.path for candidate in shown_scope.candidates)
             or assessment.digest != shown_assessment.digest
             or assessment.status is not shown_assessment.status
             or assessment.unverifiable_facts != shown_assessment.unverifiable_facts

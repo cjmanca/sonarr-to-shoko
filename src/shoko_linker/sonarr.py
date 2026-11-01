@@ -336,12 +336,17 @@ def select_eligible_series(
     return tuple(eligible), tuple(excluded)
 
 
-def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
+def parse_series_entries(
+    raw: Sequence[Any], *, allowed_roots: Sequence[str] | None = None
+) -> SeriesParseResult:
     """Parse series, excluding every copy of repeated IDs before any scope selection.
 
     Even identical duplicates invalidate the enumeration. Record identifiable IDs
     before field validation so a malformed duplicate cannot leave a trusted copy.
+    Explicit roots allow malformed metadata on positively separate series to be
+    ignored. Unknown IDs or root ownership still invalidate the scoped snapshot.
     """
+    scoped_roots = None if allowed_roots is None else _validated_series_roots(allowed_roots)
     series: list[SonarrSeries] = []
     seen_ids: set[int] = set()
     duplicate_ids: set[int] = set()
@@ -365,6 +370,20 @@ def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
         tvdb_id, tvdb_ok = _optional_int(entry, "tvdbId")
         series_type, series_type_ok = _optional_text(entry, "seriesType")
         problems = _series_problems(series_id, title, root, tvdb_ok, series_type_ok)
+        if scoped_roots is not None:
+            valid_root = _usable_series_root(root)
+            if valid_root is None:
+                problems.append("invalid rootFolderPath ownership")
+            elif (
+                problems
+                and series_id is not None
+                and series_id > 0
+                and not any(
+                    is_within_root(valid_root, selected) or is_within_root(selected, valid_root)
+                    for selected in scoped_roots
+                )
+            ):
+                continue
         if problems:
             reasons.append(VerdictReason.MALFORMED_RESPONSE)
             details.append(f"series entry {index} malformed ({', '.join(problems)})")
@@ -386,6 +405,24 @@ def parse_series_entries(raw: Sequence[Any]) -> SeriesParseResult:
         tuple(reasons),
         tuple(details),
     )
+
+
+def _usable_series_root(root: str | None) -> str | None:
+    if root is None or "\x00" in root:
+        return None
+    try:
+        return normalize_posix(root)
+    except PathError:
+        return None
+
+
+def _validated_series_roots(roots: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(
+        _usable_series_root(root) if isinstance(root, str) else None for root in roots
+    )
+    if not normalized or any(root is None for root in normalized):
+        raise ValueError("scoped series parsing requires valid nonempty roots")
+    return tuple(root for root in normalized if root is not None)
 
 
 def parse_episode_entries(raw: Sequence[Any], series_id: int) -> EpisodeParseResult:
@@ -751,7 +788,7 @@ def collect_sonarr_inventory(
         details.append(f"cannot enumerate Sonarr series: {outcome.detail}")
         return SonarrInventory((), (), (), (), (), (), (), make_verdict(reasons, details))
 
-    series_result = parse_series_entries(outcome.payload)
+    series_result = parse_series_entries(outcome.payload, allowed_roots=effective_roots)
     reasons.extend(series_result.reasons)
     details.extend(series_result.details)
     manifest_hash = _inventory_manifest_hash(endpoint, effective_roots, series_result.series)
@@ -967,7 +1004,13 @@ def _check_current_series_identity(  # noqa: PLR0911
             SourceRelationshipStatus.UNAVAILABLE,
             "Sonarr source check exceeded the apply time budget after series read",
         )
-    parsed_series = parse_series_entries(series_outcome.payload)
+    try:
+        parsed_series = parse_series_entries(series_outcome.payload, allowed_roots=allowed_roots)
+    except ValueError:
+        return SourceRelationshipVerdict(
+            SourceRelationshipStatus.UNAVAILABLE,
+            "current Sonarr source check requires valid nonempty roots",
+        )
     if parsed_series.reasons:
         return SourceRelationshipVerdict(
             SourceRelationshipStatus.UNAVAILABLE,

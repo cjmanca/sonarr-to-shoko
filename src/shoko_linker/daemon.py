@@ -152,8 +152,10 @@ from .metadata_status import observe_metadata_status, observe_resolved_metadata_
 from .onboarding import (
     METADATA_MAINTENANCE_CONFIRMATION,
     METADATA_MAINTENANCE_POLICY,
+    OnboardingContext,
     OnboardingManager,
     OnboardingRecord,
+    OnboardingStatus,
     current_metadata_maintenance_policy,
 )
 from .policies import RunPolicy
@@ -202,6 +204,7 @@ from .state import (
     META_CAMPAIGN_ZERO_PROGRESS,
     META_GLOBAL_PAUSE_ORIGIN,
     META_NEXT_FULL_RECONCILE_ISO,
+    META_NORMAL_SOURCE_OWNERSHIP,
     META_RECOVERY_CURSOR,
     ApplyLockUnavailableError,
     BaselineFile,
@@ -218,6 +221,7 @@ from .state import (
     LockHeldError,
     MetadataOperation,
     MetadataOperationState,
+    NormalSourceProof,
     ScanExclusionRow,
     SendToken,
     StateError,
@@ -347,6 +351,10 @@ class DaemonDeps:
     #: Required for service-mode writes: a missing callback fails closed and never falls back to
     #: another remote authorization request after the final protected-link read.
     service_authorized_local: Callable[[], bool] | None = None
+    #: The trusted controller's last fresh context, captured by service_authorized.
+    #: A boolean alone cannot authorize normal operation through advanced continuity holds.
+    service_context: Callable[[], OnboardingContext | None] | None = None
+    normal_source_proof: NormalSourceProof | None = None
     lease_seconds: float = 600.0
     blocked_over: int | None = None
     verification_timeout_seconds: float = 600.0
@@ -489,6 +497,77 @@ def _parse_iso(raw: str) -> datetime:
 
 def _source_identity(settings: Settings) -> str:
     return f"sonarr={settings.sonarr.url};shoko={settings.shoko.url}"
+
+
+def _configured_endpoints_match(deps: DaemonDeps) -> bool:
+    return str(deps.sonarr.base_url).rstrip("/") == deps.settings.sonarr.url.rstrip("/") and str(
+        deps.shoko.base_url
+    ).rstrip("/") == deps.settings.shoko.url.rstrip("/")
+
+
+def _normal_source_current(deps: DaemonDeps) -> bool:
+    proof = deps.normal_source_proof
+    return (
+        deps.service_mode
+        and proof is not None
+        and proof.source_identity == _source_identity(deps.settings)
+        and _configured_endpoints_match(deps)
+        and deps.store.normal_source_proof_current(proof)
+    )
+
+
+def _normal_source_context(deps: DaemonDeps) -> tuple[OnboardingContext, str] | None:
+    """Fresh supported setup observation plus durable consent, never a policy-name grant."""
+    if not deps.service_mode or deps.service_context is None or not deps.service_authorized():
+        return None
+    context = deps.service_context()
+    if context is None:
+        return None
+    binding = context.binding
+    if (
+        binding.sonarr_url != deps.settings.sonarr.url
+        or binding.shoko_url != deps.settings.shoko.url
+        or not _configured_endpoints_match(deps)
+        or binding.roots != tuple(sorted(set(deps.settings.sonarr.allowed_roots)))
+        or set(binding.path_mappings) != set(deps.settings.path_mappings)
+        or OnboardingManager(deps.store).evaluate_context(context, iso=deps.now()).status
+        is not OnboardingStatus.AUTHORIZED
+    ):
+        return None
+    ownership = deps.store.establish_normal_source_ownership(
+        _source_identity(deps.settings),
+        expected_consent=context.consent_json,
+        expected_authorization_revision=context.authorization_revision,
+        expected_settings=context.settings_json,
+    )
+    return None if ownership is None else (context, ownership)
+
+
+def _bind_normal_source_proof(
+    deps: DaemonDeps, inventory: SonarrInventory, discovery: ShokoDiscovery, *, deadline: float
+) -> DaemonDeps:
+    if (
+        not inventory.verdict.complete
+        or not discovery.verdict.complete
+        or not math.isfinite(deadline)
+        or not deps.monotonic() < deadline
+    ):
+        return replace(deps, normal_source_proof=None)
+    current = _normal_source_context(deps)
+    if current is None:
+        return replace(deps, normal_source_proof=None)
+    context, ownership = current
+    proof = NormalSourceProof(
+        context.consent_json,
+        context.authorization_revision,
+        context.settings_json,
+        context.binding.digest,
+        _source_identity(deps.settings),
+        ownership,
+        deadline,
+        deps.monotonic,
+    )
+    return replace(deps, normal_source_proof=proof)
 
 
 def roots_fingerprint(settings: Settings) -> str:
@@ -806,7 +885,11 @@ def rolling_budget_exhausted(view: BudgetView, limits: BudgetLimits, now_iso: st
 def _eligibility_flags(
     deps: DaemonDeps, mapping_present: bool, now_iso: str, *, campaign: bool = False
 ) -> _EligibilityFlags:
-    source_stable = deps.store.get_meta("requires_rebaseline") != "1"
+    source_stable = (
+        _normal_source_current(deps)
+        if deps.service_mode and not campaign and deps.service_context is not None
+        else deps.store.get_meta("requires_rebaseline") != "1"
+    )
     paused = _global_pause_reason(deps, campaign=campaign) is not None
     use_service_authorization = deps.service_mode and not campaign
     return _EligibilityFlags(
@@ -2946,6 +3029,12 @@ def _file_recovery_phase(
     ``recovery_deferred:<n>``). A huge verifying backlog drains across cycles and terminates
     instead of decoding terminal history or issuing one GET per persisted row.
     """
+    ownership_json = deps.store.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+    normal_endpoints_owned = (
+        ownership_json is not None
+        and json.loads(ownership_json).get("source_identity") == _source_identity(deps.settings)
+        and _configured_endpoints_match(deps)
+    )
     raw_cursor = deps.store.get_meta(META_RECOVERY_CURSOR)
     try:
         cursor = max(0, int(raw_cursor or "0"))
@@ -2966,6 +3055,14 @@ def _file_recovery_phase(
                 outcome = _RecoveryRowOutcome(f"recovery_missing:{file_id}")
             elif row.state is FileState.PREPARED_NOT_SENT:
                 outcome = _recovery_replan_rows(deps, (row,), now_iso)[0]
+            elif (
+                (
+                    deps.service_mode
+                    and (deps.service_context is not None or ownership_json is not None)
+                )
+                or deps.store.normal_source_send_tagged(file_id)
+            ) and (not normal_endpoints_owned or not deps.store.normal_source_send_owned(file_id)):
+                outcome = _RecoveryRowOutcome(f"recovery_source_ownership_unknown:{file_id}")
             elif row.state in (FileState.REQUEST_MAY_HAVE_BEEN_SENT, FileState.INDETERMINATE_WRITE):
                 outcome = _recovery_hold_row(deps, row, now_iso, deadline_mono=deadline)
             elif row.state in (FileState.VERIFYING, FileState.PARTIAL, FileState.CONFLICT):
@@ -3072,6 +3169,8 @@ def _post_preflight_freshness_guard(
     if guard is not None:
         return guard
     if deps.service_mode:
+        if deps.service_context is not None and not _normal_source_current(deps):
+            return _ApplyOutcome(0, 1, ("normal_source_proof_stale",), ())
         authorized = deps.service_authorized_local is not None and deps.service_authorized_local()
         if not authorized:
             return _ApplyOutcome(0, 1, ("service_authorization_changed",), ())
@@ -3302,6 +3401,7 @@ def _metadata_local_guard(
             service_mode=True,
             service_authorized=True,
             service_backlog=True,
+            normal_source_proof=deps.normal_source_proof,
             budgets_ok=True,
             mapping_stable=True,
             source_stable=True,
@@ -3465,6 +3565,7 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
             service_mode=True,
             service_authorized=True,
             service_backlog=True,
+            normal_source_proof=deps.normal_source_proof,
             budgets_ok=flags.budgets_ok and _service_candidate_budget_headroom(deps, deps.now(), 1),
             mapping_stable=flags.mapping_stable,
             source_stable=flags.source_stable,
@@ -3517,6 +3618,7 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
                 cycle_key=cycle_key,
                 iso=deps.now(),
                 expected_document_json=expected,
+                normal_source_proof=deps.normal_source_proof,
                 required_targets=required,
                 missing_targets=selected_missing,
                 series_name=demand.series_name,
@@ -3571,6 +3673,7 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
                     _parse_iso(now_iso) + timedelta(seconds=deps.verification_timeout_seconds)
                 ).isoformat(),
                 expected_document_json=expected,
+                normal_source_proof=deps.normal_source_proof,
             )
             if not _metadata_local_guard(
                 deps, demand, active, expected, revision, deadline, generation_lock_held=True
@@ -3580,7 +3683,11 @@ def process_metadata_demand(  # noqa: PLR0911, PLR0912, PLR0915 - one ordered se
                     operation, MetadataOperationState.DEFINITELY_REJECTED, iso=deps.now()
                 )
                 return MetadataExecutionOutcome("metadata_authorization_changed")
-            deps.store.admit_metadata_transport(operation, expected_document_json=expected)
+            deps.store.admit_metadata_transport(
+                operation,
+                expected_document_json=expected,
+                normal_source_proof=deps.normal_source_proof,
+            )
             if not _metadata_local_guard(
                 deps, demand, active, expected, revision, deadline, generation_lock_held=True
             ):
@@ -3737,6 +3844,7 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
         service_mode=deps.service_mode,
         service_authorized=service_authorized,
         service_backlog=service_backlog,
+        normal_source_proof=deps.normal_source_proof,
         budgets_ok=flags.budgets_ok
         and _service_candidate_budget_headroom(deps, send_iso, len(plan.episode_ids)),
         mapping_stable=flags.mapping_stable,
@@ -3845,6 +3953,7 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
                 policy=plan.policy,
                 # P2-4: reserve the plan's real episode-job count; P1-3: persist the expected
                 # verification triples so a persisted row survives restarts (re-poll/re-inspect).
+                normal_source_proof=deps.normal_source_proof,
                 expected_episode_jobs=len(plan.episode_ids),
                 target_ids=tuple(
                     (target.anidb_anime_id, target.anidb_episode_id, target.shoko_episode_id)
@@ -3857,8 +3966,8 @@ def _process_candidate(  # noqa: PLR0911, PLR0912
             if deps.service_mode:
                 deps.store.record_service_canary(file_id, send_iso, send_id=prepared.send_id)
             # mark_sent durably commits request_may_have_been_sent BEFORE any bytes reach HTTP.
-            deps.store.mark_sent(token, iso=send_iso)
-            with deps.store.protect_transport(token):
+            deps.store.mark_sent(token, iso=send_iso, normal_source_proof=deps.normal_source_proof)
+            with deps.store.protect_transport(token, normal_source_proof=deps.normal_source_proof):
                 transport_started = True
                 send = submit_link(
                     deps.shoko, plan, clock=deps.monotonic, deadline=source_check_deadline
@@ -4654,7 +4763,7 @@ def _bind_service_authorization(deps: DaemonDeps, deadline: float) -> DaemonDeps
     )
 
 
-def _run_cycle_body(  # noqa: PLR0915 - retain the bounded cycle phase ordering
+def _run_cycle_body(  # noqa: PLR0912, PLR0915 - retain the bounded cycle phase ordering
     deps: DaemonDeps,
     *,
     now_iso: str,
@@ -4688,7 +4797,15 @@ def _run_cycle_body(  # noqa: PLR0915 - retain the bounded cycle phase ordering
     # an async link that landed since the previous cycle looks like an unexplained source
     # drop until recovery verifies it, spuriously latching a hard rebaseline hold. Recovery
     # is bounded and read-only remotely; it never submits new links.
-    reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono, full=full))
+    recovery_source_ready = (
+        not deps.service_mode
+        or deps.service_context is None
+        or _normal_source_context(deps) is not None
+    )
+    if recovery_source_ready:
+        reasons.extend(_recovery_phase(deps, now_iso, cycle_start_mono, full=full))
+    else:
+        reasons.append("normal_source_recovery_waiting")
     inventory = (
         _collect_bounded_sonarr_inventory(deps, cycle_start_mono)
         if mode is CycleMode.APPLY or bounded_read_only
@@ -4722,18 +4839,24 @@ def _run_cycle_body(  # noqa: PLR0915 - retain the bounded cycle phase ordering
     # (non-truncated). A truncated page's inflated ``Total`` must never re-anchor the
     # continuity total (it would inflate the anchor and wedge the next honest cycle).
     discovery_complete = inventory.verdict.complete and discovery.verdict.complete
+    if deps.service_mode and deps.service_context is not None:
+        deps = _bind_normal_source_proof(
+            deps, inventory, discovery, deadline=cycle_start_mono + deps.max_cycle_seconds
+        )
     continuity = deps.store.check_source_continuity(
         _source_identity(deps.settings),
         snapshot_id,
         iso=now_iso,
         roots_fingerprint=roots_fingerprint(deps.settings),
         discovery_total=discovery.total_reported if discovery_complete else None,
-        complete=discovery_complete,
+        complete=discovery_complete
+        and (not deps.service_mode or deps.service_context is None or _normal_source_current(deps)),
+        normal_source_proof=deps.normal_source_proof,
         discovered_file_ids=frozenset(file.id for file in discovery.files),
     )
-    if not continuity.ok or not discovery_complete:
+    if (not continuity.ok or not discovery_complete) and not _normal_source_current(deps):
         reasons.extend(continuity.reasons)
-    elif discovery.total_reported is not None:
+    elif not deps.service_mode and discovery.total_reported is not None:
         # P1-1: a fully-complete, non-truncated, continuity-OK cycle re-anchors the
         # observation, so ordinary inventory growth never accumulates as discontinuity.
         # A latched discontinuity takes the requires_rebaseline branch above.
@@ -4744,7 +4867,11 @@ def _run_cycle_body(  # noqa: PLR0915 - retain the bounded cycle phase ordering
             roots_fingerprint=roots_fingerprint(deps.settings),
             discovery_total=discovery.total_reported,
         )
-    if not continuity.ok and not continuity.requires_rebaseline:
+    if (
+        not continuity.ok
+        and not continuity.requires_rebaseline
+        and not _normal_source_current(deps)
+    ):
         # A departed in-flight job is not evidence of either a source reset or a
         # successful link. Hold both normal apply and campaign sweeps/drains until
         # bounded recovery can explain the snapshot; never re-anchor this wait.
@@ -4796,7 +4923,7 @@ def _run_cycle_body(  # noqa: PLR0915 - retain the bounded cycle phase ordering
 
     flags = _eligibility_flags(deps, mapping_present=True, now_iso=now_iso)
     eligibility = compute_eligibility(deps, now_iso)
-    cycle_eligible = eligibility.eligible and continuity.ok
+    cycle_eligible = eligibility.eligible and (continuity.ok or _normal_source_current(deps))
     if not cycle_eligible:
         # P3c: every suppression path surfaces its refusal reasons.
         reasons.extend(eligibility.reasons)
@@ -4958,6 +5085,24 @@ def _unavailable_service_mapping_report(
 
 def _load_service_rate_state(deps: DaemonDeps, now_iso: str) -> RateState:
     encoded = deps.store.get_service_rate_state_json()
+    ownership = deps.store.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+    if ownership is not None:
+        marker = json.loads(ownership)
+        rate_source = deps.store.get_meta("normal_service_rate_source_v1")
+        epoch_digest = hashlib.sha256(ownership.encode()).hexdigest()
+        if rate_source != epoch_digest:
+            if rate_source is not None or marker["send_floor"] > 0:
+                if encoded is not None:
+                    deps.store.set_meta(
+                        "normal_source_rate_history:"
+                        + hashlib.sha256(ownership.encode()).hexdigest(),
+                        encoded,
+                    )
+                encoded = None  # Previous/unknown endpoint feedback grants no throughput credit.
+                deps.store.save_service_rate_state_json(
+                    encode_rate_state(RateState.initial(now_iso)), now_iso
+                )
+            deps.store.set_meta("normal_service_rate_source_v1", epoch_digest)
     if encoded is None:
         state = RateState.initial(now_iso)
         deps.store.save_service_rate_state_json(encode_rate_state(state), now_iso)

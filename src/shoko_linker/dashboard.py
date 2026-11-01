@@ -44,7 +44,6 @@ from .state import (
     ServiceFileCounts,
     ServiceFilePage,
     ServiceFileStatus,
-    SourceRebaselineAudit,
     StateError,
     StateStore,
     TablePage,
@@ -127,6 +126,7 @@ class DashboardSetupView:
     confirmation_enabled: bool = True
     snapshot_digest: str = ""
     loading: bool = False
+    saved_setup: bool = False
     progress_percent: int = 0
     metadata_maintenance_policy: str | None = None
     authorization_revision: str | None = None
@@ -443,12 +443,6 @@ class DashboardApplication:
             table=table,
             view=view,
             pause_reason=pause_reason,
-            source_review=(
-                self.source_review_provider(session.session_id_hash)
-                if self.source_review_provider
-                else None
-            ),
-            source_audit=store.get_source_rebaseline_review().last_audit,
             refresh_url=(path if path != "/" else "/status") + ("?" + query if query else ""),
             now=_now_utc(self.clock),
         )
@@ -553,7 +547,7 @@ class DashboardApplication:
             account.signing_key, session.session_id, session.expires_epoch, next_csrf
         )
         if path.startswith("/source-review/"):
-            return self._source_review_action(store, path, form, session, next_csrf, cookie)
+            return self._redirect("/status#linking-controls", set_cookie=cookie)
         manager = OnboardingManager(store)
         if path == "/pause":
             manager.pause(iso=now.isoformat())
@@ -630,60 +624,16 @@ class DashboardApplication:
         expected = {"csrf_token"}
         if path == "/source-review/confirm":
             expected |= {"review_token", "acknowledge"}
-        if set(form) != expected or (
-            path == "/source-review/confirm"
-            and (
-                form.get("acknowledge") != "yes"
-                or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", form.get("review_token", ""))
-            )
-        ):
-            return self._error(
-                HTTPStatus.BAD_REQUEST, "Review and explicitly accept the source change."
-            )
         if (
-            self.source_review_provider is None
-            or self.source_review_assess is None
-            or self.source_review_confirm is None
+            not {"csrf_token"} <= set(form) <= expected
+            or ("acknowledge" in form and form["acknowledge"] != "yes")
+            or (
+                "review_token" in form
+                and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", form["review_token"])
+            )
         ):
-            return self._error(HTTPStatus.NOT_FOUND, "Source review is unavailable.")
+            return self._error(HTTPStatus.BAD_REQUEST, "Invalid library update form.")
         return None
-
-    def _source_review_action(
-        self,
-        store: StateStore,
-        path: str,
-        form: Mapping[str, str],
-        session: _SessionToken,
-        next_csrf: str,
-        cookie: str,
-    ) -> DashboardResponse:
-        assert self.source_review_assess is not None
-        assert self.source_review_confirm is not None
-        assert self.source_review_provider is not None
-        try:
-            if path == "/source-review/assess":
-                self.source_review_assess(session.session_id_hash)
-            else:
-                self.source_review_confirm(form["review_token"], session.session_id_hash)
-        except StateError:
-            message = "This review is unavailable or changed. Check the library again."
-        else:
-            return self._redirect("/status#source-review", set_cookie=cookie)
-        paused, pause_reason = store.get_service_pause()
-        return self._html(
-            HTTPStatus.CONFLICT,
-            self._status_page(
-                self.status_provider(),
-                next_csrf,
-                now=_now_utc(self.clock),
-                paused=paused,
-                pause_reason=pause_reason,
-                acknowledgement=message,
-                source_review=self.source_review_provider(session.session_id_hash),
-                source_audit=store.get_source_rebaseline_review().last_audit,
-            ),
-            set_cookie=cookie,
-        )
 
     def _new_session(self, store: StateStore, signing_key: bytes, now: datetime) -> str | None:
         session_id = secrets.token_urlsafe(32)
@@ -841,8 +791,6 @@ class DashboardApplication:
         view: str = "review",
         pause_reason: str = "",
         refresh_url: str = "",
-        source_review: SourceReviewView | None = None,
-        source_audit: SourceRebaselineAudit | None = None,
         now: datetime | None = None,
     ) -> str:
         now = now or datetime.now(UTC)
@@ -881,9 +829,7 @@ class DashboardApplication:
             "conflicts and safety issues are included. These are locally tracked files "
             "across scans, not a partition of Shoko's current unrecognized list."
             "</p></section>"
-            + DashboardApplication._source_review_section(
-                source_review, source_audit, csrf_token, action=action, now=now
-            )
+            + DashboardApplication._linking_controls(action)
             + "</div>"
             + DashboardApplication._scan_section(status.last_scan, now=now)
             + DashboardApplication._metadata_section(status.metadata, now=now)
@@ -932,16 +878,6 @@ class DashboardApplication:
             + f'<h1>{titles[route]}</h1><div data-live="acknowledgement" role="status">'
             + (f"<p>{html.escape(acknowledgement)}</p>" if acknowledgement else "")
             + '</div><p id="update-status" role="status" hidden></p>'
-            + '<div data-live="source-hold">'
-            + (
-                '<aside class="panel" role="status"><strong>Library changes need review.</strong> '
-                '<a href="/status#source-review">Review library changes</a></aside>'
-                if route not in {"/", "/status"}
-                and source_review
-                and source_review.continuity.requires_rebaseline
-                else ""
-            )
-            + "</div>"
             + body
             + '<p class="hint" data-timezone>Times shown in UTC.</p>'
             + "</div></div>",
@@ -952,149 +888,14 @@ class DashboardApplication:
         )
 
     @staticmethod
-    def _source_review_section(
-        review: SourceReviewView | None,
-        audit: SourceRebaselineAudit | None,
-        csrf_token: str,
-        *,
-        action: str = "",
-        now: datetime | None = None,
-    ) -> str:
-        """Render only local evidence; no endpoint URLs or remote action history."""
-
-        body = '<div class="eyebrow">Your next step</div><h2>Linking controls</h2>'
-        if review is not None and review.continuity.requires_rebaseline:
-            body += DashboardApplication._source_review_hold(review, csrf_token, now=now)
-        elif review is not None and review.status == "confirmed":
-            body += (
-                '<p role="status">Changes accepted. '
-                "Linking depends on the current requirements below.</p>"
-            )
-            if review.service_pause == (True, "user_paused"):
-                body += "<p>Linking is paused by you. Use Resume in the header to continue.</p>"
-            elif action:
-                body += f'<p class="next-action">{html.escape(action)}</p>'
-            if review.writes_disabled:
-                body += "<p>A separate write safety hold still needs attention.</p>"
-        elif action:
-            body += f'<p class="next-action">{html.escape(action)}</p>'
-        if audit is not None:
-            body += (
-                '<details data-disclosure="recovery-details"><summary>Recovery details</summary>'
-                f"<p>Library changes accepted: {_compact_time(audit.accepted_iso, now=now)}. "
-                "This local record is separate from remote request History. "
-                "Linking still depends on current authorization and safety checks.</p></details>"
-            )
+    def _linking_controls(action: str) -> str:
         return (
-            '<section id="source-review" tabindex="-1" class="panel control-panel" '
-            'data-live="source-review">' + body + "</section>"
+            '<section id="linking-controls" tabindex="-1" class="panel control-panel" '
+            'data-live="linking-controls"><div class="eyebrow">Your next step</div>'
+            "<h2>Linking controls</h2>"
+            "<p>Library updates are handled automatically within your saved libraries.</p>"
+            f'<p class="next-action">{html.escape(action)}</p></section>'
         )
-
-    @staticmethod
-    def _source_review_hold(
-        review: SourceReviewView, csrf_token: str, *, now: datetime | None = None
-    ) -> str:
-        """Current hold evidence and its single available recovery action."""
-
-        def safe(value: str) -> str:
-            return html.escape(diagnostic_text(value))
-
-        continuity = review.continuity
-        hold = continuity.hold
-        body = (
-            "<h3>Library changes</h3><p>Linking is on hold because the library changed. "
-            "Check the library, then review and accept the changes to continue.</p>"
-        )
-        if continuity.evidence_status == "legacy_unknown":
-            body += "<p>The original cause and counts were not retained by this older hold.</p>"
-        elif hold is not None:
-            causes = {
-                "instance_identity_changed": "The connected library source changed.",
-                "roots_changed": "The selected library roots changed.",
-                "snapshot_marker_missing": "The unrecognized-file count became unavailable.",
-                "discovery_total_drop": "The unrecognized-file count fell beyond recorded links.",
-            }
-            body += (
-                "<p>"
-                + " ".join(causes[reason] for reason in hold.reasons if reason in causes)
-                + "</p>"
-            )
-            prior = None if hold.prior is None else hold.prior.discovery_total
-            current = None if hold.current is None else hold.current.discovery_total
-            body += (
-                '<p>When linking stopped: previous unrecognized files: '
-                f'{prior if prior is not None else "unknown"}; '
-                f'current: {current if current is not None else "unknown"}.</p>'
-            )
-            body += (
-                f"<p>First hold: {_compact_time(hold.detected_iso, now=now)}; "
-                f"previous observation: {_compact_time(hold.previous_anchor_iso, now=now)}.</p>"
-            )
-        if continuity.latest_complete is not None:
-            latest = continuity.latest_complete
-            latest_count = latest.observation.discovery_total
-            body += (
-                f"<p>Latest complete observation: {_compact_time(latest.observed_iso, now=now)}; "
-                "unrecognized files: "
-                f"{latest_count if latest_count is not None else 'unknown'}.</p>"
-            )
-        labels = {
-            "idle": "Ready to check the library",
-            "queued": "Library check queued. This can take several minutes.",
-            "assessing": "Checking Sonarr and Shoko… this can take several minutes.",
-            "ready": "Review the library counts below, then accept the changes.",
-            "confirming": "Rechecking Sonarr and Shoko… this can take several minutes.",
-            "changed": "The library changed again. Review and accept these new counts.",
-            "confirmed": "Changes accepted. Checking current linking requirements.",
-            "error": "Library check needs attention",
-        }
-        body += f'<p role="status" data-review-progress>{labels[review.status]}</p>'
-        busy = review.status in {"queued", "assessing", "confirming"}
-        body += (
-            '<progress data-review-busy aria-label="Checking Sonarr and Shoko"'
-            + ("" if busy else " hidden")
-            + "></progress>"
-        )
-        if review.message and review.status == "error":
-            body += f"<p>{safe(review.message)}</p>"
-        if review.started_iso:
-            body += f"<p>Fresh collection started: {_compact_time(review.started_iso, now=now)}"
-            if review.completed_iso:
-                body += f"; completed: {_compact_time(review.completed_iso, now=now)}"
-            body += ".</p>"
-        if review.summary is not None:
-            summary = review.summary
-            body += (
-                f"<p>Current selected scope: {summary.selected_roots} roots; "
-                f"Sonarr: {summary.sonarr_series} series, {summary.sonarr_files} files; "
-                f"Shoko: {summary.shoko_files} unrecognized files, "
-                f"{summary.shoko_folders} import folders.</p>"
-            )
-        token = html.escape(csrf_token, quote=True)
-        if review.token is not None and review.status in {"ready", "changed"}:
-            review_token = html.escape(review.token, quote=True)
-            body += (
-                '<form method="post" action="/source-review/confirm" '
-                f'data-review-token="{review_token}">'
-                f'<input type="hidden" name="csrf_token" value="{token}">'
-                f'<input type="hidden" name="review_token" value="{review_token}">'
-                '<label><input type="checkbox" name="acknowledge" value="yes" required> '
-                "I reviewed these library changes and accept them.</label>"
-                "<p>Acceptance rechecks fresh evidence. It grants no write permission and "
-                "does not clear other safety holds or your pause.</p>"
-                '<button type="submit">Accept changes</button></form>'
-            )
-        elif review.status not in {"queued", "assessing", "confirming"}:
-            body += (
-                '<form method="post" action="/source-review/assess">'
-                f'<input type="hidden" name="csrf_token" value="{token}">'
-                '<button type="submit">Check library</button></form>'
-            )
-        if review.service_pause[0]:
-            body += "<p>The service is paused. Accepting changes keeps that pause.</p>"
-        if review.writes_disabled:
-            body += "<p>A separate write safety hold is active and will remain in place.</p>"
-        return body
 
     @staticmethod
     def _header(
@@ -1459,6 +1260,13 @@ class DashboardApplication:
     def _setup_section(setup: DashboardSetupView | None, csrf_token: str) -> str:
         if setup is None:
             return ""
+        if setup.saved_setup:
+            return (
+                '<section class="panel setup-panel" data-saved-setup="true">'
+                '<div class="eyebrow">Saved libraries</div>'
+                "<h2>Checking saved libraries</h2>"
+                f'<p role="status">{html.escape(setup.message)}</p></section>'
+            )
         root_choices = "".join(
             f'<label><input type="checkbox" name="root_{index}" '
             f'value="{html.escape(root, quote=True)}"'
@@ -1894,22 +1702,6 @@ _DASHBOARD_JS: Final[str] = r"""
     for (const current of document.querySelectorAll('[data-live]')) {
       const fresh = next.querySelector('[data-live="' + current.dataset.live + '"]');
       if (!fresh) continue;
-      let reviewFocus = null;
-      if (current.dataset.live === 'source-review') {
-        const active = document.activeElement;
-        if (active && current.contains(active)) {
-          if (active.name === 'acknowledge') reviewFocus = 'input[name="acknowledge"]';
-          else if (active.tagName === 'BUTTON') reviewFocus = 'button[type="submit"]';
-          else if (active.tagName === 'SUMMARY') reviewFocus = 'summary';
-        }
-        const oldForm = current.querySelector('form[data-review-token]');
-        const newForm = fresh.querySelector('form[data-review-token]');
-        if (oldForm && newForm && oldForm.dataset.reviewToken === newForm.dataset.reviewToken) {
-          const oldAck = oldForm.querySelector('input[name="acknowledge"]');
-          const newAck = newForm.querySelector('input[name="acknowledge"]');
-          if (oldAck && newAck) newAck.checked = oldAck.checked;
-        }
-      }
       if (current.dataset.live === 'setup') {
         const oldPanel = current.querySelector('[data-setup-digest]');
         const newPanel = fresh.querySelector('[data-setup-digest]');
@@ -1970,7 +1762,6 @@ _DASHBOARD_JS: Final[str] = r"""
       }
       if (current.outerHTML !== fresh.outerHTML) {
         current.replaceWith(fresh);
-        if (reviewFocus) fresh.querySelector(reviewFocus)?.focus({preventScroll: true});
         if (headerFocus) {
           fresh.querySelector('[data-header-focus="' + headerFocus + '"]')
             ?.focus({preventScroll: true});
@@ -1993,22 +1784,6 @@ _DASHBOARD_JS: Final[str] = r"""
       : '';
     notice.hidden = !changedSetup;
   }
-  document.addEventListener('submit', event => {
-    const form = event.target;
-    if (!form.matches(
-      'form[action="/source-review/assess"], form[action="/source-review/confirm"]')) return;
-    // Native validation has already run. Keep the normal POST/303 navigation.
-    for (const button of form.querySelectorAll('button[type="submit"]')) {
-      button.disabled = true;
-    }
-    const panel = form.closest('[data-live="source-review"]');
-    const activity = panel?.querySelector('[data-review-busy]');
-    if (activity) activity.hidden = false;
-    const progress = panel?.querySelector('[data-review-progress]');
-    if (progress) progress.textContent =
-      'Checking Sonarr and Shoko… this can take several minutes.';
-    form.setAttribute('aria-busy', 'true');
-  });
   async function update() {
     prepareTimes(document);
     try {

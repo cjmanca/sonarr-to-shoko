@@ -57,7 +57,14 @@ from shoko_linker.shoko import (
     match_shoko_files,
 )
 from shoko_linker.sonarr import collect_sonarr_inventory
-from shoko_linker.state import BaselineFile, Cohort, FileState, SendToken, StateStore
+from shoko_linker.state import (
+    BaselineFile,
+    Cohort,
+    FileState,
+    NormalSourceProof,
+    SendToken,
+    StateStore,
+)
 
 N_SERIES = 1
 N_TWO = 2
@@ -1290,11 +1297,13 @@ def test_crash_between_prepare_and_send_replans_once_without_double_post(
     original = store.mark_sent
     monotonic, advance = _fixed_clock()
 
-    def crashing_mark_sent(token: SendToken, *, iso: str) -> None:
+    def crashing_mark_sent(
+        token: SendToken, *, iso: str, normal_source_proof: NormalSourceProof | None = None
+    ) -> None:
         marks.append(token.shoko_file_id)
         if len(marks) == N_TWO:
             raise RuntimeError("simulated crash after prepare_send")
-        original(token, iso=iso)
+        original(token, iso=iso, normal_source_proof=normal_source_proof)
 
     monkeypatch.setattr(store, "mark_sent", crashing_mark_sent)
     try:

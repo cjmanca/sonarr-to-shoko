@@ -115,11 +115,6 @@ def test_ready_only_queue_wait_reaches_authenticated_live_controls(
     [
         ("setup", "Complete setup first."),
         ("pause", "Resume when you are ready"),
-        (
-            "source_continuity",
-            "Source collection changed. Review source change on Overview "
-            "before linking can continue.",
-        ),
         ("writes_disabled", "stopped by a safety check"),
         ("failed", "service check needs attention"),
         ("mapping", "Verified mappings are unavailable."),
@@ -133,8 +128,6 @@ def test_queue_wait_does_not_shadow_higher_priority_gates(
     with open_state(tmp_path / "state.sqlite3") as store:
         if condition == "pause":
             OnboardingManager(store).pause(iso=td.T0)
-        elif condition == "source_continuity":
-            store.set_meta("requires_rebaseline", "1")
         elif condition == "writes_disabled":
             store.disable_writes("test safety hold")
         elif condition == "failed":
@@ -155,6 +148,22 @@ def test_queue_wait_does_not_shadow_higher_priority_gates(
         assert not active
         assert expected in message
         assert "job queue" not in message
+
+
+def test_advanced_count_hold_does_not_shadow_normal_queue_retry(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite3") as store:
+        store.set_meta("requires_rebaseline", "1")
+        active, message = cli._NormalServiceRuntime._operational_status(
+            store,
+            authorized=True,
+            next_action="Processing eligible files.",
+            report=queue_report("preflight_queue_unknown"),
+        )
+        assert not active
+        assert "Shoko's job queue could not be checked completely." in message
+        assert "retry" in message
+        assert "Review source" not in message
+        assert store.get_meta("requires_rebaseline") == "1"
 
 
 @pytest.mark.parametrize("reason", ["legacy queue unknown", "preflight_queue_unknown:server text"])

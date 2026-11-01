@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -2278,5 +2278,184 @@ def test_returning_same_reason_hazard_after_fresh_check_revokes_form(
             assert store.get_service_pause() == (True, "unsafe_shoko_settings")
             assert controller.onboarding(store).reconfirmation_required()
     finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize("action", ["scope", "confirm"])
+@pytest.mark.parametrize("series_ids", [(), (41, 42), (42,)])
+def test_setup_submission_does_not_bind_mutable_series_membership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, series_ids: tuple[int, ...]
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    compatibility, scope, assessment = environment
+    changed_scope = replace(scope, candidates=(AnimeRootCandidate(ANIME_ROOT, series_ids),))
+    monkeypatch.setattr(
+        controller, "_environment", lambda: (compatibility, changed_scope, assessment)
+    )
+    try:
+        if action == "scope":
+            form = {"setup_digest": form["setup_digest"], "root_0": ANIME_ROOT}
+        result = controller.action(action, form)
+        assert "Review refreshed setup" not in result
+        with open_state(controller.state_path) as store:
+            if action == "confirm":
+                record = controller.onboarding(store).record()
+                assert record is not None
+                assert record.binding.roots == (ANIME_ROOT,)
+            else:
+                assert json.loads(store.get_meta(service_setup.DRAFT_ROOTS_META) or "null") == [
+                    ANIME_ROOT
+                ]
+    finally:
+        sonarr.client.close()
+        shoko.client.close()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "empty",
+        "added",
+        "removed",
+        "unrelated_inaccessible",
+        "unrelated_malformed",
+        "unknown_series_path",
+        "new_unselected_root",
+        "selected_offline",
+        "selected_unknown",
+        "removed_root",
+        "root_api_unavailable",
+    ],
+)
+def test_restarted_controller_reuses_confirmed_registered_root_identity(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    controller.action("confirm", form)
+    compatibility, _, assessment = environment
+    with open_state(controller.state_path) as store:
+        consent_json = store.get_onboarding_json()
+        assert consent_json is not None
+    roots: list[dict[str, Any]] = [{"path": ANIME_ROOT, "accessible": True}]
+    series: list[dict[str, Any]] = [
+        {
+            "id": 42,
+            "title": "Current series",
+            "rootFolderPath": ANIME_ROOT,
+            "seriesType": "anime",
+            "tvdbId": 100,
+        }
+    ]
+    if change in {"empty", "removed"}:
+        series = []
+    elif change == "added":
+        series.append({**series[0], "id": 43})
+    elif change == "unknown_series_path":
+        series[0]["rootFolderPath"] = "unprovable-relative-path"
+        series.append({"id": 43})
+    elif change.startswith("unrelated_"):
+        roots.append(
+            {
+                "path": "/data/media/tv",
+                "accessible": (False if change == "unrelated_inaccessible" else "unknown"),
+            }
+        )
+        series.append({**series[0], "id": 43, "rootFolderPath": "/data/media/tv"})
+    elif change == "new_unselected_root":
+        roots.append({"path": "/data/media/another-anime", "accessible": True})
+    elif change == "selected_offline":
+        roots[0]["accessible"] = False
+    elif change == "selected_unknown":
+        del roots[0]["accessible"]
+    elif change == "removed_root":
+        roots = []
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/rootfolder"):
+            return httpx.Response(503 if change == "root_api_unavailable" else 200, json=roots)
+        return httpx.Response(200, json=series)
+
+    fresh_sonarr = ApiEndpoint(
+        httpx.Client(base_url="http://sonarr:8989/", transport=httpx.MockTransport(handler)),
+        lambda: {},
+    )
+    restarted = ServiceSetupController(
+        controller.bootstrap, fresh_sonarr, shoko, controller.state_path
+    )
+    monkeypatch.setattr(service_setup, "inspect_api_compatibility", lambda *_, **__: compatibility)
+    monkeypatch.setattr(service_setup, "inspect_shoko_safety_settings", lambda *_, **__: assessment)
+    monkeypatch.setattr(restarted, "_inventory", controller._inventory)
+    temporary = change in {"selected_offline", "selected_unknown", "root_api_unavailable"}
+    try:
+        with open_state(controller.state_path) as store:
+            context = restarted.current_context(store)
+            if temporary or change == "removed_root":
+                assert context is None
+                assert store.get_service_pause() == (
+                    True,
+                    "setup_unavailable" if temporary else "setup_changed",
+                )
+                assert restarted.onboarding(store).reconfirmation_required() is (not temporary)
+            else:
+                assert context is not None
+                assert context.binding.roots == (ANIME_ROOT,)
+                assert context.binding.path_mappings == (PathMapping(ANIME_ROOT, SHOKO_ROOT),)
+                assert store.get_service_pause() == (False, "")
+                assert not restarted.onboarding(store).reconfirmation_required()
+            assert store.get_onboarding_json() == consent_json
+        if not temporary and change != "removed_root":
+            assert restarted.refresh_view() is None
+        assert requests
+        assert all(request.method == "GET" for request in requests)
+    finally:
+        fresh_sonarr.client.close()
+        sonarr.client.close()
+        shoko.client.close()
+
+
+def test_restart_preserves_draft_root_identity_with_unrelated_malformed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, form, environment, _, _, sonarr, shoko = _ready_setup_form(tmp_path, monkeypatch)
+    controller.action("scope", {"setup_digest": form["setup_digest"], "root_0": ANIME_ROOT})
+    compatibility, _, assessment = environment
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=(
+                [
+                    {"path": ANIME_ROOT, "accessible": True},
+                    {
+                        "path": "/data/media/tv",
+                        "accessible": "unknown",
+                    },
+                ]
+                if request.url.path.endswith("/rootfolder")
+                else []
+            ),
+        )
+
+    fresh_sonarr = ApiEndpoint(
+        httpx.Client(base_url="http://sonarr:8989/", transport=httpx.MockTransport(handler)),
+        lambda: {},
+    )
+    restarted = ServiceSetupController(
+        controller.bootstrap, fresh_sonarr, shoko, controller.state_path
+    )
+    monkeypatch.setattr(service_setup, "inspect_api_compatibility", lambda *_, **__: compatibility)
+    monkeypatch.setattr(service_setup, "inspect_shoko_safety_settings", lambda *_, **__: assessment)
+    try:
+        _, scope, _ = restarted._environment()
+        assert scope.read_status is ScopeReadStatus.COMPLETE
+        assert scope.candidates == (AnimeRootCandidate(ANIME_ROOT, ()),)
+        with open_state(controller.state_path) as store:
+            assert store.get_onboarding_json() is None
+    finally:
+        fresh_sonarr.client.close()
         sonarr.client.close()
         shoko.client.close()

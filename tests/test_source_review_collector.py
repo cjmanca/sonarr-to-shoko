@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -153,7 +152,6 @@ def h(tmp_path: Path) -> Iterator[Harness]:
         now=lambda: clock.now,
         monotonic=clock.monotonic,
     )
-    runtime.source_review = controller
     harness = Harness(world, clock, runtime, collector, controller, requests=requests)
     holder.append(harness)
     requests.clear()
@@ -323,51 +321,18 @@ def test_unknown_association_identity_never_becomes_ready(h: Harness, refs: obje
         assert store.get_source_continuity_review().requires_rebaseline
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_review_owns_runtime_operation_before_pause_and_skips_metadata_recovery(
-    h: Harness, monkeypatch: pytest.MonkeyPatch, partial: bool
+def test_normal_worker_does_not_run_explicit_diagnostic_collection(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def forbidden(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("ordinary work ran in a source review operation")
-
-    monkeypatch.setattr(h.runtime, "_worker_tick", forbidden)
-    monkeypatch.setattr(h.runtime, "_recover_blocked_metadata", forbidden)
-    # Runtime deadlines and the injected controller/collector clock must share
-    # an origin; a host's real monotonic clock may still be below fake time 1000.
-    monkeypatch.setattr(time, "monotonic", h.clock.monotonic)
-    with open_state(h.path) as store:
-        document = load_service_settings(store, h.runtime.settings)
-        document["sync"]["max_cycle_seconds"] = 2
-        store.set_meta(META_SERVICE_SETTINGS, json.dumps(document))
-    calls: list[int] = []
-
-    def budget(request: httpx.Request) -> None:
-        if request.url.path == "/api/v3/episode":
-            series_id = int(request.url.params["seriesId"])
-            calls.append(series_id)
-            if partial and calls == [1, 2]:
-                h.clock.advance(2)
-
-    h.sonarr_hook = budget
-    if partial:
-        h.world.sonarr.add_series(2, eh.SONARR_ROOT, 300_002)
+    calls: list[str] = []
+    monkeypatch.setattr(h.runtime, "_worker_tick", lambda: calls.append("ordinary"))
+    monkeypatch.setattr(h.runtime, "_recover_blocked_metadata", lambda *_: calls.append("recovery"))
     h.controller.request_assessment(SESSION)
-    delay = h.runtime.worker_tick()
-    if partial:
-        assert delay == 1
-        assert h.controller.view(SESSION).status == "assessing"
-        assert calls == [1, 2]
-        h.clock.advance(delay)
-        assert h.runtime.worker_tick() is None
-        assert calls == [1, 2, 2]
-    else:
-        assert delay is None
-        assert calls == [1]
-    assert h.controller.view(SESSION).status == "ready"
-    with open_state(h.path) as store:
-        assert store.get_service_pause() == (True, "user_paused")
-        assert store.get_source_continuity_review().requires_rebaseline
-    assert not h.world.shoko.posts
+    assert h.runtime.worker_tick() is None
+    assert calls == ["ordinary", "recovery"]
+    assert h.controller.view(SESSION).status == "queued"
+    assert h.requests == []
+    assert not hasattr(h.runtime, "source_review")
 
 
 def test_pure_review_evaluation_preserves_tables_and_normal_pause(h: Harness) -> None:
@@ -580,18 +545,19 @@ def test_same_association_count_changed_episode_or_series_identity_changes_diges
     )
 
 
-def test_empty_series_requires_still_current_scope_consent(h: Harness) -> None:
-    # The existing setup policy invalidates consent when its selected root no
-    # longer has any eligible series. Recovery must preserve that independent gate.
+def test_empty_registered_root_retains_scope_consent_for_explicit_diagnostics(h: Harness) -> None:
     h.world.sonarr.series.clear()
     h.world.sonarr.files.clear()
     h.world.sonarr.episodes.clear()
     h.world.shoko.rows.clear()
+    with open_state(h.path) as store:
+        consent = store.get_onboarding_json()
     h.controller.request_assessment(SESSION)
     h.tick()
-    assert h.controller.view(SESSION).status == "error"
+    assert h.controller.view(SESSION).status == "ready"
     with open_state(h.path) as store:
         assert store.get_source_continuity_review().requires_rebaseline
+        assert store.get_onboarding_json() == consent
 
 
 def test_manifest_drift_between_partial_slices_rejects_review(h: Harness) -> None:

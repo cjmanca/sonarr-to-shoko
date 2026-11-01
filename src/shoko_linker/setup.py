@@ -70,7 +70,7 @@ class RootFolder:
 
 @dataclass(frozen=True)
 class AnimeRootCandidate:
-    """One registered Sonarr root containing series with supported numbering types."""
+    """One registered Sonarr root, with optional supported-series display hints."""
 
     path: str
     series_ids: tuple[int, ...]
@@ -297,7 +297,13 @@ def build_setup_readiness(
     return SetupReadiness(stage, message)
 
 
-def _parse_root_folders(raw: Any) -> tuple[RootFolder, ...] | None:
+def _roots_overlap(first: str, second: str) -> bool:
+    return is_within_root(first, second) or is_within_root(second, first)
+
+
+def _parse_root_folders(
+    raw: Any, selected_roots: Sequence[str] = ()
+) -> tuple[RootFolder, ...] | None:
     if not isinstance(raw, list):
         return None
     folders: list[RootFolder] = []
@@ -307,15 +313,22 @@ def _parse_root_folders(raw: Any) -> tuple[RootFolder, ...] | None:
             return None
         path = entry.get("path")
         accessible = entry.get("accessible")
-        if not isinstance(path, str) or not isinstance(accessible, bool):
+        if not isinstance(path, str):
             return None
         try:
             normalized = normalize_posix(path)
         except PathError:
             return None
-        if normalized in seen_paths:
-            return None
+        affects_selection = not selected_roots or any(
+            _roots_overlap(normalized, selected) for selected in selected_roots
+        )
+        duplicate = normalized in seen_paths
         seen_paths.add(normalized)
+        if not isinstance(accessible, bool) or duplicate:
+            if affects_selection:
+                return None
+            folders = [folder for folder in folders if folder.path != normalized]
+            continue
         folders.append(RootFolder(normalized, accessible))
     return tuple(sorted(folders, key=lambda folder: folder.path))
 
@@ -330,57 +343,49 @@ def _blocked(
 
 
 def select_anime_roots(
-    series: Sequence[SonarrSeries], root_folders: Sequence[RootFolder]
+    series: Sequence[SonarrSeries],
+    root_folders: Sequence[RootFolder],
+    *,
+    selected_roots: Sequence[str] = (),
 ) -> AnimeScopeDiscovery:
-    """Offer known-type series roots for explicit confirmation, never auto-selection."""
-    anime_series = tuple(item for item in series if item.series_type in SUPPORTED_SERIES_TYPES)
-    unknown_type = tuple(item for item in series if item.series_type not in SUPPORTED_SERIES_TYPES)
-    if not anime_series:
-        if unknown_type:
+    """Offer registered roots explicitly; mutable series membership is only a hint."""
+    missing_selected = not set(selected_roots) <= {folder.path for folder in root_folders}
+    for selected in selected_roots if not missing_selected else ():
+        matches = tuple(folder for folder in root_folders if folder.path == selected)
+        if matches and not matches[0].accessible:
             return _blocked(
-                "Sonarr did not identify supported series types; check its API version "
-                "and series metadata."
+                "The selected Sonarr root folder is temporarily inaccessible.",
+                read_status=ScopeReadStatus.UNAVAILABLE,
             )
-        return AnimeScopeDiscovery(
-            ScopeStatus.NO_ANIME,
-            (),
-            "No supported Sonarr series were found.",
-        )
+        if any(
+            folder.path != selected and _roots_overlap(folder.path, selected)
+            for folder in root_folders
+        ):
+            return _blocked(
+                "The selected Sonarr root has ambiguous registered folder ownership.",
+                read_status=ScopeReadStatus.INCOMPLETE,
+            )
 
-    problems: list[str] = []
-    series_by_root: dict[str, list[int]] = {}
-    for item in anime_series:
+    series_by_root: dict[str, list[int]] = {
+        folder.path: []
+        for folder in root_folders
+        if folder.accessible
+        and not any(
+            other.path != folder.path and _roots_overlap(other.path, folder.path)
+            for other in root_folders
+        )
+    }
+    for item in series:
+        if item.series_type not in SUPPORTED_SERIES_TYPES:
+            continue
         try:
             series_root = normalize_posix(item.root_folder_path)
         except PathError:
-            problems.append(f"anime series {item.id} has an unusable root-folder path")
             continue
-        matches = [folder for folder in root_folders if is_within_root(series_root, folder.path)]
-        if not matches:
-            problems.append(
-                f"anime series {item.id} is outside every registered Sonarr root folder"
-            )
-            continue
-        most_specific_depth = max(len(path_parts(folder.path)) for folder in matches)
-        most_specific = tuple(
-            folder for folder in matches if len(path_parts(folder.path)) == most_specific_depth
-        )
-        if len(most_specific) != 1:
-            problems.append(f"anime series {item.id} matches ambiguous Sonarr root folders")
-            continue
-        folder = most_specific[0]
-        if not folder.accessible:
-            problems.append(f"anime root folder {folder.path} is not accessible")
-            continue
-        series_by_root.setdefault(folder.path, []).append(item.id)
-
-    if problems:
-        return _blocked(
-            "Cannot safely discover anime folders from Sonarr. Root folders must be accessible "
-            "and scope data must be unambiguous.",
-            problems,
-        )
-
+        # A series cannot establish registered-root identity or make an ambiguous
+        # root eligible. Unknown/unusable series remain excluded by inventory checks.
+        if series_root in series_by_root:
+            series_by_root[series_root].append(item.id)
     candidates = tuple(
         AnimeRootCandidate(path, tuple(sorted(ids))) for path, ids in sorted(series_by_root.items())
     )
@@ -396,12 +401,22 @@ def select_anime_roots(
             candidates,
             "Which Sonarr folder contains your anime?",
         )
-    return _blocked("No accessible registered Sonarr root contains the detected anime series.")
+    if root_folders or missing_selected:
+        return _blocked(
+            "A selected Sonarr root folder is no longer registered."
+            if missing_selected
+            else "No registered Sonarr root folder is accessible.",
+            read_status=(
+                ScopeReadStatus.COMPLETE if missing_selected else ScopeReadStatus.UNAVAILABLE
+            ),
+        )
+    return AnimeScopeDiscovery(ScopeStatus.NO_ANIME, (), "No registered Sonarr roots were found.")
 
 
-def discover_sonarr_scope(  # noqa: PLR0911 - ordered fail-closed API read validation
+def discover_sonarr_scope(
     endpoint: ApiEndpoint,
     *,
+    selected_roots: Sequence[str] = (),
     deadline: float | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> AnimeScopeDiscovery:
@@ -419,7 +434,7 @@ def discover_sonarr_scope(  # noqa: PLR0911 - ordered fail-closed API read valid
             read_status=ScopeReadStatus.INCOMPLETE,
         )
     series_result = parse_series_entries(raw_series)
-    if series_result.reasons:
+    if series_result.reasons and not selected_roots:
         return _blocked(
             "Sonarr returned incomplete series data; automatic scope discovery is paused.",
             series_result.details,
@@ -433,22 +448,13 @@ def discover_sonarr_scope(  # noqa: PLR0911 - ordered fail-closed API read valid
             read_status=root_read.status,
         )
     raw_roots = root_read.payload
-    root_folders = _parse_root_folders(raw_roots)
+    root_folders = _parse_root_folders(raw_roots, selected_roots)
     if root_folders is None:
         return _blocked(
             "Cannot safely read Sonarr root folders. Check the address, API key, and API version.",
             read_status=ScopeReadStatus.INCOMPLETE,
         )
-    discovery = select_anime_roots(series_result.series, root_folders)
-    if any(item.series_type is None for item in series_result.series):
-        return AnimeScopeDiscovery(
-            discovery.status,
-            discovery.candidates,
-            discovery.message,
-            discovery.details,
-            ScopeReadStatus.INCOMPLETE,
-        )
-    return discovery
+    return select_anime_roots(series_result.series, root_folders, selected_roots=selected_roots)
 
 
 def _eligible_shoko_file(file: ShokoFile) -> bool:

@@ -1,3 +1,246 @@
+## 2026-11-01T11:07:19.295174+00:00 — renewed passive-service final validation gate PASS (root acceptance pending)
+
+Current reviewed behavior: registered Sonarr root paths preserve confirmed scope independently of mutable series membership, including empty selected roots and unrelated changes. Saved scope/mappings/consent survive incomplete discovery and restart; only a current, owned transient setup-unavailable hold can auto-release after fresh complete checks. Normal processing uses fresh selected-source proof and durable consent/settings/revision checks without global inventory/count approval. Legacy collection forms redirect without mutation. Per-send immutable normal ownership and unique endpoint epochs fence unknown/foreign legacy requests and old canary/rate credit; advanced continuity/campaign gates remain independent. Per-file path, size, mappings, protected associations, uncertainty, budgets, canary, and write-stop checks remain tested. Three crash-injection test signatures now accept the proof argument; the forwarding wrapper retains it and all crash/recovery assertions.
+
+Fresh frozen gate at HEAD `23a14c2f030d907b2e151c0c7c0b65f06742982b` (dirty reviewed changes listed below): `uv sync --frozen --python 3.12`, `uv lock --check`, `uv pip check`, full cold `uv run mypy --no-incremental --cache-dir <fresh mypy-cold>` (127 files), full Ruff lint and format (132 formatted files), and `git diff --check` passed. Actual Git Bash ran EXACT `bash scripts/ci_checks.sh` once with JUnit through PYTEST_ADDOPTS and the temporary official Node path. full: 3855 passed, 1 skipped, 0 failures/errors (3856 tests, 609.317s); wheel: 3617 passed, 1 skipped, 0 failures/errors (3618 tests, 607.073s); docker: 3603 passed, 0 skipped, 0 failures/errors (3603 tests, 433.524s). Windows source/wheel each skip only owner-only POSIX permissions; Docker runs that test and explicitly deselects only 14 parametrized Node-dependent cases plus the one historical-git schema extraction case, all covered in host installed-wheel tests. No arbitrary source-suite deselection. 7,000-file unchanged 10-second performance assertion passed: full whole testcase 2.588s; wheel whole testcase 2.626s; docker whole testcase 2.823s.
+
+Fresh `uv build --out-dir <evidence>/dist` produced wheel and sdist. Both archives, isolated installed wheel, and fresh Docker installed package match all 42 reviewed package files / 41 Python files byte-for-byte; installed module imports resolve to site-packages. Isolated wheel runtime suite uses 76 explicitly listed runtime test files, no application source/PYTHONPATH escape, and explicit read-only GIT_DIR/GIT_WORK_TREE for the historical fixture. Docker used fresh `docker build --no-cache`; runtime tests/smokes use `--network none`, suite/installed smoke `--user 1000:1000`, no application source tree, and only source-free pytest/plugin paths. Schema 11 and integrity, installed console help, offline config validation, default-deny apply exit 3, configurable privilege dropping, persistent SQLite across identities, symlink isolation, and invalid-ID refusal all passed. Root bootstrap identity smoke intentionally starts root and proves the child identities 1000:1000, 99:100, 1234:1234.
+
+Tools: {"docker": "Docker version 29.7.2, build a7dcaa6", "docker_python": "Python 3.12.15", "mypy": "mypy 1.13.0 (compiled: yes)", "node": {"acorn": "8.18.0", "ada": "4.0.0", "amaro": "1.1.11", "ares": "1.34.9", "brotli": "1.2.0", "cldr": "48.0", "icu": "78.3", "llhttp": "9.4.3", "merve": "1.2.2", "modules": "137", "napi": "10", "nbytes": "0.1.4", "ncrypto": "0.0.1", "nghttp2": "1.70.0", "nghttp3": "", "ngtcp2": "", "node": "24.22.2", "openssl": "3.5.9", "simdjson": "4.6.11", "simdutf": "6.4.0", "sqlite": "3.53.4", "tz": "2026e", "undici": "7.30.1", "unicode": "17.0", "uv": "1.52.1", "uvwasi": "0.0.23", "v8": "13.6.233.17-node.63", "zlib": "1.3.2.1-motley-285e94b", "zstd": "1.5.7"}, "pytest": "pytest 8.4.2", "python": "Python 3.12.11", "ruff": "ruff 0.8.6", "uv": "uv 0.9.18 (0cee76417 2025-12-16)"}
+
+Artifacts SHA256: {"shoko_sonarr_linker-0.1.0-py3-none-any.whl": "dd3c6200c3c2f33610a38f086cbfc930f10a52982ea2645e696193d684199511", "shoko_sonarr_linker-0.1.0.tar.gz": "b6ab58888350b7ae90611e5021e71102d6f21a5f89e40d512e46028d82b80201"}. Docker image `sha256:8d6e775afe08174315e7321c6c7d0f7d7392c1dc498df3e901ed033035388abe`. Evidence: `C:\Users\METHEJ~1\AppData\Local\Temp\shoko-passive-final-renewed-21a9b6cd29904fc581e2498f5b1960cf` (`full-suite.xml`, `artifact-pytest.xml`, `docker-results/docker-pytest.xml`, static/build/smoke logs, `commands.jsonl`, `selected-tests.txt`, `docker-exclusions.json`, `final-summary.json`). Frozen input manifest: 161 files; SHA256 `4de8d6d75889f1a3f5dc97ef4659e94ea2314d5ea7ab1789db0ac1fdd00baaa7`; before/after manifests identical, including new untracked tests. Source/test/build/doc inputs unchanged throughout all checks. Atomic UTF-8 prefix below preserves all 702202 prior DEBUG bytes exactly (tail verification stored in evidence).
+
+Dirty paths at gate completion:
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service_setup.py
+ M src/shoko_linker/setup.py
+ M src/shoko_linker/sonarr.py
+ M src/shoko_linker/state.py
+ M tests/test_daemon.py
+ M tests/test_dashboard.py
+ M tests/test_dashboard_dates.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_e2e.py
+ M tests/test_f_campaign_e2e.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_service_queue_guidance.py
+ M tests/test_service_runtime.py
+ M tests/test_service_setup.py
+ M tests/test_setup.py
+ M tests/test_sonarr.py
+ M tests/test_source_review_collector.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+?? tests/test_normal_source_policy.py
+?? tests/test_scoped_sonarr_collector.py
+?? tests/test_setup_availability_recovery.py
+```
+
+Limits: all API behavior here uses offline mocks/fixtures; no live Sonarr/Shoko, media access, deployment, publication, remote push, or hosted Linux CI was performed. This is observed local Windows plus Linux Docker evidence. No production/test changes were made by this validator; only this authorized DEBUG prefix. No open gate failures. Next: root acceptance; only the root may perform the standing-authorized normal commit/push after acceptance. PLAN/STATUS/ORCHESTRATION were neither read nor edited by this validator.
+
+# Independent crash-fixture review checkpoint — 2026-11-01T10:36:55.060691+00:00
+
+CLEAN: no source/test changes requested. Explicitly authorized checkpoint-only write by read-only reviewer. Scope: latest fixture deltas in tests/test_daemon.py, tests/test_e2e.py, tests/test_f_campaign_e2e.py. Actual diff: 20 insertions, 5 deletions across these three files. Read AGENTS.md, PROJECT.md, actual diff, callers, crash/recovery assertions, and normal-proof boundary tests. EMPTY ignored.
+
+Prior full gate FAILED: orchestrator reports 3853 passed, 2 failed (stale mark_sent crash mocks rejecting normal_source_proof), 1 Windows/POSIX skip; 3856 collected, 613.794 seconds. This is NOT an acceptance PASS. Other prior evidence supplied by orchestrator: cold mypy 127 files, Ruff 132 files, frozen sync/lock/pip/diff passed; 7000-file performance 2.717s <10s. These historical checks were not rerun by this reviewer.
+
+All 12 lanes renewed for this TEST-ONLY delta, with triple checks for bugs, missing implementations, and security holes; no concrete new findings:
+- L1 configuration/paths: retain supplied final_passive_state_scope_sweep production evidence; no fresh deep audit.
+- L2 transport: retain supplied final_passive_runtime_metadata_sweep production evidence; examined adjacent mark-to-transport boundary for fixture contract only.
+- L3 mapping: retain supplied final_passive_state_scope_sweep production evidence; no fresh deep audit.
+- L4 linking/crash boundaries: directly reviewed all three optional typed proof signatures, unchanged before-mark crash timing, and unchanged e2e proof forwarding. No production guard omitted.
+- L5 state/reservations: directly reviewed durable prepared/attempted rows, reservation and restart/no-double-send assertions; unchanged.
+- L6 scope/consent: retain supplied final_passive_runtime_metadata_sweep production evidence; no fresh deep audit.
+- L7 service: directly checked real normal proof at prepare/mark/transport and owner-boundary regressions (7 focused passes); advanced crash cases correctly use None.
+- L8 advanced campaign: directly reviewed campaign crash helper and restart scenario, retaining reservation, progress and exactly-one-POST assertions (affected node passes).
+- L9 dashboard: retain supplied final_passive_dashboard_delivery_sweep and actual browser evidence; no fresh deep audit.
+- L10 CLI/types: retain supplied final_passive_dashboard_delivery_sweep; fresh cold type check of the three changed tests passes.
+- L11 packaging/container: retain supplied final_passive_dashboard_delivery_sweep; fresh wheel/Docker gate still required.
+- L12 CI: retain supplied final_passive_dashboard_delivery_sweep workflow evidence; fresh full cold CI-equivalent gate still required.
+
+Retained supplied prior evidence: state/scope sweep 57 focused passes; runtime/metadata sweep 29+27 focused passes; dashboard/delivery sweep 193 focused passes plus six-file mypy. Supplied actual browser runtime: restart retains consent/maps/roots; outage resumes and verifies; user pause preserved; empty root requires no collection approval; legacy global advanced hold remains intact; stale collection form 303 enqueues no jobs and changes no baseline; no collection acceptance UI. These are retained evidence, not browser actions by this reviewer. History dates/links unchanged by this delta.
+
+Repair choice: explicit typed fixture contract updates selected; helper reuse has no existing common helper; a new custom mock framework adds unnecessary machinery. The selected repair introduces no Any/cast/ignore/new skip and preserves the production proof parameter and all assertions. Pure crash stubs intentionally raise before mutation; the noncrashing wrapper passes the received proof unchanged, including a future non-None proof.
+
+Fresh reviewer commands/results (offline/mocked):
+- uv run --frozen --python 3.12 pytest -q tests/test_daemon.py::test_prepared_crash_row_voided_and_reprepared tests/test_e2e.py::test_crash_between_prepare_and_send_replans_once_without_double_post tests/test_f_campaign_e2e.py::test_f_campaign_restart_halfway_never_replays_pending_or_sent_rows — 3 passed, exit 0.
+- uv run --frozen --python 3.12 pytest -q tests/test_normal_source_policy.py::test_normal_file_proof_is_rechecked_inside_each_send_boundary tests/test_normal_source_policy.py::test_normal_send_tag_is_required_again_at_mark_and_transport — 7 passed, exit 0.
+- uv run --frozen --python 3.12 ruff check tests/test_daemon.py tests/test_e2e.py tests/test_f_campaign_e2e.py — all checks passed.
+- uv run --frozen --python 3.12 ruff format --check tests/test_daemon.py tests/test_e2e.py tests/test_f_campaign_e2e.py — 3 files already formatted.
+- uv run --frozen --python 3.12 mypy --no-incremental tests/test_daemon.py tests/test_e2e.py tests/test_f_campaign_e2e.py — no issues in 3 source files.
+- git diff --check — exit 0; existing CRLF normalization notices only.
+
+HEAD: 23a14c2f030d907b2e151c0c7c0b65f06742982b
+Dirty paths at review checkpoint:
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service_setup.py
+ M src/shoko_linker/setup.py
+ M src/shoko_linker/sonarr.py
+ M src/shoko_linker/state.py
+ M tests/test_daemon.py
+ M tests/test_dashboard.py
+ M tests/test_dashboard_dates.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_e2e.py
+ M tests/test_f_campaign_e2e.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_service_queue_guidance.py
+ M tests/test_service_runtime.py
+ M tests/test_service_setup.py
+ M tests/test_setup.py
+ M tests/test_sonarr.py
+ M tests/test_source_review_collector.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+?? tests/test_normal_source_policy.py
+?? tests/test_scoped_sonarr_collector.py
+?? tests/test_setup_availability_recovery.py
+
+Next: orchestrator must run fresh full COLD CI-equivalent/static checks and full pytest, then fresh wheel/Docker validation. Standing-authorized normal commit/push only after every required gate PASSES. No commit/push, live API/media operation, full validation, PLAN/STATUS/ORCHESTRATION access or edits by this reviewer. No claim of overall acceptance or completion.
+
+--- Previous bytes preserved below ---
+
+# Passive behavior final review checkpoint — 2026-11-01T10:16:46.848734+00:00
+
+- User-requested passive behavior A/B/C is implemented: registered Sonarr roots remain authoritative across ordinary inventory changes; saved consent and libraries survive outages/restarts with owned temporary-pause recovery; current locally bound normal-source proof permits ordinary source-count/content changes without repeated approval. Advanced source-continuity authorization remains separate.
+- All twelve final bounded review lanes are CLEAN: L1/L3/L4/L5 and L2/L6/L7/L8 evidence was supplied by the orchestrator; this reviewer completed L9 dashboard/settings, L10 CLI/report/secrets/typed consumers, L11 package/container interfaces, and L12 unchanged CI/workflow interfaces. No code changes or findings in this final review.
+- Orchestrator-provided actual browser evidence: actual normal runtime/setup/dashboard/SQLite with mocked HTTP retained saved consent over headless API outage/restart, resumed verified processing when ready, preserved explicit Pause and empty selected roots, and showed passive Linking controls with safe stale-form redirects. This is mocked upstream evidence, not live Sonarr/Shoko validation.
+- Current final-review checks: `uv run --frozen --python 3.12 pytest -q tests/test_dashboard_source_review.py tests/test_dashboard_poll_targets.py tests/test_dashboard_live_updates.py tests/test_dashboard_dates.py tests/test_dashboard_action_history.py tests/test_cli_m7.py tests/test_container_entrypoint.py tests/test_workflows.py` exited 0 (193 passed, no skips); six-file scoped `mypy --follow-imports=silent` exited 0; scoped `git diff --check` exited 0. No current full validation gate has run. Earlier baseline pass counts do not validate this dirty tree.
+- HEAD: `23a14c2f030d907b2e151c0c7c0b65f06742982b`. Preserve all existing user work. Ignore reserved EMPTY; do not edit PLAN/STATUS. Unknown legacy reservation ownership must remain preserved; no historical-anchor adoption or unowned-send budget/canary credit.
+- Next dedicated stage: FULL COLD mypy across ALL configured modules, exact bash CI with new Node 24.22/TZ2026e, full pytest, fresh wheel/sdist installed-artifact validation, and Docker build/smoke because production code changed. Standing-authorized normal commit/push only after every required current gate passes. No live upstream writes or production resume authorized by this checkpoint.
+
+Current dirty paths:
+```text
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service_setup.py
+ M src/shoko_linker/setup.py
+ M src/shoko_linker/sonarr.py
+ M src/shoko_linker/state.py
+ M tests/test_dashboard.py
+ M tests/test_dashboard_dates.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_service_queue_guidance.py
+ M tests/test_service_runtime.py
+ M tests/test_service_setup.py
+ M tests/test_setup.py
+ M tests/test_sonarr.py
+ M tests/test_source_review_collector.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+?? tests/test_normal_source_policy.py
+?? tests/test_scoped_sonarr_collector.py
+?? tests/test_setup_availability_recovery.py
+```
+
+---
+
+# Recovery checkpoint — C2 normal dashboard/runtime integration removed (2026-11-01T09:48:54.917250+00:00)
+
+Latest user request: selected library mappings and physical safety are confirmed once; normal processing and restart recovery are passive background work. Global count/content changes (observed 76 → 69 → 8124) must never produce repeated review tokens, checkboxes or acceptance forms. Saved good setup retries readiness automatically; actual scope/endpoint/settings/physical-safety changes retain existing confirmation and hard stops. Ignore list: EMPTY.
+
+Prior-stage evidence supplied by the orchestrator's scoped brief (not rerun here): A registered-root identity independent of series membership, empty selected roots and unrelated valid roots preserved; 378 focused tests and different-agent clean review. B current-owned setup_unavailable CAS recovery binds consent/settings/revision/nonce and keeps saved setup through retry; 87+53 focused tests and different-agent clean review. C1 normal-source proof requires fresh complete selected-source observations plus current scope-bound consent/settings/revision/deadline; existing per-file, preparation, mark-sent, transport, metadata, canary, budget and write-stop guards remain. Immutable endpoint epoch normal_source_ownership_v1 and per-send normal_send_owner_v1:<send_id> tags fence unknown old ownership and cross-endpoint recovery/rate credit; advanced sends acquire no normal ownership. C1 per-send P1 fixes and actual advanced reproduction have different-agent clean re-review; 22 targeted tests and paged HTTP 76→69→8124 normal sequence reported clean, selected roots and global advanced hold preserved.
+
+C2 implemented within this task: cli.py no longer constructs or schedules normal SourceReviewController/FreshSourceReviewCollector work before ordinary checks, exposes their callbacks, or uses accepted-baseline reassessment handoff state. Normal runtime retains fresh service_context production wiring and genuine onboarding/readiness/retry checks. Saved-consent startup now reports checking saved libraries, not first-use setup. dashboard.py no longer reads the review provider/audit for ordinary pages, renders source hold banners or collection assessment/acceptance panels, or ships acknowledgment/token/focus/submit JavaScript for retired forms. Linking controls show the automatic library update policy and the real next action. Authenticated stale assess/confirm POSTs validate same-origin/session/CSRF, rotate CSRF, enforce body/duplicate/unknown/legacy-value limits and return 303 /status#linking-controls without callbacks, jobs, acceptance, audit or advanced-baseline mutations. Optional constructor callback arguments remain compatibility-only. Advanced controller/state/collector primitives remain independently usable; no new advanced UI flag/page, schema churn, or backend policy edits.
+
+C2 changed paths: PROJECT.md; src/shoko_linker/cli.py; src/shoko_linker/dashboard.py; tests/test_dashboard_source_review.py; tests/test_dashboard_dates.py; tests/test_dashboard_file_reasons.py; tests/test_source_review_scheduling.py; tests/test_source_review_collector.py; tests/test_service_queue_guidance.py. Orchestrator additionally authorized tests/test_state.py matrix fixture compatibility fix: replace five generic boolean **dict expansions with explicit named boolean arguments after C1 added optional NormalSourceProof; all eligibility values/assertions preserved, no Any/cast/ignore. DEBUG_SESSION.md checkpoint only is prepended atomically with all prior bytes retained.
+
+C2 observed offline checks (all uv run --frozen --python 3.12):
+- pytest -o addopts='' -q tests/test_dashboard_source_review.py tests/test_source_review_scheduling.py tests/test_source_review_collector.py tests/test_dashboard_dates.py tests/test_dashboard_file_reasons.py tests/test_dashboard_live_updates.py tests/test_dashboard_poll_targets.py tests/test_dashboard_routes.py tests/test_dashboard.py tests/test_service_runtime.py tests/test_normal_source_policy.py tests/test_setup_availability_recovery.py: 255 passed, 1 skipped in 85.31s (POSIX mode-bit test skipped on Windows).
+- After saved-startup guidance correction: pytest -o addopts='' -q tests/test_source_review_scheduling.py tests/test_service_runtime.py: 39 passed in 10.96s. Actual worker test confirms two automatic links across restart with saved consent/global legacy count hold, grace respected, hold/consent unchanged, no normal review controller.
+- pytest -o addopts='' -q tests/test_source_review.py tests/test_dashboard_counts.py tests/test_dashboard_action_history.py tests/test_dashboard_resize.py tests/test_metadata_dashboard.py tests/test_metadata_scheduling.py tests/test_service_queue_guidance.py tests/test_state.py::test_can_auto_apply_matrix: 170 passed in 23.59s. Obsolete queue count-hold expectation replaced with independent advanced-hold-preserving ordinary retry test. Strict advanced review tests remain green.
+- ruff check and ruff format --check on the 9 affected Python source/test paths: PASS (9 files already formatted).
+- mypy --no-incremental on src/shoko_linker/cli.py src/shoko_linker/dashboard.py tests/test_dashboard_source_review.py tests/test_dashboard_dates.py tests/test_dashboard_file_reasons.py tests/test_source_review_scheduling.py tests/test_source_review_collector.py tests/test_state.py tests/test_service_queue_guidance.py: PASS, no issues in 9 source files. Earlier imported test_state typing failures were fixed as explicitly authorized.
+- git diff --check: PASS before checkpoint; final recheck follows checkpoint. No live API/media work, full suite, build, package, Docker validation, commit or push performed.
+
+C2 independent different-agent read-only review: PENDING; implementation is awaiting orchestrator acceptance. C3 positively outside-scope malformed Sonarr-row collector handling remains PENDING as a separate task and was not bundled. Future gates remain: fresh passive reboot/normal count-change browser fixture with no forms, final 12-lane sweep, full cold CI checks, fresh package and Docker smoke evidence. Standing authorized normal commit/push is only after all required PASS gates; this checkpoint makes no current full-gate or milestone-completion claim. Reserved PLANSTATUS untouched.
+
+Actual HEAD: 23a14c2f030d907b2e151c0c7c0b65f06742982b
+Actual dirty paths at checkpoint:
+ M DEBUG_SESSION.md
+ M PROJECT.md
+ M src/shoko_linker/cli.py
+ M src/shoko_linker/daemon.py
+ M src/shoko_linker/dashboard.py
+ M src/shoko_linker/onboarding.py
+ M src/shoko_linker/service_setup.py
+ M src/shoko_linker/setup.py
+ M src/shoko_linker/state.py
+ M tests/test_dashboard.py
+ M tests/test_dashboard_dates.py
+ M tests/test_dashboard_file_reasons.py
+ M tests/test_dashboard_source_review.py
+ M tests/test_metadata_executor.py
+ M tests/test_metadata_scheduling.py
+ M tests/test_service_queue_guidance.py
+ M tests/test_service_runtime.py
+ M tests/test_service_setup.py
+ M tests/test_setup.py
+ M tests/test_source_review_collector.py
+ M tests/test_source_review_scheduling.py
+ M tests/test_state.py
+?? tests/test_normal_source_policy.py
+?? tests/test_setup_availability_recovery.py
+
+--- Prior checkpoint bytes follow unchanged ---
+
+# 2026-11-01 checkpoint - passive normal service investigation (Stage C pending)
+
+Latest explicit user requirement: after selected libraries and path mappings are confirmed, NORMAL service runs passively. Routine counts and file/path/episode/hash/association/unrelated-folder changes must not require repeated review, acceptance, or whole-library two-pass confirmation. Keep automatic per-request safety checks. Advanced campaign/operator continuity remains separate. User observed 2 selected roots, 943 Sonarr series, 28,462 files, Shoko 8,124 unrecognized files/4 folders; old first-cause 76 -> 69 remained sticky. Actual cause of historical 76 versus 8,124 is unverified.
+
+Workspace inspected at HEAD 23a14c2f030d907b2e151c0c7c0b65f06742982b. Ignore list EMPTY. Existing dirty paths preserved: PROJECT.md; src/shoko_linker/{cli,dashboard,onboarding,service_setup,setup,state}.py; tests/{test_dashboard,test_service_setup,test_setup}.py; untracked tests/test_setup_availability_recovery.py. No implementation in this investigation. PLAN/STATUS/ORCHESTRATION were not read or edited. DEBUG prior bytes preserved by binary prepend.
+
+Prior Stage A/B evidence supplied by orchestrator (not rerun here): A root identity from registered root paths independent of mutable series membership, empty confirmed roots valid, removed registered selected root hard drift, incomplete/inaccessible scope waits; 378 focused tests and different-agent clean review. B owns only setup_unavailable automatic recovery via CAS of consent/settings/revision/reconfirmation/pause nonce, preserves user/other holds, saved-setup readiness hides approval wizard during temporary outage; 87 + 53 focused checks and different-agent clean review. Prior 3,750 full baseline is NOT validation of current dirty tree.
+
+Executed Stage C evidence, offline only:
+- uv run --frozen --python 3.12 python -m pytest -q tests/test_source_continuity_evidence.py tests/test_source_review.py -k "first_cause_survives_poll_and_restart or changed_full_content_requires_another_explicit_acceptance": 2 passed.
+- Temporary stdin Python probe, actual SQLite APIs, no repo files: 76 -> 69 -> 8124 shows advanced eligibility True -> False -> False, requires_rebaseline 0 -> 1 -> 1. Illustrative proposed service-proof composition remains eligible without clearing advanced flag; missing consent/current scope/completeness/candidate identity/source ownership or budget failure refuses. This is design feasibility evidence, NOT implementation verification.
+- Same stdin probe with httpx.MockTransport: missing title in positively outside /data/media/tv series poisons global Sonarr inventory; removing that outside row yields complete selected inventory and no TV child reads.
+- git diff --check passed (CRLF normalization warnings only). No full validation, live API, media, commit, or push.
+
+C backend map:
+daemon.py:809 derives source_stable from global requires_rebaseline; :4725 calls count continuity; :4747 transient departure hold; :4798 cycle eligibility requires continuity.ok. state.py:5127 independently adds source_discontinuity even when service caller supplies source_stable=True. Metadata daemon.py:3274 local guard and :3460 execution use same eligibility, so fixing cycle alone fails. cli.py:984 status globally nags. source_review.py:510 executes global checker, :528 prepares review; content change at :525 issues a different token; collector :250-335 insists complete fresh sweeps and :390+ binds all content. Runtime cli.py:942 instantiates normal controller, :1301 schedules worker before ordinary work, :1655 injects dashboard providers. dashboard.py:447/452 reads review/audit, :628 validates old forms, :652 enqueues them, :885/:941/:956 render normal hold/check boxes; JS has review-specific refresh/submit handling.
+
+Recommended minimal architecture:
+1. Keep advanced check_source_continuity/requires_rebaseline/anchors/review audit and explicit CLI primitives unchanged. NORMAL must not call record_source_observation, clear flag, or run SourceReviewController jobs. Count variations become scan diagnostics. Never generic skip_safety_checks or raw mode-string bypass.
+2. Existing RunPolicy.SERVICE is reserved and excluded from advanced CLI choices, but enum alone is not authorization. Conjoin deps.service_mode + SERVICE policy + trusted controller-owned current OnboardingContext, matching durable consent/settings/revision and complete selected scope/import-folder evidence. Semantic can_service_apply/prepare_service_send or equivalent private typed proof can reuse common durable state/budget code while advanced eligibility still enforces its source flag.
+3. Existing per-candidate guards remain mandatory: fresh Sonarr series/file/complete episode set, root/path/size, ED2K, mapping generation/immutable destinations, Shoko target identity/jobs/protected associations, every location/folder policy, current consent remote and post-I/O local, apply ownership, write-stop, replay, uncertainty, budgets and canary. Incomplete inventory cannot be labelled complete or grant selected candidate proof.
+4. Guard legacy adoption. Actual unchanged-source count-only hold should auto-recover after fresh complete proof bound to existing consent; preserve global advanced hold and all other pauses. Do not clear a system/user hold by its text. Current supported onboarding reasons are setup_changed/setup_unavailable/unsafe_shoko_settings, not a dedicated source reason: only B-owned temporary availability pause is auto-clearable. Proven root/endpoint/ownership changes use existing ONE setup confirmation, never a second source-content confirmation.
+5. Safety gap requiring bounded source guard: files/sends and plan fingerprint have no immutable endpoint identity. Recovery uses stored ED2K+size+target triples against current endpoint before continuity, so accepting new endpoint consent then ignoring global hold can misattribute historical requests. Add minimal NORMAL durable source/scope ownership guard in existing meta, not general per-request provenance schema. Fresh current unsent plans can be adopted only with complete current proof. Historical attempted/uncertain rows with unavailable original source must remain isolated/held, never inspected as current or released. A source-transition send-id cutoff can fence old unknown requests while new requests remain recoverable; no historical identity may be fabricated from today's mutable advanced anchor. Scope-only change remains governed by existing consent and fresh per-file root checks. Retain old canary/uncertainty holds; do not reset them to make progress.
+
+Three options: (BEST) separate semantic normal eligibility backed by existing context + small durable source guard; (smaller but fragile) add policy-aware composition inside current eligibility while still requiring trusted context and ownership, never raw bool alone; (larger, unnecessary) new parallel continuity anchor/rebaseline state machine. Prefer first; do not copy advanced count mechanics into normal.
+
+Bounded next briefs:
+C1 backend policy + legacy/source guards + PROJECT source-continuity policy update. Focus daemon/state/onboarding/service setup as needed and CLI runtime status. Tests must prove normal 76->69->8124 and ordinary content mutation remain automatic, advanced count-drop remains blocked, existing legacy advanced flag survives, unknown identity/attempted sends cannot be adopted, changed source/root prompts existing setup once, user/write-stop/canary/budget/uncertainty unchanged, restart saved paths no nag.
+C2 retire ordinary source-review UI/runtime scheduling; preserve explicit advanced primitives/audit where actual consumers remain. Stale authenticated+CSRF-valid old POST returns plain routine-changes-automatic guidance without enqueue, acceptance, flag mutation, or external reads. GET/status stays local. Keep stable persisted Pause/Resume controls. Choose focused deletion after call-site inventory; avoid broad dead-code cleanup.
+C3 scoped collector correction demonstrated above: ignore malformed rows only when positively outside selected registered roots, while preserving duplicate-ID collision protection and fail-closed unknown/selected paths. Do not weaken advanced unknown-scope handling or treat incomplete pagination as complete.
+
+Then distinct read-only review of each implementation, focused checks, browser validation, final 12-pass sweep and full fresh checks/packaging/Docker per orchestrator. Standing authorized local commit/normal push only after all gates pass. No acceptance/milestone decision was made by this read-only investigator.
+
+---
+
 # Final DST cross-runtime gate — PASS (2026-11-01T02:35:28.473177+00:00)
 
 - HEAD `8f016279d1efa52779647d123c50356db3a79153` on `main`; only `tests/test_dashboard_dates.py` was dirty before this evidence entry. The change uses historical Edmonton 2025 repeat/skip-hour fixtures; production formatter and all thresholds/assertions are unchanged. Separate implementation review was supplied by the orchestrator; this gate independently executed the checks below.

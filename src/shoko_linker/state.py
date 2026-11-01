@@ -209,6 +209,8 @@ META_SERVICE_SETTINGS: Final[str] = "normal_service_settings_v1"
 SERVICE_AUTHORIZATION_REVISION_CHARS: Final[int] = 32
 META_SERVICE_DRAFT_ROOTS: Final[str] = "normal_service_draft_roots_v1"
 META_SERVICE_AUTHORIZATION_REVISION: Final[str] = "normal_service_authorization_revision_v1"
+META_NORMAL_SOURCE_OWNERSHIP: Final[str] = "normal_source_ownership_v1"
+
 SYSTEM_PAUSE_REASONS: Final[frozenset[str]] = frozenset(
     {"setup_changed", "setup_unavailable", "unsafe_shoko_settings"}
 )
@@ -2969,6 +2971,24 @@ def _row_to_file_record(row: Any) -> FileRecord:
 # ------------------------------------------------------------------- store
 
 
+@dataclass(frozen=True)
+class NormalSourceProof:
+    """One complete worker observation, bound to fresh controller facts and local consent.
+
+    Inventory contents/counts are deliberately not approval identities. This proof lasts only
+    through the existing operation deadline; durable authorization is rechecked at every use.
+    """
+
+    consent_json: str
+    authorization_revision: str | None
+    settings_json: str | None
+    binding_digest: str
+    source_identity: str
+    ownership_json: str
+    deadline: float
+    clock: Callable[[], float] = field(repr=False, compare=False)
+
+
 class StateStore:
     """Durable state machine over one SQLite file. No network, no in-memory truths."""
 
@@ -4009,8 +4029,136 @@ class StateStore:
                 f"persisted service mapping drift contains invalid values: {exc}"
             ) from None
 
+    def _require_normal_source_proof(self, proof: NormalSourceProof | None) -> None:
+        if proof is not None and not self.normal_source_proof_current(proof):
+            raise StateError("normal source authorization changed before transport")
+
+    def normal_source_proof_current(self, proof: NormalSourceProof) -> bool:
+        """Check local proof binding, never remote facts, without changing advanced holds."""
+        if (
+            not proof.clock() < proof.deadline
+            or self.get_onboarding_json() != proof.consent_json
+            or self.get_service_authorization_revision() != proof.authorization_revision
+            or self.get_meta(META_SERVICE_SETTINGS) != proof.settings_json
+            or self.get_meta(META_NORMAL_SOURCE_OWNERSHIP) != proof.ownership_json
+            or self.get_service_pause()[0]
+            or self.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None
+        ):
+            return False
+        document = json.loads(proof.consent_json)
+        ownership = json.loads(proof.ownership_json)
+        return (
+            document.get("automatic_link_consent") is True
+            and document.get("binding_digest") == proof.binding_digest
+            and ownership.get("source_identity") == proof.source_identity
+        )
+
+    @_mutation
+    def establish_normal_source_ownership(
+        self,
+        source_identity: str,
+        *,
+        expected_consent: str,
+        expected_authorization_revision: str | None,
+        expected_settings: str | None,
+    ) -> str | None:
+        """Bind future sends to the confirmed endpoint pair before any recovery reads.
+
+        Pre-marker sends have no immutable endpoint identity. Fence all of them, even
+        after advanced continuity acceptance: mutable anchors/audits cannot prove where
+        an old request was attempted. Retain their outcomes and reservations. Definitely
+        unsent rows may still be voided and freshly planned by ordinary recovery. Scope/counts
+        never change an established endpoint epoch. The caller validates fresh controller facts.
+        """
+        with self._transaction():
+            if (
+                self.get_onboarding_json() != expected_consent
+                or self.get_service_authorization_revision() != expected_authorization_revision
+                or self.get_meta(META_SERVICE_SETTINGS) != expected_settings
+                or self.get_service_pause()[0]
+                or self.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None
+            ):
+                return None
+            document = json.loads(expected_consent)
+            binding = document.get("binding", {})
+            if (
+                document.get("automatic_link_consent") is not True
+                or source_identity
+                != f"sonarr={binding.get('sonarr_url')};shoko={binding.get('shoko_url')}"
+            ):
+                return None
+            previous = self.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+            if previous is not None:
+                current = json.loads(previous)
+                if current.get("source_identity") == source_identity:
+                    return previous
+            maximum = int(
+                self._conn.execute("SELECT COALESCE(MAX(send_id),0) FROM sends").fetchone()[0]
+            )
+            floor = maximum
+            if previous is not None:
+                # Preserve epoch/canary evidence rather than assigning old credit to a new server.
+                archive_key = (
+                    META_NORMAL_SOURCE_OWNERSHIP
+                    + ":history:"
+                    + hashlib.sha256(previous.encode()).hexdigest()
+                )
+                self._set_meta_tx(archive_key, previous)
+            encoded = json.dumps(
+                {
+                    "source_identity": source_identity,
+                    "send_floor": floor,
+                    "epoch": uuid.uuid4().hex,
+                },
+                sort_keys=True,
+            )
+            self._set_meta_tx(META_NORMAL_SOURCE_OWNERSHIP, encoded)
+            return encoded
+
+    def _normal_send_id_owned(self, send_id: int, ownership_json: str) -> bool:
+        """Only an immutable prepare-time tag proves ownership; an ID range never does."""
+        marker = json.loads(ownership_json)
+        return (
+            send_id > marker["send_floor"]
+            and self.get_meta(f"normal_send_owner_v1:{send_id}")
+            == hashlib.sha256(ownership_json.encode()).hexdigest()
+        )
+
+    def _require_normal_send_owner(self, send_id: int, proof: NormalSourceProof | None) -> None:
+        retained_owner = self.get_meta(f"normal_send_owner_v1:{send_id}")
+        if retained_owner is None and proof is None:
+            return  # Advanced/legacy sends have no normal ownership claim.
+        if proof is None or not self._normal_send_id_owned(send_id, proof.ownership_json):
+            raise StateError("normal send endpoint ownership is missing or changed")
+
+    def normal_source_send_tagged(self, file_id: int) -> bool:
+        """An explicit normal tag also fences its recovery from advanced callers."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='normal_send_owner_v1:' || "
+            "(SELECT send_id FROM sends WHERE shoko_file_id=? ORDER BY send_id DESC LIMIT 1)",
+            (file_id,),
+        ).fetchone()
+        return row is not None
+
+    def normal_source_send_owned(self, file_id: int) -> bool:
+        """Unknown/advanced/previous-epoch attempts cannot be inspected at this server."""
+        encoded = self.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+        if encoded is None:
+            return False
+        row = self._conn.execute(
+            "SELECT send_id FROM sends WHERE shoko_file_id=? ORDER BY send_id DESC LIMIT 1",
+            (file_id,),
+        ).fetchone()
+        return row is not None and self._normal_send_id_owned(int(row[0]), encoded)
+
     def get_service_canary(self) -> tuple[int, str] | None:
         """Return the durable first-send canary identity and its monotonic status."""
+        ownership = self.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+        raw_anchor = self.get_meta(META_SERVICE_CANARY_SEND_ID)
+        if ownership is not None and (
+            raw_anchor is None or not self._normal_send_id_owned(int(raw_anchor), ownership)
+        ):
+            return None
         raw_file_id = self.get_meta(META_SERVICE_CANARY_FILE_ID)
         raw_status = self.get_meta(META_SERVICE_CANARY_STATUS)
         if raw_file_id is None and raw_status is None:
@@ -4023,6 +4171,8 @@ class StateStore:
             raise StateError("service canary file id is invalid") from None
         if file_id < 1:
             raise StateError("service canary file id is invalid")
+        if ownership is not None and not self.normal_source_send_owned(file_id):
+            return None
         updated_iso = self.get_meta(META_SERVICE_CANARY_UPDATED_ISO)
         if updated_iso is None:
             raise StateError("service canary timestamp is missing")
@@ -4046,6 +4196,27 @@ class StateStore:
             raise StateError("service canary send id must be a positive integer")
         _require_iso(iso, "service_canary.updated_iso")
         with self._transaction():
+            ownership = self.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+            if ownership is not None and (
+                send_id is None or not self._normal_send_id_owned(send_id, ownership)
+            ):
+                raise StateError("service canary requires a current normal-owned send")
+            if self.get_service_canary() is None:
+                old = {
+                    key: self.get_meta(key)
+                    for key in (
+                        META_SERVICE_CANARY_FILE_ID,
+                        META_SERVICE_CANARY_SEND_ID,
+                        META_SERVICE_CANARY_STATUS,
+                        META_SERVICE_CANARY_UPDATED_ISO,
+                    )
+                }
+                if old[META_SERVICE_CANARY_FILE_ID] is not None:
+                    self._set_meta_tx(
+                        "normal_source_canary_history:" + str(send_id), json.dumps(old)
+                    )
+                    for key in old:
+                        self._conn.execute("DELETE FROM meta WHERE key=?", (key,))
             existing = self._conn.execute(
                 "SELECT value FROM meta WHERE key = ?", (META_SERVICE_CANARY_FILE_ID,)
             ).fetchone()
@@ -4088,11 +4259,16 @@ class StateStore:
         if send_id < 1 or str(send_id) != raw_send_id:
             raise StateError("service canary send id is invalid")
         rows = self._conn.execute(
-            "SELECT outcome FROM sends WHERE shoko_file_id = ? AND send_id >= ?"
+            "SELECT send_id, outcome FROM sends WHERE shoko_file_id = ? AND send_id >= ?"
             " AND attempted_iso IS NOT NULL ORDER BY send_id",
             (canary[0], send_id),
         ).fetchall()
-        return tuple(_as_str(row[0], "send.outcome") for row in rows)
+        ownership = self.get_meta(META_NORMAL_SOURCE_OWNERSHIP)
+        return tuple(
+            _as_str(row[1], "send.outcome")
+            for row in rows
+            if ownership is None or self._normal_send_id_owned(int(row[0]), ownership)
+        )
 
     @_mutation
     def set_service_canary_status(self, status: Literal["verified", "failed"], iso: str) -> None:
@@ -4101,6 +4277,11 @@ class StateStore:
             raise StateError("service canary status must be verified or failed")
         _require_iso(iso, "service_canary.updated_iso")
         with self._transaction():
+            if (
+                self.get_meta(META_NORMAL_SOURCE_OWNERSHIP) is not None
+                and self.get_service_canary() is None
+            ):
+                raise StateError("service canary endpoint ownership is missing or changed")
             current = self._conn.execute(
                 "SELECT value FROM meta WHERE key = ?", (META_SERVICE_CANARY_STATUS,)
             ).fetchone()
@@ -4271,10 +4452,13 @@ class StateStore:
             self._set_meta_tx(META_ONBOARDING_RECONFIRMATION_REQUIRED, "1")
         if (
             (paused and existing_reason == "user_paused")
+            or (reason == "setup_unavailable" and paused and existing_reason != reason)
             or (not hard_hold and existing_hard_hold)
             or (paused and existing_reason == "unsafe_shoko_settings")
         ):
             return
+        if reason == "setup_unavailable":
+            self._set_meta_tx("setup_availability_pause_owner_v1", uuid.uuid4().hex)
         self._conn.execute(
             "INSERT INTO onboarding (singleton, document_json, paused, pause_reason, updated_iso)"
             " VALUES (1, NULL, 1, ?, ?) ON CONFLICT (singleton) DO UPDATE SET"
@@ -4295,6 +4479,49 @@ class StateStore:
             if paused and reason in SYSTEM_RECONFIRMATION_PAUSE_REASONS:
                 self._set_meta_tx(META_ONBOARDING_RECONFIRMATION_REQUIRED, "1")
             self._set_service_pause_tx(True, "user_paused", iso)
+
+    def temporary_setup_pause_token(self) -> str | None:
+        """Identify the currently owned availability pause without changing it."""
+        row = self._conn.execute(
+            "SELECT updated_iso FROM onboarding WHERE singleton = 1"
+            " AND paused = 1 AND pause_reason = 'setup_unavailable'"
+        ).fetchone()
+        if row is None:
+            return None
+        token = self.get_meta("setup_availability_pause_owner_v1")
+        if token is not None:
+            if len(token) != SERVICE_AUTHORIZATION_REVISION_CHARS or any(
+                char not in "0123456789abcdef" for char in token
+            ):
+                raise StateError("setup availability pause owner is malformed")
+            return token
+        legacy_token = _as_str(row[0], "onboarding.updated_iso")
+        _require_iso(legacy_token, "onboarding.updated_iso")
+        return legacy_token
+
+    @_mutation
+    def clear_temporary_setup_pause_if_current(
+        self,
+        expected_document_json: str,
+        *,
+        expected_authorization_revision: str | None,
+        expected_settings_json: str | None,
+        expected_pause_token: str,
+        iso: str,
+    ) -> bool:
+        """Release only the availability hold whose fresh checks have just passed."""
+        _require_iso(iso, "onboarding.updated_iso")
+        with self._transaction():
+            if (
+                self.get_onboarding_json() != expected_document_json
+                or self.get_service_authorization_revision() != expected_authorization_revision
+                or self.get_meta(META_SERVICE_SETTINGS) != expected_settings_json
+                or self.get_meta(META_ONBOARDING_RECONFIRMATION_REQUIRED) is not None
+                or self.temporary_setup_pause_token() != expected_pause_token
+            ):
+                return False
+            self._set_service_pause_tx(False, "", iso)
+        return True
 
     @_mutation
     def resume_onboarding_if_current(self, expected_document_json: str, iso: str) -> bool:
@@ -4336,6 +4563,8 @@ class StateStore:
             raise StateError("onboarding.pause_reason: a resumed service must clear the reason")
         _require_iso(iso, "onboarding.updated_iso")
         with self._transaction():
+            if paused and reason == "setup_unavailable":
+                self._set_meta_tx("setup_availability_pause_owner_v1", uuid.uuid4().hex)
             self._set_service_pause_tx(paused, reason, iso)
 
     def _set_service_pause_tx(self, paused: bool, reason: str, iso: str) -> None:
@@ -5020,6 +5249,7 @@ class StateStore:
         service_mode: bool = False,
         service_authorized: bool | None = None,
         service_backlog: bool = False,
+        normal_source_proof: NormalSourceProof | None = None,
     ) -> EligibilityVerdict:
         """Pure composition of durable facts + caller-supplied external facts.
 
@@ -5029,9 +5259,19 @@ class StateStore:
         onboarding authorization instead. Backlog/campaign files never use this auto-apply path.
         """
         _require_iso(now, "now")
-        reasons = self._eligibility_reasons(
-            shoko_file_id, now, allow_backlog=service_mode and service_backlog
+        normal_current = (
+            service_mode
+            and normal_source_proof is not None
+            and self.normal_source_proof_current(normal_source_proof)
         )
+        reasons = self._eligibility_reasons(
+            shoko_file_id,
+            now,
+            allow_backlog=service_mode and service_backlog,
+            normal_current=normal_current,
+        )
+        if normal_source_proof is not None and not normal_current:
+            reasons.append("normal_source_proof_stale")
         authorization_gates = (
             ((service_authorized is True, "onboarding_not_authorized"),)
             if service_mode
@@ -5050,12 +5290,19 @@ class StateStore:
         return EligibilityVerdict(not reasons, tuple(reasons))
 
     def _eligibility_reasons(
-        self, shoko_file_id: int, now: str, *, allow_backlog: bool = False
+        self,
+        shoko_file_id: int,
+        now: str,
+        *,
+        allow_backlog: bool = False,
+        normal_current: bool = False,
     ) -> list[str]:
         """Durable-side refusals: baseline state, cohort membership, discontinuity."""
         reasons: list[str] = []
         baseline = self.latest_baseline()
-        if baseline is None:
+        if normal_current:
+            pass  # Complete current selected-source proof is independent of advanced baselines.
+        elif baseline is None:
             reasons.append("no_baseline")
         else:
             if not baseline.complete:
@@ -5076,7 +5323,7 @@ class StateStore:
                 else "campaign_requires_approval"
             )
             reasons.append(label)
-        if self.get_meta(META_REQUIRES_REBASELINE) == "1":
+        if not normal_current and self.get_meta(META_REQUIRES_REBASELINE) == "1":
             reasons.append("source_discontinuity")
         return reasons
 
@@ -5567,6 +5814,7 @@ class StateStore:
         campaign_id: str | None = None,
         expected_episode_jobs: int = 1,
         target_ids: Sequence[tuple[int, int, int]] = (),
+        normal_source_proof: NormalSourceProof | None = None,
     ) -> SendToken | BudgetRefusal:
         """Commit ``prepared_not_sent`` **and** the budget slot in ONE transaction.
 
@@ -5583,6 +5831,8 @@ class StateStore:
         Only a ``voided`` prepared send (definitely not sent) stops blocking its replacement
         (P2-2); sent rows are never resubmitted (no transition edge).
         """
+        if normal_source_proof is not None and campaign_id is not None:
+            raise StateError("normal source proof cannot authorize a campaign send")
         _require_iso(iso, "iso")
         _require_hex64(plan_fingerprint, "plan_fingerprint")
         _require_hex64(request_fingerprint, "request_fingerprint")
@@ -5592,6 +5842,7 @@ class StateStore:
         if jobs < 0:
             raise StateError("expected_episode_jobs must be non-negative")
         with self._transaction():
+            self._require_normal_source_proof(normal_source_proof)
             # Quarantine and replay protection precede any slot reservation:
             # an active send with the same request
             # fingerprint (prepared/attempted/accepted-unverified) never reserves a
@@ -5688,6 +5939,14 @@ class StateStore:
                 ),
             )
             send_id = _as_int(cursor.lastrowid, "send_id")
+            if normal_source_proof is not None:
+                self._conn.execute(
+                    "INSERT INTO meta (key,value) VALUES (?,?)",
+                    (
+                        f"normal_send_owner_v1:{send_id}",
+                        hashlib.sha256(normal_source_proof.ownership_json.encode()).hexdigest(),
+                    ),
+                )
             base_cohort = Cohort(_as_str(row[1], "cohort"))
             cohort = Cohort.CAMPAIGN if campaign_id is not None else base_cohort
             self._conn.execute(
@@ -5720,7 +5979,9 @@ class StateStore:
         )
 
     @_mutation
-    def mark_sent(self, token: SendToken, *, iso: str) -> None:
+    def mark_sent(
+        self, token: SendToken, *, iso: str, normal_source_proof: NormalSourceProof | None = None
+    ) -> None:
         """Durably advance to ``request_may_have_been_sent`` **before** the caller sends.
 
         The row is committed by the time this returns; M6-b calls it immediately
@@ -5733,6 +5994,8 @@ class StateStore:
         _require_iso(iso, "iso")
         limit_reached: tuple[str, int, int] | None = None
         with self._transaction():
+            self._require_normal_source_proof(normal_source_proof)
+            self._require_normal_send_owner(token.send_id, normal_source_proof)
             row = self._conn.execute(
                 "SELECT state FROM files WHERE shoko_file_id = ?", (token.shoko_file_id,)
             ).fetchone()
@@ -5778,7 +6041,9 @@ class StateStore:
             )
 
     @contextlib.contextmanager
-    def protect_transport(self, token: SendToken) -> Iterator[None]:
+    def protect_transport(
+        self, token: SendToken, *, normal_source_proof: NormalSourceProof | None = None
+    ) -> Iterator[None]:
         """Fence transport admission against a concurrent durable write stop.
 
         ``mark_sent`` remains committed before transport. This fresh, write-serialized check
@@ -5789,6 +6054,8 @@ class StateStore:
         """
         try:
             with self._transaction():
+                self._require_normal_source_proof(normal_source_proof)
+                self._require_normal_send_owner(token.send_id, normal_source_proof)
                 row = self._conn.execute(
                     "SELECT outcome FROM sends WHERE send_id = ? AND shoko_file_id = ?",
                     (token.send_id, token.shoko_file_id),
@@ -6608,6 +6875,7 @@ class StateStore:
         cycle_key: str,
         iso: str,
         expected_document_json: str | None = None,
+        normal_source_proof: NormalSourceProof | None = None,
         retry_unsent_claim: str | None = None,
         adopt_external_claim: str | None = None,
         after_ready_claim: str | None = None,
@@ -6636,6 +6904,7 @@ class StateStore:
             required_targets, missing_targets, anidb_anime_id
         )
         with self._transaction():
+            self._require_normal_source_proof(normal_source_proof)
             self._metadata_consent_tx(expected_document_json)
             prior = self.get_metadata_operation(source_key, anidb_anime_id)
             ready_rearm = self._metadata_ready_rearm_tx(prior, after_ready_claim, missing)
@@ -6714,6 +6983,7 @@ class StateStore:
         iso: str,
         verification_deadline_iso: str,
         expected_document_json: str | None = None,
+        normal_source_proof: NormalSourceProof | None = None,
     ) -> MetadataOperation:
         """Commit before HTTP. A crash after this boundary must only inspect/verify."""
         _require_iso(iso, "iso")
@@ -6721,6 +6991,7 @@ class StateStore:
         if _parse_iso(verification_deadline_iso) <= _parse_iso(iso):
             raise StateError("metadata verification deadline must follow attempt")
         with self._transaction():
+            self._require_normal_source_proof(normal_source_proof)
             self._metadata_consent_tx(expected_document_json)
             current = self._metadata_owner_tx(operation)
             if current.state != MetadataOperationState.PREPARED:
@@ -6744,7 +7015,11 @@ class StateStore:
 
     @_mutation
     def admit_metadata_transport(
-        self, operation: MetadataOperation, *, expected_document_json: str | None = None
+        self,
+        operation: MetadataOperation,
+        *,
+        expected_document_json: str | None = None,
+        normal_source_proof: NormalSourceProof | None = None,
     ) -> None:
         """One-shot transport fence after durable mark; no external I/O in transaction.
 
@@ -6755,6 +7030,7 @@ class StateStore:
         if operation.claim not in self._metadata_transport_claims:
             raise StateError("metadata transport requires this handle's successful durable mark")
         with self._transaction():
+            self._require_normal_source_proof(normal_source_proof)
             self._metadata_consent_tx(expected_document_json)
             current = self._metadata_owner_tx(operation)
             if (
@@ -7349,6 +7625,7 @@ class StateStore:
         iso: str,
         *,
         clear_flag: bool,
+        normal_source_proof: NormalSourceProof | None = None,
     ) -> None:
         """Persist the observation as the new continuity anchor (re-anchoring on every
         evaluated cycle; growth/monotonic changes re-anchor, P1-1).
@@ -7357,6 +7634,9 @@ class StateStore:
         links at anchor time, so the next cycle's expected drops are the links landed *after* this
         anchor — not the cumulative links the anchored total already nets out.
         """
+        if normal_source_proof is not None:
+            self._require_normal_source_proof(normal_source_proof)
+            return  # Normal observations never advance advanced approval anchors.
         self._set_meta_tx(META_SOURCE_INSTANCE, observation.instance_identity)
         self._set_meta_tx(META_SONARR_STATUS_SNAPSHOT_ID, observation.snapshot_summary_id)
         self._set_meta_tx(META_SOURCE_LAST_OBSERVED_ISO, iso)
@@ -7424,6 +7704,7 @@ class StateStore:
         complete: bool = True,
         tolerance: int = 0,
         discovered_file_ids: frozenset[int] | None = None,
+        normal_source_proof: NormalSourceProof | None = None,
     ) -> ContinuityVerdict:
         """Structured continuity check — ordinary inventory growth is NORMAL (P1-1).
 
@@ -7470,6 +7751,7 @@ class StateStore:
             discovery_total=discovery_total,
         )
         with self._transaction():
+            self._require_normal_source_proof(normal_source_proof)
             latched = self.get_meta(META_REQUIRES_REBASELINE) == "1"
             self._ensure_legacy_continuity_hold_tx(latched)
             if not complete:
@@ -7479,7 +7761,12 @@ class StateStore:
             self._record_continuity_latest_tx(observation, iso)
             known = self.get_meta(META_SOURCE_INSTANCE)
             if known is None:
-                self._anchor_source_tx(observation, iso, clear_flag=not latched)
+                self._anchor_source_tx(
+                    observation,
+                    iso,
+                    clear_flag=not latched,
+                    normal_source_proof=normal_source_proof,
+                )
                 return ContinuityVerdict(not latched, ("first_observation",), latched)
             reasons: list[str] = []
             if known != current_identity:
@@ -7534,7 +7821,9 @@ class StateStore:
                 self._set_meta_tx(META_SOURCE_CONTINUITY_HOLD, json.dumps(asdict(hold)))
             # Re-anchor every evaluated cycle: the anchor tracks the source forward, so
             # growth never accumulates as a permanent discontinuity.
-            self._anchor_source_tx(observation, iso, clear_flag=not requires)
+            self._anchor_source_tx(
+                observation, iso, clear_flag=not requires, normal_source_proof=normal_source_proof
+            )
             if requires:
                 self._set_meta_tx(META_REQUIRES_REBASELINE, "1")
         return ContinuityVerdict(not requires, tuple(reasons), requires)

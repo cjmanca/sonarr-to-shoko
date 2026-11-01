@@ -13,7 +13,7 @@ import pytest
 import test_dashboard as dashboard
 from test_dashboard_action_history import action
 from test_dashboard_routes import login, request_headers
-from test_dashboard_source_review import fixture, get, post
+from test_dashboard_source_review import fixture, get
 
 from shoko_linker.action_history import ActionHistoryPage
 from shoko_linker.dashboard import (
@@ -111,22 +111,12 @@ def test_authenticated_overview_and_history_use_shared_times(tmp_path: Path) -> 
     assert "<waiting>" not in panel
 
 
-def test_recovery_uses_compact_times_with_injected_request_clock(tmp_path: Path) -> None:
-    app, cookie, _, controller, clock, _ = fixture(tmp_path)
-    response, cookie = post(app, cookie, "/source-review/assess")
-    assert response.status == 303
-    controller.worker_tick(clock.mono + 60)
-    markup = get(app, cookie).split('id="source-review"', 1)[1].split("</section>", 1)[0]
-    for label in (
-        "First hold:",
-        "previous observation:",
-        "Latest complete observation:",
-        "Fresh collection started:",
-        "completed:",
-    ):
-        assert label in markup
-    assert markup.count("data-compact-time") == 5
-    assert "+00:00" not in "".join(Text(markup).parts)
+def test_historical_collection_hold_does_not_add_primary_recovery_dates(tmp_path: Path) -> None:
+    app, cookie, _, _, _, _ = fixture(tmp_path)
+    markup = get(app, cookie).split('id="linking-controls"', 1)[1].split("</section>", 1)[0]
+    assert "First hold:" not in markup
+    assert "accepted" not in markup
+    assert "data-compact-time" not in markup
 
 
 def test_production_browser_formatter_local_dates_dst_and_poll_transitions() -> None:

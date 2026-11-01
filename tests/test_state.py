@@ -2733,7 +2733,15 @@ def test_can_auto_apply_matrix(tmp_path: Path) -> None:
             iso=T0,
         )
 
-        verdict = store.can_auto_apply(101, now=T1, **all_open)
+        verdict = store.can_auto_apply(
+            101,
+            now=T1,
+            attestation_valid=all_open["attestation_valid"],
+            gate_open=all_open["gate_open"],
+            budgets_ok=all_open["budgets_ok"],
+            mapping_stable=all_open["mapping_stable"],
+            source_stable=all_open["source_stable"],
+        )
         assert verdict.eligible is True
         assert verdict.reasons == ()
 
@@ -2747,18 +2755,56 @@ def test_can_auto_apply_matrix(tmp_path: Path) -> None:
         for label, overrides in refusals.items():
             kwargs = dict(all_open)
             kwargs.update(overrides)
-            verdict = store.can_auto_apply(101, now=T1, **kwargs)
+            verdict = store.can_auto_apply(
+                101,
+                now=T1,
+                attestation_valid=kwargs["attestation_valid"],
+                gate_open=kwargs["gate_open"],
+                budgets_ok=kwargs["budgets_ok"],
+                mapping_stable=kwargs["mapping_stable"],
+                source_stable=kwargs["source_stable"],
+            )
             assert verdict.eligible is False, label
             assert verdict.reasons, label
 
         # backlog and campaign cohorts never auto-apply from the daemon
-        assert store.can_auto_apply(102, now=T1, **all_open).eligible is False
-        assert store.can_auto_apply(103, now=T1, **all_open).eligible is False
+        assert (
+            store.can_auto_apply(
+                102,
+                now=T1,
+                attestation_valid=all_open["attestation_valid"],
+                gate_open=all_open["gate_open"],
+                budgets_ok=all_open["budgets_ok"],
+                mapping_stable=all_open["mapping_stable"],
+                source_stable=all_open["source_stable"],
+            ).eligible
+            is False
+        )
+        assert (
+            store.can_auto_apply(
+                103,
+                now=T1,
+                attestation_valid=all_open["attestation_valid"],
+                gate_open=all_open["gate_open"],
+                budgets_ok=all_open["budgets_ok"],
+                mapping_stable=all_open["mapping_stable"],
+                source_stable=all_open["source_stable"],
+            ).eligible
+            is False
+        )
 
     with open_store(path) as fresh:
         # an incomplete baseline recorded later wins as the newest gate state
         fresh.record_baseline([], complete=False, auto_apply_eligible=False, iso=T2)
-        verdict = fresh.can_auto_apply(101, now=T3, **all_open)
+        verdict = fresh.can_auto_apply(
+            101,
+            now=T3,
+            attestation_valid=all_open["attestation_valid"],
+            gate_open=all_open["gate_open"],
+            budgets_ok=all_open["budgets_ok"],
+            mapping_stable=all_open["mapping_stable"],
+            source_stable=all_open["source_stable"],
+        )
         assert verdict.eligible is False
         assert "baseline_incomplete" in verdict.reasons
 

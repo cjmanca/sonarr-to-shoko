@@ -237,10 +237,8 @@ def test_unvisited_global_hold_is_separate_from_recorded_file_reason(tmp_path: P
 
     app.table_provider = table
     text = app.handle("GET", "/files/waiting", request_headers(cookie)).body.decode()
-    assert 'data-live="source-hold"' in text
-    hold = text.split('data-live="source-hold">', 1)[1].split("</div>", 1)[0]
-    assert "Library changes need review." in hold
-    assert '<a href="/status#source-review">Review library changes</a>' in hold
+    assert 'data-live="source-hold"' not in text
+    assert "Review library changes" not in text
     reason = text.split('data-disclosure="file-reason-101"', 1)[1].split("</details>", 1)[0]
     assert "TVDB episode mapping was unavailable" in reason
     assert "Last recorded file detail; this is not a fresh check" in reason

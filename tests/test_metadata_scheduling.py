@@ -29,6 +29,7 @@ from shoko_linker.metadata_refresh import (
 )
 from shoko_linker.onboarding import (
     METADATA_MAINTENANCE_POLICY,
+    OnboardingContext,
     OnboardingManager,
     required_confirmation_facts,
 )
@@ -246,10 +247,26 @@ def test_ready_links_run_before_metadata_with_separate_throughput_cap(
     assert second.metadata_requests_attempted == 0
 
 
+@pytest.mark.parametrize("normal_source_proof", [False, True])
 def test_two_missing_anime_share_configured_cap_without_canary(
-    service: Service, tmp_path: Path
+    service: Service,
+    tmp_path: Path,
+    normal_source_proof: bool,
 ) -> None:
     _add_anime(service, tmp_path)
+    if normal_source_proof:
+        store = service.deps.store
+        record = OnboardingManager(store).record()
+        assert record is not None
+        context = OnboardingContext(
+            record.binding,
+            to.safe_assessment(),
+            record.to_json(),
+            store.get_service_authorization_revision(),
+            settings_json=store.get_meta(META_SERVICE_SETTINGS),
+        )
+        store.set_meta("requires_rebaseline", "1")
+        service.deps = replace(service.deps, service_context=lambda: context)
     first = service.cycle("first-anime")
     assert first.metadata_requests_attempted == 2
     assert len(service.shoko.refreshes) == 2

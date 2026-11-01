@@ -56,6 +56,7 @@ from shoko_linker.state import (
     ATTESTATION_PAUSE_REASON,
     META_GLOBAL_PAUSE_ORIGIN,
     FileState,
+    NormalSourceProof,
     SendToken,
     StateStore,
 )
@@ -739,7 +740,9 @@ def _crash_after_prepare(env: CampEnv, store: StateStore, monkeypatch: pytest.Mo
     Returns the file whose row durably persists as ``prepared_not_sent``.
     """
 
-    def crashing_mark(token: SendToken, *, iso: str) -> None:
+    def crashing_mark(
+        token: SendToken, *, iso: str, normal_source_proof: NormalSourceProof | None = None
+    ) -> None:
         raise RuntimeError("simulated crash after prepare_send, before the send")
 
     original = store.mark_sent

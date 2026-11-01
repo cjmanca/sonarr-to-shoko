@@ -39,6 +39,8 @@ from shoko_linker.sonarr import (
     SonarrFile,
     SonarrInventory,
     SonarrSeries,
+    parse_series_entries,
+    select_eligible_series,
 )
 
 SONARR_KEY = "sonarr-setup-test-key-never-a-real-secret"
@@ -231,7 +233,7 @@ def test_multiple_anime_roots_ask_one_plain_language_question() -> None:
     assert discovery.message == "Which Sonarr folder contains your anime?"
 
 
-def test_unidentified_series_type_does_not_guess_anime_scope() -> None:
+def test_unidentified_series_type_is_only_a_hint_for_explicit_registered_root_selection() -> None:
     endpoint, _ = endpoint_for(
         series=[series_entry(1, ANIME_ROOT, series_type=None)],
         roots=[root_entry(ANIME_ROOT)],
@@ -241,10 +243,9 @@ def test_unidentified_series_type_does_not_guess_anime_scope() -> None:
     finally:
         endpoint.client.close()
 
-    assert discovery.status is ScopeStatus.BLOCKED
-    assert discovery.candidates == ()
-    assert "supported series types" in discovery.message
-    assert discovery.read_status is ScopeReadStatus.INCOMPLETE
+    assert discovery.status is ScopeStatus.CONFIRM_SCOPE
+    assert discovery.candidates == (AnimeRootCandidate(ANIME_ROOT, ()),)
+    assert discovery.read_status is ScopeReadStatus.COMPLETE
 
 
 @pytest.mark.parametrize("series_type", ["standard", "daily"])
@@ -327,7 +328,7 @@ def test_successful_rootfolder_response_missing_confirmed_root_is_complete_obser
     finally:
         endpoint.client.close()
 
-    assert discovery.status is ScopeStatus.BLOCKED
+    assert discovery.status is ScopeStatus.NO_ANIME
     assert discovery.read_status is ScopeReadStatus.COMPLETE
     assert discovery.candidates == ()
 
@@ -649,3 +650,121 @@ def test_conflicting_shoko_roots_for_one_sonarr_root_require_user_mapping() -> N
     assert result.status is MappingDiscoveryStatus.NEEDS_USER_MAPPING
     assert result.mappings == ()
     assert len(result.evidence) == 2
+
+
+@pytest.mark.parametrize(
+    "membership",
+    [
+        [],
+        [series_entry(2, ANIME_ROOT)],
+        [
+            series_entry(3, "not/an/absolute/path"),
+            {"id": 4},
+        ],
+    ],
+)
+@pytest.mark.parametrize(
+    "unselected",
+    [
+        root_entry(LIVE_ROOT, accessible=False),
+        {"path": LIVE_ROOT, "accessible": "unknown"},
+    ],
+)
+def test_confirmed_registered_root_is_independent_of_series_and_unrelated_root_health(
+    membership: list[dict[str, Any]], unselected: dict[str, Any]
+) -> None:
+    endpoint, _ = endpoint_for(series=membership, roots=[root_entry(ANIME_ROOT), unselected])
+    try:
+        discovery = discover_sonarr_scope(endpoint, selected_roots=(ANIME_ROOT,))
+    finally:
+        endpoint.client.close()
+    assert discovery.read_status is ScopeReadStatus.COMPLETE
+    assert discovery.candidates[0].path == ANIME_ROOT
+    assert tuple(candidate.path for candidate in discovery.candidates) == (ANIME_ROOT,)
+
+
+@pytest.mark.parametrize(
+    ("roots", "status"),
+    [
+        ([root_entry(ANIME_ROOT, accessible=False)], ScopeReadStatus.UNAVAILABLE),
+        ([{"path": ANIME_ROOT}], ScopeReadStatus.INCOMPLETE),
+        ([{"accessible": True}], ScopeReadStatus.INCOMPLETE),
+        ([root_entry(ANIME_ROOT), root_entry(ANIME_ROOT + "/nested")], ScopeReadStatus.INCOMPLETE),
+        ([root_entry(ANIME_ROOT), root_entry(ANIME_ROOT)], ScopeReadStatus.INCOMPLETE),
+        ([], ScopeReadStatus.COMPLETE),
+    ],
+)
+def test_confirmed_root_absence_is_distinct_from_unavailable_or_ambiguous_metadata(
+    roots: list[dict[str, Any]], status: ScopeReadStatus
+) -> None:
+    endpoint, _ = endpoint_for(series=[], roots=roots)
+    try:
+        discovery = discover_sonarr_scope(endpoint, selected_roots=(ANIME_ROOT,))
+    finally:
+        endpoint.client.close()
+    assert discovery.read_status is status
+    assert discovery.candidates == ()
+
+
+def test_new_empty_registered_root_is_offered_but_never_selected_implicitly() -> None:
+    endpoint, _ = endpoint_for(series=[], roots=[root_entry(ANIME_ROOT), root_entry(SECOND_ROOT)])
+    try:
+        discovery = discover_sonarr_scope(endpoint, selected_roots=(ANIME_ROOT,))
+    finally:
+        endpoint.client.close()
+    assert discovery.status is ScopeStatus.SELECT_SCOPE
+    assert discovery.candidates == (
+        AnimeRootCandidate(ANIME_ROOT, ()),
+        AnimeRootCandidate(SECOND_ROOT, ()),
+    )
+
+
+def test_unprovable_series_root_is_excluded_without_replacing_registered_scope() -> None:
+    parsed = parse_series_entries(
+        [
+            series_entry(1, "relative/unknown"),
+            series_entry(2, ANIME_ROOT, series_type=None),
+        ]
+    )
+    eligible, excluded = select_eligible_series(parsed.series, (ANIME_ROOT,))
+    assert eligible == ()
+    assert {series.id for series in excluded} == {1, 2}
+
+
+@pytest.mark.parametrize(
+    "unselected_roots",
+    [
+        [root_entry(LIVE_ROOT, accessible=False)],
+        [root_entry(LIVE_ROOT), root_entry(LIVE_ROOT)],
+    ],
+)
+def test_removed_selected_root_remains_proven_despite_unrelated_root_problems(
+    unselected_roots: list[dict[str, Any]],
+) -> None:
+    endpoint, _ = endpoint_for(series=[], roots=unselected_roots)
+    try:
+        discovery = discover_sonarr_scope(endpoint, selected_roots=(ANIME_ROOT,))
+    finally:
+        endpoint.client.close()
+    assert discovery.read_status is ScopeReadStatus.COMPLETE
+    assert discovery.status is ScopeStatus.BLOCKED
+    assert discovery.candidates == ()
+
+
+def test_registered_root_normalization_preserves_component_boundaries() -> None:
+    endpoint, _ = endpoint_for(
+        series=[],
+        roots=[
+            root_entry("//data/media/./anime/"),
+            {
+                "path": ANIME_ROOT + "-old",
+                "accessible": "unknown",
+            },
+        ],
+    )
+    try:
+        discovery = discover_sonarr_scope(endpoint, selected_roots=(ANIME_ROOT,))
+    finally:
+        endpoint.client.close()
+    assert discovery.read_status is ScopeReadStatus.COMPLETE
+    assert discovery.candidates == (AnimeRootCandidate(ANIME_ROOT, ()),)

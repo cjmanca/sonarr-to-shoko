@@ -361,6 +361,8 @@ class OnboardingContext(NamedTuple):
     assessment: SafetyAssessment
     consent_json: str
     authorization_revision: str | None = None
+    temporary_pause_token: str | None = None
+    settings_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -474,14 +476,35 @@ class OnboardingManager:
         )
 
     def evaluate_context(self, context: OnboardingContext, *, iso: str) -> OnboardingDecision:
-        return self.evaluate(
+        _validate_iso(iso)
+        # Only a controller context captured before fresh external checks can own
+        # recovery. Legacy/direct evaluation continues to respect every pause.
+        recovering = context.temporary_pause_token is not None
+        decision = self._evaluate(
             context.binding,
             context.assessment,
             iso=iso,
+            respect_user_pause=not recovering,
             expected_consent=context.consent_json,
             expected_authorization_revision=context.authorization_revision,
             check_authorization_revision=True,
+            temporary_recovery=recovering,
         )
+        if recovering and decision.status is OnboardingStatus.AUTHORIZED:
+            assert context.temporary_pause_token is not None
+            if not self.store.clear_temporary_setup_pause_if_current(
+                context.consent_json,
+                expected_authorization_revision=context.authorization_revision,
+                expected_settings_json=context.settings_json,
+                expected_pause_token=context.temporary_pause_token,
+                iso=iso,
+            ):
+                return OnboardingDecision(
+                    OnboardingStatus.PAUSED,
+                    "Service state changed during setup checks. Waiting for fresh checks.",
+                    context.binding.digest,
+                )
+        return decision
 
     def evaluate_source_review_context(
         self, context: OnboardingContext, *, iso: str
@@ -606,6 +629,7 @@ class OnboardingManager:
         iso: str,
         respect_user_pause: bool,
         persist_observations: bool = True,
+        temporary_recovery: bool = False,
         expected_consent: str | None = None,
         expected_authorization_revision: str | None = None,
         check_authorization_revision: bool = False,
@@ -682,15 +706,17 @@ class OnboardingManager:
                 message = "Explicit consent to automatic linking is required."
             else:
                 paused, reason = self.store.get_service_pause()
-                if paused and respect_user_pause:
+                if paused and (
+                    respect_user_pause or (temporary_recovery and reason != "setup_unavailable")
+                ):
                     status = OnboardingStatus.PAUSED
                     message = "Automatic linking is paused."
-                elif paused and reason == "setup_unavailable":
+                elif paused and reason == "setup_unavailable" and not temporary_recovery:
                     message = (
                         "Current setup checks pass. Resume automatic linking to clear the "
                         "temporary connection hold."
                     )
-                elif paused and reason != "user_paused":
+                elif paused and reason != "user_paused" and not temporary_recovery:
                     status = OnboardingStatus.NEEDS_CONFIRMATION
                     message = "Setup must be confirmed again before automatic linking can resume."
         if status is OnboardingStatus.AUTHORIZED and self.store.get_onboarding_json() != encoded:

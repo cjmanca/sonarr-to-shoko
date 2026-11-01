@@ -192,8 +192,6 @@ from .service_settings import (
     load_service_settings,
 )
 from .service_setup import ServiceSetupController
-from .source_review import SourceReviewController, SourceReviewTick
-from .source_review_collector import FreshSourceReviewCollector
 from .state import (
     ATTESTATION_PAUSE_REASON,
     META_LAST_CYCLE_END_ISO,
@@ -917,8 +915,6 @@ class _NormalServiceRuntime:
         sonarr: ApiEndpoint,
         shoko: ApiEndpoint,
         state: StopState,
-        *,
-        wake: Callable[[], None] = lambda: None,
     ) -> None:
         self.settings = settings
         self.sonarr = sonarr
@@ -930,7 +926,6 @@ class _NormalServiceRuntime:
             "connection": None,
             "authorized": False,
             "next_action": self._INITIAL_ACTION,
-            "reassessment_pending": False,
             "diagnostics": (),
             "worker_activity": "",
             "mapping_cache": "Available after scope and safety setup is confirmed above.",
@@ -939,19 +934,9 @@ class _NormalServiceRuntime:
         }
         self.setup = ServiceSetupController(settings, sonarr, shoko, settings.database_path)
         self._tick_cycle_started = False
-        self.source_review = SourceReviewController(
-            Path(settings.database_path),
-            FreshSourceReviewCollector(
-                settings, sonarr, shoko, self.setup, shutdown_requested=state.should_stop
-            ),
-            wake=wake,
-            shutdown_requested=state.should_stop,
-        )
 
     def _update_latest(self, **changes: Any) -> None:
         with self._latest_lock:
-            if "next_action" in changes:
-                self.latest["reassessment_pending"] = False
             self.latest.update(changes)
 
     def _latest_snapshot(self) -> dict[str, Any]:
@@ -966,7 +951,6 @@ class _NormalServiceRuntime:
         next_action: str,
         report: CycleReport | None = None,
         mapping_action: str | None = None,
-        reassessment_pending: bool = False,
     ) -> tuple[bool, str]:
         """Project write availability separately from consent and cycle success."""
         paused, pause_reason = store.get_service_pause()
@@ -975,33 +959,30 @@ class _NormalServiceRuntime:
             # Before the first check, derive guidance from the durable hold instead.
             if (
                 authorized
-                or reassessment_pending
                 or next_action == _NormalServiceRuntime._INITIAL_ACTION
                 or pause_reason == "user_paused"
             ):
                 next_action = _NormalServiceRuntime._pause_guidance(store, pause_reason)
             return False, next_action
-        continuity_held = store.get_meta("requires_rebaseline") == "1"
-        if store.writes_disabled or continuity_held:
-            guidance = (
-                "Source collection changed. Review source change on Overview "
-                "before linking can continue."
-                if continuity_held
-                else "Automatic linking is stopped by a safety check. "
+        if store.writes_disabled:
+            return False, (
+                "Automatic linking is stopped by a safety check. "
                 "Review advanced diagnostics before retrying."
             )
-            return False, guidance
         canary = store.get_service_canary()
         if canary is not None and canary[1] == "failed":
             return False, (
                 "Automatic linking is stopped because the initial link could not be verified. "
                 "Review advanced diagnostics before retrying."
             )
-        if not authorized and not (
-            reassessment_pending and canary is not None and canary[1] == "pending"
-        ):
-            if reassessment_pending and OnboardingManager(store).reconfirmation_required():
-                next_action = "Confirm the current scope and safety setup again."
+        if not authorized:
+            if next_action == _NormalServiceRuntime._INITIAL_ACTION and store.get_onboarding_json():
+                next_action = (
+                    "Confirm the current scope and safety setup again."
+                    if OnboardingManager(store).reconfirmation_required()
+                    else "Checking saved libraries and safety requirements. "
+                    "Automatic processing will resume when checks pass; retries are automatic."
+                )
             return False, next_action
         if report is not None and (report.failed or report.writes_suppressed):
             next_action = "A service check needs attention; automatic linking will retry safely."
@@ -1025,6 +1006,11 @@ class _NormalServiceRuntime:
             return "Review and fix Shoko safety settings, then confirm setup again."
         if OnboardingManager(store).reconfirmation_required():
             return "Confirm the current scope and safety setup again."
+        if reason == "setup_unavailable":
+            return (
+                "Waiting for Sonarr/Shoko setup checks; the service will retry automatically. "
+                "Saved libraries and safety consent are retained."
+            )
         if reason == "user_paused":
             return "Automatic linking is paused. Resume when you are ready."
         return "Review the current scope, safety setup and connections."
@@ -1121,7 +1107,6 @@ class _NormalServiceRuntime:
             active, next_action = self._operational_status(
                 store,
                 authorized=bool(latest["authorized"]),
-                reassessment_pending=bool(latest["reassessment_pending"]),
                 next_action=(
                     self._INITIAL_ACTION
                     if latest["worker_activity"] and store.get_service_pause()[0]
@@ -1280,7 +1265,6 @@ class _NormalServiceRuntime:
         started = time.monotonic()
         self._tick_cycle_started = False
         recovery_limits: tuple[float, int] | None = None
-        review_operation = False
         try:
             # Snapshot limits before connection/setup I/O. A blocked check must not
             # grant recovery a fresh wall-time allowance when it eventually returns.
@@ -1293,31 +1277,13 @@ class _NormalServiceRuntime:
                     started + sync.max_cycle_seconds,
                     sync.max_recovery_rows_per_cycle,
                 )
-            review_result = self.source_review.worker_tick(recovery_limits[0])
-            review_operation = review_result is not SourceReviewTick.IDLE
-            if review_operation:
-                if review_result is SourceReviewTick.ACCEPTED:
-                    self._update_latest(
-                        authorized=False,
-                        next_action=(
-                            "The local source baseline was accepted. "
-                            "Checking current requirements before automatic linking can continue."
-                        ),
-                        reassessment_pending=True,
-                    )
-                    return 1.0
-                return self.source_review.continuation_delay()
             self._worker_tick()
         except Exception:
             # Include failures before opening the state store (connection/configuration I/O).
             self._cycle_deferred()
             self.logger.error("Normal service check failed; it will be retried.")
         finally:
-            if (
-                not review_operation
-                and not self._tick_cycle_started
-                and recovery_limits is not None
-            ):
+            if not self._tick_cycle_started and recovery_limits is not None:
                 self._recover_blocked_metadata(*recovery_limits)
             self._update_latest(worker_activity="")
         return None
@@ -1387,7 +1353,11 @@ class _NormalServiceRuntime:
                 self._update_latest(
                     authorized=False,
                     next_action=(
-                        "Complete or review scope and safety setup before automatic linking."
+                        "Waiting for fresh Sonarr/Shoko setup checks; retries are automatic. "
+                        "Saved libraries and safety consent are retained."
+                        if store.get_onboarding_json() is not None
+                        and not OnboardingManager(store).reconfirmation_required()
+                        else "Complete or review scope and safety setup before automatic linking."
                     ),
                 )
                 return
@@ -1494,6 +1464,7 @@ class _NormalServiceRuntime:
             service_mode=True,
             service_authorized_for_deadline=service_authorized,
             service_authorized_local=service_authorized_local,
+            service_context=lambda: authorization_context[0],
         )
         try:
             self._tick_cycle_started = True
@@ -1614,7 +1585,7 @@ def _run_service(_args: argparse.Namespace) -> int:
         raise ConfigError("DASHBOARD_PORT must be an integer between 1 and 65535") from None
 
     worker_wake = threading.Event()
-    runtime = _NormalServiceRuntime(settings, sonarr, shoko, state, wake=worker_wake.set)
+    runtime = _NormalServiceRuntime(settings, sonarr, shoko, state)
     server = None
     dashboard_endpoints: tuple[ApiEndpoint, ApiEndpoint] | None = None
     try:
@@ -1643,9 +1614,6 @@ def _run_service(_args: argparse.Namespace) -> int:
             setup_action=dashboard_setup.action,
             settings_provider=preferences.view,
             settings_action=preferences.save,
-            source_review_provider=runtime.source_review.view,
-            source_review_assess=runtime.source_review.request_assessment,
-            source_review_confirm=runtime.source_review.request_confirmation,
             control_changed=worker_wake.set,
         )
         server = create_dashboard_server(DASHBOARD_BIND_HOST, dashboard_port, application)
