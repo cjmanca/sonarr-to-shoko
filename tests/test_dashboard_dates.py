@@ -179,12 +179,14 @@ assert.match(visible[0].attrs.title, /2026-10-29T12:00:01\+00:00/);
   const productionFormatter = PRODUCTION.split('  function prepareTimes')[1]
     .split('  prepareTimes(document);')[0];
   vm.runInContext('function prepareTimes' + productionFormatter, context);
+  // Historical Edmonton transitions keep repeat/skip-hour checks independent of
+  // future timezone-rule changes and the runtime's bundled timezone database.
   for (const [value, current, expected] of [
     ['2026-10-29T01:00:00+00:00', '2026-10-30T12:00:00Z', '2026-10-28'],
-    ['2026-11-01T07:30:00Z', '2026-11-01T12:00:00Z', '01:30'],
-    ['2026-11-01T08:30:00Z', '2026-11-01T12:00:00Z', '01:30'],
-    ['2026-03-08T08:30:00Z', '2026-03-08T12:00:00Z', '01:30'],
-    ['2026-03-08T09:30:00Z', '2026-03-08T12:00:00Z', '03:30'],
+    ['2025-11-02T07:30:00Z', '2025-11-02T12:00:00Z', '01:30'],
+    ['2025-11-02T08:30:00Z', '2025-11-02T12:00:00Z', '01:30'],
+    ['2025-03-09T08:30:00Z', '2025-03-09T12:00:00Z', '01:30'],
+    ['2025-03-09T09:30:00Z', '2025-03-09T12:00:00Z', '03:30'],
     ['2026-10-31T12:00:00Z', '2026-10-30T12:00:00Z', '2026-10-31'],
     ['2026-10-30T06:15:00-06:00', '2026-10-30T12:00:00Z', '06:15']
   ]) {
